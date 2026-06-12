@@ -1,392 +1,427 @@
 #!/bin/bash
-# ========================================
-# GOST 一键管理脚本
-# ========================================
 
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+
+# ================== 配色 ==================
 GREEN="\033[32m"
+CYAN="\033[36m"
 YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="flux-panel"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-GOST_SQL_URL="https://github.com/bqlpfy/flux-panel/releases/download/1.4.3/gost.sql"
-NODE_SCRIPT_URL="https://github.com/bqlpfy/flux-panel/raw/main/install.sh"
+# ================== 全局变量 ==================
+BASE_DIR="/opt/docker_backups"
+SCRIPT_DIR="$BASE_DIR/scripts"
+BACKUP_DIR="$BASE_DIR/data"
+CONFIG_FILE="$BASE_DIR/config.sh"
+LOG_FILE="$BASE_DIR/cron.log"
+REMOTE_SCRIPT_PATH="$SCRIPT_DIR/remote_script.sh"
+SSH_KEY="$HOME/.ssh/id_rsa_vpsbackup"
+INSTALL_PATH="$(realpath "$0")"
+CRON_TAG="#docker_backup_cron"
+EXCLUDE_DIR_NAME="$(basename "$BASE_DIR")"
 
-DOCKER_CMD="docker compose"
+# 默认配置
+RETAIN_DAYS_DEFAULT=7
+TG_TOKEN_DEFAULT=""
+TG_CHAT_ID_DEFAULT=""
+SERVER_NAME_DEFAULT="$(hostname)"
+REMOTE_USER_DEFAULT=""
+REMOTE_IP_DEFAULT=""
+REMOTE_DIR_DEFAULT="$BACKUP_DIR"
 
+mkdir -p "$SCRIPT_DIR" "$BACKUP_DIR"
 
-# 代理前缀列表（第一个留空代表直连尝试）
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
-
-
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! $DOCKER_CMD version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
-
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
-check_ipv6_support() {
-    if ping6 -c 1 ::1 &>/dev/null; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# 代理轮询下载通用函数
-download_file() {
-    local url="$1"
-    local output="$2"
-    local success=false
-
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local target_url="${proxy}${url}"
-        if [ -n "$proxy" ]; then
-            echo "📡 正在尝试通过代理下载: ${proxy}"
-        else
-            echo "📡 正在尝试直连下载..."
-        fi
-        
-        curl -L -k --max-time 15 -o "$output" "$target_url"
-        
-        if [ -s "$output" ]; then
-            success=true
-            break
-        else
-            rm -f "$output"
-        fi
-    done
-
-    if [ "$success" = true ]; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
-
-configure_docker_ipv6() {
-    # 确保 daemon.json 存在
-    if [ ! -f /etc/docker/daemon.json ]; then
-        echo '{}' > /etc/docker/daemon.json
-    fi
-
-    # 检查是否已经启用 IPv6
-    IPV6_ENABLED=$(jq '.ipv6 // false' /etc/docker/daemon.json)
-    if [ "$IPV6_ENABLED" = "true" ]; then
-        echo -e "${GREEN}✅ Docker 已启用 IPv6，无需重复配置${RESET}"
-        return
-    fi
-
-    # 配置 IPv6
-    jq '. + {ipv6:true, "fixed-cidr-v6":"fd00:dead:beef::/48"}' /etc/docker/daemon.json > /tmp/daemon.json.tmp
-    mv /tmp/daemon.json.tmp /etc/docker/daemon.json
-
-    # 重启 Docker
-    systemctl restart docker
-    echo -e "${GREEN}✅ Docker IPv6 已启用${RESET}"
-}
-
-menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}============================${RESET}"
-        echo -e "${GREEN}  ◈   哆啦A梦转发面板   ◈   ${RESET}"
-        echo -e "${GREEN}============================${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}7)${RESET} {YELLOW}节点管理${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        echo -e "${GREEN}============================${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            7) manage_nodes ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    cd "$APP_DIR" || exit
-
-    
-    # 下载数据库初始化文件
-    echo "📡 准备下载数据库初始化文件..."
-    if [ ! -f gost.sql ] || [ ! -s gost.sql ]; then
-        if ! download_file "$GOST_SQL_URL" "gost.sql"; then
-            echo -e "${RED}❌ 数据库文件下载失败，请检查网络渠道${RESET}"
-            read -p "按回车返回菜单..."
-            return
-        fi
-    fi
-    echo -e "${GREEN}✅ 数据库文件准备完成${RESET}"
-
-    # 设置端口
-    read -p "请输入前端端口 [默认:6366]: " input_front
-    FRONTEND_PORT=${input_front:-6366}
-    check_port "$FRONTEND_PORT" || return
-
-    read -p "请输入后端端口 [默认:6365]: " input_back
-    BACKEND_PORT=${input_back:-6365}
-    check_port "$BACKEND_PORT" || return
-
-    # 设置数据库账户
-    read -p "请输入数据库用户名 [默认:gost]: " input_user
-    DB_USER=${input_user:-gost}
-    read -p "请输入数据库名 [默认:gost]: " input_db
-    DB_NAME=${input_db:-gost}
-    read -p "请输入数据库密码 [默认:123456]: " input_pass
-    DB_PASSWORD=${input_pass:-123456}
-
-    # JWT secret
-    JWT_SECRET=$(openssl rand -hex 16)
-
-    # 检测 IPv6
-    if check_ipv6_support; then
-        echo -e "${GREEN}🚀 系统支持 IPv6，自动启用 IPv6 配置...${RESET}"
-        configure_docker_ipv6
-    else
-        echo -e "${YELLOW}⚠️ 系统不支持 IPv6，跳过配置${RESET}"
-    fi
-
-    # 生成 .env
-    cat > .env <<EOF
-DB_NAME=$DB_NAME
-DB_USER=$DB_USER
-DB_PASSWORD=$DB_PASSWORD
-JWT_SECRET=$JWT_SECRET
-FRONTEND_PORT=$FRONTEND_PORT
-BACKEND_PORT=$BACKEND_PORT
-EOF
-    echo -e "${GREEN}✅ .env 文件生成完成${RESET}"
-
-        # IPv6 设置
-    read -p "是否启用 Docker IPv6 网络? [Y/n] (默认开启): " ipv6_input
-    if [[ "$ipv6_input" =~ ^[Nn]$ ]]; then
-        ENABLE_IPV6=false
-    fi
-
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-
-services:
-  mysql:
-    image: mysql:5.7
-    container_name: gost-mysql
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_USER: ${DB_USER}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
-      TZ: Asia/Shanghai
-    volumes:
-      - mysql_data:/var/lib/mysql
-      - ./gost.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    command: >
-      --default-authentication-plugin=mysql_native_password
-      --character-set-server=utf8mb4
-      --collation-server=utf8mb4_unicode_ci
-      --max_connections=1000
-      --innodb_buffer_pool_size=256M
-    networks:
-      - gost-network
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      timeout: 10s
-      retries: 10
-
-  backend:
-    image: bqlpfy/springboot-backend:1.4.3
-    container_name: springboot-backend
-    restart: unless-stopped
-    environment:
-      DB_HOST: mysql
-      DB_NAME: ${DB_NAME}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      JWT_SECRET: ${JWT_SECRET}
-      LOG_DIR: /app/logs
-      JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
-    ports:
-      - "${BACKEND_PORT}:6365"
-    volumes:
-      - backend_logs:/app/logs
-    depends_on:
-      mysql:
-        condition: service_healthy
-    networks:
-      - gost-network
-    healthcheck:
-      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 90s
-
-  frontend:
-    image: bqlpfy/vite-frontend:1.4.3
-    container_name: vite-frontend
-    restart: unless-stopped
-    ports:
-      - "${FRONTEND_PORT}:80"
-    depends_on:
-      backend:
-        condition: service_healthy
-    networks:
-      - gost-network
-
-volumes:
-  mysql_data:
-    name: mysql_data
-    driver: local
-  backend_logs:
-    name: backend_logs
-    driver: local
-EOF
-
-# 添加 IPv6 网络
-if [ "$ENABLE_IPV6" = true ]; then
-cat >> "$COMPOSE_FILE" <<EOF
-
-networks:
-  gost-network:
-    name: gost-network
-    driver: bridge
-    enable_ipv6: true
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
-        - subnet: fd00:dead:beef::/48
-EOF
-else
-cat >> "$COMPOSE_FILE" <<EOF
-
-networks:
-  gost-network:
-    name: gost-network
-    driver: bridge
-EOF
+# ================== 首次运行下载远程脚本 ==================
+if [[ ! -f "$REMOTE_SCRIPT_PATH" ]]; then
+    curl -fsSL "https://raw.githubusercontent.com/iu683/uu/main/vv.sh" -o "$REMOTE_SCRIPT_PATH"
+    chmod +x "$REMOTE_SCRIPT_PATH"
+    exec "$REMOTE_SCRIPT_PATH"
 fi
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
-
-    SERVER_IP=$(get_public_ip)
-
-    echo -e "${GREEN}✅ 哆啦A梦转发面板 已启动${RESET}"
-    echo -e "${YELLOW}🌐 前端访问: http://${SERVER_IP}:${FRONTEND_PORT}${RESET}"
-    echo -e "${YELLOW}🌐 后端访问: http://${SERVER_IP}:${BACKEND_PORT}${RESET}"
-    echo -e "${YELLOW}🌐 默认账号: admin_user${RESET}"
-    echo -e "${YELLOW}🌐 默认密码: admin_user${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    read -p "按回车返回菜单..."
+# ================== 配置加载/保存 ==================
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+    BACKUP_DIR=${BACKUP_DIR:-$BACKUP_DIR}
+    RETAIN_DAYS=${RETAIN_DAYS:-$RETAIN_DAYS_DEFAULT}
+    TG_TOKEN=${TG_TOKEN:-$TG_TOKEN_DEFAULT}
+    TG_CHAT_ID=${TG_CHAT_ID:-$TG_CHAT_ID_DEFAULT}
+    SERVER_NAME=${SERVER_NAME:-$SERVER_NAME_DEFAULT}
+    REMOTE_USER=${REMOTE_USER:-$REMOTE_USER_DEFAULT}
+    REMOTE_IP=${REMOTE_IP:-$REMOTE_IP_DEFAULT}
+    REMOTE_DIR=${REMOTE_DIR:-$REMOTE_DIR_DEFAULT}
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    $DOCKER_CMD pull
-    $DOCKER_CMD up -d
-    echo -e "${GREEN}✅ 哆啦A梦转发面板 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+save_config() {
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat >"$CONFIG_FILE" <<EOF
+BACKUP_DIR="$BACKUP_DIR"
+RETAIN_DAYS="$RETAIN_DAYS"
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+SERVER_NAME="$SERVER_NAME"
+REMOTE_USER="$REMOTE_USER"
+REMOTE_IP="$REMOTE_IP"
+REMOTE_DIR="$REMOTE_DIR"
+EOF
+    echo -e "${GREEN}✅ 配置已保存到 $CONFIG_FILE${RESET}"
 }
 
-restart_app() {
-    docker restart gost-mysql springboot-backend vite-frontend
-    echo -e "${GREEN}✅ 哆啦A梦转发面板 已重启${RESET}"
-    read -p "按回车返回菜单..."
+load_config
+
+# ================== Telegram通知 ==================
+tg_send() {
+    local MESSAGE="$1"
+    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
+    local SERVER=${SERVER_NAME:-localhost}
+    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+        --data-urlencode "chat_id=$TG_CHAT_ID" \
+        --data-urlencode "text=[$SERVER] $MESSAGE" >/dev/null 2>&1
 }
 
-view_logs() {
-    echo -e "${GREEN}选择容器查看日志:${RESET}"
-    echo "1) MySQL"
-    echo "2) Backend"
-    echo "3) Frontend"
-    read -p "选择: " c
-    case $c in
-        1) docker logs -f gost-mysql ;;
-        2) docker logs -f springboot-backend ;;
-        3) docker logs -f vite-frontend ;;
-        *) echo -e "${RED}无效选择${RESET}" ;;
-    esac
-}
 
-check_status() {
-    docker ps | grep -E "gost-mysql|springboot-backend|vite-frontend"
-    read -p "按回车返回菜单..."
-}
+# ================== SSH密钥自动生成 ==================
+setup_ssh_key() {
+    if [[ ! -f "$SSH_KEY" ]]; then
+        echo -e "${CYAN}🔑 生成 SSH 密钥...${RESET}"
+        ssh-keygen -t rsa -b 4096 -f "$SSH_KEY" -N ""
+        echo -e "${GREEN}✅ 密钥生成完成: $SSH_KEY${RESET}"
+    fi
 
-manage_nodes() {
-    echo "📡 正在获取节点管理..."
-    if download_file "$NODE_SCRIPT_URL" "node_install.sh"; then
-        chmod +x node_install.sh
-        ./node_install.sh
-        rm -f node_install.sh
+    # ---- 交互式读取远程信息 ----
+    # 1. 读取用户名（默认 root）
+    read -rp "$(echo -e "${GREEN}请输入远程用户名（默认 root）: ${RESET}")" username
+    username=${username:-root}
+
+    # 2. 读取服务器 IP 并校验
+    read -rp "$(echo -e "${GREEN}请输入远程服务器 IP: ${RESET}")" ip_address
+    if [ -z "$ip_address" ]; then
+        echo -e "${RED}❌ 错误: 服务器 IP 不能为空！${RESET}"
+        return 1  # 使用 return 避免直接关闭整个菜单脚本
+    fi
+
+    # 3. 读取 SSH 端口（默认 22）
+    read -rp "$(echo -e "${GREEN}请输入SSH端口（默认 22）: ${RESET}")" port
+    port=${port:-22}
+
+    echo -e "${CYAN}🚀 正在将公钥部署到远程服务器 ${username}@${ip_address}:${port} ...${RESET}"
+    
+    # 核心：将端口参数 -p 传递给 ssh-copy-id
+    ssh-copy-id -i "$SSH_KEY.pub" -p "$port" -o StrictHostKeyChecking=no "${username}@${ip_address}"
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✅ 密钥已成功部署到远程: ${username}@${ip_address}:${port}${RESET}"
+        
+        # 可选：顺便把这些信息同步到你的全局配置中，方便远程备份功能直接使用
+        REMOTE_USER="$username"
+        REMOTE_IP="$ip_address"
+        save_config
     else
-        echo -e "${RED}❌ 无法下载节点管理，请检查网络！${RESET}"
-        read -p "按回车返回菜单..."
+        echo -e "${RED}❌ 密钥部署失败，请检查网络或密码是否正确。${RESET}"
     fi
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅  哆啦A梦转发面板 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
+# ================== 本地备份 ==================
+backup_local() {
+    read -rp "请输入要备份的 Docker Compose 项目目录（例如 /opt 多目录空格分隔）: " -a PROJECT_DIRS
+    [[ ${#PROJECT_DIRS[@]} -eq 0 ]] && { echo -e "${RED}❌ 没有输入目录${RESET}"; return; }
+
+    mkdir -p "$BACKUP_DIR"
+    for PROJECT_DIR in "${PROJECT_DIRS[@]}"; do
+        [[ ! -d "$PROJECT_DIR" ]] && { echo -e "${RED}❌ 目录不存在: $PROJECT_DIR${RESET}"; continue; }
+
+        if [[ -f "$PROJECT_DIR/docker-compose.yml" ]]; then
+            echo -e "${CYAN}⏸️ 暂停容器: $PROJECT_DIR${RESET}"
+            cd "$PROJECT_DIR" || continue
+            docker compose down
+        fi
+
+        TIMESTAMP=$(date +%F_%H-%M-%S)
+        BACKUP_FILE="$BACKUP_DIR/$(basename "$PROJECT_DIR")_backup_$TIMESTAMP.tar.gz"
+        echo -e "${CYAN}📦 正在备份 $PROJECT_DIR → $BACKUP_FILE${RESET}"
+        tar czf "$BACKUP_FILE" \
+            --exclude="$EXCLUDE_DIR_NAME" \
+            -C "$PROJECT_DIR" .
+
+        if [[ -f "$PROJECT_DIR/docker-compose.yml" ]]; then
+            echo -e "${CYAN}🚀 启动容器: $PROJECT_DIR${RESET}"
+            cd "$PROJECT_DIR" || continue
+            docker compose up -d
+        fi
+
+        echo -e "${GREEN}✅ 本地备份完成: $BACKUP_FILE${RESET}"
+        tg_send "本地备份完成: $(basename "$PROJECT_DIR")"
+    done
+
+    find "$BACKUP_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -exec rm -f {} \;
+    tg_send "🗑️ 已清理 $RETAIN_DAYS 天以上旧备份"
 }
 
-menu
+# ================== 远程上传（上传目录内所有备份文件，不解压） ==================
+backup_remote_all() {
+    [[ ! -d "$BACKUP_DIR" ]] && { echo -e "${RED}❌ 本地备份目录不存在: $BACKUP_DIR${RESET}"; return; }
+
+    FILE_LIST=("$BACKUP_DIR"/*.tar.gz)
+    [[ ${#FILE_LIST[@]} -eq 0 ]] && { echo -e "${RED}❌ 没有备份文件${RESET}"; return; }
+
+    echo -e "${CYAN}📤 上传所有备份文件到远程: $REMOTE_USER@$REMOTE_IP:$REMOTE_DIR${RESET}"
+
+    # 远程删除旧备份
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DIR\" && rm -f \"$REMOTE_DIR\"/*.tar.gz"
+
+    # 上传所有文件
+    for FILE in "${FILE_LIST[@]}"; do
+        scp -i "$SSH_KEY" "$FILE" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DIR/" >> "$LOG_FILE" 2>&1
+        tg_send "备份上传完成: $(basename "$FILE") → $REMOTE_IP"
+    done
+
+    echo -e "${GREEN}✅ 所有备份文件上传完成${RESET}"
+}
+
+# ================== 恢复 ==================
+restore() {
+    read -rp "请输入备份存放目录（默认 $BACKUP_DIR）: " INPUT_DIR
+    BACKUP_DIR=${INPUT_DIR:-$BACKUP_DIR}
+
+    [[ ! -d "$BACKUP_DIR" ]] && { echo -e "${RED}❌ 目录不存在: $BACKUP_DIR${RESET}"; return; }
+    FILE_LIST=("$BACKUP_DIR"/*.tar.gz)
+    [[ ${#FILE_LIST[@]} -eq 0 ]] && { echo -e "${RED}❌ 没有找到任何备份文件${RESET}"; return; }
+
+    echo -e "${CYAN}📂 本地备份文件列表:${RESET}"
+    for i in "${!FILE_LIST[@]}"; do
+        echo -e "${GREEN}$((i+1)). $(basename "${FILE_LIST[$i]}")${RESET}"
+    done
+
+    read -rp "请输入要恢复的序号（空格分隔，all 全选，latest 最新备份）: " SELECTION
+    BACKUP_FILES=()
+    if [[ "$SELECTION" == "all" ]]; then
+        BACKUP_FILES=("${FILE_LIST[@]}")
+    elif [[ "$SELECTION" == "latest" ]]; then
+        BACKUP_FILES=($(ls -t "$BACKUP_DIR"/*.tar.gz | head -n1))
+    else
+        for num in $SELECTION; do
+            [[ $num =~ ^[0-9]+$ ]] && (( num>=1 && num<=${#FILE_LIST[@]} )) && BACKUP_FILES+=("${FILE_LIST[$((num-1))]}") || echo -e "${RED}❌ 无效序号: $num${RESET}"
+        done
+    fi
+    [[ ${#BACKUP_FILES[@]} -eq 0 ]] && { echo -e "${RED}❌ 没有选择有效文件${RESET}"; return; }
+
+    read -rp "请输入恢复到的项目目录（默认 /opt/原项目名）: " PROJECT_DIR_INPUT
+    for FILE in "${BACKUP_FILES[@]}"; do
+        BASE_NAME=$(basename "$FILE" | sed 's/_backup_.*\.tar\.gz//')
+        TARGET_DIR=${PROJECT_DIR_INPUT:-/opt/$BASE_NAME}
+        mkdir -p "$TARGET_DIR"
+
+        echo -e "${CYAN}📂 解压备份 $(basename "$FILE") → $TARGET_DIR${RESET}"
+        tar xzf "$FILE" -C "$TARGET_DIR"
+
+        if [[ -f "$TARGET_DIR/docker-compose.yml" ]]; then
+            echo -e "${CYAN}🚀 启动容器...${RESET}"
+            cd "$TARGET_DIR" || continue
+            docker compose up -d
+            echo -e "${GREEN}✅ 恢复完成: $TARGET_DIR${RESET}"
+            tg_send "恢复完成: $BASE_NAME → $TARGET_DIR"
+        else
+            echo -e "${RED}❌ docker-compose.yml 不存在，无法启动容器${RESET}"
+        fi
+    done
+}
+
+# ================== 配置菜单 ==================
+configure_settings_menu() {
+    load_config
+    while true; do
+        clear
+        echo -e "${GREEN}====================================${RESET}"
+        echo -e "${GREEN}      ◈       配置设置       ◈    ${RESET}"
+        echo -e "${GREEN}====================================${RESET}"
+        echo -e "${GREEN}1. Telegram Bot Token (当前:${RESET} ${YELLOW}$TG_TOKEN${RESET}${GREEN})${RESET}"
+        echo -e "${GREEN}2. Telegram Chat ID (当前:${RESET} ${YELLOW}$TG_CHAT_ID${RESET}${GREEN})${RESET}"
+        echo -e "${GREEN}3. 服务器名称 (当前:${RESET} ${YELLOW}$SERVER_NAME${RESET}${GREEN})${RESET}"
+        echo -e "${GREEN}4. 本地备份保留天数 (当前:${RESET} ${YELLOW}$RETAIN_DAYS${RESET}${GREEN})${RESET}"
+        echo -e "${GREEN}5. 本地备份目录 (当前:${RESET} ${YELLOW}$BACKUP_DIR${RESET}${GREEN})${RESET}"
+        echo -e "${GREEN}6. 远程服务器用户名 (当前:${RESET} ${YELLOW}$REMOTE_USER${RESET}${GREEN})${RESET}"
+        echo -e "${GREEN}7. 远程服务器 IP (当前:${RESET} ${YELLOW}$REMOTE_IP${RESET}${GREEN})${RESET}"
+        echo -e "${GREEN}8. 远程备份目录 (当前:${RESET} ${YELLOW}$REMOTE_DIR${RESET}${GREEN})${RESET}"
+        echo -e "${GREEN}0. 返回上级菜单${RESET}"
+        echo -e "${GREEN}====================================${RESET}"
+        read -rp "$(echo -e "${GREEN}请选择操作: ${RESET}")" choice
+        case $choice in
+            1) read -rp "请输入 Telegram Bot Token: " input; [[ -n "$input" ]] && TG_TOKEN="$input" ;;
+            2) read -rp "请输入 Telegram Chat ID: " input; [[ -n "$input" ]] && TG_CHAT_ID="$input" ;;
+            3) read -rp "请输入服务器名称: " input; [[ -n "$input" ]] && SERVER_NAME="$input" ;;
+            4) read -rp "请输入本地备份保留天数: " input; [[ -n "$input" ]] && RETAIN_DAYS="$input" ;;
+            5) read -rp "请输入本地备份目录: " input; [[ -n "$input" ]] && BACKUP_DIR="$input" ;;
+            6) read -rp "请输入远程服务器用户名: " input; [[ -n "$input" ]] && REMOTE_USER="$input" ;;
+            7) read -rp "请输入远程服务器 IP: " input; [[ -n "$input" ]] && REMOTE_IP="$input" ;;
+            8) read -rp "请输入远程备份目录: " input; [[ -n "$input" ]] && REMOTE_DIR="$input" ;;
+            0) save_config; load_config; break ;;
+            *) echo -e "${RED}❌ 无效选择${RESET}" ;;
+        esac
+        save_config
+        load_config
+        read -rp "$(echo -e "${GREEN}按回车继续...${RESET}")"
+    done
+}
+
+# ================== 定时任务管理 ==================
+list_cron() {
+    mapfile -t lines < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
+    [ ${#lines[@]} -eq 0 ] && { echo -e "${YELLOW}暂无定时任务${RESET}"; return; }
+    for i in "${!lines[@]}"; do
+        cron=$(echo "${lines[$i]}" | sed "s|$INSTALL_PATH auto||;s|$CRON_TAG||")
+        echo "$i) $cron"
+    done
+}
+
+schedule_add() {
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}1. 每天0点${RESET}"
+    echo -e "${GREEN}2. 每周一0点${RESET}"
+    echo -e "${GREEN}3. 每月1号0点${RESET}"
+    echo -e "${GREEN}4. 自定义cron${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    read -rp "$(echo -e "${GREEN}选择: ${RESET}")" t
+    case $t in
+        1) cron_expr="0 0 * * *" ;;
+        2) cron_expr="0 0 * * 1" ;;
+        3) cron_expr="0 0 1 * *" ;;
+        4) read -p "请输入自定义 cron 表达式: " cron_expr ;;
+        *) echo -e "${RED}❌ 无效选择${RESET}"; return ;;
+    esac
+
+    read -p "备份目录(空格分隔, 留空使用默认 $BACKUP_DIR): " dirs
+    [[ -z "$dirs" ]] && dirs="$BACKUP_DIR"
+
+    (crontab -l 2>/dev/null; \
+    echo "$cron_expr /bin/bash \"$INSTALL_PATH\" auto \"$dirs\" >> \"$LOG_FILE\" 2>&1 $CRON_TAG") | crontab -
+    echo -e "${GREEN}✅ 添加成功，cron 日志: $LOG_FILE${RESET}"
+}
+
+schedule_del_one() {
+    mapfile -t lines < <(crontab -l 2>/dev/null | grep "$CRON_TAG")
+    [ ${#lines[@]} -eq 0 ] && { echo -e "${YELLOW}暂无定时任务${RESET}"; return; }
+    list_cron
+    read -p "输入要删除的编号: " idx
+    unset 'lines[idx]'
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG"; for l in "${lines[@]}"; do echo "$l"; done) | crontab -
+    echo -e "${GREEN}✅ 已删除${RESET}"
+}
+
+schedule_del_all() {
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    echo -e "${GREEN}✅ 已清空全部定时任务${RESET}"
+}
+
+schedule_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}====================================${RESET}"
+        echo -e "${GREEN}       ◈    定时任务管理    ◈       ${RESET}"
+        echo -e "${GREEN}====================================${RESET}"
+        echo -e "${GREEN}------------------------------------${RESET}"
+        list_cron
+        echo -e "${GREEN}------------------------------------${RESET}"
+        echo -e "${GREEN}1. 添加任务${RESET}"
+        echo -e "${GREEN}2. 删除任务${RESET}"
+        echo -e "${GREEN}3. 清空全部${RESET}"
+        echo -e "${GREEN}0. 返回${RESET}"
+        echo -e "${GREEN}====================================${RESET}"
+        read -p "$(echo -e "${GREEN}请选择:${RESET} ")" choice
+        case $choice in
+            1) schedule_add ;;
+            2) schedule_del_one ;;
+            3) schedule_del_all ;;
+            0) break ;;
+            *) echo -e "${RED}❌ 无效选择${RESET}" ;;
+        esac
+        read -rp "$(echo -e "${GREEN}按回车继续...${RESET}")"
+    done
+}
+
+# ================== 卸载 ==================
+uninstall() {
+    echo -e "${YELLOW}正在彻底卸载...${RESET}"
+    [[ -f "$CONFIG_FILE" ]] && rm -f "$CONFIG_FILE" && echo -e "${GREEN}✅ 配置文件已删除${RESET}"
+    [[ -f "$REMOTE_SCRIPT_PATH" ]] && rm -f "$REMOTE_SCRIPT_PATH" && echo -e "${GREEN}✅ 远程脚本已删除${RESET}"
+    crontab -l 2>/dev/null | grep -v -E "($INSTALL_PATH|$CRON_TAG)" | crontab -
+    [[ -d "$BASE_DIR" ]] && rm -rf "$BASE_DIR" && echo -e "${GREEN}✅ 本地备份目录已删除${RESET}"
+    [[ -f "$SSH_KEY" ]] && rm -f "$SSH_KEY" "$SSH_KEY.pub" && echo -e "${GREEN}✅ SSH 密钥已删除: $SSH_KEY${RESET}"
+    echo -e "${GREEN}✅ 卸载完成，所有文件和定时任务已清理干净${RESET}"
+    exit 0
+}
+
+# ================== auto模式 ==================
+if [[ "$1" == "auto" ]]; then
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export HOME=/root
+    load_config
+    mkdir -p "$BACKUP_DIR"
+
+    DIRS=()
+    [[ -n "$2" ]] && IFS=' ' read -r -a DIRS <<< "$2"
+    [[ ${#DIRS[@]} -eq 0 ]] && DIRS=("$BACKUP_DIR")
+
+    for PROJECT_DIR in "${DIRS[@]}"; do
+        [[ ! -d "$PROJECT_DIR" ]] && continue
+        TIMESTAMP=$(date +%F_%H-%M-%S)
+        BACKUP_FILE="$BACKUP_DIR/$(basename "$PROJECT_DIR")_backup_$TIMESTAMP.tar.gz"
+        tar czf "$BACKUP_FILE" \
+            --exclude="$EXCLUDE_DIR_NAME" \
+            -C "$PROJECT_DIR" . >> "$LOG_FILE" 2>&1
+        tg_send "自动备份完成: $(basename "$PROJECT_DIR") → $BACKUP_FILE"
+    done
+
+    find "$BACKUP_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -exec rm -f {} \;
+    tg_send "🗑️ 自动清理 $RETAIN_DAYS 天以上旧备份"
+
+    if [[ -n "$REMOTE_USER" && -n "$REMOTE_IP" ]]; then
+        backup_remote_all
+    fi
+
+    exit 0
+fi
+
+# ================== 主菜单 ==================
+while true; do
+    load_config
+    clear
+
+    # ---- 动态获取状态 ----
+    # 检查 crontab 中是否存在该脚本的定时任务
+    if crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
+        CRON_STATUS="${YELLOW}已开启${RESET}"
+    else
+        CRON_STATUS="${RED}已关闭${RESET}"
+    fi
+
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}  ◈ Docker compose 备份恢复管理 ◈   ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 📂 当前备份目录: ${YELLOW}$BACKUP_DIR${RESET}"
+    echo -e "${GREEN} ⏰ 定时任务状态: $CRON_STATUS${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}1. 本地备份${RESET}"
+    echo -e "${GREEN}2. 恢复项目${RESET}"
+    echo -e "${GREEN}3. 设置SSH密钥自动登录${RESET}"
+    echo -e "${GREEN}4. 配置设置（Telegram/保留天数/目录/远程信息）${RESET}"
+    echo -e "${GREEN}5. 远程备份${RESET}"
+    echo -e "${GREEN}6. 定时任务管理${RESET}"
+    echo -e "${GREEN}7. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+
+    read -p "$(echo -e ${GREEN}请选择操作: ${RESET})" CHOICE
+    case $CHOICE in
+        1) backup_local ;;
+        2) restore ;;
+        3) setup_ssh_key ;;
+        4) configure_settings_menu ;;
+        5) backup_remote_all ;;
+        6) schedule_menu ;;
+        7) uninstall ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}❌ 无效选择${RESET}" ;;
+    esac
+    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+done

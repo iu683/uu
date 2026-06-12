@@ -98,26 +98,45 @@ aliyun_alpine_source="https://mirrors.aliyun.com/alpine/"
 official_alpine_source="https://dl-cdn.alpinelinux.org/alpine/"
 tsinghua_alpine_source="https://mirrors.tuna.tsinghua.edu.cn/alpine/"
 
-# 6. 获取当前软件源状态
+# 6. 获取当前软件源状态（Ubuntu 与 Debian 已完全分离独立检查）
 get_current_source_status() {
     case "$ID" in
-        ubuntu|debian)
+        ubuntu)
             local file="/etc/apt/sources.list"
-            # 优先检测 24.04+ 的新版源文件
-            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-                file="/etc/apt/sources.list.d/ubuntu.sources"
-            fi
+            # 只要新版文件存在，就强制切换到新文件（不管旧文件在不在）
+            [ -f /etc/apt/sources.list.d/ubuntu.sources ] && file="/etc/apt/sources.list.d/ubuntu.sources"
             
             if [ -f "$file" ]; then
-                # 同时兼容抓取旧版的 "deb http" 和新版的 "URIs: http"
-                local main_url=$(grep -v '^#' "$file" | grep -E -i 'deb http|deb https|URIs: http' | head -n 1 | awk '{print $2}' | sed -e 's/URIs://' -e 's/["\']//g')
-                [ -z "$main_url" ] && echo "未检测到有效源" || echo "$main_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||'
+                # 先过滤掉注释，抓取包含有效源的行
+                local raw_line=$(grep -v '^#' "$file" | grep -E -i 'deb http|deb https|URIs: http' | head -n 1)
+                
+                # 核心修复：直接把前缀 (deb或URIs:) 以及 http(s):// 剥离，再切出域名
+                local main_url=$(echo "$raw_line" | sed -E 's/^(deb|URIs:)[[:space:]]*//I' | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||')
+                
+                [ -z "$main_url" ] && echo "未检测到有效 Ubuntu 源" || echo "$main_url"
             else
-                echo "未找到软件源配置文件"
+                echo "未找到 Ubuntu 软件源配置文件"
             fi
             ;;
+
+        debian)
+            local file="/etc/apt/sources.list"
+            # Debian 13+ 专属路径检测
+            [ -f /etc/apt/sources.list.d/debian.sources ] && file="/etc/apt/sources.list.d/debian.sources"
+            
+            if [ -f "$file" ]; then
+                local raw_line=$(grep -v '^#' "$file" | grep -E -i 'deb http|deb https|URIs: http' | head -n 1)
+                
+                # 同理，先扒掉开头的 deb 或 URIs:，再清理协议和路径
+                local main_url=$(echo "$raw_line" | sed -E 's/^(deb|URIs:)[[:space:]]*//I' | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||')
+                
+                [ -z "$main_url" ] && echo "未检测到有效 Debian 源" || echo "$main_url"
+            else
+                echo "未找到 Debian 软件源配置文件"
+            fi
+            ;;
+            
         centos|rhel|rocky|almalinux)
-            # 兼容 CentOS 7 (CentOS-Base.repo) 与 Rocky/Alma/CentOS 8+ (rocky.repo / almalinux.repo)
             local repo_file=""
             for f in /etc/yum.repos.d/*.repo; do
                 if [ -f "$f" ] && grep -q -E '^baseurl=|^mirrorlist=' "$f"; then
@@ -132,6 +151,7 @@ get_current_source_status() {
                 echo "未找到有效 repo 配置文件"
             fi
             ;;
+
         alpine)
             if [ -f /etc/apk/repositories ]; then
                 local main_url=$(grep -v '^#' /etc/apk/repositories | head -n 1)
@@ -140,12 +160,12 @@ get_current_source_status() {
                 echo "repositories 不存在"
             fi
             ;;
+
         *)
             echo "不支持的系统"
             ;;
     esac
 }
-
 # 7. 备份当前源
 backup_sources() {
     case "$ID" in
@@ -155,7 +175,6 @@ backup_sources() {
             ;;
         centos|rhel|rocky|almalinux)
             mkdir -p /etc/yum.repos.d/bak 2>/dev/null
-            # 避免重复备份覆盖最初的纯净备份
             if [ -z "$(ls -A /etc/yum.repos.d/bak 2>/dev/null)" ]; then
                 cp -f /etc/yum.repos.d/*.repo /etc/yum.repos.d/bak/ 2>/dev/null
             fi
@@ -198,6 +217,7 @@ restore_sources() {
     esac
 }
 
+# 9. 切换 Ubuntu/Debian 源
 switch_apt_source() {
     local new_source="$1"
     local source_name="$2"
@@ -216,9 +236,8 @@ EOF
         echo -e "${GREEN}✅ 已切换到 ${source_name} Debian 源（${codename}）${RESET}"
 
     elif [ "$ID" = "ubuntu" ]; then
-        # 判断是否为 Ubuntu 24.04 或更高版本
         if [ -f /etc/apt/sources.list.d/ubuntu.sources ] || [ "$VERSION_ID" = "24.04" ]; then
-            # 24.04+ 使用全新的 DEB822 格式
+            # Ubuntu 24.04+ 新版 DEB822 规范
             cat > /etc/apt/sources.list.d/ubuntu.sources <<EOF
 Types: deb
 URIs: ${new_source}
@@ -226,11 +245,10 @@ Suites: ${codename} ${codename}-updates ${codename}-backports ${codename}-securi
 Components: main restricted universe multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
-            # 清空旧的 sources.list，避免双源冲突导致报错
             echo "# 软件源已移至 sources.list.d/ubuntu.sources" > /etc/apt/sources.list
             echo -e "${GREEN}✅ 已切换到 ${source_name} Ubuntu 新版源（DEB822 格式）${RESET}"
         else
-            # 22.04 及以下版本保持传统单行格式
+            # Ubuntu 22.04 及以下旧版规范
             [ -f /etc/apt/sources.list.d/ubuntu.sources ] && rm -f /etc/apt/sources.list.d/ubuntu.sources
             cat > /etc/apt/sources.list <<EOF
 deb ${new_source} ${codename} main restricted universe multiverse
@@ -241,6 +259,28 @@ EOF
             echo -e "${GREEN}✅ 已切换到 ${source_name} Ubuntu 传统源（${codename}）${RESET}"
         fi
     fi
+}
+
+# 10. 切换 CentOS / RHEL / Rocky / Alma 源（在此处补齐补全）
+switch_yum_source() {
+    local new_source="$1"
+    local source_name="$2"
+    
+    if ls /etc/yum.repos.d/CentOS-*.repo >/dev/null 2>&1; then
+        sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/CentOS-*.repo
+        sed -i 's|^#baseurl=|baseurl=|g' /etc/yum.repos.d/CentOS-*.repo
+        sed -i "s|mirror.centos.org|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
+        sed -i "s|mirrors.aliyun.com|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
+        sed -i "s|mirrors.tuna.tsinghua.edu.cn|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
+    else
+        sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/*.repo 2>/dev/null
+        sed -i 's|^#baseurl=|baseurl=|g' /etc/yum.repos.d/*.repo 2>/dev/null
+        sed -i -E "s|dl.rockylinux.org|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
+        sed -i -E "s|repo.almalinux.org|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
+        sed -i -E "s|mirrors.aliyun.com|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
+        sed -i -E "s|mirrors.tuna.tsinghua.edu.cn|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
+    fi
+    echo -e "${GREEN}✅ 已切换到 ${source_name} YUM 源${RESET}"
 }
 
 # 11. 切换 Alpine 源

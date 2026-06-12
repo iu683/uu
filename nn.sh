@@ -190,14 +190,17 @@ update_status_variables() {
 }
 
 select_role() {
-    clear
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}      ◈     FRP 初始化安装     ◈       ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
     echo -e "${YELLOW}提示：当前本机未检测到已初始化的 FRP 服务端或客户端。${RESET}"
-    echo -e "${GREEN}请选择本机角色："
+    echo -e "${YELLOW}请选择本机角色："
+    echo -e "${GREEN}========================================${RESET}"
     echo -e "${GREEN}1) FRPS 服务端 (用于公网VPS)${RESET}"
     echo -e "${GREEN}2) FRPC 客户端 (用于内网/被穿透设备)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    
-    read -p "${GREEN}请选择: ${RESET}" role </dev/tty
+    echo -e "${GREEN}========================================${RESET}"  
+    echo -ne "${GREEN}请输入选项(不选回车退出): ${RESET}"
+    read role </dev/tty
     
     mkdir -p "$FRP_INSTALL_DIR"
     case $role in
@@ -209,7 +212,7 @@ select_role() {
             echo "client" > "$ROLE_FILE" 
             client_menu
             ;;
-        0) 
+        *) 
             exit 1 
             ;;
     esac
@@ -644,9 +647,9 @@ log_frpc() {
 }
 
 show_frps_dashboard_info() {
-    clear
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       FRPS 面板详情        ${RESET}"
+    echo -e "${GREEN}     ◈  FRPS 面板详情  ◈       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     if [ -f "$FRP_INSTALL_DIR/frps.toml" ]; then
         local DASH_HOST=$(awk -F'=' '/webServer\.addr/{gsub(/[ "]/,"",$2);print $2}' "$FRP_INSTALL_DIR/frps.toml")
@@ -678,7 +681,7 @@ server_menu() {
         update_status_variables
         clear
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}       FRPS 服务端管理面板      ${RESET}"
+        echo -e "${GREEN}    ◈  FRPS 服务端管理面板  ◈   ${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}状态   :${RESET} $G_STATUS"
         echo -e "${GREEN}版本   :${RESET} ${YELLOW}${G_VERSION}${RESET}"
@@ -719,7 +722,7 @@ client_menu() {
         update_status_variables
         clear
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}       FRPC 客户端管理面板      ${RESET}"
+        echo -e "${GREEN}    ◈  FRPC 客户端管理面板  ◈   ${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}状态   :${RESET} $G_STATUS"
         echo -e "${GREEN}版本   :${RESET} ${YELLOW}${G_VERSION}${RESET}"

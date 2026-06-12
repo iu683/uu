@@ -1,429 +1,292 @@
 #!/bin/bash
+# =========================================================================
+# 一键系统重装脚本（跨平台极致兼容通用版）
+# 支持 Linux 全系列 + Windows 全系列
+# =========================================================================
 
-# =========================================
-# 系统更新源切换菜单脚本
-# 支持 Ubuntu / Debian / CentOS / Alpine / RHEL 等
-# =========================================
+# 设置颜色
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# 1. 检查 Root 权限
-if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[31m❌ 错误：请使用 root 权限或 sudo 运行此脚本！\033[0m"
+# 【核心修复】跨平台通用依赖检查（抛弃非标数组，完美兼容 Alpine sh）
+install_dependencies() {
+    local missing_deps=""
+    
+    # 用最传统稳健的空格字符串替代数组
+    for dep in curl wget openssl; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            missing_deps="$missing_deps $dep"
+        fi
+    done
+
+    # 去除首尾空格
+    missing_deps=$(echo "$missing_deps" | sed 's/^ *//;s/ *$//')
+
+    if [ -z "$missing_deps" ]; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}🔧 发现缺失依赖: ${missing_deps}，正在自动安装...${RESET}"
+
+    # 识别包管理器并全自动打补丁
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache $missing_deps
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y && apt-get install -y $missing_deps
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y $missing_deps
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y $missing_deps
+    else
+        echo -e "${RED}❌ 错误: 未知系统包管理器，请手动安装 [ ${missing_deps} ] 后重试。${RESET}"
+        exit 1
+    fi
+}
+
+# 运行依赖检查
+install_dependencies
+
+# 随机密码生成函数（生成12位包含大小写字母和数字的随机密码）
+generate_random_password() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 9 | tr -d '+/' | cut -c1-12
+    else
+        tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 12
+    fi
+}
+
+# GitHub 代理镜像列表（用传统的空格字符串替代非标数组，完美兼容 Alpine sh）
+# 第一个节点为空，代表优先尝试直连
+GITHUB_PROXIES="DIRECT https://v6.gh-proxy.org/ https://gh-proxy.com/ https://hub.glowp.xyz/ https://proxy.vvvv.ee/ https://ghproxy.lvedong.eu.org/"
+
+download_script() {
+    local type="$1"
+    local raw_url=""
+    local file_name=""
+
+    if [ "$type" = "MollyLau" ]; then
+        file_name="InstallNET.sh"
+        raw_url="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh"
+    else
+        file_name="reinstall.sh"
+        raw_url="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+    fi
+
+    # 遍历空格分隔的代理字符串
+    for proxy in $GITHUB_PROXIES; do
+        local proxy_url=""
+        rm -f "$file_name"
+        
+        if [ "$proxy" = "DIRECT" ]; then
+            proxy_url="$raw_url"
+            echo -e "${YELLOW}📡 正在尝试直连下载...${RESET}"
+        else
+            proxy_url="${proxy}${raw_url}"
+            echo -e "${YELLOW}🔄 正在尝试代理节点: ${proxy}${RESET}"
+        fi
+
+        # 带有 3 秒超时限制的下载块，防止死节点卡网速
+        if command -v wget >/dev/null 2>&1; then
+            wget --no-check-certificate --timeout=3 --tries=1 -qO "$file_name" "$proxy_url" && chmod +x "$file_name"
+        else
+            if [ "$proxy" = "DIRECT" ]; then
+                curl -m 3 -sO "$proxy_url" && chmod +x "$file_name"
+            else
+                # 代理站通常有302重定向，curl 必须加 -L 顺着重定向下载
+                curl -m 3 -sL -o "$file_name" "$proxy_url" && chmod +x "$file_name"
+            fi
+        fi
+
+        # 严格验证：确保文件存在且大小大于 0 字节（防止把代理站的 404 报错网页抓下来）
+        if [ -f "$file_name" ] && [ -s "$file_name" ]; then
+            echo -e "${GREEN}✅ 下载成功！${RESET}"
+            return 0
+        fi
+    done
+
+    echo -e "${RED}❌ 错误: 尝试了所有渠道及代理节点，均无法下载重装内核！${RESET}"
     exit 1
-fi
-
-# 2. 颜色定义
-GREEN='\033[32m'
-YELLOW='\033[33m'
-RED='\033[31m'
-RESET='\033[0m'
-
-# 3. 获取系统信息
-if [ -f /etc/os-release ]; then
-    . /etc/os-release  # 使用 . 代替 source，完美兼容所有 POSIX Shell
-    OS_ID="${NAME} ${VERSION_ID}"
-else
-    OS_ID="Unknown Linux"
-    ID="unknown"
-fi
-
-# 4. 获取系统 codename 或版本标识
-get_codename() {
-    if command -v lsb_release >/dev/null 2>&1; then
-        codename=$(lsb_release -cs)
-    elif [ -n "$VERSION_CODENAME" ]; then
-        codename=$VERSION_CODENAME
-    elif [ "$ID" = "alpine" ]; then
-        # 兼容 Alpine 环境获取版本
-        if [ -z "$VERSION_ID" ] && [ -f /etc/alpine-release ]; then
-            VERSION_ID=$(cat /etc/alpine-release)
-        fi
-
-        if [[ "$VERSION_ID" == *"_alpha"* || "$VERSION_ID" == *"_beta"* || "$VERSION_ID" == *"_rc"* || "$VERSION_ID" == "edge" ]]; then
-            codename="edge"
-        elif [ -n "$VERSION_ID" ]; then
-            local major_version=$(echo "$VERSION_ID" | cut -d. -f1-2)
-            codename="v${major_version}"
-        else
-            codename="edge"
-        fi
-    elif [ -n "$VERSION_ID" ]; then
-        case "$ID" in
-            ubuntu)
-                case "$VERSION_ID" in
-                    "18.04") codename="bionic" ;;
-                    "20.04") codename="focal" ;;
-                    "22.04") codename="jammy" ;;
-                    "24.04") codename="noble" ;;
-                    *) codename="noble" ;; # 默认最新长期支持版
-                esac
-                ;;
-            debian)
-                case "$VERSION_ID" in
-                    "10") codename="buster" ;;
-                    "11") codename="bullseye" ;;
-                    "12") codename="bookworm" ;;
-                    "13") codename="trixie" ;;
-                    *) codename="bookworm" ;;
-                esac
-                ;;
-            centos|rhel|rocky|almalinux)
-                codename="el${VERSION_ID%%.*}"
-                ;;
-        esac
-    else
-        codename="stable"
-    fi
-
-    # 防止 n/a 或空值保底
-    if [ -z "$codename" ] || [ "$codename" = "n/a" ]; then
-        [ "$ID" = "alpine" ] && codename="edge" || codename="stable"
-    fi
-}
-get_codename
-
-# 5. 定义更新源链接
-aliyun_ubuntu_source="http://mirrors.aliyun.com/ubuntu/"
-official_ubuntu_source="http://archive.ubuntu.com/ubuntu/"
-tsinghua_ubuntu_source="https://mirrors.tuna.tsinghua.edu.cn/ubuntu/"
-
-aliyun_debian_source="http://mirrors.aliyun.com/debian/"
-official_debian_source="http://deb.debian.org/debian/"
-tsinghua_debian_source="https://mirrors.tuna.tsinghua.edu.cn/debian/"
-
-aliyun_centos_source="mirrors.aliyun.com"
-official_centos_source="mirror.centos.org"
-tsinghua_centos_source="mirrors.tuna.tsinghua.edu.cn"
-
-aliyun_alpine_source="https://mirrors.aliyun.com/alpine/"
-official_alpine_source="https://dl-cdn.alpinelinux.org/alpine/"
-tsinghua_alpine_source="https://mirrors.tuna.tsinghua.edu.cn/alpine/"
-
-# 6. 获取当前软件源状态（Ubuntu 与 Debian 已完全分离独立检查）
-get_current_source_status() {
-    case "$ID" in
-        ubuntu)
-            local file="/etc/apt/sources.list"
-            # Ubuntu 24.04+ 优先检测新版源文件路径
-            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-                file="/etc/apt/sources.list.d/ubuntu.sources"
-            fi
-            
-            if [ -f "$file" ]; then
-                # 精准提取 URIs: 或 deb 后的 Ubuntu 软件源域名
-                local raw_line=$(grep -v '^#' "$file" | grep -E -i 'deb https?://|URIs:\s*https?://' | head -n 1)
-                if [ -n "$raw_line" ]; then
-                    echo "$raw_line" | sed -E 's|.*https?://([^/ ]+).*|\1|'
-                else
-                    echo "未检测到有效 Ubuntu 源"
-                fi
-            else
-                echo "未找到 Ubuntu 软件源配置文件"
-            fi
-            ;;
-
-        debian)
-            local file="/etc/apt/sources.list"
-            # Debian 13+ 优先检测新版源文件路径
-            if [ -f /etc/apt/sources.list.d/debian.sources ]; then
-                file="/etc/apt/sources.list.d/debian.sources"
-            fi
-            
-            if [ -f "$file" ]; then
-                # 精准提取 URIs: 或 deb 后的 Debian 软件源域名
-                local raw_line=$(grep -v '^#' "$file" | grep -E -i 'deb https?://|URIs:\s*https?://' | head -n 1)
-                if [ -n "$raw_line" ]; then
-                    echo "$raw_line" | sed -E 's|.*https?://([^/ ]+).*|\1|'
-                else
-                    echo "未检测到有效 Debian 源"
-                fi
-            else
-                echo "未找到 Debian 软件源配置文件"
-            fi
-            ;;
-
-        centos|rhel|rocky|almalinux)
-            local repo_file=""
-            for f in /etc/yum.repos.d/*.repo; do
-                if [ -f "$f" ] && grep -q -E '^baseurl=|^mirrorlist=' "$f"; then
-                    repo_file="$f"
-                    break
-                fi
-            done
-            if [ -n "$repo_file" ]; then
-                local main_url=$(grep -E '^baseurl=|^mirrorlist=' "$repo_file" | head -n 1 | cut -d= -f2)
-                [ -z "$main_url" ] && echo "未检测到有效源" || echo "$main_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||'
-            else
-                echo "未找到有效 repo 配置文件"
-            fi
-            ;;
-
-        alpine)
-            if [ -f /etc/apk/repositories ]; then
-                local main_url=$(grep -v '^#' /etc/apk/repositories | head -n 1)
-                [ -z "$main_url" ] && echo "未检测到有效源" || echo "$main_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||'
-            else
-                echo "repositories 不存在"
-            fi
-            ;;
-
-        *)
-            echo "不支持的系统"
-            ;;
-    esac
-}
-# 7. 备份当前源
-backup_sources() {
-    case "$ID" in
-        ubuntu|debian)
-            [ -f /etc/apt/sources.list ] && cp -f /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null
-            [ -f /etc/apt/sources.list.d/ubuntu.sources ] && cp -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak 2>/dev/null
-            ;;
-        centos|rhel|rocky|almalinux)
-            mkdir -p /etc/yum.repos.d/bak 2>/dev/null
-            if [ -z "$(ls -A /etc/yum.repos.d/bak 2>/dev/null)" ]; then
-                cp -f /etc/yum.repos.d/*.repo /etc/yum.repos.d/bak/ 2>/dev/null
-            fi
-            ;;
-        alpine)
-            [ -f /etc/apk/repositories ] && cp -f /etc/apk/repositories /etc/apk/repositories.bak 2>/dev/null
-            ;;
-    esac
-    echo -e "${GREEN}已完成当前更新源备份${RESET}"
 }
 
-# 8. 还原初始源
-restore_sources() {
-    case "$ID" in
-        ubuntu|debian)
-            if [ -f /etc/apt/sources.list.bak ] || [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ]; then
-                [ -f /etc/apt/sources.list.bak ] && cp -f /etc/apt/sources.list.bak /etc/apt/sources.list
-                [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ] && cp -f /etc/apt/sources.list.d/ubuntu.sources.bak /etc/apt/sources.list.d/ubuntu.sources
-                echo -e "${GREEN}已还原初始更新源${RESET}"
-            else
-                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
-            fi
-            ;;
-        centos|rhel|rocky|almalinux)
-            if [ -d /etc/yum.repos.d/bak ] && [ "$(ls -A /etc/yum.repos.d/bak 2>/dev/null)" ]; then
-                cp -f /etc/yum.repos.d/bak/*.repo /etc/yum.repos.d/
-                echo -e "${GREEN}已还原初始更新源${RESET}"
-            else
-                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
-            fi
-            ;;
-        alpine)
-            if [ -f /etc/apk/repositories.bak ]; then
-                cp -f /etc/apk/repositories.bak /etc/apk/repositories
-                echo -e "${GREEN}已还原初始更新源${RESET}"
-            else
-                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
-            fi
-            ;;
-    esac
-}
+# 系统核心数据库表
+systems=(
+"1|debian13|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 13"
+"2|debian12|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 12"
+"3|debian11|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 11"
+"4|debian10|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 10"
+"5|ubuntu26.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 26.04"
+"6|ubuntu24.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 24.04"
+"7|ubuntu22.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 22.04"
+"8|ubuntu20.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 20.04"
+"9|ubuntu18.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 18.04"
+"10|Alpine3.23|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.23"
+"11|Alpine3.22|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.22"
+"12|Alpine3.21|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.21"
+"13|Alpine3.20|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.20"
+"14|AlpineEdge|Alpine|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -alpine"
+"15|rocky10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky"
+"16|rocky9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky 9"
+"17|alma10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux"
+"18|alma9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux 9"
+"19|oracle10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle"
+"20|oracle9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle 9"
+"21|fedora44|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 44"
+"22|fedora43|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 43"
+"23|centos10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 10"
+"24|centos9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 9"
+"25|arch|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh arch"
+"26|kali|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh kali"
+"27|openeuler|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh openeuler"
+"28|opensuseTumbleweed|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh opensuse"
+"29|fnos飞牛公测版|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh fnos"
+"30|windows11|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 11 -lang cn"
+"31|windows10|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 10 -lang cn"
+"32|windows7|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh windows --iso=\"https://download.testip.xyz/windows/cn_windows_7_professional_with_sp1_vl_build_x64_dvd_u_677816.iso\" --image-name='Windows 7 PROFESSIONAL'"
+"33|windowsServer2025|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2025 -lang cn"
+"34|windowsServer2022|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2022 -lang cn"
+"35|windowsServer2019|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2019 -lang cn"
+"36|windowsServer2016|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2016 -lang cn"
+"37|windows11ARM|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh dd --img https://r2.hotdog.eu.org/win11-arm-with-pagefile-15g.xz"
+)
 
-# 9. 切换 Ubuntu/Debian 源
-switch_apt_source() {
-    local new_source="$1"
-    local source_name="$2"
-
-    if [ "$ID" = "debian" ]; then
-        local sec_url="http://security.debian.org/debian-security"
-        [[ "$new_source" == *"aliyun"* ]] && sec_url="http://mirrors.aliyun.com/debian-security"
-        [[ "$new_source" == *"tsinghua"* ]] && sec_url="https://mirrors.tuna.tsinghua.edu.cn/debian-security"
-
-        cat > /etc/apt/sources.list <<EOF
-deb ${new_source} ${codename} main contrib non-free non-free-firmware
-deb ${new_source} ${codename}-updates main contrib non-free non-free-firmware
-deb ${new_source} ${codename}-backports main contrib non-free non-free-firmware
-deb ${sec_url} ${codename}-security main contrib non-free non-free-firmware
-EOF
-        echo -e "${GREEN}✅ 已切换到 ${source_name} Debian 源（${codename}）${RESET}"
-
-    elif [ "$ID" = "ubuntu" ]; then
-        if [ -f /etc/apt/sources.list.d/ubuntu.sources ] || [ "$VERSION_ID" = "24.04" ]; then
-            # Ubuntu 24.04+ 新版 DEB822 规范
-            cat > /etc/apt/sources.list.d/ubuntu.sources <<EOF
-Types: deb
-URIs: ${new_source}
-Suites: ${codename} ${codename}-updates ${codename}-backports ${codename}-security
-Components: main restricted universe multiverse
-Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-EOF
-            echo "# 软件源已移至 sources.list.d/ubuntu.sources" > /etc/apt/sources.list
-            echo -e "${GREEN}✅ 已切换到 ${source_name} Ubuntu 新版源（DEB822 格式）${RESET}"
-        else
-            # Ubuntu 22.04 及以下旧版规范
-            [ -f /etc/apt/sources.list.d/ubuntu.sources ] && rm -f /etc/apt/sources.list.d/ubuntu.sources
-            cat > /etc/apt/sources.list <<EOF
-deb ${new_source} ${codename} main restricted universe multiverse
-deb ${new_source} ${codename}-updates main restricted universe multiverse
-deb ${new_source} ${codename}-backports main restricted universe multiverse
-deb ${new_source} ${codename}-security main restricted universe multiverse
-EOF
-            echo -e "${GREEN}✅ 已切换到 ${source_name} Ubuntu 传统源（${codename}）${RESET}"
-        fi
-    fi
-}
-
-# 10. 切换 CentOS / RHEL / Rocky / Alma 源（在此处补齐补全）
-switch_yum_source() {
-    local new_source="$1"
-    local source_name="$2"
-    
-    if ls /etc/yum.repos.d/CentOS-*.repo >/dev/null 2>&1; then
-        sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/CentOS-*.repo
-        sed -i 's|^#baseurl=|baseurl=|g' /etc/yum.repos.d/CentOS-*.repo
-        sed -i "s|mirror.centos.org|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
-        sed -i "s|mirrors.aliyun.com|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
-        sed -i "s|mirrors.tuna.tsinghua.edu.cn|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
-    else
-        sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/*.repo 2>/dev/null
-        sed -i 's|^#baseurl=|baseurl=|g' /etc/yum.repos.d/*.repo 2>/dev/null
-        sed -i -E "s|dl.rockylinux.org|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
-        sed -i -E "s|repo.almalinux.org|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
-        sed -i -E "s|mirrors.aliyun.com|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
-        sed -i -E "s|mirrors.tuna.tsinghua.edu.cn|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
-    fi
-    echo -e "${GREEN}✅ 已切换到 ${source_name} YUM 源${RESET}"
-}
-
-# 11. 切换 Alpine 源
-switch_alpine_source() {
-    local new_source="$1"
-    local source_name="$2"
-    
-    cat > /etc/apk/repositories <<EOF
-${new_source}${codename}/main
-${new_source}${codename}/community
-EOF
-    echo -e "${GREEN}✅ 已切换到 ${source_name} Alpine 源（${codename}）${RESET}"
-}
-
-# 12. 更新缓存
-update_cache() {
-    case "$ID" in
-        ubuntu|debian)
-            echo -e "${YELLOW}正在更新 apt 缓存...${RESET}"
-            apt-get update -y
-            ;;
-        centos|rhel|rocky|almalinux)
-            echo -e "${YELLOW}正在生成 yum/dnf 缓存...${RESET}"
-            if command -v dnf >/dev/null 2>&1; then
-                dnf clean all && dnf makecache -y
-            else
-                yum clean all && yum makecache -y
-            fi
-            ;;
-        alpine)
-            echo -e "${YELLOW}正在更新 apk 缓存...${RESET}"
-            apk update --no-cache
-            ;;
-    esac
-    echo -e "${GREEN}缓存更新完成${RESET}"
-}
-
-# 13. 暂停函数
-pause() {
-    read -rp "$(echo -e "${YELLOW}按回车键继续...${RESET}")"
-}
-
-# 14. 显示国内/国外推荐源列表
-show_recommended_sources() {
-    clear
-    echo -e "${GREEN}正在获取外部推荐源脚本...${RESET}"
-    if command -v curl >/dev/null 2>&1; then
-        bash <(curl -sSL https://linuxmirrors.cn/main.sh)
-    elif command -v wget >/dev/null 2>&1; then
-        bash <(wget -qO- https://linuxmirrors.cn/main.sh)
-    else
-        echo -e "${RED}未检测到 curl 或 wget 命令！${RESET}"
-        if [ "$ID" = "alpine" ]; then
-            echo -e "${YELLOW}提示：Alpine 系统请先运行: apk add curl${RESET}"
-        fi
-    fi
-    pause
-}
-
-# 15. 主菜单展示
-show_menu() {
-    clear
-    STATUS=$(get_current_source_status)
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}      ◈    系统更新源管理面板    ◈     ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 系统环境  : ${YELLOW}${OS_ID}${RESET}"
-    echo -e "${GREEN} 当前源状态: ${YELLOW}${STATUS}${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}  1. 切换到 阿里云源 (国内推荐)${RESET}"
-    echo -e "${GREEN}  2. 切换到 官方原生源 (海外推荐)${RESET}"
-    echo -e "${GREEN}  3. 切换到 清华大学源 (高校教育网)${RESET}"
-    echo -e "${GREEN}  4. 备份当前源文件副本${RESET}"
-    echo -e "${GREEN}  5. 还原初始更新源 (并自动刷新缓存)${RESET}"
-    echo -e "${GREEN}  6. 国内/国外推荐源一键通 (LinuxMirrors)${RESET}"
-    echo -e "${GREEN}  0. 退出${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -ne "${GREEN} 请输入操作编号: ${RESET}"
-}
-
-# 16. 主循环
+# 主循环面板
 while true; do
-    show_menu
-    read -r choice
-    case "$choice" in
-        1)
-            backup_sources
-            case "$ID" in
-                ubuntu) switch_apt_source "$aliyun_ubuntu_source" "阿里云" ;;
-                debian) switch_apt_source "$aliyun_debian_source" "阿里云" ;;
-                centos|rhel|rocky|almalinux) switch_yum_source "$aliyun_centos_source" "阿里云" ;;
-                alpine) switch_alpine_source "$aliyun_alpine_source" "阿里云" ;;
-            esac
-            update_cache
-            pause
-            ;;
-        2)
-            backup_sources
-            case "$ID" in
-                ubuntu) switch_apt_source "$official_ubuntu_source" "官方" ;;
-                debian) switch_apt_source "$official_debian_source" "官方" ;;
-                centos|rhel|rocky|almalinux) switch_yum_source "$official_centos_source" "官方" ;;
-                alpine) switch_alpine_source "$official_alpine_source" "官方" ;;
-            esac
-            update_cache
-            pause
-            ;;
-        3)
-            backup_sources
-            case "$ID" in
-                ubuntu) switch_apt_source "$tsinghua_ubuntu_source" "清华" ;;
-                debian) switch_apt_source "$tsinghua_debian_source" "清华" ;;
-                centos|rhel|rocky|almalinux) switch_yum_source "$tsinghua_centos_source" "清华" ;;
-                alpine) switch_alpine_source "$tsinghua_alpine_source" "清华" ;;
-            esac
-            update_cache
-            pause
-            ;;
-        4)
-            backup_sources
-            pause
-            ;;
-        5)
-            if restore_sources; then
-                update_cache
+    clear
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}        ◈  系统重装管理菜单  ◈         ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+
+    # 渲染动态分类菜单
+    last_category=""
+    for sys in "${systems[@]}"; do
+        
+        id=$(echo "$sys" | cut -d'|' -f1)
+        name=$(echo "$sys" | cut -d'|' -f2)
+        category=$(echo "$sys" | cut -d'|' -f3)
+        
+        if [ "$category" != "$last_category" ]; then
+            echo -e "${GREEN}--- ❖ $category 系统 ❖ ---${RESET}"
+            last_category="$category"
+        fi
+        
+        printf "${YELLOW}  %2d) %-22s${RESET}\n" "$id" "$name"
+    done
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${RED}   0) 退出${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+
+    echo -ne "${GREEN}请输入你想要重装的系统编号: ${RESET}"
+    read -r num_choice
+
+    if [ "$num_choice" = "0" ] || [ "$num_choice" = "00" ] || [ -z "$num_choice" ]; then
+        exit 0
+    fi
+
+    found=0
+    for sys in "${systems[@]}"; do
+        # 解构获取单行数据
+        id=$(echo "$sys" | cut -d'|' -f1)
+        
+        if [ "$num_choice" = "$id" ]; then
+            found=1
+            
+            # 提取各项参数
+            name=$(echo "$sys" | cut -d'|' -f2)
+            category=$(echo "$sys" | cut -d'|' -f3)
+            dl=$(echo "$sys" | cut -d'|' -f4)
+            def_user=$(echo "$sys" | cut -d'|' -f5)
+            def_pass=$(echo "$sys" | cut -d'|' -f6)
+            def_port=$(echo "$sys" | cut -d'|' -f7)
+            cmd=$(echo "$sys" | cut -d'|' -f8)
+
+            echo -e "\n${RED}  💥 极度高危警告：${RESET}"
+            echo -e "${RED}您当前选择的操作将会彻底抹除整台服务器的硬盘，所有数据将灰飞烟灭！${RESET}"
+            echo -e "${YELLOW}请务必确认已经离线备份了您的所有核心资产数据！${RESET}"
+            echo ""
+            echo -ne "${YELLOW}确定要对这台机器重装，强制重装为 [ ${name} ] 吗？(y/n): ${RESET}"
+            read -r confirm
+            
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo -e "${YELLOW}正在取消重装，返回主菜单...${RESET}"
+                sleep 1.5
+                break
             fi
-            pause
-            ;;
-        6)
-            show_recommended_sources
-            ;;
-        0)
-            echo -e "${GREEN}感谢使用，再见！${RESET}"
-            break
-            ;;
-        *)
-            echo -e "${RED}无效选择，请重新输入${RESET}"
-            sleep 1
-            ;;
-    esac
+
+            final_cmd="$cmd"
+
+            # 针对 bin456789 且非 Windows 系统的自定义凭据交互
+            if [ "$dl" = "bin456789" ] && [ "$category" != "Windows" ] && [[ "$name" != *"dd"* ]]; then
+                echo -e "\n${GREEN}--- 👤 配置新系统登录凭据 ---${RESET}"
+                
+                # 初始化/清空旧循环的残存变量，防止变量污染
+                custom_user="" custom_key="" custom_pass="" custom_port=""
+
+                read -r -p "请输入用户名 (直接回车默认: ${def_user}): " custom_user
+                custom_user=${custom_user:-$def_user}
+
+                echo -e "${YELLOW}提示: 密钥支持 公钥字符串、URL、github:用户名、gitlab:用户名${RESET}"
+                echo -e "${YELLOW}例如: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPYYSr25hwiXYTbVBlSzNNiYHl6vCD8CJWG70rTU+6qj2T root@localhost${RESET}"
+                read -r -p "请输入 SSH 公钥 (留空则代表使用密码登录): " custom_key
+
+                if [ -z "$custom_key" ]; then
+                    # 动态生成随机密码
+                    rand_pass=$(generate_random_password)
+                    read -r -p "请输入登录密码 (直接回车为您随机生成: ${rand_pass}): " custom_pass
+                    custom_pass=${custom_pass:-$rand_pass}
+                else
+                    echo -e "${GREEN}✓ 检测到您输入了公钥，系统将默认关闭密码登录，大幅增强安全性！${RESET}"
+                fi
+
+                read -r -p "请输入自定义 SSH 端口号 (直接回车默认: ${def_port}): " custom_port
+                custom_port=${custom_port:-$def_port}
+
+                # 动态科学拼接命令
+                if [ -n "$custom_key" ]; then
+                    final_cmd="$cmd --username \"$custom_user\" --ssh-key \"$custom_key\" --ssh-port \"$custom_port\""
+                else
+                    final_cmd="$cmd --username \"$custom_user\" --password \"$custom_pass\" --ssh-port \"$custom_port\""
+                fi
+                
+                # 打印最终核对看板
+                echo -e "\n${YELLOW}=======================================${RESET}"
+                echo -e "${YELLOW}      📌 请截图或复制保存新系统凭据     ${RESET}"
+                echo -e "${YELLOW}=======================================${RESET}"
+                echo -e " 目标系统 : ${GREEN}${name}${RESET}"
+                echo -e " 用户名   : ${GREEN}${custom_user}${RESET}"
+                echo -e " SSH端口  : ${GREEN}${custom_port}${RESET}"
+                if [ -n "$custom_key" ]; then
+                    echo -e " 登录验证 : ${GREEN}仅限私钥证书配对登录${RESET}"
+                else
+                    echo -e " 初始密码 : ${RED}${custom_pass}${RESET}"
+                fi
+                echo -e "${YELLOW}=======================================${RESET}"
+            else
+                # MollyLau 或 Windows 保持默认配置提示
+                echo -e "\n${YELLOW}📌 重装就绪凭据：用户名: ${GREEN}$def_user${RESET} | 初始密码: ${GREEN}$def_pass${RESET} | 远程端口: ${GREEN}$def_port${RESET}"
+            fi
+
+            echo ""
+            read -r -p "👉 确认无误？按 [回车键] 开始自动下载重装内核文件 (Ctrl+C 取消)..." dummy
+
+            echo -e "\n${GREEN}🚀 正在从上游源安全拉取重装驱动内核...${RESET}"
+            download_script "$dl"
+            
+            echo -e "${GREEN}⚙️ 正在向内核注入重装指令参数...${RESET}"
+            eval "$final_cmd"
+
+            echo -e "\n${GREEN}✔ 系统重装环境已就绪！${RESET}"
+            read -r -p "按 [回车键] 将立即强制重启服务器进行底层安装 (此时断开连接属于正常现象)..." dummy
+            
+            echo -e "${GREEN}>>> 正在重启...${RESET}"
+            reboot
+            exit 0
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo -e "${RED}❌ 错误：无效编号，请重新输入正确的系统选项！${RESET}"
+        sleep 1.5
+    fi
 done

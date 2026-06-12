@@ -1,322 +1,552 @@
 #!/bin/bash
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export HOME=/root
 
-#################################################
-# caadybackup - 自动安装 + 自动更新增强版 (Caddy + 网站)
-#################################################
+# =========================================
+# 系统更新源切换菜单脚本
+# 支持 Ubuntu / Debian / CentOS / Alpine / RHEL 等
+# =========================================
 
-#################################
-# 远程自动安装逻辑
-#################################
+# 1. 检查 Root 权限
+if [ "$EUID" -ne 0 ]; then
+    echo -e "\033[31m❌ 错误：请使用 root 权限或 sudo 运行此脚本！\033[0m"
+    exit 1
+fi
 
-INSTALL_DIR="/opt/caadybackup"
-LOCAL_SCRIPT="$INSTALL_DIR/caadybackup.sh"
-REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/vv.sh"
+# 2. 颜色定义
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+RESET='\033[0m'
 
-if [[ "$0" != "$LOCAL_SCRIPT" ]]; then
-    mkdir -p "$INSTALL_DIR"
+# 3. 获取系统信息
+if [ -f /etc/os-release ]; then
+    . /etc/os-release  # 使用 . 代替 source，完美兼容所有 POSIX Shell
+    OS_ID="${NAME} ${VERSION_ID}"
+else
+    OS_ID="Unknown Linux"
+    ID="unknown"
+fi
 
-    curl -fsSL -o "$LOCAL_SCRIPT.tmp" "$REMOTE_URL" || {
-        echo "安装失败"
-        exit 1
-    }
+# 4. 获取系统 codename 或版本标识
+get_codename() {
+    if command -v lsb_release >/dev/null 2>&1; then
+        codename=$(lsb_release -cs)
+    elif [ -n "$VERSION_CODENAME" ]; then
+        codename=$VERSION_CODENAME
+    elif [ "$ID" = "alpine" ]; then
+        # 兼容 Alpine 环境获取版本
+        if [ -z "$VERSION_ID" ] && [ -f /etc/alpine-release ]; then
+            VERSION_ID=$(cat /etc/alpine-release)
+        fi
 
-    if [[ ! -f "$LOCAL_SCRIPT" ]] || ! cmp -s "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"; then
-        mv "$LOCAL_SCRIPT.tmp" "$LOCAL_SCRIPT"
-        chmod +x "$LOCAL_SCRIPT"
+        if [[ "$VERSION_ID" == *"_alpha"* || "$VERSION_ID" == *"_beta"* || "$VERSION_ID" == *"_rc"* || "$VERSION_ID" == "edge" ]]; then
+            codename="edge"
+        elif [ -n "$VERSION_ID" ]; then
+            local major_version=$(echo "$VERSION_ID" | cut -d. -f1-2)
+            codename="v${major_version}"
+        else
+            codename="edge"
+        fi
+    elif [ -n "$VERSION_ID" ]; then
+        case "$ID" in
+            ubuntu)
+                case "$VERSION_ID" in
+                    "18.04") codename="bionic" ;;
+                    "20.04") codename="focal" ;;
+                    "22.04") codename="jammy" ;;
+                    "24.04") codename="noble" ;;
+                    *) codename="noble" ;; # 默认最新长期支持版
+                esac
+                ;;
+            debian)
+                case "$VERSION_ID" in
+                    "10") codename="buster" ;;
+                    "11") codename="bullseye" ;;
+                    "12") codename="bookworm" ;;
+                    "13") codename="trixie" ;;
+                    *) codename="bookworm" ;;
+                esac
+                ;;
+            centos|rhel|rocky|almalinux)
+                codename="el${VERSION_ID%%.*}"
+                ;;
+        esac
     else
-        rm -f "$LOCAL_SCRIPT.tmp"
+        codename="stable"
     fi
 
-    exec bash "$LOCAL_SCRIPT" "$@"
-fi
-
-#################################
-# 颜色
-#################################
-GREEN="\033[32m"
-RED="\033[31m"
-CYAN="\033[36m"
-YELLOW="\033[33m"
-RESET="\033[0m"
-
-#################################
-# 基础路径
-#################################
-CONFIG_FILE="$INSTALL_DIR/config.sh"
-LOG_FILE="$INSTALL_DIR/backup.log"
-CRON_TAG="#caadybackup_cron"
-
-DATA_DIR_DEFAULT="$INSTALL_DIR/data"
-RETAIN_DAYS_DEFAULT=7
-SERVICE_NAME_DEFAULT="$(hostname)"
-
-mkdir -p "$INSTALL_DIR"
-
-#################################
-# Caddy 配置/数据
-#################################
-CADDYFILE="/etc/caddy/Caddyfile"
-CADDY_DATA="/var/lib/caddy/.local/share/caddy"
-WWW_DIR="/var/www"
-
-#################################
-# 卸载
-#################################
-if [[ "$1" == "--uninstall" ]]; then
-    echo -e "${YELLOW}正在卸载...${RESET}"
-    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
-    rm -rf "$INSTALL_DIR"
-    echo -e "${GREEN}卸载完成${RESET}"
-    exit 0
-fi
-
-#################################
-# 加载配置
-#################################
-load_config() {
-    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
-
-    DATA_DIR=${DATA_DIR:-$DATA_DIR_DEFAULT}
-    RETAIN_DAYS=${RETAIN_DAYS:-$RETAIN_DAYS_DEFAULT}
-    SERVICE_NAME=${SERVICE_NAME:-$SERVICE_NAME_DEFAULT}
+    # 防止 n/a 或空值保底
+    if [ -z "$codename" ] || [ "$codename" = "n/a" ]; then
+        [ "$ID" = "alpine" ] && codename="edge" || codename="stable"
+    fi
 }
-load_config
-mkdir -p "$DATA_DIR"
+get_codename
 
-#################################
-# 保存配置
-#################################
-save_config() {
-cat > "$CONFIG_FILE" <<EOF
-DATA_DIR="$DATA_DIR"
-RETAIN_DAYS="$RETAIN_DAYS"
-SERVICE_NAME="$SERVICE_NAME"
-TG_TOKEN="$TG_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
+# 5. 定义更新源链接
+aliyun_ubuntu_source="http://mirrors.aliyun.com/ubuntu/"
+official_ubuntu_source="http://archive.ubuntu.com/ubuntu/"
+tsinghua_ubuntu_source="https://mirrors.tuna.tsinghua.edu.cn/ubuntu/"
+
+aliyun_debian_source="http://mirrors.aliyun.com/debian/"
+official_debian_source="http://deb.debian.org/debian/"
+tsinghua_debian_source="https://mirrors.tuna.tsinghua.edu.cn/debian/"
+
+aliyun_centos_source="mirrors.aliyun.com"
+official_centos_source="mirror.centos.org"
+tsinghua_centos_source="mirrors.tuna.tsinghua.edu.cn"
+
+aliyun_alpine_source="https://mirrors.aliyun.com/alpine/"
+official_alpine_source="https://dl-cdn.alpinelinux.org/alpine/"
+tsinghua_alpine_source="https://mirrors.tuna.tsinghua.edu.cn/alpine/"
+
+
+# 6. 获取当前软件源状态
+get_current_source_status() {
+    case "$ID" in
+        ubuntu)
+            local file="/etc/apt/sources.list"
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+                file="/etc/apt/sources.list.d/ubuntu.sources"
+            fi
+            
+            if [ -f "$file" ]; then
+                # 严格匹配：要么是新版专用的 URIs: 行，要么是旧版顶格的 deb/deb-src 行
+                local raw_line=$(grep -v '^#' "$file" | grep -E -i '^URIs:[[:space:]]*https?://|^deb(-src)?[[:space:]]+https?://' | head -n 1)
+                
+                if [ -n "$raw_line" ]; then
+                    echo "$raw_line" | sed -E 's|.*https?://([^/ ]+).*|\1|'
+                else
+                    echo "未检测到有效 Ubuntu 源"
+                fi
+            else
+                echo "未找到 Ubuntu 软件源配置文件"
+            fi
+            ;;
+
+        debian)
+            local file="/etc/apt/sources.list"
+            if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+                file="/etc/apt/sources.list.d/debian.sources"
+            fi
+            
+            if [ -f "$file" ]; then
+                # 严格匹配：只抓取真正的 URIs: 行 或 传统的 deb 网址行，排除 Types: 干扰
+                local raw_line=$(grep -v '^#' "$file" | grep -E -i '^URIs:|^deb(-src)?[[:space:]]' | head -n 1)
+                
+                if [ -n "$raw_line" ]; then
+                    # 如果是 Debian 13 原生的本地重定向机制
+                    if echo "$raw_line" | grep -q 'mirror+file://'; then
+                        local list_file=$(echo "$raw_line" | sed -E 's|.*mirror+file://||' | awk '{print $1}')
+                        if [ -f "$list_file" ] && grep -v '^#' "$list_file" | grep -q -E 'https?://'; then
+                            local real_url=$(grep -v '^#' "$list_file" | grep -E 'https?://' | head -n 1)
+                            echo "$(echo "$real_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||') (官方重定向)"
+                        else
+                            echo "Debian 官方重定向源"
+                        fi
+                    else
+                        # 如果是用户切换后的标准 http/https 源
+                        local main_url=$(echo "$raw_line" | sed -E 's/^(deb(-src)?|URIs:)[[:space:]]*//I' | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||')
+                        [ -z "$main_url" ] && echo "未检测到有效 Debian 源" || echo "$main_url"
+                    fi
+                else
+                    echo "未检测到有效 Debian 源"
+                fi
+            else
+                echo "未找到 Debian 软件源配置文件"
+            fi
+            ;;
+
+        centos|rhel|rocky|almalinux)
+            local repo_file=""
+            for f in /etc/yum.repos.d/*.repo; do
+                if [ -f "$f" ] && grep -q -E '^baseurl=|^mirrorlist=' "$f"; then
+                    repo_file="$f"
+                    break
+                fi
+            done
+            if [ -n "$repo_file" ]; then
+                local main_url=$(grep -E '^baseurl=|^mirrorlist=' "$repo_file" | head -n 1 | cut -d= -f2)
+                [ -z "$main_url" ] && echo "未检测到有效源" || echo "$main_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||'
+            else
+                echo "未找到有效 repo 配置文件"
+            fi
+            ;;
+
+        alpine)
+            if [ -f /etc/apk/repositories ]; then
+                local main_url=$(grep -v '^#' /etc/apk/repositories | head -n 1)
+                [ -z "$main_url" ] && echo "未检测到有效源" || echo "$main_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||'
+            else
+                echo "repositories 不存在"
+            fi
+            ;;
+
+        *)
+            echo "不支持的系统"
+            ;;
+    esac
+}
+
+
+# 7. 备份当前源
+backup_sources() {
+    case "$ID" in
+        ubuntu|debian)
+            [ -f /etc/apt/sources.list ] && cp -f /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null
+            [ -f /etc/apt/sources.list.d/ubuntu.sources ] && cp -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak 2>/dev/null
+            [ -f /etc/apt/sources.list.d/debian.sources ] && cp -f /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.sources.bak 2>/dev/null
+            ;;
+        centos|rhel|rocky|almalinux)
+            mkdir -p /etc/yum.repos.d/bak 2>/dev/null
+            if [ -z "$(ls -A /etc/yum.repos.d/bak 2>/dev/null)" ]; then
+                cp -f /etc/yum.repos.d/*.repo /etc/yum.repos.d/bak/ 2>/dev/null
+            fi
+            ;;
+        alpine)
+            [ -f /etc/apk/repositories ] && cp -f /etc/apk/repositories /etc/apk/repositories.bak 2>/dev/null
+            ;;
+    esac
+    echo -e "${GREEN}已完成当前更新源备份${RESET}"
+}
+
+# 8. 还原初始源
+restore_sources() {
+    case "$ID" in
+        ubuntu|debian)
+            if [ -f /etc/apt/sources.list.bak ] || [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ] || [ -f /etc/apt/sources.list.d/debian.sources.bak ]; then
+                [ -f /etc/apt/sources.list.bak ] && cp -f /etc/apt/sources.list.bak /etc/apt/sources.list
+                [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ] && cp -f /etc/apt/sources.list.d/ubuntu.sources.bak /etc/apt/sources.list.d/ubuntu.sources
+                [ -f /etc/apt/sources.list.d/debian.sources.bak ] && cp -f /etc/apt/sources.list.d/debian.sources.bak /etc/apt/sources.list.d/debian.sources
+                echo -e "${GREEN}已还原初始更新源${RESET}"
+            else
+                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
+            fi
+            ;;
+        centos|rhel|rocky|almalinux)
+            if [ -d /etc/yum.repos.d/bak ] && [ "$(ls -A /etc/yum.repos.d/bak 2>/dev/null)" ]; then
+                cp -f /etc/yum.repos.d/bak/*.repo /etc/yum.repos.d/
+                echo -e "${GREEN}已还原初始更新源${RESET}"
+            else
+                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
+            fi
+            ;;
+        alpine)
+            if [ -f /etc/apk/repositories.bak ]; then
+                cp -f /etc/apk/repositories.bak /etc/apk/repositories
+                echo -e "${GREEN}已还原初始更新源${RESET}"
+            else
+                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
+            fi
+            ;;
+    esac
+}
+
+# 8. 还原初始源
+restore_sources() {
+    case "$ID" in
+        ubuntu|debian)
+            if [ -f /etc/apt/sources.list.bak ] || [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ]; then
+                [ -f /etc/apt/sources.list.bak ] && cp -f /etc/apt/sources.list.bak /etc/apt/sources.list
+                [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ] && cp -f /etc/apt/sources.list.d/ubuntu.sources.bak /etc/apt/sources.list.d/ubuntu.sources
+                echo -e "${GREEN}已还原初始更新源${RESET}"
+            else
+                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
+            fi
+            ;;
+        centos|rhel|rocky|almalinux)
+            if [ -d /etc/yum.repos.d/bak ] && [ "$(ls -A /etc/yum.repos.d/bak 2>/dev/null)" ]; then
+                cp -f /etc/yum.repos.d/bak/*.repo /etc/yum.repos.d/
+                echo -e "${GREEN}已还原初始更新源${RESET}"
+            else
+                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
+            fi
+            ;;
+        alpine)
+            if [ -f /etc/apk/repositories.bak ]; then
+                cp -f /etc/apk/repositories.bak /etc/apk/repositories
+                echo -e "${GREEN}已还原初始更新源${RESET}"
+            else
+                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
+            fi
+            ;;
+    esac
+}
+
+
+# 9. 切换 Ubuntu/Debian 源
+switch_apt_source() {
+    local new_source="$1"
+    local source_name="$2"
+
+    if [ "$ID" = "debian" ]; then
+        local sec_url="http://security.debian.org/debian-security"
+        [[ "$new_source" == *"aliyun"* ]] && sec_url="http://mirrors.aliyun.com/debian-security"
+        [[ "$new_source" == *"tsinghua"* ]] && sec_url="https://mirrors.tuna.tsinghua.edu.cn/debian-security"
+
+        # 判断是否为 Debian 13 (Trixie) 或更高版本
+        if [ -f /etc/apt/sources.list.d/debian.sources ] || [ "$VERSION_ID" = "13" ]; then
+            # Debian 13+ 使用全新的 DEB822 格式
+            cat > /etc/apt/sources.list.d/debian.sources <<EOF
+Types: deb
+URIs: ${new_source}
+Suites: ${codename} ${codename}-updates ${codename}-backports
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: ${sec_url}
+Suites: ${codename}-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 EOF
+            echo "# 软件源已移至 sources.list.d/debian.sources" > /etc/apt/sources.list
+            echo -e "${GREEN}✅ 已切换到 ${source_name} Debian 新版源（DEB822 格式）${RESET}"
+        else
+            # Debian 12 及以下版本保持传统单行格式
+            [ -f /etc/apt/sources.list.d/debian.sources ] && rm -f /etc/apt/sources.list.d/debian.sources
+            cat > /etc/apt/sources.list <<EOF
+deb ${new_source} ${codename} main contrib non-free non-free-firmware
+deb ${new_source} ${codename}-updates main contrib non-free non-free-firmware
+deb ${new_source} ${codename}-backports main contrib non-free non-free-firmware
+deb ${sec_url} ${codename}-security main contrib non-free non-free-firmware
+EOF
+            echo -e "${GREEN}✅ 已切换到 ${source_name} Debian 传统源（${codename}）${RESET}"
+        fi
+
+    elif [ "$ID" = "ubuntu" ]; then
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ] || [ "$VERSION_ID" = "24.04" ]; then
+            # Ubuntu 24.04+ 新版 DEB822 规范
+            cat > /etc/apt/sources.list.d/ubuntu.sources <<EOF
+Types: deb
+URIs: ${new_source}
+Suites: ${codename} ${codename}-updates ${codename}-backports ${codename}-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+            echo "# 软件源已移至 sources.list.d/ubuntu.sources" > /etc/apt/sources.list
+            echo -e "${GREEN}✅ 已切换到 ${source_name} Ubuntu 新版源（DEB822 格式）${RESET}"
+        else
+            # Ubuntu 22.04 及以下旧版规范
+            [ -f /etc/apt/sources.list.d/ubuntu.sources ] && rm -f /etc/apt/sources.list.d/ubuntu.sources
+            cat > /etc/apt/sources.list <<EOF
+deb ${new_source} ${codename} main restricted universe multiverse
+deb ${new_source} ${codename}-updates main restricted universe multiverse
+deb ${new_source} ${codename}-backports main restricted universe multiverse
+deb ${new_source} ${codename}-security main restricted universe multiverse
+EOF
+            echo -e "${GREEN}✅ 已切换到 ${source_name} Ubuntu 传统源（${codename}）${RESET}"
+        fi
+    fi
 }
 
-#################################
-# Telegram 通知
-#################################
-send_tg() {
-    [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]] && return
-    MESSAGE="[$SERVICE_NAME] $1"
-    curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
-        -d chat_id="$TG_CHAT_ID" \
-        -d text="$MESSAGE" >/dev/null 2>&1
-}
-
-#################################
-# 备份 Caddy 配置 + 证书 + 可执行文件
-#################################
-backup() {
-    TIMESTAMP=$(date +%F_%H-%M-%S)
-    FILE="$DATA_DIR/caddy_backup_$TIMESTAMP.tar.gz"
-
-    echo -e "${CYAN}开始备份 Caddy 配置、证书...${RESET}"
-
-    # 检查文件和目录
-    [[ ! -f "/usr/bin/caddy" ]] && echo -e "${RED}未找到 Caddy 可执行文件${RESET}" && return
-    [[ ! -f "$CADDYFILE" ]] && echo -e "${RED}未找到 Caddyfile${RESET}" && return
-    [[ ! -d "$CADDY_DATA" ]] && echo -e "${RED}未找到 Caddy 数据目录${RESET}" && return
-
-    tar czf "$FILE" \
-        /usr/bin/caddy \
-        "$CADDYFILE" \
-        "$CADDY_DATA" >> "$LOG_FILE" 2>&1
-
-    if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}备份成功：$FILE${RESET}"
-        send_tg "✅ Caddy备份成功: $TIMESTAMP"
+# 10. 切换 CentOS / RHEL / Rocky / Alma 源（在此处补齐补全）
+switch_yum_source() {
+    local new_source="$1"
+    local source_name="$2"
+    
+    if ls /etc/yum.repos.d/CentOS-*.repo >/dev/null 2>&1; then
+        sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/CentOS-*.repo
+        sed -i 's|^#baseurl=|baseurl=|g' /etc/yum.repos.d/CentOS-*.repo
+        sed -i "s|mirror.centos.org|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
+        sed -i "s|mirrors.aliyun.com|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
+        sed -i "s|mirrors.tuna.tsinghua.edu.cn|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
     else
-        echo -e "${RED}备份失败${RESET}"
-        send_tg "❌ Caddy备份失败"
+        sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/*.repo 2>/dev/null
+        sed -i 's|^#baseurl=|baseurl=|g' /etc/yum.repos.d/*.repo 2>/dev/null
+        sed -i -E "s|dl.rockylinux.org|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
+        sed -i -E "s|repo.almalinux.org|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
+        sed -i -E "s|mirrors.aliyun.com|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
+        sed -i -E "s|mirrors.tuna.tsinghua.edu.cn|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
+    fi
+    echo -e "${GREEN}✅ 已切换到 ${source_name} YUM 源${RESET}"
+}
+
+# 11. 切换 Alpine 源
+switch_alpine_source() {
+    local new_source="$1"
+    local source_name="$2"
+    
+    cat > /etc/apk/repositories <<EOF
+${new_source}${codename}/main
+${new_source}${codename}/community
+EOF
+    echo -e "${GREEN}✅ 已切换到 ${source_name} Alpine 源（${codename}）${RESET}"
+}
+
+# 12. 更新缓存
+update_cache() {
+    case "$ID" in
+        ubuntu|debian)
+            echo -e "${YELLOW}正在更新 apt 缓存...${RESET}"
+            apt-get update -y
+            ;;
+        centos|rhel|rocky|almalinux)
+            echo -e "${YELLOW}正在生成 yum/dnf 缓存...${RESET}"
+            if command -v dnf >/dev/null 2>&1; then
+                dnf clean all && dnf makecache -y
+            else
+                yum clean all && yum makecache -y
+            fi
+            ;;
+        alpine)
+            echo -e "${YELLOW}正在更新 apk 缓存...${RESET}"
+            apk update --no-cache
+            ;;
+    esac
+    echo -e "${GREEN}缓存更新完成${RESET}"
+}
+
+# 13. 暂停函数
+pause() {
+    read -rp "$(echo -e "${YELLOW}按回车键继续...${RESET}")"
+}
+
+# 14. 显示国内/国外推荐源列表（引入 GitHub 代理轮询加速机制）
+show_recommended_sources() {
+    clear
+    echo -e "${GREEN}正在获取外部推荐源...${RESET}"
+    
+    # 1. 定义 GitHub 代理数组
+    local GITHUB_PROXY=(
+        ''
+        'https://v6.gh-proxy.org/'
+        'https://gh-proxy.com/'
+        'https://hub.glowp.xyz/'
+        'https://proxy.vvvv.ee/'
+        'https://ghproxy.lvedong.eu.org/'
+    )
+    
+    # 目标脚本的基础 URL
+    local target_url="https://linuxmirrors.cn/main.sh"
+    local success=false
+
+    # 2. 检查基础网络工具
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        echo -e "${RED}❌ 错误：未检测到 curl 或 wget 命令！${RESET}"
+        if [ "$ID" = "alpine" ]; then
+            echo -e "${YELLOW}提示：Alpine 系统请先运行: apk add curl${RESET}"
+        fi
+        pause
+        return 1
     fi
 
-    # 清理旧备份
-    find "$DATA_DIR" -type f -name "*.tar.gz" -mtime +"$RETAIN_DAYS" -delete
-}
+    # 3. 轮询代理阵列尝试下载并执行
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local full_url="${proxy}${target_url}"
+        if [ -n "$proxy" ]; then
+            echo
+        else
+            echo
+        fi
 
-restore() {
-    shopt -s nullglob
-    FILE_LIST=("$DATA_DIR"/*.tar.gz)
-    [[ ${#FILE_LIST[@]} -eq 0 ]] && echo -e "${RED}没有备份文件${RESET}" && return
+        # 根据系统现有的工具选择执行命令（使用临时文件确保能够安全判定下载状态）
+        local tmp_script="/tmp/linuxmirrors_action.sh"
+        rm -f "$tmp_script"
 
-    echo -e "${CYAN}备份列表:${RESET}"
-    for i in "${!FILE_LIST[@]}"; do
-        echo -e "${GREEN}$((i+1)). $(basename "${FILE_LIST[$i]}")${RESET}"
+        if command -v curl >/dev/null 2>&1; then
+            curl -sSL --connect-timeout 5 --max-time 15 "$full_url" -o "$tmp_script"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$tmp_script" --connect-timeout=5 --timeout=15 "$full_url"
+        fi
+
+        # 验证下载的文件是否有效（是否包含 shell 脚本特征）
+        if [ -f "$tmp_script" ] && grep -q -E '#!/bin/|case|menu' "$tmp_script" 2>/dev/null; then
+            success=true
+            echo -e "${GREEN}下载成功，开始执行外部脚本...${RESET}"
+            chmod +x "$tmp_script"
+            bash "$tmp_script"
+            rm -f "$tmp_script"
+            break
+        fi
+        
+        echo -e "${RED}当前连接超时或失败，尝试下一个节点...${RESET}"
+        rm -f "$tmp_script"
     done
 
-    read -p "输入恢复序号: " num
-    [[ ! $num =~ ^[0-9]+$ ]] && return
-    FILE="${FILE_LIST[$((num-1))]}"
-    [[ -z "$FILE" ]] && return
-
-    echo -e "${YELLOW}确认恢复？将覆盖 Caddy 配置、证书 (y/n)${RESET}"
-    read confirm
-    [[ "$confirm" != "y" ]] && return
-
-    # 直接恢复文件
-    tar xzf "$FILE" -C /
-
-    echo -e "${GREEN}恢复完成${RESET}"
-    send_tg "🔄 Caddy 已恢复: $(basename "$FILE")"
-
-    # 自动重启 Caddy
-        echo -e "${CYAN}正在重启 Caddy (systemd)...${RESET}"
-
-    if systemctl list-unit-files | grep -q '^caddy.service'; then
-        systemctl daemon-reload
-        systemctl restart caddy
-
-        if systemctl is-active --quiet caddy; then
-            echo -e "${GREEN}Caddy 重启成功${RESET}"
-            send_tg "⚡ Caddy 已通过 systemd 重启"
-        else
-            echo -e "${RED}Caddy 启动失败，请检查日志${RESET}"
-            send_tg "❌ Caddy 重启失败"
-        fi
-    else
-        echo -e "${RED}未检测到 caddy.service，无法使用 systemd 启动${RESET}"
-        send_tg "❌ 未找到 systemd 版本 Caddy"
+    if [ "$success" = false ]; then
+        echo -e "${RED}❌ 错误：所有网络节点均无法连接，请检查本地网络设置！${RESET}"
     fi
+
+    pause
 }
 
-#################################
-# 设置 TG
-#################################
-set_tg() {
-    read -p "服务名称: " SERVICE_NAME
-    read -p "TG BOT TOKEN: " TG_TOKEN
-    read -p "TG CHAT ID: " TG_CHAT_ID
-    save_config
-    echo -e "${GREEN}TG 已启用${RESET}"
-    send_tg "✅ TG 测试成功"
-}
-
-#################################
-# 设置定时任务（稳定版）
-#################################
-add_cron() {
-    echo -e "${CYAN}1 每天0点${RESET}"
-    echo -e "${CYAN}2 每周一0点${RESET}"
-    echo -e "${CYAN}3 每月1号${RESET}"
-    echo -e "${CYAN}4 自定义${RESET}"
-
-    read -p "选择: " t
-    case $t in
-        1) cron="0 0 * * *" ;;
-        2) cron="0 0 * * 1" ;;
-        3) cron="0 0 1 * *" ;;
-        4) read -p "cron表达式: " cron ;;
-        *) return ;;
-    esac
-
-    crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/caadybackup_cron 2>/dev/null
-    echo "$cron /usr/bin/env bash $INSTALL_DIR/caadybackup.sh auto >> $INSTALL_DIR/cron.log 2>&1 $CRON_TAG" >> /tmp/caadybackup_cron
-    crontab /tmp/caadybackup_cron
-    rm -f /tmp/caadybackup_cron
-    echo -e "${GREEN}定时任务已设置${RESET}"
-}
-
-#################################
-# 删除定时任务
-#################################
-remove_cron() {
-    if crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
-        crontab -l 2>/dev/null | grep -v "$CRON_TAG" > /tmp/caadybackup_cron 2>/dev/null
-        crontab /tmp/caadybackup_cron
-        rm -f /tmp/caadybackup_cron
-        echo -e "${GREEN}定时任务已删除${RESET}"
-    else
-        echo -e "${YELLOW}未发现定时任务${RESET}"
-    fi
-}
-
-#################################
-# auto模式
-#################################
-if [[ "$1" == "auto" ]]; then
-    backup
-    exit 0
-fi
-
-#################################
-# 菜单
-#################################
-#################################
-# 菜单
-#################################
-while true; do
+# 15. 主菜单展示
+show_menu() {
     clear
-    
-    # ---- 动态获取定时任务状态 ----
-    if crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
-        CRON_STATUS="${YELLOW}已开启${RESET}"
-    else
-        CRON_STATUS="${RED}已关闭${RESET}"
-    fi
+    STATUS=$(get_current_source_status)
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}    ◈     系统更新源管理面板     ◈     ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN} 系统环境  : ${YELLOW}${OS_ID}${RESET}"
+    echo -e "${GREEN} 当前源状态: ${YELLOW}${STATUS}${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}  1. 切换到 阿里云源 (国内推荐)${RESET}"
+    echo -e "${GREEN}  2. 切换到 官方原生源 (海外推荐)${RESET}"
+    echo -e "${GREEN}  3. 切换到 清华大学源 (高校教育网)${RESET}"
+    echo -e "${GREEN}  4. 备份当前源文件副本${RESET}"
+    echo -e "${GREEN}  5. 还原初始更新源 (并自动刷新缓存)${RESET}"
+    echo -e "${GREEN}  6. 国内/国外推荐源(LinuxMirrors)${RESET}"
+    echo -e "${GREEN}  0. 退出${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -ne "${GREEN} 请输入操作编号: ${RESET}"
+}
 
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}       ◈  Caddy 备份系统  ◈        ${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 📂 当前备份目录: ${YELLOW}$DATA_DIR${RESET}"
-    echo -e "${GREEN} ⏳  备份保留天数: ${YELLOW}$RETAIN_DAYS 天${RESET}"
-    echo -e "${GREEN} ⏰  定时任务状态: $CRON_STATUS${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}1. 立即备份${RESET}"
-    echo -e "${GREEN}2. 恢复备份${RESET}"
-    echo -e "${GREEN}3. 设置定时任务${RESET}"
-    echo -e "${GREEN}4. 删除定时任务${RESET}"
-    echo -e "${GREEN}5. 设置备份目录${RESET}"
-    echo -e "${GREEN}6. 设置保留天数${RESET}"
-    echo -e "${GREEN}7. 设置Telegram通知${RESET}"
-    echo -e "${GREEN}8. 卸载${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-
-    read -p "$(echo -e ${GREEN}选择: ${RESET})" c
-
-    case $c in
-        1) backup ;;
-        2) restore ;;
-        3) add_cron ;;
-        4) remove_cron ;;
-        5) 
-            read -p "新目录: " input_dir
-            if [[ -n "$input_dir" ]]; then
-                DATA_DIR="$input_dir"
-                mkdir -p "$DATA_DIR"
-                save_config
-                echo -e "${GREEN}✅ 备份目录已更新${RESET}"
-            else
-                echo -e "${YELLOW}未输入有效目录，保持原样${RESET}"
+# 16. 主循环
+while true; do
+    show_menu
+    read -r choice
+    case "$choice" in
+        1)
+            backup_sources
+            case "$ID" in
+                ubuntu) switch_apt_source "$aliyun_ubuntu_source" "阿里云" ;;
+                debian) switch_apt_source "$aliyun_debian_source" "阿里云" ;;
+                centos|rhel|rocky|almalinux) switch_yum_source "$aliyun_centos_source" "阿里云" ;;
+                alpine) switch_alpine_source "$aliyun_alpine_source" "阿里云" ;;
+            esac
+            update_cache
+            pause
+            ;;
+        2)
+            backup_sources
+            case "$ID" in
+                ubuntu) switch_apt_source "$official_ubuntu_source" "官方" ;;
+                debian) switch_apt_source "$official_debian_source" "官方" ;;
+                centos|rhel|rocky|almalinux) switch_yum_source "$official_centos_source" "官方" ;;
+                alpine) switch_alpine_source "$official_alpine_source" "官方" ;;
+            esac
+            update_cache
+            pause
+            ;;
+        3)
+            backup_sources
+            case "$ID" in
+                ubuntu) switch_apt_source "$tsinghua_ubuntu_source" "清华" ;;
+                debian) switch_apt_source "$tsinghua_debian_source" "清华" ;;
+                centos|rhel|rocky|almalinux) switch_yum_source "$tsinghua_centos_source" "清华" ;;
+                alpine) switch_alpine_source "$tsinghua_alpine_source" "清华" ;;
+            esac
+            update_cache
+            pause
+            ;;
+        4)
+            backup_sources
+            pause
+            ;;
+        5)
+            if restore_sources; then
+                update_cache
             fi
+            pause
             ;;
-        6) 
-            read -p "保留天数: " input_days
-            if [[ "$input_days" =~ ^[0-9]+$ ]]; then
-                RETAIN_DAYS="$input_days"
-                save_config
-                echo -e "${GREEN}✅ 保留天数已更新${RESET}"
-            else
-                echo -e "${RED}❌ 输入无效，请输入纯数字${RESET}"
-            fi
+        6)
+            show_recommended_sources
             ;;
-        7) set_tg ;;
-        8)
-            echo -e "${YELLOW}正在卸载...${RESET}"
-            crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
-            rm -rf "$INSTALL_DIR"
-            echo -e "${GREEN}卸载完成${RESET}"
-            exit 0
+        0)
+            break
             ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}❌ 无效选择${RESET}" ;;
+        *)
+            echo -e "${RED}无效选择，请重新输入${RESET}"
+            sleep 1
+            ;;
     esac
-
-    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
 done

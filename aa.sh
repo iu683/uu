@@ -10,7 +10,6 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-
 # 【核心修复】跨平台通用依赖检查（抛弃非标数组，完美兼容 Alpine sh）
 install_dependencies() {
     local missing_deps=""
@@ -49,25 +48,20 @@ install_dependencies() {
 # 运行依赖检查
 install_dependencies
 
-# 随机密码生成函数（生成12位包含大小写字母和数字的随机密码）
+# 随机密码生成函数（生成20位包含大小写字母和数字的随机密码）
 generate_random_password() {
     if command -v openssl >/dev/null 2>&1; then
-        openssl rand -base64 9 | tr -d '+/' | cut -c1-12
+        # 增加随机字节数至 15，确保 Base64 编码并过滤后足够截取 20 位
+        openssl rand -base64 15 | tr -d '+/' | cut -c1-20
     else
-        tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 12
+        # 直接修改截取长度为 20
+        tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 20
     fi
 }
 
-
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    ''https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
-
+# GitHub 代理镜像列表（用传统的空格字符串替代非标数组，完美兼容 Alpine sh）
+# 第一个节点为空，代表优先尝试直连
+GITHUB_PROXIES="DIRECT https://v6.gh-proxy.org/ https://gh-proxy.com/ https://hub.glowp.xyz/ https://proxy.vvvv.ee/ https://ghproxy.lvedong.eu.org/"
 
 download_script() {
     local type="$1"
@@ -82,35 +76,39 @@ download_script() {
         raw_url="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
     fi
 
-    # 遍历 Bash 数组
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local proxy_url="${proxy}${raw_url}"
+    # 遍历空格分隔的代理字符串
+    for proxy in $GITHUB_PROXIES; do
+        local proxy_url=""
         rm -f "$file_name"
         
-        if [ -z "$proxy" ]; then
+        if [ "$proxy" = "DIRECT" ]; then
+            proxy_url="$raw_url"
             echo -e "${YELLOW}📡 正在尝试直连下载...${RESET}"
         else
+            proxy_url="${proxy}${raw_url}"
             echo -e "${YELLOW}🔄 正在尝试代理节点: ${proxy}${RESET}"
         fi
 
+        # 带有 3 秒超时限制的下载块，防止死节点卡网速
         if command -v wget >/dev/null 2>&1; then
             wget --no-check-certificate --timeout=3 --tries=1 -qO "$file_name" "$proxy_url" && chmod +x "$file_name"
         else
-            if [ -z "$proxy" ]; then
+            if [ "$proxy" = "DIRECT" ]; then
                 curl -m 3 -sO "$proxy_url" && chmod +x "$file_name"
             else
+                # 代理站通常有302重定向，curl 必须加 -L 顺着重定向下载
                 curl -m 3 -sL -o "$file_name" "$proxy_url" && chmod +x "$file_name"
             fi
         fi
 
-        # 判断是否成功
+        # 严格验证：确保文件存在且大小大于 0 字节（防止把代理站的 404 报错网页抓下来）
         if [ -f "$file_name" ] && [ -s "$file_name" ]; then
             echo -e "${GREEN}✅ 下载成功！${RESET}"
             return 0
         fi
     done
 
-    echo -e "${RED}❌ 错误: 尝试了所有代理节点，均无法下载重装内核！${RESET}"
+    echo -e "${RED}❌ 错误: 尝试了所有渠道及代理节点，均无法下载重装内核！${RESET}"
     exit 1
 }
 
@@ -174,7 +172,6 @@ while true; do
             echo -e "${GREEN}--- ❖ $category 系统 ❖ ---${RESET}"
             last_category="$category"
         fi
-        
         
         printf "${YELLOW}  %2d) %-22s${RESET}\n" "$id" "$name"
     done

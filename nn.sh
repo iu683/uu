@@ -1,279 +1,451 @@
 #!/bin/bash
-# =================================================================
-# qBittorrent Docker Compose 管理面板
-# =================================================================
+set -e
 
-# 颜色
-RED="\033[31m"
+# ================== 颜色 ==================
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="qbittorrent"
-BASE_DIR="/opt/qbittorrent"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+# ================== 变量 ==================
+SNELL_DIR="/etc/snell"
+SNELL_CONFIG="$SNELL_DIR/snell-server.conf"
+SNELL_SERVICE="/etc/systemd/system/snell.service"
+LOG_FILE="/var/log/snell_manager.log"
 
-# 检测依赖
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
-    fi
-}
-
-# 动态获取容器状态、镜像版本、映射端口和下载目录
-get_status_info() {
-    # 1. 容器运行状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
-
-
-    # 2. 【精准匹配修复】完美剥离特定格式，只留纯版本号
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{ index .Config.Labels "build_version" }}' "$CONTAINER_NAME" 2>/dev/null | sed 's/Linuxserver.io version:- //g' | awk '{print $1}')
-        [[ -z "$img_version" ]] && img_version="已安装"
-    else
-        img_version="${RED}未安装${RESET}"
-    fi
-
-    # 3. 【精准修复】自适应解析 Compose 文件中的官方环境变量与目录映射
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        # 直接抓取官方环境变量 WEBUI_PORT=xxxx
-        webui_port=$(grep -E "WEBUI_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-        # 如果由于某种原因没抓到环境变量，则降级兼容原有的端口映射格式抓取
-        if [[ -z "$webui_port" ]]; then
-            webui_port=$(grep -E "\-[[:space:]]+[0-9]+:[0-9]+" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d ' -')
-        fi
-        [[ -z "$webui_port" ]] && webui_port="8080"
-
-        # 直接抓取官方环境变量 TORRENTING_PORT=xxxx
-        torrent_port=$(grep -E "TORRENTING_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-        if [[ -z "$torrent_port" ]]; then
-            torrent_port=$(grep -E "\-[[:space:]]+[0-9]+:[0-9]+" "$COMPOSE_FILE" | tail -n 1 | awk -F ':' '{print $1}' | tr -d ' -')
-        fi
-        [[ -z "$torrent_port" ]] && torrent_port="6881"
-
-        # 优化下载目录抓取，支持去掉可能存在的双引号或空格
-        download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | tr -d '"' | xargs)
-        [[ -z "$download_dir" ]] && download_dir="/opt/qbittorrent/downloads"
-    else
-        webui_port="N/A"
-        torrent_port="N/A"
-        download_dir="N/A"
-    fi
-}
-
-# 提取 Docker 容器内的 WebUI 临时密码
-get_qb_password() {
-    if [ ! "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        echo -e "${RED}容器未部署${RESET}"
-        return
-    fi
-    
-    local log_pass
-    log_pass=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -iE "temporary password|session:" | tail -n 1 | sed 's/\r//g' | awk '{print $NF}' | tr -d '[:space:].')
-    
-    if [[ -n "$log_pass" && ! "$log_pass" =~ "session:" && ! "$log_pass" =~ "password" ]]; then
-        echo -e "${GREEN}${log_pass}${RESET}"
-    else
-        echo -e "${YELLOW}未探测到初始随机密码（可能已被你修改，或日志已被冲刷）${RESET}"
-    fi
+# ================== 工具函数 ==================
+create_user() {
+    id -u snell &>/dev/null || useradd -r -s /usr/sbin/nologin snell
 }
 
 get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
-    else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-
-    error "无法获取公网 IP 地址，请检查网络或 DNS 设置！" && echo "127.0.0.1" && return 1
+    done
+    echo "无法获取公网 IP 地址。" && return
 }
 
-install_qbittorrent() {
-    check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入 WebUI 访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
     fi
+}
 
-    echo -ne "${YELLOW}请输入 Torrent 传输端口 (宿主机端口) [默认: 6881]: ${RESET}"
-    read -r custom_p2p_port
-    [[ -z "$custom_p2p_port" ]] && custom_p2p_port="6881"
+random_key() {
+    tr -dc A-Za-z0-9 </dev/urandom | head -c 16
+}
 
-    echo -ne "${YELLOW}请输入宿主机下载绝对路径 [默认: /opt/qbittorrent/downloads]: ${RESET}"
-    read -r custom_download
-    [[ -z "$custom_download" ]] && custom_download="/opt/qbittorrent/downloads"
+random_port() {
+    shuf -i 2000-65000 -n 1
+}
 
-    mkdir -p "$BASE_DIR/config"
-    chmod -R 777 "$BASE_DIR/config" "$custom_download"
+get_system_dns() {
+    grep -E "^nameserver" /etc/resolv.conf | awk '{print $2}' | paste -sd "," -
+}
 
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
-    
-    # 【完美重构点】严格遵循官方规范：-p 两侧端口保持一致，并同步下发给环境变量
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:latest
-    container_name: ${CONTAINER_NAME}
-    environment:
-      - PUID=$(id -u)
-      - PGID=$(id -g)
-      - TZ=Asia/Shanghai
-      - WEBUI_PORT=${custom_port}
-      - TORRENTING_PORT=${custom_p2p_port}
-    volumes:
-      - ${BASE_DIR}/config:/config
-      - ${custom_download}:/downloads
-    ports:
-      - ${custom_port}:${custom_port}
-      - ${custom_p2p_port}:${custom_p2p_port}
-      - ${custom_p2p_port}:${custom_p2p_port}/udp
-    stop_grace_period: 10s
-    restart: unless-stopped
+pause() {
+    read -n 1 -s -r -p "按任意键返回菜单..."
+}
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+# 动态获取官方最新 Snell v6 版本 (保留完整抓取到的字符串，交给下载函数做双向匹配)
+get_latest_snell_version() {
+    local latest_version
+    latest_version=$(curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+        "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | \
+        grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
+        
+    if [[ -z "$latest_version" ]]; then
+        latest_version="v6.0.0b2"
+    fi
+    echo "$latest_version"
+}
+
+# ================== 配置 Snell ==================
+configure_snell() {
+    echo -e "${GREEN}[信息] 开始配置 Snell (v6 协议栈增强版)...${RESET}"
+
+    read -p "请输入端口 (默认: 随机生成): " input_port
+    port=${input_port:-$(random_port)}
+    check_port "$port" || return
+
+    read -p "请输入 Snell 密钥 (默认: 随机生成): " key
+    key=${key:-$(random_key)}
+
+    echo -e "${YELLOW}请选择监听网络模式 (Listen Mode):${RESET}"
+    echo "1. 同时监听 IPv4 & IPv6 (双栈显式绑定，推荐)"
+    echo "2. 仅监听 IPv4 (0.0.0.0)"
+    echo "3. 仅监听 IPv6 ([::])"
+    read -p "(默认: 1): " listen_choice
+    listen_choice=${listen_choice:-1}
+    case $listen_choice in
+        2) LISTEN="0.0.0.0:$port" ;;
+        3) LISTEN="[::]:$port" ;;
+        *) LISTEN="0.0.0.0:$port,[::]:$port" ;;
+    esac
+
+    echo -e "${YELLOW}请选择 DNS 解析 IP 家族优先级 (dns-ip-preference):${RESET}"
+    echo "1. default      (系统默认)"
+    echo "2. prefer-ipv4  (IPv4 优先)"
+    echo "3. prefer-ipv6  (IPv6 优先)"
+    echo "4. ipv4-only    (仅使用 IPv4)"
+    echo "5. ipv6-only    (仅使用 IPv6)"
+    read -p "(默认: 1): " dns_pref_choice
+    case $dns_pref_choice in
+        2) dns_pref="prefer-ipv4" ;;
+        3) dns_pref="prefer-ipv6" ;;
+        4) dns_pref="ipv4-only" ;;
+        5) dns_pref="ipv6-only" ;;
+        *) dns_pref="default" ;;
+    esac
+
+    echo -e "${YELLOW}配置 OBFS：[注意] 无特殊作用不建议启用${RESET}"
+    echo "1. TLS   2. HTTP   3. 关闭"
+    read -p "(默认: 3): " obfs
+    case $obfs in
+        1) obfs="tls" ;;
+        2) obfs="http" ;;
+        *) obfs="off" ;;
+    esac
+
+    echo -e "${YELLOW}是否开启 TCP Fast Open？${RESET}"
+    echo "1. 开启   2. 关闭"
+    read -p "(默认: 1): " tfo
+    tfo=${tfo:-1}
+    tfo=$([ "$tfo" = "1" ] && echo true || echo false)
+
+    default_dns=$(get_system_dns)
+    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
+    read -p "请输入上游 DNS (默认: $default_dns): " dns
+    dns=${dns:-$default_dns}
+
+    cat > "$SNELL_CONFIG" <<EOF
+[snell-server]
+listen = $LISTEN
+psk = $key
+obfs = $obfs
+tfo = $tfo
+dns = $dns
+dns-ip-preference = $dns_pref
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 qBittorrent...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    IP=$(get_public_ip)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
 
-    echo -e "${YELLOW}等待容器初始化并同步密码日志 (约10秒)...${RESET}"
-    sleep 10
+    cat <<EOF > "$SNELL_DIR/config.txt"
+$HOSTNAME-Snell = snell, $IP, $port, psk=$key, version=6, tfo=$tfo, reuse=true, ecn=true
+EOF
 
-    SHOW_IP=$(get_public_ip)
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     qBittorrent  部署成功！    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${SHOW_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}默认用户名     : admin${RESET}"
-    echo -ne "${YELLOW}初始临时密码   : ${RESET}"
-    get_qb_password
-    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR/config${RESET}"
-    echo -e "${YELLOW}宿主机下载路径 : $custom_download${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}[完成] 配置已写入 $SNELL_CONFIG${RESET}"
+    echo -e "${GREEN}====== Snell Server 配置信息 ======${RESET}"
+    echo -e "${YELLOW} 绑定地址 (Listen) : $LISTEN${RESET}"
+    echo -e "${YELLOW} 密钥 (PSK)        : $key${RESET}"
+    echo -e "${YELLOW} OBFS 混淆         : $obfs${RESET}"
+    echo -e "${YELLOW} TFO 快速打开      : $tfo${RESET}"
+    echo -e "${YELLOW} DNS 上游          : $dns${RESET}"
+    echo -e "${YELLOW} DNS 家族优先级    : $dns_pref${RESET}"
+    echo -e "${YELLOW}---------------------------------${RESET}"
+    echo -e "${YELLOW}[信息] Surge 配置示例：${RESET}"
+    cat "$SNELL_DIR/config.txt"
+    echo -e "${YELLOW}---------------------------------\n${RESET}"
 }
 
-update_qbittorrent() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+# ================== 修改配置 Snell ==================
+configures_snell() {
+    echo -e "${GREEN}[信息] 开始修改 Snell 配置...${RESET}"
+
+    if [[ -f "$SNELL_CONFIG" ]]; then
+        old_listen=$(grep '^listen' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
+        old_port=$(echo "$old_listen" | awk -F: '{print $NF}')
+        old_key=$(grep '^psk' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
+        old_obfs=$(grep '^obfs' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
+        old_tfo=$(grep '^tfo' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
+        old_dns=$(grep '^dns' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
+        old_dns_pref=$(grep '^dns-ip-preference' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
+    fi
+
+    default_port=${old_port:-$(random_port)}
+    default_key=${old_key:-$(random_key)}
+    default_obfs=${old_obfs:-off}
+    default_tfo=${old_tfo:-true}
+    default_dns_pref=${old_dns_pref:-default}
+    
+    default_dns=$(get_system_dns)
+    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
+    default_dns=${old_dns:-$default_dns}
+
+    read -p "请输入端口 [当前: $default_port]: " input_port
+    port=${input_port:-$default_port}
+    if [[ "$port" != "$old_port" ]]; then
+        check_port "$port" || return
+    fi
+
+    read -p "请输入 Snell 密钥 [当前: $default_key]: " key
+    key=${key:-$default_key}
+
+    echo -e "${YELLOW}请选择监听网络模式 (当前: $old_listen):${RESET}"
+    echo "1. 同时监听 IPv4 & IPv6 (双栈绑定)"
+    echo "2. 仅监听 IPv4"
+    echo "3. 仅监听 IPv6"
+    read -p "(直接回车保留当前): " listen_choice
+    case $listen_choice in
+        1) LISTEN="0.0.0.0:$port,[::]:$port" ;;
+        2) LISTEN="0.0.0.0:$port" ;;
+        3) LISTEN="[::]:$port" ;;
+        *) LISTEN=${old_listen:-"0.0.0.0:$port,[::]:$port"} ;;
+    esac
+
+    echo -e "${YELLOW}请选择 DNS 解析 IP 家族优先级 (当前: $default_dns_pref):${RESET}"
+    echo "1. default    2. prefer-ipv4    3. prefer-ipv6    4. ipv4-only    5. ipv6-only"
+    read -p "(直接回车保留当前): " dns_pref_choice
+    case $dns_pref_choice in
+        1) dns_pref="default" ;;
+        2) dns_pref="prefer-ipv4" ;;
+        3) dns_pref="prefer-ipv6" ;;
+        4) dns_pref="ipv4-only" ;;
+        5) dns_pref="ipv6-only" ;;
+        *) dns_pref="$default_dns_pref" ;;
+    esac
+
+    echo -e "${YELLOW}配置 OBFS [当前: $default_obfs]:${RESET}"
+    echo "1. TLS   2. HTTP   3. 关闭"
+    read -p "(直接回车保留当前): " obfs_choice
+    case $obfs_choice in
+        1) obfs="tls" ;;
+        2) obfs="http" ;;
+        3) obfs="off" ;;
+        *) obfs="$default_obfs" ;;
+    esac
+
+    echo -e "${YELLOW}是否开启 TCP Fast Open？[当前: $default_tfo]${RESET}"
+    echo "1. 开启   2. 关闭"
+    read -p "(直接回车保留当前): " tfo_choice
+    case $tfo_choice in
+        1) tfo=true ;;
+        2) tfo=false ;;
+        *) tfo="$default_tfo" ;;
+    esac
+
+    read -p "请输入 DNS [当前: $default_dns]: " dns
+    dns=${dns:-$default_dns}
+
+    cat > "$SNELL_CONFIG" <<EOF
+[snell-server]
+listen = $LISTEN
+psk = $key
+obfs = $obfs
+tfo = $tfo
+dns = $dns
+dns-ip-preference = $dns_pref
+EOF
+
+    IP=$(get_public_ip)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+    cat > "$SNELL_DIR/config.txt" <<EOF
+$HOSTNAME-Snell = snell, $IP, $port, psk=$key, version=6, tfo=$tfo, reuse=true, ecn=true
+EOF
+
+    echo -e "${GREEN}[完成] 配置已保存${RESET}"
+}
+
+# ================== 下载与解压内核 (双重适配官方命名 Bug) ==================
+download_and_extract_snell() {
+    local RAW_VERSION=$1
+    local ARCH
+    ARCH=$(uname -m)
+    
+    if ! command -v unzip &>/dev/null; then
+        echo -e "${YELLOW}[提示] 未检测到 unzip，正在安装...${RESET}"
+        if command -v apt &>/dev/null; then apt update && apt install -y unzip;
+        elif command -v yum &>/dev/null; then yum install -y unzip;
+        elif command -v apk &>/dev/null; then apk add unzip; fi
+    fi
+
+    # 规范化架构标识
+    local URL_ARCH
+    case "$ARCH" in
+        aarch64|arm64)              URL_ARCH="linux-aarch64" ;;
+        armv7l|armhf|armv8l)        URL_ARCH="linux-armv7l" ;;
+        x86_64|amd64)               URL_ARCH="linux-amd64" ;;
+        i386|i686|x86)              URL_ARCH="linux-i386" ;;
+        *) echo -e "${RED}[错误] 不支持的架构: ${ARCH}${RESET}"; return 1 ;;
+    esac
+
+    # 预设两种命名URL形式（第一种带 v，第二种去 v）
+    local VERSION_WITH_V="${RAW_VERSION#v}"
+    VERSION_WITH_V="v${VERSION_WITH_V}"
+    local VERSION_WITHOUT_V="${RAW_VERSION#v}"
+
+    local SNELL_URL1="https://dl.nssurge.com/snell/snell-server-${VERSION_WITH_V}-${URL_ARCH}.zip"
+    local SNELL_URL2="https://dl.nssurge.com/snell/snell-server-${VERSION_WITHOUT_V}-${URL_ARCH}.zip"
+
+    echo -e "${GREEN}[信息] 正在尝试从官方路径下载（方案一：${VERSION_WITH_V}）...${RESET}"
+    if wget --spider -q -T 5 "$SNELL_URL1"; then
+        wget -O snell.zip "$SNELL_URL1"
+    else
+        echo -e "${YELLOW}[提示] 方案一返回 404，正在自动切换（方案二：${VERSION_WITHOUT_V}）...${RESET}"
+        if wget --spider -q -T 5 "$SNELL_URL2"; then
+            wget -O snell.zip "$SNELL_URL2"
+        else
+            echo -e "${RED}[错误] 官方服务器上未找到该版本的下载包，请检查网络或版本号。${RESET}"
+            return 1
+        fi
+    fi
+
+    unzip -o snell.zip -d "$SNELL_DIR"
+    rm -f snell.zip
+    chmod +x "$SNELL_DIR/snell-server"
+}
+
+# ================== 安装 Snell ==================
+install_snell() {
+    echo -e "${GREEN}[信息] 正在获取官方最新版本号...${RESET}"
+    local VERSION
+    VERSION=$(get_latest_snell_version)
+    echo -e "${GREEN}[信息] 检测到官方最新版本号为: ${VERSION}${RESET}"
+
+    create_user
+    mkdir -p "$SNELL_DIR"
+    cd "$SNELL_DIR"
+
+    download_and_extract_snell "$VERSION" || return
+    configure_snell
+
+    cat > "$SNELL_SERVICE" <<EOF
+[Unit]
+Description=Snell Server
+After=network.target
+
+[Service]
+ExecStart=$SNELL_DIR/snell-server -c $SNELL_CONFIG
+Restart=on-failure
+User=snell
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable snell
+    systemctl start snell
+    echo -e "${GREEN}[完成] Snell 已成功安装并启动！${RESET}"
+    log "Snell 已安装并启动 (${VERSION})"
+}
+
+# ================== 更新 Snell ==================
+update_snell() {
+    if [ ! -f "$SNELL_CONFIG" ]; then
+        echo -e "${RED}未找到配置文件，无法更新${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 linuxserver 最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    
-    echo -e "${YELLOW}正在应用更新并重启容器...${RESET}"
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+
+    echo -e "${GREEN}[信息] 正在获取官方最新版本号...${RESET}"
+    local VERSION
+    VERSION=$(get_latest_snell_version)
+    echo -e "${GREEN}[信息] 检测到官方最新版本为: ${VERSION}${RESET}"
+
+    systemctl stop snell || true
+    cd "$SNELL_DIR"
+
+    download_and_extract_snell "$VERSION" || return
+    systemctl restart snell
+
+    echo -e "${GREEN}[完成] Snell 已更新至 ${VERSION}${RESET}"
+    log "Snell 已更新 (${VERSION})"
 }
 
-uninstall_qbittorrent() {
-    echo -ne "${YELLOW}确定要卸载并删除 qBittorrent 容器吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和下载的数据？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
-            fi
-        else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
-        fi
-        echo -e "${GREEN}卸载完成！${RESET}"
-    fi
+# ================== 卸载 Snell ==================
+uninstall_snell() {
+    echo -e "${RED}[警告] 正在彻底卸载 Snell...${RESET}"
+    systemctl stop snell || true
+    systemctl disable snell || true
+    rm -f "$SNELL_SERVICE"
+    rm -rf "$SNELL_DIR"
+    systemctl daemon-reload
+    echo -e "${GREEN}[完成] Snell 已完美卸载${RESET}"
+    log "Snell 已卸载"
 }
 
-start_qb() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_qb() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_qb() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_qb() { docker logs -f "$CONTAINER_NAME"; }
-
-show_info() {
-    get_status_info
-    SHOW_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像版本       : ${img_version}${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${SHOW_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}P2P 传输端口   : ${torrent_port} (TCP/UDP)${RESET}"
-    echo -e "${YELLOW}宿主机下载路径 : ${download_dir}${RESET}"
-    echo -ne "${YELLOW}初始密码探测   : ${RESET}"
-    get_qb_password
-    echo -e "${GREEN}================================${RESET}"
-}
-
-menu() {
+# ================== 菜单面版 ==================
+show_menu() {
     clear
-    get_status_info
+    if systemctl is-active --quiet snell; then
+        STATUS="${GREEN}● 运行中${RESET}"
+    else
+        STATUS="${RED}● 未运行${RESET}"
+    fi
+
+    VERSION_SHOW="未安装"
+    if [ -x "$SNELL_DIR/snell-server" ]; then
+        VERSION_SHOW=$("$SNELL_DIR/snell-server" -v 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?')
+        [ -z "$VERSION_SHOW" ] && VERSION_SHOW=$("$SNELL_DIR/snell-server" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?')
+        [ -z "$VERSION_SHOW" ] && VERSION_SHOW="未知版本"
+    fi
+
+    LISTEN_SHOW="-"
+    if [ -f "$SNELL_CONFIG" ]; then
+        LISTEN_SHOW=$(grep '^listen' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
+    fi
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      qBittorrent 管理面板       ${RESET}"
+    echo -e "${GREEN}      Snell v6 管理面板 (双栈版)  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${img_version}${RESET}"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}   ${GREEN}P2P端口 :${RESET} ${YELLOW}${torrent_port}${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $STATUS"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
+    echo -e "${GREEN}绑定   :${RESET} ${YELLOW}$LISTEN_SHOW${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}1. 安装 Snell${RESET}"
+    echo -e "${GREEN}2. 更新 Snell${RESET}"
+    echo -e "${GREEN}3. 卸载 Snell${RESET}"
+    echo -e "${GREEN}4. 修改网络栈及配置${RESET}"
+    echo -e "${GREEN}5. 启动 Snell${RESET}"
+    echo -e "${GREEN}6. 停止 Snell${RESET}"
+    echo -e "${GREEN}7. 重启 Snell${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置 (Surge格式)${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_qbittorrent ;;
-        2) update_qbittorrent ;;
-        3) uninstall_qbittorrent ;;
-        4) start_qb ;;
-        5) stop_qb ;;
-        6) restart_qb ;;
-        7) logs_qb ;;
-        8) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
 }
 
+# ================== 主循环 ==================
 while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
+    show_menu
+    read -r -p $'\033[32m请输入选项: \033[0m' choice
+    case $choice in
+        1) install_snell; pause ;;
+        2) update_snell; pause ;;
+        3) uninstall_snell; pause ;;
+        4) configures_snell; systemctl restart snell; pause ;;
+        5) systemctl start snell; echo -e "${GREEN}[完成] 已启动${RESET}"; pause ;;
+        6) systemctl stop snell; echo -e "${GREEN}[完成] 已停止${RESET}"; pause ;;
+        7) systemctl restart snell; echo -e "${GREEN}[完成] 已重启${RESET}"; pause ;;
+        8) journalctl -u snell -e --no-pager; pause ;;
+        9)
+            if [ -f "$SNELL_CONFIG" ]; then
+                echo -e "${GREEN}====== Snell 内部配置文件 ======${RESET}"
+                cat "$SNELL_CONFIG"
+                echo -e "${GREEN}====== Surge 节点配置单行 ======${RESET}"
+                cat "$SNELL_DIR/config.txt"
+            else
+                echo -e "${RED}配置文件不存在${RESET}"
+            fi
+            pause ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效输入${RESET}"; pause ;;
+    esac
 done

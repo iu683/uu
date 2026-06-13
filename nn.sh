@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# DaiDai-Panel 一键管理脚本
+# Suwayomi Server 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="daidai-panel"
+APP_NAME="suwayomi"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== DaiDai-Panel 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Suwayomi 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -58,6 +58,7 @@ menu() {
 }
 
 install_app() {
+
     check_docker
     mkdir -p "$APP_DIR"
 
@@ -67,28 +68,28 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:5700]: " input_port
-    PORT=${input_port:-5700}
+    echo
+    read -p "请输入访问端口 [默认:4567]: " input_port
+    PORT=${input_port:-4567}
     check_port "$PORT" || return
 
-    read -p "请输入数据目录 [默认:$APP_DIR/Dumb-Panel]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/Dumb-Panel}
+    echo
+    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/data}
     mkdir -p "$DATA_DIR"
 
 cat > "$COMPOSE_FILE" <<EOF
 services:
-  daidai-panel:
-    image: linzixuanzz/daidai-panel:latest
-    container_name: daidai-panel
+  suwayomi:
+    image: ghcr.io/suwayomi/suwayomi-server:stable
+    container_name: suwayomi
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:5700"
-    volumes:
-      - ${DATA_DIR}:/app/Dumb-Panel
+      - "127.0.0.1:${PORT}:4567"
     environment:
       TZ: Asia/Shanghai
-      CONTAINER_NAME: daidai-panel
-      IMAGE_NAME: linzixuanzz/daidai-panel:latest
+    volumes:
+      - ${DATA_DIR}:/home/suwayomi/.local/share/Tachidesk
 EOF
 
     cd "$APP_DIR" || exit
@@ -100,7 +101,7 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ DaiDai-Panel 已启动${RESET}"
+    echo -e "${GREEN}✅ Suwayomi 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
     echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
 
@@ -111,22 +112,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ DaiDai-Panel 更新完成${RESET}"
+    echo -e "${GREEN}✅ Suwayomi 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart daidai-panel
-    echo -e "${GREEN}✅ DaiDai-Panel 已重启${RESET}"
+    docker restart suwayomi
+    echo -e "${GREEN}✅ Suwayomi 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f daidai-panel
+    docker logs -f suwayomi
 }
 
 check_status() {
-    docker ps | grep daidai-panel
+    docker ps | grep suwayomi
     read -p "按回车返回菜单..."
 }
 
@@ -134,7 +135,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ DaiDai-Panel 已卸载${RESET}"
+    echo -e "${RED}✅ Suwayomi 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

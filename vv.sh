@@ -1,552 +1,488 @@
-#!/bin/bash
+#!/bin/sh
+set -e
 
-# =========================================
-# 系统更新源切换菜单脚本
-# 支持 Ubuntu / Debian / CentOS / Alpine / RHEL 等
-# =========================================
+# =========================================================
+# Snell v6 (双栈+DNS增强+自定义监听) Alpine OpenRC 管理脚本
+# =========================================================
 
-# 1. 检查 Root 权限
-if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[31m❌ 错误：请使用 root 权限或 sudo 运行此脚本！\033[0m"
-    exit 1
-fi
+# ================== 颜色与输出函数 ==================
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-# 2. 颜色定义
-GREEN='\033[32m'
-YELLOW='\033[33m'
-RED='\033[31m'
-RESET='\033[0m'
+_ok()   { echo -e "${GREEN}[OK] $1${RESET}"; }
+_warn() { echo -e "${YELLOW}[WARN] $1${RESET}"; }
+_err()  { echo -e "${RED}[ERROR] $1${RESET}"; return 1; }
+_info() { echo -e "${GREEN}[INFO] $1${RESET}"; }
 
-# 3. 获取系统信息
-if [ -f /etc/os-release ]; then
-    . /etc/os-release  # 使用 . 代替 source，完美兼容所有 POSIX Shell
-    OS_ID="${NAME} ${VERSION_ID}"
-else
-    OS_ID="Unknown Linux"
-    ID="unknown"
-fi
+# ================== 变量 ==================
+SNELL_DIR="/etc/snell"
+SNELL_CONFIG="$SNELL_DIR/snell-server.conf"
+SNELL_RC_SERVICE="/etc/init.d/snell"
+SNELL_LOG="/var/log/snell.log"
+LOG_FILE="/var/log/snell_manager.log"
+SNELL_DEFAULT_VERSION="6.0.0b2"
 
-# 4. 获取系统 codename 或版本标识
-get_codename() {
-    if command -v lsb_release >/dev/null 2>&1; then
-        codename=$(lsb_release -cs)
-    elif [ -n "$VERSION_CODENAME" ]; then
-        codename=$VERSION_CODENAME
-    elif [ "$ID" = "alpine" ]; then
-        # 兼容 Alpine 环境获取版本
-        if [ -z "$VERSION_ID" ] && [ -f /etc/alpine-release ]; then
-            VERSION_ID=$(cat /etc/alpine-release)
-        fi
-
-        if [[ "$VERSION_ID" == *"_alpha"* || "$VERSION_ID" == *"_beta"* || "$VERSION_ID" == *"_rc"* || "$VERSION_ID" == "edge" ]]; then
-            codename="edge"
-        elif [ -n "$VERSION_ID" ]; then
-            local major_version=$(echo "$VERSION_ID" | cut -d. -f1-2)
-            codename="v${major_version}"
-        else
-            codename="edge"
-        fi
-    elif [ -n "$VERSION_ID" ]; then
-        case "$ID" in
-            ubuntu)
-                case "$VERSION_ID" in
-                    "18.04") codename="bionic" ;;
-                    "20.04") codename="focal" ;;
-                    "22.04") codename="jammy" ;;
-                    "24.04") codename="noble" ;;
-                    *) codename="noble" ;; # 默认最新长期支持版
-                esac
-                ;;
-            debian)
-                case "$VERSION_ID" in
-                    "10") codename="buster" ;;
-                    "11") codename="bullseye" ;;
-                    "12") codename="bookworm" ;;
-                    "13") codename="trixie" ;;
-                    *) codename="bookworm" ;;
-                esac
-                ;;
-            centos|rhel|rocky|almalinux)
-                codename="el${VERSION_ID%%.*}"
-                ;;
-        esac
-    else
-        codename="stable"
-    fi
-
-    # 防止 n/a 或空值保底
-    if [ -z "$codename" ] || [ "$codename" = "n/a" ]; then
-        [ "$ID" = "alpine" ] && codename="edge" || codename="stable"
-    fi
-}
-get_codename
-
-# 5. 定义更新源链接
-aliyun_ubuntu_source="http://mirrors.aliyun.com/ubuntu/"
-official_ubuntu_source="http://archive.ubuntu.com/ubuntu/"
-tsinghua_ubuntu_source="https://mirrors.tuna.tsinghua.edu.cn/ubuntu/"
-
-aliyun_debian_source="http://mirrors.aliyun.com/debian/"
-official_debian_source="http://deb.debian.org/debian/"
-tsinghua_debian_source="https://mirrors.tuna.tsinghua.edu.cn/debian/"
-
-aliyun_centos_source="mirrors.aliyun.com"
-official_centos_source="mirror.centos.org"
-tsinghua_centos_source="mirrors.tuna.tsinghua.edu.cn"
-
-aliyun_alpine_source="https://mirrors.aliyun.com/alpine/"
-official_alpine_source="https://dl-cdn.alpinelinux.org/alpine/"
-tsinghua_alpine_source="https://mirrors.tuna.tsinghua.edu.cn/alpine/"
-
-
-# 6. 获取当前软件源状态
-get_current_source_status() {
-    case "$ID" in
-        ubuntu)
-            local file="/etc/apt/sources.list"
-            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-                file="/etc/apt/sources.list.d/ubuntu.sources"
-            fi
-            
-            if [ -f "$file" ]; then
-                # 严格匹配：要么是新版专用的 URIs: 行，要么是旧版顶格的 deb/deb-src 行
-                local raw_line=$(grep -v '^#' "$file" | grep -E -i '^URIs:[[:space:]]*https?://|^deb(-src)?[[:space:]]+https?://' | head -n 1)
-                
-                if [ -n "$raw_line" ]; then
-                    echo "$raw_line" | sed -E 's|.*https?://([^/ ]+).*|\1|'
-                else
-                    echo "未检测到有效 Ubuntu 源"
-                fi
-            else
-                echo "未找到 Ubuntu 软件源配置文件"
-            fi
-            ;;
-
-        debian)
-            local file="/etc/apt/sources.list"
-            if [ -f /etc/apt/sources.list.d/debian.sources ]; then
-                file="/etc/apt/sources.list.d/debian.sources"
-            fi
-            
-            if [ -f "$file" ]; then
-                # 严格匹配：只抓取真正的 URIs: 行 或 传统的 deb 网址行，排除 Types: 干扰
-                local raw_line=$(grep -v '^#' "$file" | grep -E -i '^URIs:|^deb(-src)?[[:space:]]' | head -n 1)
-                
-                if [ -n "$raw_line" ]; then
-                    # 如果是 Debian 13 原生的本地重定向机制
-                    if echo "$raw_line" | grep -q 'mirror+file://'; then
-                        local list_file=$(echo "$raw_line" | sed -E 's|.*mirror+file://||' | awk '{print $1}')
-                        if [ -f "$list_file" ] && grep -v '^#' "$list_file" | grep -q -E 'https?://'; then
-                            local real_url=$(grep -v '^#' "$list_file" | grep -E 'https?://' | head -n 1)
-                            echo "$(echo "$real_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||') (官方重定向)"
-                        else
-                            echo "Debian 官方重定向源"
-                        fi
-                    else
-                        # 如果是用户切换后的标准 http/https 源
-                        local main_url=$(echo "$raw_line" | sed -E 's/^(deb(-src)?|URIs:)[[:space:]]*//I' | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||')
-                        [ -z "$main_url" ] && echo "未检测到有效 Debian 源" || echo "$main_url"
-                    fi
-                else
-                    echo "未检测到有效 Debian 源"
-                fi
-            else
-                echo "未找到 Debian 软件源配置文件"
-            fi
-            ;;
-
-        centos|rhel|rocky|almalinux)
-            local repo_file=""
-            for f in /etc/yum.repos.d/*.repo; do
-                if [ -f "$f" ] && grep -q -E '^baseurl=|^mirrorlist=' "$f"; then
-                    repo_file="$f"
-                    break
-                fi
-            done
-            if [ -n "$repo_file" ]; then
-                local main_url=$(grep -E '^baseurl=|^mirrorlist=' "$repo_file" | head -n 1 | cut -d= -f2)
-                [ -z "$main_url" ] && echo "未检测到有效源" || echo "$main_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||'
-            else
-                echo "未找到有效 repo 配置文件"
-            fi
-            ;;
-
-        alpine)
-            if [ -f /etc/apk/repositories ]; then
-                local main_url=$(grep -v '^#' /etc/apk/repositories | head -n 1)
-                [ -z "$main_url" ] && echo "未检测到有效源" || echo "$main_url" | sed -e 's|http://||' -e 's|https://||' -e 's|/.*||'
-            else
-                echo "repositories 不存在"
-            fi
-            ;;
-
-        *)
-            echo "不支持的系统"
-            ;;
-    esac
+# ================== 工具函数 ==================
+create_user() {
+    id -u snell >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin snell 2>/dev/null || true
 }
 
-
-# 7. 备份当前源
-backup_sources() {
-    case "$ID" in
-        ubuntu|debian)
-            [ -f /etc/apt/sources.list ] && cp -f /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null
-            [ -f /etc/apt/sources.list.d/ubuntu.sources ] && cp -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak 2>/dev/null
-            [ -f /etc/apt/sources.list.d/debian.sources ] && cp -f /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.sources.bak 2>/dev/null
-            ;;
-        centos|rhel|rocky|almalinux)
-            mkdir -p /etc/yum.repos.d/bak 2>/dev/null
-            if [ -z "$(ls -A /etc/yum.repos.d/bak 2>/dev/null)" ]; then
-                cp -f /etc/yum.repos.d/*.repo /etc/yum.repos.d/bak/ 2>/dev/null
-            fi
-            ;;
-        alpine)
-            [ -f /etc/apk/repositories ] && cp -f /etc/apk/repositories /etc/apk/repositories.bak 2>/dev/null
-            ;;
-    esac
-    echo -e "${GREEN}已完成当前更新源备份${RESET}"
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
+        done
+    done
+    echo "你的服务器IP"
 }
 
-# 8. 还原初始源
-restore_sources() {
-    case "$ID" in
-        ubuntu|debian)
-            if [ -f /etc/apt/sources.list.bak ] || [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ] || [ -f /etc/apt/sources.list.d/debian.sources.bak ]; then
-                [ -f /etc/apt/sources.list.bak ] && cp -f /etc/apt/sources.list.bak /etc/apt/sources.list
-                [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ] && cp -f /etc/apt/sources.list.d/ubuntu.sources.bak /etc/apt/sources.list.d/ubuntu.sources
-                [ -f /etc/apt/sources.list.d/debian.sources.bak ] && cp -f /etc/apt/sources.list.d/debian.sources.bak /etc/apt/sources.list.d/debian.sources
-                echo -e "${GREEN}已还原初始更新源${RESET}"
-            else
-                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
-            fi
-            ;;
-        centos|rhel|rocky|almalinux)
-            if [ -d /etc/yum.repos.d/bak ] && [ "$(ls -A /etc/yum.repos.d/bak 2>/dev/null)" ]; then
-                cp -f /etc/yum.repos.d/bak/*.repo /etc/yum.repos.d/
-                echo -e "${GREEN}已还原初始更新源${RESET}"
-            else
-                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
-            fi
-            ;;
-        alpine)
-            if [ -f /etc/apk/repositories.bak ]; then
-                cp -f /etc/apk/repositories.bak /etc/apk/repositories
-                echo -e "${GREEN}已还原初始更新源${RESET}"
-            else
-                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
-            fi
-            ;;
-    esac
-}
-
-# 8. 还原初始源
-restore_sources() {
-    case "$ID" in
-        ubuntu|debian)
-            if [ -f /etc/apt/sources.list.bak ] || [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ]; then
-                [ -f /etc/apt/sources.list.bak ] && cp -f /etc/apt/sources.list.bak /etc/apt/sources.list
-                [ -f /etc/apt/sources.list.d/ubuntu.sources.bak ] && cp -f /etc/apt/sources.list.d/ubuntu.sources.bak /etc/apt/sources.list.d/ubuntu.sources
-                echo -e "${GREEN}已还原初始更新源${RESET}"
-            else
-                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
-            fi
-            ;;
-        centos|rhel|rocky|almalinux)
-            if [ -d /etc/yum.repos.d/bak ] && [ "$(ls -A /etc/yum.repos.d/bak 2>/dev/null)" ]; then
-                cp -f /etc/yum.repos.d/bak/*.repo /etc/yum.repos.d/
-                echo -e "${GREEN}已还原初始更新源${RESET}"
-            else
-                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
-            fi
-            ;;
-        alpine)
-            if [ -f /etc/apk/repositories.bak ]; then
-                cp -f /etc/apk/repositories.bak /etc/apk/repositories
-                echo -e "${GREEN}已还原初始更新源${RESET}"
-            else
-                echo -e "${RED}❌ 备份文件不存在，无法还原${RESET}"; return 1
-            fi
-            ;;
-    esac
-}
-
-
-# 9. 切换 Ubuntu/Debian 源
-switch_apt_source() {
-    local new_source="$1"
-    local source_name="$2"
-
-    if [ "$ID" = "debian" ]; then
-        local sec_url="http://security.debian.org/debian-security"
-        [[ "$new_source" == *"aliyun"* ]] && sec_url="http://mirrors.aliyun.com/debian-security"
-        [[ "$new_source" == *"tsinghua"* ]] && sec_url="https://mirrors.tuna.tsinghua.edu.cn/debian-security"
-
-        # 判断是否为 Debian 13 (Trixie) 或更高版本
-        if [ -f /etc/apt/sources.list.d/debian.sources ] || [ "$VERSION_ID" = "13" ]; then
-            # Debian 13+ 使用全新的 DEB822 格式
-            cat > /etc/apt/sources.list.d/debian.sources <<EOF
-Types: deb
-URIs: ${new_source}
-Suites: ${codename} ${codename}-updates ${codename}-backports
-Components: main contrib non-free non-free-firmware
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
-
-Types: deb
-URIs: ${sec_url}
-Suites: ${codename}-security
-Components: main contrib non-free non-free-firmware
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
-EOF
-            echo "# 软件源已移至 sources.list.d/debian.sources" > /etc/apt/sources.list
-            echo -e "${GREEN}✅ 已切换到 ${source_name} Debian 新版源（DEB822 格式）${RESET}"
-        else
-            # Debian 12 及以下版本保持传统单行格式
-            [ -f /etc/apt/sources.list.d/debian.sources ] && rm -f /etc/apt/sources.list.d/debian.sources
-            cat > /etc/apt/sources.list <<EOF
-deb ${new_source} ${codename} main contrib non-free non-free-firmware
-deb ${new_source} ${codename}-updates main contrib non-free non-free-firmware
-deb ${new_source} ${codename}-backports main contrib non-free non-free-firmware
-deb ${sec_url} ${codename}-security main contrib non-free non-free-firmware
-EOF
-            echo -e "${GREEN}✅ 已切换到 ${source_name} Debian 传统源（${codename}）${RESET}"
-        fi
-
-    elif [ "$ID" = "ubuntu" ]; then
-        if [ -f /etc/apt/sources.list.d/ubuntu.sources ] || [ "$VERSION_ID" = "24.04" ]; then
-            # Ubuntu 24.04+ 新版 DEB822 规范
-            cat > /etc/apt/sources.list.d/ubuntu.sources <<EOF
-Types: deb
-URIs: ${new_source}
-Suites: ${codename} ${codename}-updates ${codename}-backports ${codename}-security
-Components: main restricted universe multiverse
-Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-EOF
-            echo "# 软件源已移至 sources.list.d/ubuntu.sources" > /etc/apt/sources.list
-            echo -e "${GREEN}✅ 已切换到 ${source_name} Ubuntu 新版源（DEB822 格式）${RESET}"
-        else
-            # Ubuntu 22.04 及以下旧版规范
-            [ -f /etc/apt/sources.list.d/ubuntu.sources ] && rm -f /etc/apt/sources.list.d/ubuntu.sources
-            cat > /etc/apt/sources.list <<EOF
-deb ${new_source} ${codename} main restricted universe multiverse
-deb ${new_source} ${codename}-updates main restricted universe multiverse
-deb ${new_source} ${codename}-backports main restricted universe multiverse
-deb ${new_source} ${codename}-security main restricted universe multiverse
-EOF
-            echo -e "${GREEN}✅ 已切换到 ${source_name} Ubuntu 传统源（${codename}）${RESET}"
-        fi
-    fi
-}
-
-# 10. 切换 CentOS / RHEL / Rocky / Alma 源（在此处补齐补全）
-switch_yum_source() {
-    local new_source="$1"
-    local source_name="$2"
-    
-    if ls /etc/yum.repos.d/CentOS-*.repo >/dev/null 2>&1; then
-        sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/CentOS-*.repo
-        sed -i 's|^#baseurl=|baseurl=|g' /etc/yum.repos.d/CentOS-*.repo
-        sed -i "s|mirror.centos.org|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
-        sed -i "s|mirrors.aliyun.com|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
-        sed -i "s|mirrors.tuna.tsinghua.edu.cn|$new_source|g" /etc/yum.repos.d/CentOS-*.repo
-    else
-        sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/*.repo 2>/dev/null
-        sed -i 's|^#baseurl=|baseurl=|g' /etc/yum.repos.d/*.repo 2>/dev/null
-        sed -i -E "s|dl.rockylinux.org|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
-        sed -i -E "s|repo.almalinux.org|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
-        sed -i -E "s|mirrors.aliyun.com|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
-        sed -i -E "s|mirrors.tuna.tsinghua.edu.cn|$new_source|g" /etc/yum.repos.d/*.repo 2>/dev/null
-    fi
-    echo -e "${GREEN}✅ 已切换到 ${source_name} YUM 源${RESET}"
-}
-
-# 11. 切换 Alpine 源
-switch_alpine_source() {
-    local new_source="$1"
-    local source_name="$2"
-    
-    cat > /etc/apk/repositories <<EOF
-${new_source}${codename}/main
-${new_source}${codename}/community
-EOF
-    echo -e "${GREEN}✅ 已切换到 ${source_name} Alpine 源（${codename}）${RESET}"
-}
-
-# 12. 更新缓存
-update_cache() {
-    case "$ID" in
-        ubuntu|debian)
-            echo -e "${YELLOW}正在更新 apt 缓存...${RESET}"
-            apt-get update -y
-            ;;
-        centos|rhel|rocky|almalinux)
-            echo -e "${YELLOW}正在生成 yum/dnf 缓存...${RESET}"
-            if command -v dnf >/dev/null 2>&1; then
-                dnf clean all && dnf makecache -y
-            else
-                yum clean all && yum makecache -y
-            fi
-            ;;
-        alpine)
-            echo -e "${YELLOW}正在更新 apk 缓存...${RESET}"
-            apk update --no-cache
-            ;;
-    esac
-    echo -e "${GREEN}缓存更新完成${RESET}"
-}
-
-# 13. 暂停函数
-pause() {
-    read -rp "$(echo -e "${YELLOW}按回车键继续...${RESET}")"
-}
-
-# 14. 显示国内/国外推荐源列表（引入 GitHub 代理轮询加速机制）
-show_recommended_sources() {
-    clear
-    echo -e "${GREEN}正在获取外部推荐源...${RESET}"
-    
-    # 1. 定义 GitHub 代理数组
-    local GITHUB_PROXY=(
-        ''
-        'https://v6.gh-proxy.org/'
-        'https://gh-proxy.com/'
-        'https://hub.glowp.xyz/'
-        'https://proxy.vvvv.ee/'
-        'https://ghproxy.lvedong.eu.org/'
-    )
-    
-    # 目标脚本的基础 URL
-    local target_url="https://linuxmirrors.cn/main.sh"
-    local success=false
-
-    # 2. 检查基础网络工具
-    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-        echo -e "${RED}❌ 错误：未检测到 curl 或 wget 命令！${RESET}"
-        if [ "$ID" = "alpine" ]; then
-            echo -e "${YELLOW}提示：Alpine 系统请先运行: apk add curl${RESET}"
-        fi
-        pause
+check_port() {
+    if netstat -tln | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
+}
 
-    # 3. 轮询代理阵列尝试下载并执行
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local full_url="${proxy}${target_url}"
-        if [ -n "$proxy" ]; then
-            echo
-        else
-            echo
-        fi
+random_key() {
+    cat /dev/urandom | tr -dc A-Za-z0-9 | head -c 16
+}
 
-        # 根据系统现有的工具选择执行命令（使用临时文件确保能够安全判定下载状态）
-        local tmp_script="/tmp/linuxmirrors_action.sh"
-        rm -f "$tmp_script"
+random_port() {
+    awk 'BEGIN{srand();print int(rand()*(65000-2000+1))+2000}'
+}
 
-        if command -v curl >/dev/null 2>&1; then
-            curl -sSL --connect-timeout 5 --max-time 15 "$full_url" -o "$tmp_script"
-        elif command -v wget >/dev/null 2>&1; then
-            wget -qO "$tmp_script" --connect-timeout=5 --timeout=15 "$full_url"
-        fi
+get_system_dns() {
+    grep -E "^nameserver" /etc/resolv.conf | awk '{print $2}' | paste -sd "," -
+}
 
-        # 验证下载的文件是否有效（是否包含 shell 脚本特征）
-        if [ -f "$tmp_script" ] && grep -q -E '#!/bin/|case|menu' "$tmp_script" 2>/dev/null; then
-            success=true
-            echo -e "${GREEN}下载成功，开始执行外部脚本...${RESET}"
-            chmod +x "$tmp_script"
-            bash "$tmp_script"
-            rm -f "$tmp_script"
-            break
-        fi
-        
-        echo -e "${RED}当前连接超时或失败，尝试下一个节点...${RESET}"
-        rm -f "$tmp_script"
-    done
+pause() {
+    echo -n "按任意键返回菜单..."
+    read -r -n 1 arg
+    echo
+}
 
-    if [ "$success" = false ]; then
-        echo -e "${RED}❌ 错误：所有网络节点均无法连接，请检查本地网络设置！${RESET}"
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+_map_arch() {
+    local raw_arch=$(uname -m)
+    case "$raw_arch" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *) return 1 ;;
+    esac
+}
+
+_get_snell_latest_version() {
+    local latest_version
+    latest_version=$(curl -sL -A "Mozilla/5.0" "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
+    if [ -n "$latest_version" ]; then
+        echo "${latest_version#v}"
+    else
+        echo "$SNELL_DEFAULT_VERSION"
+    fi
+}
+
+# 精准无误的配置提取引擎
+_get_conf_value() {
+    local key="$1"
+    if [ -f "$SNELL_CONFIG" ]; then
+        grep -E "^${key}\s*=" "$SNELL_CONFIG" | awk -F'=' '{print $2}' | sed 's/ //g' | tr -d '\r\n'
+    fi
+}
+
+# ================== 配置 Snell (支持自定义监听与完美修复) ==================
+configure_snell() {
+    mkdir -p "$SNELL_DIR"
+    echo -e "${GREEN}[信息] 开始配置 Snell v6 增强参数...${RESET}"
+
+    # 读取并解析旧配置
+    local old_listen=$(_get_conf_value "listen")
+    local old_port=""
+    if [ -n "$old_listen" ]; then
+        local first_listen="${old_listen%%,*}"
+        old_port=$(echo "$first_listen" | awk -F: '{print $NF}')
+    fi
+    local old_key=$(_get_conf_value "psk")
+    local old_obfs=$(_get_conf_value "obfs")
+    local old_dns_pref=$(_get_conf_value "dns-ip-preference")
+    local old_tfo=$(_get_conf_value "tfo")
+    local old_dns=$(_get_conf_value "dns")
+
+    # 1. 端口引导
+    local default_port="${old_port:-$(random_port)}"
+    echo -n "请输入端口 (当前/默认: $default_port): "
+    read -r input_port
+    port=${input_port:-$default_port}
+    if [ "$port" != "$old_port" ]; then
+        check_port "$port" || return 1
     fi
 
-    pause
+    # 2. 密钥引导
+    local default_key="${old_key:-$(random_key)}"
+    echo -n "请输入 Snell 核心密钥 (当前/默认: $default_key): "
+    read -r input_key
+    key=${input_key:-$default_key}
+
+    # 3. 监听地址策略引导 (新增特性)
+    local current_listen_str="双栈全监听"
+    if [ "$old_listen" = "0.0.0.0:$port" ]; then
+        current_listen_str="仅监听 IPv4"
+    elif [ "$old_listen" = "[::]:$port" ]; then
+        current_listen_str="仅监听 IPv6"
+    fi
+    echo -e "${YELLOW}请选择 Snell v6 监听地址策略 (当前配置: $current_listen_str)：${RESET}"
+    echo "1. 双栈全监听  (0.0.0.0 和 [::] 同时绑定，全能推荐)"
+    echo "2. 仅监听 IPv4 (仅绑定 0.0.0.0)"
+    echo "3. 仅监听 IPv6 (仅绑定 [::]，适合纯 IPv6 小鸡)"
+    echo -n "请选择序号 (直接回车保持当前不变): "
+    read -r listen_choice
+    case $listen_choice in
+        1) listen_addr="0.0.0.0:$port,[::]:$port" ;;
+        2) listen_addr="0.0.0.0:$port" ;;
+        3) listen_addr="[::]:$port" ;;
+        *) listen_addr="${old_listen:-0.0.0.0:$port,[::]:$port}" ;;
+    esac
+
+    # 4. OBFS 混淆引导
+    local current_obfs_str="${old_obfs:-off}"
+    echo -e "${YELLOW}配置 OBFS 混淆 (当前配置: $current_obfs_str)：[注意] 无特殊需求不建议启用${RESET}"
+    echo "1. TLS   2. HTTP   3. 关闭"
+    echo -n "请选择 (直接回车保持当前不变): "
+    read -r obfs_choice
+    case $obfs_choice in
+        1) obfs="tls" ;;
+        2) obfs="http" ;;
+        3) obfs="off" ;;
+        *) obfs="$current_obfs_str" ;;
+    esac
+
+    # 5. DNS IP 家族优先级引导
+    local current_dns_pref="${old_dns_pref:-default}"
+    echo -e "${YELLOW}请选择 Snell v6 DNS 解析 IP 家族优先级 (当前配置: $current_dns_pref)：${RESET}"
+    echo "1. default      (系统默认)"
+    echo "2. prefer-ipv4  (IPv4 优先)"
+    echo "3. prefer-ipv6  (IPv6 优先)"
+    echo "4. ipv4-only    (仅解析 IPv4)"
+    echo "5. ipv6-only    (仅解析 IPv6)"
+    echo -n "请选择序号 (直接回车保持当前不变): "
+    read -r dns_pref_choice
+    case $dns_pref_choice in
+        1) dns_pref="default" ;;
+        2) dns_pref="prefer-ipv4" ;;
+        3) dns_pref="prefer-ipv6" ;;
+        4) dns_pref="ipv4-only" ;;
+        5) dns_pref="ipv6-only" ;;
+        *) dns_pref="$current_dns_pref" ;;
+    esac
+
+    # 6. TFO 引导
+    local current_tfo_str="开启"
+    [ "$old_tfo" = "0" ] || [ "$old_tfo" = "false" ] && current_tfo_str="关闭"
+    echo -e "${YELLOW}是否开启 TCP Fast Open (TFO)？(当前配置: $current_tfo_str)${RESET}"
+    echo "1. 开启   2. 关闭"
+    echo -n "请选择 (直接回车保持当前不变): "
+    read -r tfo_choice
+    case $tfo_choice in
+        1) tfo="true" ;;
+        2) tfo="false" ;;
+        *) tfo="${old_tfo:-true}" ;;
+    esac
+
+    # 7. DNS 引导
+    local system_dns=$(get_system_dns)
+    local default_dns="${old_dns:-${system_dns:-1.1.1.1,8.8.8.8}}"
+    echo -n "请输入自定义 DNS (当前/默认: $default_dns): "
+    read -r input_dns
+    dns=${input_dns:-$default_dns}
+
+    # 规范化 TFO 的值
+    local conf_tfo="true"
+    if [ "$tfo" = "0" ] || [ "$tfo" = "false" ]; then conf_tfo="false"; fi
+
+    # 写入 v6 规范配置文件
+    cat > "$SNELL_CONFIG" <<EOF
+[snell-server]
+listen = $listen_addr
+psk = $key
+obfs = $obfs
+tfo = $conf_tfo
+dns = $dns
+dns-ip-preference = $dns_pref
+EOF
+
+    IP=$(get_public_ip)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+
+    # 生成规范节点配置
+    cat <<EOF > "$SNELL_DIR/config.txt"
+$HOSTNAME-Snell-v6 = snell, $IP, $port, psk=$key, version=6, tfo=$conf_tfo, reuse=true, ecn=true
+EOF
+
+    _ok "配置已成功安全写入 $SNELL_CONFIG"
+    log "Snell v6 配置已成功同步更新。"
 }
 
-# 15. 主菜单展示
+# ================== 核心 Alpine 部署逻辑 (防 404/解压兜底) ==================
+_download_and_install_binary() {
+    local sarch=$( _map_arch ) || { _err "不支持的架构"; return 1; }
+    
+    _info "正在安装 Alpine 必要系统依赖 (upx, unzip, curl, gcompat)..."
+    apk add --no-cache upx unzip curl gcompat >/dev/null 2>&1
+
+    _info "正在获取官方最新稳定版版本号..."
+    local version=$( _get_snell_latest_version )
+    version="${version#v}"
+
+    local tmp=$(mktemp -d)
+    local download_url_A="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
+    local download_url_B="https://dl.nssurge.com/snell/snell-server-${version}-linux-${sarch}.zip"
+    local download_url_C="https://dl.nssurge.com/snell/snell-server-v6.0.0b2-linux-${sarch}.zip"
+
+    _info "正在通过智能路由下载 Snell v6 核心组件..."
+    
+    if curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -o "$tmp/snell.zip" --connect-timeout 15 "$download_url_A" && unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
+        _info "方案 A 下载并校验成功！"
+    elif curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o "$tmp/snell.zip" --connect-timeout 15 "$download_url_B" && unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
+        _info "方案 B 下载并校验成功！"
+    else
+        _warn "官方主动拦截，启动终极弹性回滚，下载 v6.0.0b2 保底包..."
+        if ! curl -sL -A "Mozilla/5.0" -o "$tmp/snell.zip" --connect-timeout 20 "$download_url_C" || ! unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
+            _err "所有下载源均被防火墙拦截，请稍后再试！"
+            rm -rf "$tmp"; return 1
+        fi
+        version="6.0.0b2"
+    fi
+
+    if unzip -oq "$tmp/snell.zip" -d "$tmp/"; then
+        _info "正在进行 UPX 壳解压兼容处理..."
+        if command -v upx >/dev/null 2>&1; then
+            upx -d "$tmp/snell-server" >/dev/null 2>&1 || _warn "UPX 脱壳失败或无需脱壳"
+        else
+            _err "UPX 工具不可用，无法完成解压"
+            rm -rf "$tmp"; return 1
+        fi
+
+        install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server-v5
+        rm -rf "$tmp"
+        echo "$version"
+        return 0
+    else
+        _err "未知原因导致解压最终失败"
+        rm -rf "$tmp"
+        return 1
+    fi
+}
+
+_deploy_openrc_service() {
+    _info "正在写入 Alpine OpenRC 服务管理配置..."
+    cat > "$SNELL_RC_SERVICE" <<'EOF'
+#!/sbin/openrc-run
+
+description="Snell Server v6"
+command="/usr/local/bin/snell-server-v5"
+command_args="-c /etc/snell/snell-server.conf"
+command_background="yes"
+pidfile="/run/snell.pid"
+output_log="/var/log/snell.log"
+error_log="/var/log/snell.log"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+    chmod +x "$SNELL_RC_SERVICE"
+    rc-update add snell default >/dev/null 2>&1 || true
+}
+
+install_snell_v5() {
+    if [ -x /usr/local/bin/snell-server-v5 ]; then
+        _ok "Snell 已安装，如需更新请使用选项 2，修改配置请用选项 4。"; return 0
+    fi
+
+    local ver=$(_download_and_install_binary)
+    [ -z "$ver" ] && return 1
+
+    create_user
+    configure_snell || return 1
+    _deploy_openrc_service
+    
+    rc-service snell restart >/dev/null 2>&1 || true
+    _ok "Snell v6 已在 Alpine Linux 上成功部署并全栈运行！"
+    log "Alpine Snell v6 安装成功"
+
+    echo
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${GREEN}                🎉 Snell v6 安装成功 🎉         ${RESET}"
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${GREEN}👉 请复制以下配置到你的 Surge 6 配置文件中：${RESET}"
+    echo
+    if [ -f "$SNELL_DIR/config.txt" ]; then
+        echo -e "${YELLOW}$(cat "$SNELL_DIR/config.txt")${RESET}"
+    else
+        _warn "未找到节点配置文件文本。"
+    fi
+    echo -e "${GREEN}===============================================${RESET}"
+    echo
+}
+
+update_snell_v5() {
+    if [ ! -x /usr/local/bin/snell-server-v5 ]; then
+        _err "检测到系统未安装 Snell，请先选择选项 1 进行安装！"; return 1
+    fi
+
+    _info "开始检查并更新 Snell v6 二进制程序..."
+    local ver=$(_download_and_install_binary)
+    [ -z "$ver" ] && return 1
+
+    _deploy_openrc_service
+    _restart_snell_process
+    _ok "Snell 已成功更新至 v6，且当前配置已完好保留并重启完毕！"
+    log "Alpine Snell 成功更新"
+}
+
+uninstall_snell() {
+    echo -e "${RED}[警告] 正在彻底从 Alpine 卸载 Snell 服务...${RESET}"
+    rc-service snell stop >/dev/null 2>&1 || true
+    rc-update del snell >/dev/null 2>&1 || true
+    pkill -f snell-server-v5 || true
+    rm -f "$SNELL_RC_SERVICE"
+    rm -f /usr/local/bin/snell-server-v5
+    rm -rf "$SNELL_DIR"
+    rm -f "$SNELL_LOG"
+    _ok "Alpine Snell 服务已完全卸载。"
+}
+
+_restart_snell_process() {
+    rc-service snell restart >/dev/null 2>&1 || {
+        pkill -f snell-server-v5 || true
+        touch "$SNELL_LOG"
+        nohup /usr/local/bin/snell-server-v5 -c "$SNELL_CONFIG" >> "$SNELL_LOG" 2>&1 &
+    }
+}
+
+# ================== 菜单 ==================
 show_menu() {
     clear
-    STATUS=$(get_current_source_status)
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}    ◈     系统更新源管理面板     ◈     ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 系统环境  : ${YELLOW}${OS_ID}${RESET}"
-    echo -e "${GREEN} 当前源状态: ${YELLOW}${STATUS}${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}  1. 切换到 阿里云源 (国内推荐)${RESET}"
-    echo -e "${GREEN}  2. 切换到 官方原生源 (海外推荐)${RESET}"
-    echo -e "${GREEN}  3. 切换到 清华大学源 (高校教育网)${RESET}"
-    echo -e "${GREEN}  4. 备份当前源文件副本${RESET}"
-    echo -e "${GREEN}  5. 还原初始更新源 (并自动刷新缓存)${RESET}"
-    echo -e "${GREEN}  6. 国内/国外推荐源(LinuxMirrors)${RESET}"
-    echo -e "${GREEN}  0. 退出${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -ne "${GREEN} 请输入操作编号: ${RESET}"
+    if rc-service snell status 2>&1 | grep -q "started" || pgrep -x "snell-server-v5" >/dev/null; then
+        STATUS="${GREEN}● 运行中${RESET}"
+    else
+        STATUS="${RED}● 未运行${RESET}"
+    fi
+
+    VERSION_SHOW="未安装"
+    if [ -x /usr/local/bin/snell-server-v5 ]; then
+        VERSION_SHOW=$(/usr/local/bin/snell-server-v5 -v 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?' || echo "v6.x")
+    fi
+
+    PORT_SHOW="-"
+    if [ -f "$SNELL_CONFIG" ]; then
+        local raw_listen=$(_get_conf_value "listen")
+        local first_listen="${raw_listen%%,*}"
+        PORT_SHOW=$(echo "$first_listen" | awk -F: '{print $NF}')
+    fi
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}      Snell v6 管理面板 (Alpine) ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $STATUS"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}$PORT_SHOW${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 Snell v6${RESET}"
+    echo -e "${GREEN}2. 更新 Snell v6${RESET}"
+    echo -e "${GREEN}3. 卸载 Snell${RESET}"
+    echo -e "${GREEN}4. 修改自定义配置${RESET}"
+    echo -e "${GREEN}5. 启动 Snell${RESET}"
+    echo -e "${GREEN}6. 停止 Snell${RESET}"
+    echo -e "${GREEN}7. 重启 Snell${RESET}"
+    echo -e "${GREEN}8. 查看运行日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置 (Surge 6 格式)${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 16. 主循环
+# ================== 主循环 ==================
 while true; do
     show_menu
+    echo -e -n "${GREEN}请输入选项: ${RESET}"
     read -r choice
-    case "$choice" in
-        1)
-            backup_sources
-            case "$ID" in
-                ubuntu) switch_apt_source "$aliyun_ubuntu_source" "阿里云" ;;
-                debian) switch_apt_source "$aliyun_debian_source" "阿里云" ;;
-                centos|rhel|rocky|almalinux) switch_yum_source "$aliyun_centos_source" "阿里云" ;;
-                alpine) switch_alpine_source "$aliyun_alpine_source" "阿里云" ;;
-            esac
-            update_cache
-            pause
-            ;;
-        2)
-            backup_sources
-            case "$ID" in
-                ubuntu) switch_apt_source "$official_ubuntu_source" "官方" ;;
-                debian) switch_apt_source "$official_debian_source" "官方" ;;
-                centos|rhel|rocky|almalinux) switch_yum_source "$official_centos_source" "官方" ;;
-                alpine) switch_alpine_source "$official_alpine_source" "官方" ;;
-            esac
-            update_cache
-            pause
-            ;;
-        3)
-            backup_sources
-            case "$ID" in
-                ubuntu) switch_apt_source "$tsinghua_ubuntu_source" "清华" ;;
-                debian) switch_apt_source "$tsinghua_debian_source" "清华" ;;
-                centos|rhel|rocky|almalinux) switch_yum_source "$tsinghua_centos_source" "清华" ;;
-                alpine) switch_alpine_source "$tsinghua_alpine_source" "清华" ;;
-            esac
-            update_cache
-            pause
-            ;;
-        4)
-            backup_sources
-            pause
-            ;;
-        5)
-            if restore_sources; then
-                update_cache
+    case $choice in
+        1) install_snell_v5; pause ;;
+        2) update_snell_v5; pause ;;
+        3) uninstall_snell; pause ;;
+        4) 
+            if [ ! -f "$SNELL_CONFIG" ]; then 
+                _err "未找到配置文件，请先安装！"
+            else
+                configure_snell
+                _restart_snell_process
+                _ok "配置已重载，Snell v6 服务已平滑重启！"
+                echo -e "\n${GREEN}👉 最新 Surge 6 节点配置：${RESET}"
+                if [ -f "$SNELL_DIR/config.txt" ]; then
+                    cat "$SNELL_DIR/config.txt"
+                    echo ""
+                fi
             fi
-            pause
-            ;;
-        6)
-            show_recommended_sources
-            ;;
-        0)
-            break
-            ;;
-        *)
-            echo -e "${RED}无效选择，请重新输入${RESET}"
-            sleep 1
-            ;;
+            pause ;;
+        5) 
+            rc-service snell start >/dev/null 2>&1 || { 
+                if ! pgrep -x "snell-server-v5" >/dev/null; then
+                    touch "$SNELL_LOG"
+                    nohup /usr/local/bin/snell-server-v5 -c "$SNELL_CONFIG" >> "$SNELL_LOG" 2>&1 &
+                fi
+            }
+            _ok "Snell 已成功启动"
+            pause ;;
+        6) 
+            rc-service snell stop >/dev/null 2>&1 || pkill -f snell-server-v5 || true
+            _ok "Snell 已停止"
+            pause ;;
+        7) 
+            _restart_snell_process
+            _ok "Snell 已重启"
+            pause ;;
+        8)
+            echo -e "${GREEN}--- Snell 核心运行日志 (最新50行) ---${RESET}"
+            if [ -f "$SNELL_LOG" ] && [ -s "$SNELL_LOG" ]; then
+                tail -n 50 "$SNELL_LOG"
+                echo -e "${YELLOW}------------------------------------------------${RESET}"
+                echo -n "是否需要实时追踪新日志输出？(y/n, 默认 n): "
+                read -r watch_choice
+                if [ "$watch_choice" = "y" ] || [ "$watch_choice" = "Y" ]; then
+                    echo -e "${YELLOW}提示: 按 Ctrl+C 即可退出日志实时追踪并返回菜单${RESET}"
+                    tail -f "$SNELL_LOG"
+                fi
+            else
+                _warn "暂无 Snell 运行日志或日志文件为空。"
+            fi
+            pause ;;
+        9)
+            if [ -f "$SNELL_CONFIG" ]; then
+                echo -e "${GREEN}====== 当前 Snell v6 内部配置 ======${RESET}"
+                cat "$SNELL_CONFIG"
+                echo -e "${GREEN}====== Surge 6 专属配置 ======${RESET}"
+                if [ -f "$SNELL_DIR/config.txt" ]; then
+                    cat "$SNELL_DIR/config.txt"
+                    echo ""
+                else
+                    echo "暂无配置文本"
+                fi
+            else
+                echo -e "${RED}配置文件不存在，请先安装！${RESET}"
+            fi
+            pause ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效输入${RESET}"; pause ;;
     esac
 done

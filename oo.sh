@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# GHProxy 一键管理脚本
+# Suwayomi Server 一键管理脚本 
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="ghproxy"
+APP_NAME="suwayomi"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== GHProxy 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Suwayomi 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -67,29 +67,31 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:7210]: " input_port
-    PORT=${input_port:-7210}
+    echo
+    read -p "请输入访问端口 [默认:4567]: " input_port
+    PORT=${input_port:-4567}
     check_port "$PORT" || return
 
-    read -p "请输入日志目录 [默认:$APP_DIR/log]: " input_log
-    LOG_DIR=${input_log:-$APP_DIR/log}
-    mkdir -p "$LOG_DIR"
-
-    read -p "请输入配置目录 [默认:$APP_DIR/config]: " input_conf
-    CONF_DIR=${input_conf:-$APP_DIR/config}
-    mkdir -p "$CONF_DIR"
+    echo
+    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
+    DATA_DIR=${input_data:-$APP_DIR/data}
+    
+    mkdir -p "$DATA_DIR"
+    echo -e "${YELLOW}正在配置数据目录权限...${RESET}"
+    chown -R 1000:1000 "$DATA_DIR"
 
 cat > "$COMPOSE_FILE" <<EOF
 services:
-  ghproxy:
-    image: wjqserver/ghproxy:latest
-    container_name: ghproxy
-    restart: always
+  suwayomi:
+    image: ghcr.io/suwayomi/suwayomi-server:stable
+    container_name: suwayomi
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT}:8080"
+      - "127.0.0.1:${PORT}:4567"
+    environment:
+      TZ: Asia/Shanghai
     volumes:
-      - ${LOG_DIR}:/data/ghproxy/log
-      - ${CONF_DIR}:/data/ghproxy/config
+      - ${DATA_DIR}:/home/suwayomi/.local/share/Tachidesk
 EOF
 
     cd "$APP_DIR" || exit
@@ -101,10 +103,9 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ GHProxy 已启动${RESET}"
+    echo -e "${GREEN}✅ Suwayomi 已启动${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 日志目录: ${LOG_DIR}${RESET}"
-    echo -e "${GREEN}📂 配置目录: ${CONF_DIR}${RESET}"
+    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -113,22 +114,22 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ GHProxy 更新完成${RESET}"
+    echo -e "${GREEN}✅ Suwayomi 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart ghproxy
-    echo -e "${GREEN}✅ GHProxy 已重启${RESET}"
+    docker restart suwayomi
+    echo -e "${GREEN}✅ Suwayomi 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f ghproxy
+    docker logs -f suwayomi
 }
 
 check_status() {
-    docker ps | grep ghproxy
+    docker ps | grep suwayomi
     read -p "按回车返回菜单..."
 }
 
@@ -136,7 +137,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ GHProxy 已卸载${RESET}"
+    echo -e "${RED}✅ Suwayomi 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

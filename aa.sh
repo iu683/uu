@@ -1,34 +1,37 @@
-#!/bin/bash
-set -euo pipefail
+#!/bin/sh
+# 针对 Alpine Linux 深度优化，使用标准 sh 执行
+set -eu
 
 # =========================================================
-# Snell  + Shadow-TLS v3 管理脚本 
+# Snell v6 + Shadow-TLS v3 一体化增强管理脚本 (Alpine 专属)
 # =========================================================
 
-# ================== 颜色 ==================
+# ================== 颜色与输出函数 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
 RESET="\033[0m"
-Info="${GREEN}[信息]${RESET}"
-Error="${RED}[错误]${RESET}"
+
+_info() { echo -e "${GREEN}[信息] $1${RESET}"; }
+_warn() { echo -e "${YELLOW}[警告] $1${RESET}"; }
+_err()  { echo -e "${RED}[错误] $1${RESET}"; }
 
 # ================== 基础变量 ==================
 SNELL_DIR="/etc/snell-tls"
 SNELL_Conf="${SNELL_DIR}/snell-server.conf"
-SNELL_File="/usr/local/bin/stls-integrated-snell-server"
+SNELL_File="/usr/local/bin/snell-server-v5"
 
 STLS_Env="${SNELL_DIR}/shadow-tlsn.env"
 STLS_File="/usr/local/bin/stls-integrated-shadow-tlsn"
 
 LOG_FILE="/var/log/stls-integrated-snell-managers.log"
+SNELL_DEFAULT_VERSION="6.0.0b2"
 
 TMP_DIR=$(mktemp -d -t snell-v6.XXXXXX)
 
 # ================== cleanup ==================
 cleanup() {
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+    [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT INT TERM
 
@@ -39,7 +42,7 @@ log() {
 
 pause() {
     echo -n "按任意键返回菜单..."
-    read -n 1 -s -r || true
+    read -r -n 1 -s || true
     echo
 }
 
@@ -47,41 +50,18 @@ pause() {
 get_public_ip() {
     local ip
     ip=$(curl -4fsSL --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
-    if [[ -z "$ip" ]]; then
+    if [ -z "$ip" ]; then
         ip=$(curl -6fsSL --max-time 3 https://api64.ipify.org 2>/dev/null || echo "")
-        [[ -n "$ip" ]] && echo "[$ip]" && return
+        [ -n "$ip" ] && echo "[$ip]" && return
     fi
-    [[ -z "$ip" ]] && ip="你的服务器IP"
+    [ -z "$ip" ] && ip="你的服务器IP"
     echo "$ip"
-}
-
-# ================== 检查依赖 ==================
-check_deps() {
-    echo -e "${GREEN}[信息] 检查系统依赖...${RESET}"
-    install_pkg() {
-        if command -v apt >/dev/null 2>&1; then
-            apt update -y && apt install -y "$@"
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y "$@"
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y "$@"
-        fi
-    }
-    command -v curl >/dev/null 2>&1 || install_pkg curl
-    command -v wget >/dev/null 2>&1 || install_pkg wget
-    command -v tar  >/dev/null 2>&1 || install_pkg tar
-    command -v unzip >/dev/null 2>&1 || install_pkg unzip
-    command -v ss >/dev/null 2>&1 || {
-        if command -v apt >/dev/null 2>&1; then install_pkg iproute2; else install_pkg iproute; fi
-    }
-    command -v openssl >/dev/null 2>&1 || install_pkg openssl
-    echo -e "${GREEN}[完成] 依赖检查完成${RESET}"
 }
 
 # ================== 检查端口 ==================
 check_port() {
-    if ss -tulnH "( sport = :$1 )" 2>/dev/null | grep -q .; then
-        echo -e "${RED}端口 $1 已被占用${RESET}"
+    if netstat -tln | grep -q ":$1 "; then
+        _err "端口 $1 已被占用"
         return 1
     fi
     return 0
@@ -92,14 +72,19 @@ random_key() {
     tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 16 || echo "SnellPskKey12345"
 }
 
-random_port() { shuf -i 2000-65000 -n 1; }
-get_system_dns() { grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | paste -sd "," - || echo "1.1.1.1,8.8.8.8"; }
+random_port() {
+    awk 'BEGIN{srand(); print int(rand()*(65000-2000+1))+2000}'
+}
 
-detect_arch() {
+get_system_dns() { 
+    grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ',' | sed 's/,$//' || echo "1.1.1.1,8.8.8.8"
+}
+
+_map_arch() {
     case "$(uname -m)" in
-        x86_64|amd64) echo "linux-amd64" ;;
-        aarch64|arm64) echo "linux-aarch64" ;;
-        *) echo -e "${RED}不支持架构: $(uname -m)${RESET}" && exit 1 ;;
+        x86_64|amd64)  echo "amd64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *) return 1 ;;
     esac
 }
 
@@ -107,19 +92,34 @@ detect_stls_arch() {
     case "$(uname -m)" in
         x86_64|amd64)  echo "x86_64-unknown-linux-musl" ;;
         aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
-        *) echo -e "${RED}不支持架构: $(uname -m)${RESET}" && exit 1 ;;
+        *) _err "不支持架构: $(uname -m)" && exit 1 ;;
     esac
 }
 
-get_latest_version() {
+_get_snell_latest_version() {
     local latest_version
     latest_version=$(curl -sL -A "Mozilla/5.0" "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
-    [[ -z "$latest_version" ]] && latest_version="v6.0.0b2"
-    echo "$latest_version"
+    if [ -n "$latest_version" ]; then
+        echo "${latest_version#v}"
+    else
+        echo "$SNELL_DEFAULT_VERSION"
+    fi
 }
 
 get_latest_stls_version() {
     curl -fsSL --max-time 5 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" 2>/dev/null | grep tag_name | cut -d '"' -f4 || echo "v0.2.25"
+}
+
+create_user() {
+    id -u snell-tls >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin snell-tls 2>/dev/null || true
+}
+
+# 精准无误的配置提取引擎 (兼容 BusyBox awk)
+_get_conf_value() {
+    local key="$1"
+    if [ -f "$SNELL_Conf" ]; then
+        grep -E "^${key}\s*=" "$SNELL_Conf" | awk -F'=' '{print $2}' | sed 's/ //g' | tr -d '\r\n'
+    fi
 }
 
 # ================== 安全的数据提取引擎 ==================
@@ -128,31 +128,33 @@ load_existing_config() {
     OLD_SNELL_PORT=""
     OLD_SNELL_PSK=""
     OLD_STLS_PWD=""
-    OLD_STLS_SNI="captive.apple.com"
+    OLD_STLS_SNI="gateway.icloud.com"
     OLD_DNS=""
-    OLD_IPV6="false"
     OLD_TFO="true"
+    OLD_DNS_PREF="default"
 
-    if [[ -f "$SNELL_Conf" ]]; then
-        local raw_listen
-        raw_listen=$(awk -F'= ' '/^listen/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "")
-        OLD_SNELL_PORT=${raw_listen#*:}
-        OLD_SNELL_PSK=$(awk -F'= ' '/^psk/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "")
-        OLD_DNS=$(awk -F'= ' '/^dns/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "")
-        OLD_IPV6=$(awk -F'= ' '/^ipv6/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "false")
-        OLD_TFO=$(awk -F'= ' '/^tfo/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "true")
+    if [ -f "$SNELL_Conf" ]; then
+        local raw_listen=$(_get_conf_value "listen")
+        if [ -n "$raw_listen" ]; then
+            local first_listen="${raw_listen%%,*}"
+            OLD_SNELL_PORT=$(echo "$first_listen" | awk -F: '{print $NF}')
+        fi
+        OLD_SNELL_PSK=$(_get_conf_value "psk")
+        OLD_DNS=$(_get_conf_value "dns")
+        OLD_TFO=$(_get_conf_value "tfo")
+        OLD_DNS_PREF=$(_get_conf_value "dns-ip-preference")
     fi
 
-    if [[ -f "$STLS_Env" ]]; then
+    if [ -f "$STLS_Env" ]; then
         OLD_STLS_PORT=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "443")
         OLD_STLS_PWD=$(awk -F'=' '/^STLS_PASSWORD=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
         
         local raw_tls
         raw_tls=$(awk -F'=' '/^STLS_TLS=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
-        if [[ -n "$raw_tls" ]]; then
+        if [ -n "$raw_tls" ]; then
             OLD_STLS_SNI=${raw_tls%:[0-9]*}
         fi
-        [[ -z "$OLD_STLS_SNI" ]] && OLD_STLS_SNI="gateway.icloud.com"
+        [ -z "$OLD_STLS_SNI" ] && OLD_STLS_SNI="gateway.icloud.com"
     fi
     return 0
 }
@@ -162,22 +164,23 @@ write_config() {
     local snell_port="$1"
     local psk="$2"
     local dns="$3"
-    local ipv6="$4"
-    local tfo="$5"
+    local tfo="$4"
+    local dns_pref="$5"
     local stls_port="$6"
     local stls_sni="$7"
     local stls_pwd="$8"
 
     mkdir -p "$SNELL_DIR"
 
+    # 由于 Shadow-TLS 在本机作为流量入口，Snell 内部只需要牢牢绑定本地回环 127.0.0.1 即可
     cat > "$SNELL_Conf" <<EOF
 [snell-server]
 listen = 127.0.0.1:$snell_port
 psk = $psk
 obfs = off
-ipv6 = $ipv6
 tfo = $tfo
 dns = $dns
+dns-ip-preference = $dns_pref
 EOF
     chmod 600 "$SNELL_Conf"
 
@@ -189,152 +192,129 @@ STLS_PASSWORD=$stls_pwd
 EOF
     chmod 600 "$STLS_Env"
 
-    id -u snell-tls &>/dev/null || useradd -r -s /usr/sbin/nologin snell-tls || true
+    create_user
     chown -R snell-tls:snell-tls "$SNELL_DIR"
 }
 
 # ================== 生成并保存链接 ==================
 generate_links() {
-    local snell_port="$1"
-    local psk="$2"
-    local tfo="$3"
-    local stls_port="$4"
-    local stls_sni="$5"
-    local stls_pwd="$6"
+    local psk="$1"
+    local tfo="$2"
+    local stls_port="$3"
+    local stls_sni="$4"
+    local stls_pwd="$5"
 
     IP=$(get_public_ip)
     HOSTNAME=$(hostname -s 2>/dev/null | sed 's/ /_/g' || echo "server")
 
     cat > "${SNELL_DIR}/surge.txt" <<EOF
-$HOSTNAME-Snell+ShadowTLS = snell, $IP, $stls_port, psk=$psk, version=6, tfo=$tfo, shadow-tls-password=$stls_pwd, shadow-tls-sni=$stls_sni, shadow-tls-version=3, ecn=true
+$HOSTNAME-Snell+ShadowTLS = snell, $IP, $stls_port, psk=$psk, version=6, tfo=$tfo, shadow-tls-password=$stls_pwd, shadow-tls-sni=$stls_sni, shadow-tls-version=3, reuse=true, ecn=true
 EOF
     chown snell-tls:snell-tls "${SNELL_DIR}/surge.txt" || true
 }
 
-# ================== 构建系统自启动服务 ==================
+# ================== OpenRC 服务启动脚本构建 (Alpine专属) ==================
 service() {
-    id -u snell-tls &>/dev/null || useradd -r -s /usr/sbin/nologin snell-tls || true
+    create_user
 
-    cat > /etc/systemd/system/snell-tlss.service <<EOF
-[Unit]
-Description=Snell v6 Server Service
-After=network-online.target
-Wants=network-online.target systemd-networkd-wait-online.service
+    cat > /etc/init.d/snell-tlss <<'EOF'
+#!/sbin/openrc-run
 
-[Service]
-Type=simple
-User=snell-tls
-Group=snell-tls
-LimitNOFILE=51200
-Restart=on-failure
-RestartSec=5s
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=${SNELL_File} -c ${SNELL_Conf}
+description="Snell v6 Server Service"
+command="/usr/local/bin/snell-server-v5"
+command_args="-c /etc/snell-tls/snell-server.conf"
+command_background="yes"
+command_user="snell-tls:snell-tls"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/snell.log"
+error_log="/var/log/snell.log"
 
-[Install]
-WantedBy=multi-user.target
+depend() {
+    need net
+    after firewall
+}
 EOF
-
-    systemctl daemon-reload
-    systemctl enable --now snell-tlss || true
+    chmod +x /etc/init.d/snell-tlss
+    rc-update add snell-tlss default || true
+    touch /var/log/snell.log && chown snell-tls:snell-tls /var/log/snell.log || true
+    rc-service snell-tlss start || true
 }
 
 service_stls() {
-    cat > /etc/systemd/system/shadowtlsn.service <<-EOF
-[Unit]
-Description=Shadow TLS Service (Custom shadowtlsn)
-After=network-online.target snell-tlss.service
-Wants=network-online.target systemd-networkd-wait-online.service snell-tlss.service
+    cat > /etc/init.d/shadowtlsn <<'EOF'
+#!/sbin/openrc-run
 
-[Service]
-Type=simple
-User=root
-Group=root
-LimitNOFILE=51200
-Restart=on-failure
-RestartSec=5s
-Environment=MONOIO_FORCE_LEGACY_DRIVER=1
-EnvironmentFile=${STLS_Env}
-ExecStart=${STLS_File} --v3 server --password \$STLS_PASSWORD --listen \$STLS_LISTEN --server \$STLS_SERVER --tls \$STLS_TLS
+description="Shadow TLS Service v3"
+command="/usr/local/bin/stls-integrated-shadow-tlsn"
+pidfile="/run/${RC_SVCNAME}.pid"
+command_background="yes"
+output_log="/var/log/shadowtls.log"
+error_log="/var/log/shadowtls.log"
 
-[Install]
-WantedBy=multi-user.target
+start_pre() {
+    if [ -f /etc/snell-tls/shadow-tlsn.env ]; then
+        . /etc/snell-tls/shadow-tlsn.env
+    else
+        eerror "Environment file /etc/snell-tls/shadow-tlsn.env missing!"
+        return 1
+    fi
+    
+    export MONOIO_FORCE_LEGACY_DRIVER=1
+    command_args="--v3 server --password $STLS_PASSWORD --listen $STLS_LISTEN --server $STLS_SERVER --tls $STLS_TLS"
+}
+
+depend() {
+    need net snell-tlss
+    after firewall snell-tlss
+}
 EOF
-
-    systemctl daemon-reload
-    systemctl enable --now shadowtlsn || true
-    echo -e "${Info} 服务部署自启配置完成！"
+    chmod +x /etc/init.d/shadowtlsn
+    rc-update add shadowtlsn default || true
+    touch /var/log/shadowtls.log && chown root:root /var/log/shadowtls.log || true
+    rc-service shadowtlsn start || true
+    _info "OpenRC 服务部署自启配置完成！"
 }
 
 # ================== 打印配置详情 ==================
 print_node_info() {
     IP=$(get_public_ip)
-    if [[ ! -f "$STLS_Env" ]] || [[ ! -f "$SNELL_Conf" ]]; then
-        echo -e "${RED}配置文件不存在，请先选择选项【1】进行安装初始化。${RESET}" && return
+    if [ ! -f "$STLS_Env" ] || [ ! -f "$SNELL_Conf" ]; then
+        _err "配置文件不存在，请先选择选项【1】进行安装初始化。" && return
     fi
     
     local snell_port
-    local raw_listen=$(awk -F'= ' '/^listen/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "未知")
-    snell_port=${raw_listen#*:}
-    local psk=$(awk -F'= ' '/^psk/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "未知")
+    local raw_listen=$(_get_conf_value "listen")
+    local first_listen="${raw_listen%%,*}"
+    snell_port=$(echo "$first_listen" | awk -F: '{print $NF}')
+    local psk=$(_get_conf_value "psk")
+    local dns_pref=$(_get_conf_value "dns-ip-preference")
     
     local show_listen_port=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "未知")
     local stls_pwd=$(awk -F'=' '/^STLS_PASSWORD=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "未知")
     
     local raw_tls b_sni="未知"
     raw_tls=$(awk -F'=' '/^STLS_TLS=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
-    if [[ -n "$raw_tls" ]]; then
+    if [ -n "$raw_tls" ]; then
         b_sni=${raw_tls%:[0-9]*}
     fi
 
-    echo -e "${GREEN}====== Snell  + Shadow-TLS v3 配置 ======${RESET}"
-    echo -e "${YELLOW} 公网 IP 地址   : ${IP}${RESET}"
-    echo -e "${YELLOW} 外网公网端口   : ${show_listen_port}${RESET}"
-    echo -e "${YELLOW} Shadow-TLS 密码 : ${stls_pwd}${RESET}"
-    echo -e "${YELLOW} SNI 伪装域名    : ${b_sni}${RESET}"
-    echo -e "${YELLOW} Snell内部端口   : ${snell_port} ${RESET}"
-    echo -e "${YELLOW} Snell PSK 密钥  : ${psk}${RESET}"
-    echo -e "${YELLOW}📄 V6VPS 替换IP地址为V6 ★${RESET}"
+    echo -e "${GREEN}====== Snell v6 + Shadow-TLS v3 配置 ======${RESET}"
+    echo -e "${YELLOW} 入口公网 IP   : ${IP}${RESET}"
+    echo -e "${YELLOW} 入口公网端口   : ${show_listen_port}${RESET}"
+    echo -e "${YELLOW} Shadow-TLS 密码: ${stls_pwd}${RESET}"
+    echo -e "${YELLOW} SNI 伪装域名   : ${b_sni}${RESET}"
+    echo -e "${YELLOW} 内部 Snell 端口 : ${snell_port} ${RESET}"
+    echo -e "${YELLOW} Snell PSK 密钥 : ${psk}${RESET}"
+    echo -e "${YELLOW} DNS 家族优先级 : ${dns_pref}${RESET}"
     echo -e "${YELLOW}-------------------------------------------------${RESET}"
-    echo -e "${GREEN}[信息] Surge  配置:${RESET}"
-    if [[ -f "${SNELL_DIR}/surge.txt" ]]; then
-        echo -e "${YELLOW}$(cat "${SNELL_DIR}/surge.txt")${RESET}"
+    _info "Surge 6 专属托管节点配置:"
+    if [ -f "${SNELL_DIR}/surge.txt" ]; then
+        cat "${SNELL_DIR}/surge.txt"
+        echo ""
     else
         echo "未生成配置"
     fi
     echo -e "${YELLOW}-------------------------------------------------${RESET}"
-}
-
-# ================== 智能下载中枢 (解决官方命名不统一导致的404错误) ==================
-download_snell_core() {
-    local target_ver=$1
-    local target_arch=$2
-
-    local ver_with_v="v${target_ver#v}"
-    local ver_without_v="${target_ver#v}"
-
-    local url_v="https://dl.nssurge.com/snell/snell-server-${ver_with_v}-${target_arch}.zip"
-    local url_no_v="https://dl.nssurge.com/snell/snell-server-${ver_without_v}-${target_arch}.zip"
-
-    echo -e "${GREEN}[信息] 优先尝试下载方案 A (${ver_with_v})...${RESET}"
-    if wget --spider -q -T 5 "$url_v"; then
-        wget -O snell.zip "$url_v"
-        echo "$ver_with_v" > "${SNELL_DIR}/version.txt"
-    else
-        echo -e "${YELLOW}[提示] 方案 A 返回 404，自动切换方案 B (${ver_without_v})...${RESET}"
-        if wget --spider -q -T 5 "$url_no_v"; then
-            wget -O snell.zip "$url_no_v"
-            echo "$ver_without_v" > "${SNELL_DIR}/version.txt"
-        else
-            # 最终的防线：直接降级嗅探已知长期在线的公认测试包
-            echo -e "${RED}[警告] 远程正式版文件未就绪，使用 v6.0.0b2 进行弹性回滚...${RESET}"
-            local fallback_url="https://dl.nssurge.com/snell/snell-server-v6.0.0b2-${target_arch}.zip"
-            wget -O snell.zip "$fallback_url"
-            echo "v6.0.0b2" > "${SNELL_DIR}/version.txt"
-        fi
-    fi
 }
 
 # ================== 动态配置交互流 ==================
@@ -343,25 +323,21 @@ execute_configuration_flow() {
     
     load_existing_config || true
     
-    local snell_port psk dns ipv6 tfo stls_port stls_sni stls_pwd
-    local input_stls_port input_snell_port input_psk input_stls_pwd input_sni input_dns input_ipv6 input_tfo
+    local snell_port psk dns tfo dns_pref stls_port stls_sni stls_pwd
+    local input_stls_port input_snell_port input_psk input_stls_pwd input_sni input_dns input_tfo input_dns_pref
 
     while true; do
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入Shadow-TLS公网端口 (当前: %s, 回车保持不修改): " "${OLD_STLS_PORT:-443}"
-        else
-            printf "请输入Shadow-TLS公网端口 (默认: %s, 回车直接采纳): " "${OLD_STLS_PORT:-443}"
-        fi
+        printf "请输入 Shadow-TLS 入口公网端口 (当前/默认: %s): " "${OLD_STLS_PORT:-443}"
         read -r input_stls_port || input_stls_port=""
         stls_port=${input_stls_port:-${OLD_STLS_PORT:-443}}
 
-        if [[ "$stls_port" =~ ^[0-9]+$ ]] && [ "$stls_port" -ge 1 ] && [ "$stls_port" -le 65535 ]; then
+        if echo "$stls_port" | grep -qE '^[0-9]+$' && [ "$stls_port" -ge 1 ] && [ "$stls_port" -le 65535 ]; then
             if [ "$stls_port" != "$OLD_STLS_PORT" ]; then
                 check_port "$stls_port" || continue
             fi
             break
         else
-            echo -e "${RED}端口格式不正确，必须在 1-65535 之间。${RESET}"
+            _err "端口格式不正确，必须在 1-65535 之间。"
         fi
     done
 
@@ -369,17 +345,13 @@ execute_configuration_flow() {
         local default_snell_port=""
         default_snell_port=${OLD_SNELL_PORT:-$(random_port || echo "38221")}
         
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入内部Snell端口 (当前: %s, 回车保持不修改): " "$default_snell_port"
-        else
-            printf "请输入内部Snell端口 (随机推荐: %s, 回车直接采纳): " "$default_snell_port"
-        fi
+        printf "请输入内部本地 Snell 端口 (当前/随机: %s): " "$default_snell_port"
         read -r input_snell_port || input_snell_port=""
         snell_port=${input_snell_port:-$default_snell_port}
 
-        if [[ "$snell_port" =~ ^[0-9]+$ ]] && [ "$snell_port" -ge 1 ] && [ "$snell_port" -le 65535 ]; then
+        if echo "$snell_port" | grep -qE '^[0-9]+$' && [ "$snell_port" -ge 1 ] && [ "$snell_port" -le 65535 ]; then
             if [ "$snell_port" -eq "$stls_port" ]; then
-                echo -e "${RED}内部Snell端口绝不能与外网公网端口相同！${RESET}"
+                _err "内部 Snell 端口绝不能与外网公共入口端口相同！"
                 continue
             fi
             if [ "$snell_port" != "$OLD_SNELL_PORT" ]; then
@@ -387,7 +359,7 @@ execute_configuration_flow() {
             fi
             break
         else
-            echo -e "${RED}端口格式不正确，必须在 1-65535 之间。${RESET}"
+            _err "端口格式不正确，必须在 1-65535 之间。"
         fi
     done
 
@@ -395,51 +367,31 @@ execute_configuration_flow() {
         local default_psk=""
         default_psk=${OLD_SNELL_PSK:-$(random_key || echo "")}
 
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入Snell PSK密钥 (当前: %s, 回车保持不修改):\n> " "$default_psk"
-        else
-            printf "请输入Snell PSK密钥 (默认随机生成: %s, 回车直接采纳):\n> " "$default_psk"
-        fi
+        printf "请输入 Snell PSK 密钥 (当前/随机: %s):\n> " "$default_psk"
         read -r input_psk || input_psk=""
         psk=${input_psk:-$default_psk}
-        if [[ -n "$psk" ]]; then
-            break
-        else
-            echo -e "${RED}PSK密钥不能为空！${RESET}"
-        fi
+        if [ -n "$psk" ]; then break; else _err "PSK 密钥不能为空！"; fi
     done
 
     while true; do
         local default_stls_pwd=""
         default_stls_pwd=${OLD_STLS_PWD:-$(openssl rand -hex 8 2>/dev/null || echo "StlsPurePwd123456")}
         
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入Shadow-TLS密码 (当前: %s, 回车保持不修改): " "$default_stls_pwd"
-        else
-            printf "请输入Shadow-TLS密码 (默认随机生成: %s, 回直接采纳): " "$default_stls_pwd"
-        fi
+        printf "请输入 Shadow-TLS 传输密码 (当前/随机: %s): " "$default_stls_pwd"
         read -r input_stls_pwd || input_stls_pwd=""
         stls_pwd=${input_stls_pwd:-$default_stls_pwd}
-        if [[ -n "$stls_pwd" ]]; then
-            break
-        else
-            echo -e "${RED}密码不能为空！${RESET}"
-        fi
+        if [ -n "$stls_pwd" ]; then break; else _err "密码不能为空！"; fi
     done
 
     while true; do
         local default_sni=${OLD_STLS_SNI:-"gateway.icloud.com"}
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入Shadow-TLS SNI伪装域名 (当前: %s, 回车保持不修改): " "$default_sni"
-        else
-            printf "请输入Shadow-TLS SNI伪装域名 (默认: %s, 回车直接采纳): " "$default_sni"
-        fi
+        printf "请输入 Shadow-TLS SNI 伪装域名 (当前/默认: %s): " "$default_sni"
         read -r input_sni || input_sni=""
         stls_sni=${input_sni:-$default_sni}
-        if [[ "$stls_sni" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        if echo "$stls_sni" | grep -qE '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
             break
         else
-            echo -e "${RED}伪装域名格式不正确，请输入合法的域名 (如 gateway.icloud.com)${RESET}"
+            _err "伪装域名格式不正确，请输入合法的域名 (如 gateway.icloud.com)"
         fi
     done
 
@@ -448,148 +400,224 @@ execute_configuration_flow() {
         sys_dns=$(get_system_dns || echo "1.1.1.1,8.8.8.8")
         local default_dns=${OLD_DNS:-$sys_dns}
         
-        if [ "$is_modify_mode" = true ]; then
-            printf "请输入Snell自定义DNS (当前: %s, 回车保持不修改): " "$default_dns"
-        else
-            printf "请输入Snell自定义DNS (默认采纳系统: %s, 回车直接采纳): " "$default_dns"
-        fi
+        printf "请输入 Snell 内部自定义 DNS (当前/默认: %s): " "$default_dns"
         read -r input_dns || input_dns=""
         dns=${input_dns:-$default_dns}
-        if [[ -n "$dns" ]]; then
-            break
-        else
-            echo -e "${RED}DNS 不能为空！${RESET}"
-        fi
+        if [ -n "$dns" ]; then break; else _err "DNS 不能为空！"; fi
     done
 
-    printf "是否开启 IPv6 支持？(当前: %s, 1.开启 2.关闭, 默认 2): " "$OLD_IPV6"
-    read -r input_ipv6 || input_ipv6=""
-    if [[ "$input_ipv6" == "1" ]]; then ipv6="true"; elif [[ "$input_ipv6" == "2" ]]; then ipv6="false"; else ipv6="$OLD_IPV6"; fi
+    # v6 高级 DNS 家族优先级引导
+    local default_dns_pref="${OLD_DNS_PREF:-default}"
+    echo -e "\n${YELLOW}请选择 Snell v6 DNS 解析 IP 家族优先级 (当前: $default_dns_pref)：${RESET}"
+    echo "1. default      (系统默认)"
+    echo "2. prefer-ipv4  (IPv4 优先)"
+    echo "3. prefer-ipv6  (IPv6 优先)"
+    echo "4. ipv4-only    (仅解析 IPv4)"
+    echo "5. ipv6-only    (仅解析 IPv6)"
+    printf "请选择序号 (直接回车保持不变): "
+    read -r input_dns_pref || input_dns_pref=""
+    case $input_dns_pref in
+        1) dns_pref="default" ;;
+        2) dns_pref="prefer-ipv4" ;;
+        3) dns_pref="prefer-ipv6" ;;
+        4) dns_pref="ipv4-only" ;;
+        5) dns_pref="ipv6-only" ;;
+        *) dns_pref="$default_dns_pref" ;;
+    esac
 
-    printf "是否开启 TCP Fast Open？(当前: %s, 1.开启 2.关闭, 默认 1): " "$OLD_TFO"
+    local default_tfo_str="开启"
+    [ "$OLD_TFO" = "false" ] && default_tfo_str="关闭"
+    printf "是否开启 TCP Fast Open？(当前: %s, 1.开启 2.关闭, 默认 1): " "$default_tfo_str"
     read -r input_tfo || input_tfo=""
-    if [[ "$input_tfo" == "1" ]]; then tfo="true"; elif [[ "$input_tfo" == "2" ]]; then tfo="false"; else tfo="$OLD_TFO"; fi
+    if [ "$input_tfo" = "1" ]; then tfo="true"; elif [ "$input_tfo" = "2" ]; then tfo="false"; else tfo="$OLD_TFO"; fi
 
-    write_config "$snell_port" "$psk" "$dns" "$ipv6" "$tfo" "$stls_port" "$stls_sni" "$stls_pwd" || true
-    generate_links "$snell_port" "$psk" "$tfo" "$stls_port" "$stls_sni" "$stls_pwd" || true
+    write_config "$snell_port" "$psk" "$dns" "$tfo" "$dns_pref" "$stls_port" "$stls_sni" "$stls_pwd" || true
+    generate_links "$psk" "$tfo" "$stls_port" "$stls_sni" "$stls_pwd" || true
+}
+
+# ================== 核心 Alpine 部署与下载逻辑 (防 404/解压保底) ==================
+_download_and_install_binary() {
+    local sarch=$( _map_arch ) || { _err "不支持的架构"; return 1; }
+    
+    _info "正在安装 Alpine 必要系统依赖 (upx, unzip, curl, iproute2, openssl, shadow, gcompat)..."
+    apk add --no-cache upx unzip curl iproute2 openssl shadow gcompat >/dev/null 2>&1
+
+    _info "正在获取官方最新稳定版版本号..."
+    local version=$( _get_snell_latest_version )
+    version="${version#v}"
+
+    local tmp=$(mktemp -d)
+    local download_url_A="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
+    local download_url_B="https://dl.nssurge.com/snell/snell-server-${version}-linux-${sarch}.zip"
+    local download_url_C="https://dl.nssurge.com/snell/snell-server-v6.0.0b2-linux-${sarch}.zip"
+
+    _info "正在通过智能路由下载 Snell v6 核心组件..."
+    
+    if curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -o "$tmp/snell.zip" --connect-timeout 15 "$download_url_A" && unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
+        _info "方案 A (标准新版 v${version}) 下载并校验成功！"
+    elif curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o "$tmp/snell.zip" --connect-timeout 15 "$download_url_B" && unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
+        _info "方案 B (变体路径) 下载并校验成功！"
+    else
+        _warn "官方主动拦截或版本号未就绪，启动弹性回滚，下载 v6.0.0b2 保底包..."
+        if ! curl -sL -A "Mozilla/5.0" -o "$tmp/snell.zip" --connect-timeout 20 "$download_url_C" || ! unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
+            _err "所有下载源均被 Surge 防火墙拦截或网络超时，请稍后再试！"
+            rm -rf "$tmp"; return 1
+        fi
+        version="6.0.0b2"
+    fi
+
+    if unzip -oq "$tmp/snell.zip" -d "$tmp/"; then
+        _info "正在进行 UPX 壳解压兼容处理..."
+        if command -v upx >/dev/null 2>&1; then
+            upx -d "$tmp/snell-server" >/dev/null 2>&1 || _warn "UPX 脱壳失败或无需脱壳"
+        else
+            _err "UPX 工具不可用，无法完成解压"
+            rm -rf "$tmp"; return 1
+        fi
+
+        install -m 755 "$tmp/snell-server" "$SNELL_File"
+        rm -rf "$tmp"
+        echo "$version" > "${SNELL_DIR}/version.txt"
+        return 0
+    else
+        _err "解压失败"
+        rm -rf "$tmp"
+        return 1
+    fi
 }
 
 # ================== 安装入口 ==================
 install_ss() {
-    echo -e "${GREEN}[信息] 开始全新安装 Snell & Shadow-TLS v3 核心组件...${RESET}"
-    check_deps
+    _info "开始全新安装 Snell v6 & Shadow-TLS v3 核心组件..."
     mkdir -p "$SNELL_DIR"
-    cd "$TMP_DIR"
 
-    VERSION=$(get_latest_version)
-    ARCH=$(detect_arch)
-    
-    echo -e "${GREEN}[信息] 解析到官方目标版本: ${VERSION}...${RESET}"
-    download_snell_core "$VERSION" "$ARCH"
-    
-    unzip -o snell.zip && install -m 755 snell-server "$SNELL_File"
+    _download_and_install_binary
 
     STLS_VERSION=$(get_latest_stls_version)
     STLS_ARCH=$(detect_stls_arch)
-    echo -e "${GREEN}[信息] 正在下载 Shadow-TLS ${STLS_VERSION}...${RESET}"
-    wget -O shadow-tls "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
-    install -m 755 shadow-tls "$STLS_File"
+    _info "正在下载 Shadow-TLS ${STLS_VERSION}..."
+    wget -O "$TMP_DIR/shadow-tls" "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
+    install -m 755 "$TMP_DIR/shadow-tls" "$STLS_File"
     echo "$STLS_VERSION" > "${SNELL_DIR}/stls_version.txt"
 
     execute_configuration_flow false
     service
     service_stls
 
-    echo -e "${GREEN}[完成] 服务安装部署成功，节点已启动运行！${RESET}"
+    _info "服务安装部署成功，节点已启动运行！"
     log "全新安装并初始化成功"
     print_node_info
 }
 
 # ================== 修改现有配置 ==================
 modify_ss() {
-    echo -e "${GREEN}[信息] 进入修改配置模块...${RESET}"
-    if [[ ! -f "$SNELL_Conf" ]] || [[ ! -f "$STLS_Env" ]]; then
-        echo -e "${RED}错误：未检测到环境配置文件，请先选择选项【1】进行完整安装！${RESET}"
+    _info "进入修改配置模块..."
+    if [ ! -f "$SNELL_Conf" ] || [ ! -f "$STLS_Env" ]; then
+        _err "错误：未检测到环境配置文件，请先选择选项【1】进行完整安装！"
         return
     fi
     
+    _info "正在安全停止现有服务以防死锁..."
+    rc-service shadowtlsn stop >/dev/null 2>&1 || true
+    rc-service snell-tlss stop >/dev/null 2>&1 || true
+    
     execute_configuration_flow true
     
-    echo -e "${GREEN}[管理] 正在安全平滑重启底层内核服务...${RESET}"
-    systemctl restart snell-tlss || true
-    service_stls
-    systemctl restart shadowtlsn || true
+    _info "正在通过 OpenRC 依赖链平滑安全启动服务..."
+    rc-service snell-tlss start || true
+    sleep 1 
+    rc-service shadowtlsn start || true
     
-    echo -e "${GREEN}[完成] 核心配置已被覆写，服务重启完毕！${RESET}"
+    _info "核心配置已被覆写，服务安全重启完毕！"
     print_node_info
     log "配置已被修改并安全应用"
 }
 
-# ================== 日志查看菜单 ==================
-show_log_menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${GREEN}        Snell + Shadow-TLS 日志面板         ${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${YELLOW}1. 查看 Shadow-TLS 运行日志 (最新50条)${RESET}"
-        echo -e "${YELLOW}2. 实时追踪 Shadow-TLS 日志 (Ctrl+C 退出)${RESET}"
-        echo -e "${YELLOW}-------------------------------------------${RESET}"
-        echo -e "${YELLOW}3. 查看 Snell 运行日志 (最新50条)${RESET}"
-        echo -e "${YELLOW}4. 实时追踪 Snell 日志 (Ctrl+C 退出)${RESET}"
-        echo -e "${RED}0. 返回主菜单${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        
-        local sub_choice
-        read -r -p $'\033[32m请输入选项: \033[0m' sub_choice || true
-        case $sub_choice in
-            1) journalctl -u shadowtlsn -n 50 --no-pager || true; pause ;;
-            2) journalctl -u shadowtlsn -f || true ;;
-            3) journalctl -u snell-tlss -n 50 --no-pager || true; pause ;;
-            4) journalctl -u snell-tlss -f || true ;;
-            0) break ;;
-            *) echo -e "${RED}无效输入${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
 # ================== 更新 ==================
 update_ss() {
-    echo -e "${GREEN}[信息] 开始更新二进制组件...${RESET}"
-    cd "$TMP_DIR"
+    _info "开始更新二进制组件..."
     
-    if [[ -f "$SNELL_Conf" ]]; then
-        VERSION=$(get_latest_version)
-        ARCH=$(detect_arch)
-        download_snell_core "$VERSION" "$ARCH"
-        unzip -o snell.zip && install -m 755 snell-server "$SNELL_File"
+    _info "正在安全停止旧服务..."
+    rc-service shadowtlsn stop >/dev/null 2>&1 || true
+    rc-service snell-tlss stop >/dev/null 2>&1 || true
+    sleep 1
+
+    if [ -f "$SNELL_Conf" ]; then
+        _download_and_install_binary
     fi
 
-    if [[ -f "$STLS_Env" ]]; then
+    if [ -f "$STLS_Env" ]; then
         STLS_VERSION=$(get_latest_stls_version)
         STLS_ARCH=$(detect_stls_arch)
-        wget -O shadow-tls "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
-        install -m 755 shadow-tls "$STLS_File"
+        wget -O "$TMP_DIR/shadow-tls" "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
+        install -m 755 "$TMP_DIR/shadow-tls" "$STLS_File"
         echo "$STLS_VERSION" > "${SNELL_DIR}/stls_version.txt"
     fi
 
-    service_stls
-    systemctl restart snell-tlss shadowtlsn || true
-    echo -e "${GREEN}[完成] 更新执行完毕，服务已安全重启${RESET}"
+    _info "正在重新拉起全新组件..."
+    rc-service snell-tlss start || true
+    sleep 1
+    rc-service shadowtlsn start || true
+    
+    _info "更新执行完毕，服务已安全重启"
     log "更新组件成功"
 }
 
 # ================== 卸载 ==================
 uninstall_ss() {
-    echo -e "${RED}[警告] 正在卸载独立一体化服务...${RESET}"
-    systemctl stop shadowtlsn snell-tlss || true
-    systemctl disable shadowtlsn snell-tlss || true
-    rm -f /etc/systemd/system/snell-tlss.service /etc/systemd/system/shadowtlsn.service
+    _warn "正在卸载服务..."
+    rc-service shadowtlsn stop || true
+    rc-service snell-tlss stop || true
+    rc-update del shadowtlsn default || true
+    rc-update del snell-tlss default || true
+    rm -f /etc/init.d/snell-tlss /etc/init.d/shadowtlsn
     rm -rf "$SNELL_DIR"
     rm -f "$SNELL_File" "$STLS_File"
-    systemctl daemon-reload
-    echo -e "${GREEN}[完成] 卸载清理完毕${RESET}"
+    _info "卸载清理完毕"
     log "安全卸载成功"
+}
+
+# ================== 独立日志查看子菜单 ==================
+check_logs() {
+    while true; do
+        clear
+        echo -e "${GREEN}===========================================${RESET}"
+        echo -e "${GREEN}         Snell + Shadow-TLS 日志面板        ${RESET}"
+        echo -e "${GREEN}===========================================${RESET}"
+        echo -e "${YELLOW}1. 查看 Snell 最新日志 (最后50行)${RESET}"
+        echo -e "${YELLOW}2. 实时追踪 Snell 日志 (Ctrl+C 退出)${RESET}"
+        echo -e "${YELLOW}-------------------------------------------${RESET}"
+        echo -e "${YELLOW}3. 查看 Shadow-TLS 最新日志 (最后50行)${RESET}"
+        echo -e "${YELLOW}4. 实时追踪 Shadow-TLS 日志 (Ctrl+C 退出)${RESET}"
+        echo -e "${YELLOW}===========================================${RESET}"
+        echo -e "${RED}0. 返回主菜单${RESET}"
+        echo -e "${GREEN}===========================================${RESET}"
+        printf "\033[32m请选择日志操作: \033[0m"
+        read -r log_choice || true
+        
+        case $log_choice in
+            1)
+                echo -e "\n${GREEN}====== Snell 运行日志 ======${RESET}"
+                if [ -f "/var/log/snell.log" ]; then tail -n 50 /var/log/snell.log; else _warn "暂无 Snell 日志文件"; fi
+                pause
+                ;;
+            2)
+                echo -e "\n${GREEN}====== 正在实时追踪 Snell 日志 (按 Ctrl+C 终止) ======${RESET}"
+                if [ -f "/var/log/snell.log" ]; then tail -f /var/log/snell.log; else _warn "日志文件不存在"; pause; fi
+                ;;
+            3)
+                echo -e "\n${GREEN}====== Shadow-TLS 运行日志 ======${RESET}"
+                if [ -f "/var/log/shadowtls.log" ]; then tail -n 50 /var/log/shadowtls.log; else _warn "暂无 Shadow-TLS 日志文件"; fi
+                pause
+                ;;
+            4)
+                echo -e "\n${GREEN}====== 正在实时追踪 Shadow-TLS 日志 (按 Ctrl+C 终止) ======${RESET}"
+                if [ -f "/var/log/shadowtls.log" ]; then tail -f /var/log/shadowtls.log; else _warn "日志文件不存在"; pause; fi
+                ;;
+            0) break ;;
+            *) _err "无效输入"; pause ;;
+        esac
+    done
 }
 
 # ================== 主菜单面板 ==================
@@ -597,38 +625,40 @@ show_menu() {
     clear
     local status_snell="${RED}● Snell未运行${RESET}"
     local status_stls="${RED}● TLS未运行${RESET}"
-    systemctl is-active --quiet snell-tlss && status_snell="${GREEN}● Snell运行中${RESET}"
-    systemctl is-active --quiet shadowtlsn && status_stls="${GREEN}● TLS运行中${RESET}"
+    
+    rc-service snell-tlss status >/dev/null 2>&1 && status_snell="${GREEN}● Snell运行中${RESET}"
+    rc-service shadowtlsn status >/dev/null 2>&1 && status_stls="${GREEN}● TLS运行中${RESET}"
 
-    local v_snell="未安装" && [[ -f "${SNELL_DIR}/version.txt" ]] && v_snell="$(cat "${SNELL_DIR}/version.txt")"
-    local v_stls="未安装" && [[ -f "${SNELL_DIR}/stls_version.txt" ]] && v_stls="$(cat "${SNELL_DIR}/stls_version.txt")"
+    local v_snell="未安装" && [ -f "${SNELL_DIR}/version.txt" ] && v_snell="$(cat "${SNELL_DIR}/version.txt")"
+    local v_stls="未安装" && [ -f "${SNELL_DIR}/stls_version.txt" ] && v_stls="$(cat "${SNELL_DIR}/stls_version.txt")"
     
     local p_stls="-"
-    if [[ -f "$STLS_Env" ]]; then 
+    if [ -f "$STLS_Env" ]; then 
         p_stls=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "-")
     fi
     local p_snell="-"
-    if [[ -f "$SNELL_Conf" ]]; then
-        local raw_listen=$(awk -F'= ' '/^listen/{print $2}' "$SNELL_Conf" 2>/dev/null | tr -d ' \t\n' || echo "-")
-        p_snell=${raw_listen#*:}
+    if [ -f "$SNELL_Conf" ]; then
+        local raw_listen=$(_get_conf_value "listen")
+        local first_listen="${raw_listen%%,*}"
+        p_snell=$(echo "$first_listen" | awk -F: '{print $NF}')
     fi
 
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}        Snell  + Shadow-TLS 管理面板       ${RESET}"
+    echo -e "${GREEN}       Snell v6 + Shadow-TLS 面板 (Alpine) ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}服务状态 :${RESET} ${status_snell} | ${status_stls}"
-    echo -e "${GREEN}组件版本 :${RESET} ${YELLOW}Snell: ${v_snell}${RESET} | ${YELLOW}Shadow-TLS: ${v_stls}${RESET}"
+    echo -e "${GREEN}组件版本 :${RESET} ${YELLOW}Snell: v${v_snell}${RESET} | ${YELLOW}Shadow-TLS: ${v_stls}${RESET}"
     echo -e "${GREEN}运行端口 :${RESET} ${YELLOW}外网(TLS): ${p_stls}${RESET} | ${YELLOW}内部(Snell): ${p_snell}${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}1. 安装 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}2. 更新 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}3. 卸载 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}6. 停止 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}7. 重启 Snell  + Shadow-TLS ${RESET}"
-    echo -e "${GREEN}8. 查看运行日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}1. 安装 Snell + Shadow-TLS${RESET}"
+    echo -e "${GREEN}2. 更新 Snell + Shadow-TLS${RESET}"
+    echo -e "${GREEN}3. 卸载 Snell + Shadow-TLS${RESET}"
+    echo -e "${GREEN}4. 修改配置 (高级双栈与DNS优先级)${RESET}"
+    echo -e "${GREEN}5. 启动 Snell + Shadow-TLS${RESET}"
+    echo -e "${GREEN}6. 停止 Snell + Shadow-TLS${RESET}"
+    echo -e "${GREEN}7. 重启 Snell + Shadow-TLS${RESET}"
+    echo -e "${GREEN}8. 查看运行日志 (分类排查)${RESET}"
+    echo -e "${GREEN}9. 查看节点配置 (直接复制链接)${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
 }
@@ -636,18 +666,19 @@ show_menu() {
 # ================== 主循环 ==================
 while true; do
     show_menu
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    printf "\033[32m请输入选项: \033[0m"
+    read -r choice || true
     case $choice in
         1) install_ss; pause ;;
         2) update_ss; pause ;;
         3) uninstall_ss; pause ;;
         4) modify_ss; pause ;;
-        5) systemctl start snell-tlss shadowtlsn || true; echo -e "${GREEN}[完成] 服务已启动${RESET}"; pause ;;
-        6) systemctl stop shadowtlsn snell-tlss || true; echo -e "${GREEN}[完成] 服务已停止${RESET}"; pause ;;
-        7) systemctl restart snell-tlss shadowtlsn || true; echo -e "${GREEN}[完成] 服务已重启${RESET}"; pause ;;
-        8) show_log_menu ;;
+        5) rc-service snell-tlss start || true; rc-service shadowtlsn start || true; _info "服务已启动"; pause ;;
+        6) rc-service shadowtlsn stop || true; rc-service snell-tlss stop || true; _info "服务已停止"; pause ;;
+        7) rc-service snell-tlss restart || true; rc-service shadowtlsn restart || true; _info "服务已重启"; pause ;;
+        8) check_logs ;;
         9) print_node_info; pause ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效输入${RESET}" ; pause ;;
+        *) _err "无效输入" ; pause ;;
     esac
 done

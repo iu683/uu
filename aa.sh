@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# ZhuQue 一键管理脚本
+# GHProxy + Smart-Git 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="zhuque"
+APP_NAME="ghproxy-smartgit"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -34,7 +34,7 @@ check_port() {
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== ZhuQue 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== GHProxy + Smart-Git 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
         echo -e "${GREEN}2) 更新${RESET}"
         echo -e "${GREEN}3) 重启${RESET}"
@@ -58,7 +58,6 @@ menu() {
 }
 
 install_app() {
-
     check_docker
     mkdir -p "$APP_DIR"
 
@@ -68,26 +67,60 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    read -p "请输入访问端口 [默认:3000]: " input_port
-    PORT=${input_port:-3000}
-    check_port "$PORT" || return
+    echo
+    read -p "请输入 GHProxy 端口 [默认:7210]: " input_ghport
+    GHPROXY_PORT=${input_ghport:-7210}
+    check_port "$GHPROXY_PORT" || return
 
-    read -p "请输入数据目录 [默认:$APP_DIR/data]: " input_data
-    DATA_DIR=${input_data:-$APP_DIR/data}
-    mkdir -p "$DATA_DIR"
+    echo
+    read -p "请输入 GHProxy 日志目录 [默认:$APP_DIR/ghproxy/log]: " input_ghlog
+    GHPROXY_LOG=${input_ghlog:-$APP_DIR/ghproxy/log}
+
+    echo
+    read -p "请输入 GHProxy 配置目录 [默认:$APP_DIR/ghproxy/config]: " input_ghconf
+    GHPROXY_CONF=${input_ghconf:-$APP_DIR/ghproxy/config}
+
+    echo
+    read -p "请输入 Smart-Git 日志目录 [默认:$APP_DIR/smart-git/log]: " input_gitlog
+    GIT_LOG=${input_gitlog:-$APP_DIR/smart-git/log}
+
+    echo
+    read -p "请输入 Smart-Git 配置目录 [默认:$APP_DIR/smart-git/config]: " input_gitconf
+    GIT_CONF=${input_gitconf:-$APP_DIR/smart-git/config}
+
+    echo
+    read -p "请输入 Smart-Git 仓库目录 [默认:$APP_DIR/smart-git/repos]: " input_repos
+    GIT_REPOS=${input_repos:-$APP_DIR/smart-git/repos}
+
+    echo
+    read -p "请输入 Smart-Git 数据库目录 [默认:$APP_DIR/smart-git/db]: " input_db
+    GIT_DB=${input_db:-$APP_DIR/smart-git/db}
+
+    mkdir -p "$GHPROXY_LOG" "$GHPROXY_CONF"
+    mkdir -p "$GIT_LOG" "$GIT_CONF" "$GIT_REPOS" "$GIT_DB"
 
 cat > "$COMPOSE_FILE" <<EOF
 services:
-  zhuque:
-    container_name: zhuque
-    image: ghcr.io/mtvpls/zhuque:latest
-    restart: unless-stopped
+
+  ghproxy:
+    image: wjqserver/ghproxy:latest
+    container_name: ghproxy
+    restart: always
     ports:
-      - "127.0.0.1:${PORT}:3000"
+      - "127.0.0.1:${GHPROXY_PORT}:8080"
     volumes:
-      - ${DATA_DIR}:/app/data
-    environment:
-      TZ: Asia/Shanghai
+      - ${GHPROXY_LOG}:/data/ghproxy/log
+      - ${GHPROXY_CONF}:/data/ghproxy/config
+
+  smart-git:
+    image: wjqserver/smart-git:latest
+    container_name: smart-git
+    restart: always
+    volumes:
+      - ${GIT_LOG}:/data/smart-git/log
+      - ${GIT_CONF}:/data/smart-git/config
+      - ${GIT_REPOS}:/data/smart-git/repos
+      - ${GIT_DB}:/data/smart-git/db
 EOF
 
     cd "$APP_DIR" || exit
@@ -99,9 +132,9 @@ EOF
     fi
 
     echo
-    echo -e "${GREEN}✅ ZhuQue 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${GREEN}📂 数据目录: ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}✅ GHProxy + Smart-Git 已启动${RESET}"
+    echo -e "${YELLOW}🌐 GHProxy: http://127.0.0.1:${GHPROXY_PORT}${RESET}"
+    echo -e "${GREEN}📂 所有数据已持久化到自定义目录${RESET}"
 
     read -p "按回车返回菜单..."
 }
@@ -110,22 +143,29 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ ZhuQue 更新完成${RESET}"
+    echo -e "${GREEN}✅ 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart zhuque
-    echo -e "${GREEN}✅ ZhuQue 已重启${RESET}"
+    docker restart ghproxy smart-git
+    echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    docker logs -f zhuque
+    echo "1) ghproxy"
+    echo "2) smart-git"
+    read -p "选择查看日志: " opt
+    case $opt in
+        1) docker logs -f ghproxy ;;
+        2) docker logs -f smart-git ;;
+        *) echo "无效选择" ;;
+    esac
 }
 
 check_status() {
-    docker ps | grep zhuque
+    docker ps | grep -E "ghproxy|smart-git"
     read -p "按回车返回菜单..."
 }
 
@@ -133,7 +173,7 @@ uninstall_app() {
     cd "$APP_DIR" || return
     docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ ZhuQue 已卸载${RESET}"
+    echo -e "${RED}✅ 已卸载全部服务${RESET}"
     read -p "按回车返回菜单..."
 }
 

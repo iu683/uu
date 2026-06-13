@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# GHProxy + Smart-Git 一键管理脚本
+# Paperphone-plus 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,9 +8,10 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="ghproxy-smartgit"
-APP_DIR="/opt/$APP_NAME"
+REPO_URL="https://github.com/619dev/Paperphone-plus.git"
+APP_DIR="/opt/paperphone-plus"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/server/.env"
 
 check_docker() {
     if ! command -v docker &>/dev/null; then
@@ -31,26 +32,29 @@ check_port() {
     fi
 }
 
+# 随机字符串生成器（用于 JWT）
+generate_secret() {
+    echo $(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
+}
+
 menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== GHProxy + Smart-Git 管理菜单 ===${RESET}"
+        echo -e "${GREEN}=== Paperphone-plus 管理菜单 ===${RESET}"
         echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}2) 重启服务${RESET}"
+        echo -e "${GREEN}3) 查看日志${RESET}"
+        echo -e "${GREEN}4) 查看状态${RESET}"
+        echo -e "${GREEN}5) 彻底卸载${RESET}"
         echo -e "${GREEN}0) 退出${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
 
         case $choice in
             1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
+            2) restart_app ;;
+            3) view_logs ;;
+            4) check_status ;;
+            5) uninstall_app ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
         esac
@@ -59,122 +63,139 @@ menu() {
 
 install_app() {
     check_docker
-    mkdir -p "$APP_DIR"
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+    if [ -d "$APP_DIR" ]; then
+        echo -e "${YELLOW}检测到已存在安装目录 $APP_DIR，是否覆盖安装？(y/n)${RESET}"
         read confirm
         [[ "$confirm" != "y" ]] && return
+        echo -e "${YELLOW}正在清理旧文件...${RESET}"
+        cd "$APP_DIR" && docker compose down -v &>/dev/null
+        rm -rf "$APP_DIR"
     fi
 
-    echo
-    read -p "请输入 GHProxy 端口 [默认:7210]: " input_ghport
-    GHPROXY_PORT=${input_ghport:-7210}
-    check_port "$GHPROXY_PORT" || return
+    echo -e "${YELLOW}正在克隆仓库...${RESET}"
+    git clone "$REPO_URL" "$APP_DIR"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 克隆仓库失败，请检查网络（GitHub 连通性）${RESET}"
+        read -p "按回车返回..."
+        return
+    fi
+
+    mkdir -p "$APP_DIR/server"
 
     echo
-    read -p "请输入 GHProxy 日志目录 [默认:$APP_DIR/ghproxy/log]: " input_ghlog
-    GHPROXY_LOG=${input_ghlog:-$APP_DIR/ghproxy/log}
+    echo -e "${GREEN}--- 配置环境变量 ---${RESET}"
+    
+    read -p "请输入服务访问端口 [默认:3000]: " input_port
+    PORT=${input_port:-3000}
+    check_port "$PORT" || return
 
-    echo
-    read -p "请输入 GHProxy 配置目录 [默认:$APP_DIR/ghproxy/config]: " input_ghconf
-    GHPROXY_CONF=${input_ghconf:-$APP_DIR/ghproxy/config}
+    read -p "请输入数据库密码 (DB_PASS) [默认:changeme]: " input_db_pass
+    DB_PASS=${input_db_pass:-changeme}
 
-    echo
-    read -p "请输入 Smart-Git 日志目录 [默认:$APP_DIR/smart-git/log]: " input_gitlog
-    GIT_LOG=${input_gitlog:-$APP_DIR/smart-git/log}
+    read -p "请输入后台管理路径 (ADMIN_PATH) [默认:/admin]: " input_admin_path
+    ADMIN_PATH=${input_admin_path:-/admin}
 
-    echo
-    read -p "请输入 Smart-Git 配置目录 [默认:$APP_DIR/smart-git/config]: " input_gitconf
-    GIT_CONF=${input_gitconf:-$APP_DIR/smart-git/config}
+    read -p "请输入后台管理密码 (ADMIN_PASSWORD) [默认:admin123]: " input_admin_user_pass
+    ADMIN_PASSWORD=${input_admin_user_pass:-admin123}
 
-    echo
-    read -p "请输入 Smart-Git 仓库目录 [默认:$APP_DIR/smart-git/repos]: " input_repos
-    GIT_REPOS=${input_repos:-$APP_DIR/smart-git/repos}
+    # 自动生成随机的 JWT 密钥，更安全
+    JWT_SECRET=$(generate_secret)
 
-    echo
-    read -p "请输入 Smart-Git 数据库目录 [默认:$APP_DIR/smart-git/db]: " input_db
-    GIT_DB=${input_db:-$APP_DIR/smart-git/db}
+    echo -e "${YELLOW}正在生成配置文件 (.env)...${RESET}"
+    
+    # 写入 .env 配置文件
+cat > "$ENV_FILE" <<EOF
+# ─── Server ───────────────────────────────────────────────────
+PORT=${PORT}
+JWT_SECRET=${JWT_SECRET}
+JWT_EXPIRES_IN=7d
 
-    mkdir -p "$GHPROXY_LOG" "$GHPROXY_CONF"
-    mkdir -p "$GIT_LOG" "$GIT_CONF" "$GIT_REPOS" "$GIT_DB"
+# ─── MySQL ────────────────────────────────────────────────────
+DB_HOST=mysql
+DB_PORT=3306
+DB_USER=paperphone
+DB_PASS=${DB_PASS}
+DB_NAME=paperphone
 
-cat > "$COMPOSE_FILE" <<EOF
-services:
+# ─── Redis ────────────────────────────────────────────────────
+REDIS_HOST=redis
+REDIS_PORT=6379
 
-  ghproxy:
-    image: wjqserver/ghproxy:latest
-    container_name: ghproxy
-    restart: always
-    ports:
-      - "127.0.0.1:${GHPROXY_PORT}:8080"
-    volumes:
-      - ${GHPROXY_LOG}:/data/ghproxy/log
-      - ${GHPROXY_CONF}:/data/ghproxy/config
-
-  smart-git:
-    image: wjqserver/smart-git:latest
-    container_name: smart-git
-    restart: always
-    volumes:
-      - ${GIT_LOG}:/data/smart-git/log
-      - ${GIT_CONF}:/data/smart-git/config
-      - ${GIT_REPOS}:/data/smart-git/repos
-      - ${GIT_DB}:/data/smart-git/db
+# ─── Admin Panel ─────────────────────────────────────────────
+ADMIN_PATH=${ADMIN_PATH}
+ADMIN_PASSWORD=${ADMIN_PASSWORD}
 EOF
 
+    # 💡 核心修复：如果是通过 Docker 编排，.env 里的 localhost 要改成服务名（mysql / redis）
+    # 同时，如果项目的 docker-compose.yml 没有做端口映射，我们用脚本动态确保它能用
+    
     cd "$APP_DIR" || exit
+    echo -e "${YELLOW}正在启动 Docker 容器...${RESET}"
     docker compose up -d
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        echo -e "${RED}❌ 启动失败，请检查配置或日志${RESET}"
+        read -p "按回车返回..."
         return
     fi
 
     echo
-    echo -e "${GREEN}✅ GHProxy + Smart-Git 已启动${RESET}"
-    echo -e "${YELLOW}🌐 GHProxy: http://127.0.0.1:${GHPROXY_PORT}${RESET}"
-    echo -e "${GREEN}📂 所有数据已持久化到自定义目录${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ 更新完成${RESET}"
+    echo -e "${GREEN}✅ Paperphone-plus 已成功启动！${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://你的服务器IP:${PORT}${RESET}"
+    echo -e "${YELLOW}👑 管理后台: http://你的服务器IP:${PORT}${ADMIN_PATH}${RESET}"
+    echo -e "${YELLOW}🔑 管理密码: ${ADMIN_PASSWORD}${RESET}"
+    echo
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart ghproxy smart-git
-    echo -e "${GREEN}✅ 已重启${RESET}"
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" && docker compose restart
+        echo -e "${GREEN}✅ 服务已重启${RESET}"
+    else
+        echo -e "${RED}❌ 未检测到安装目录${RESET}"
+    fi
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    echo "1) ghproxy"
-    echo "2) smart-git"
-    read -p "选择查看日志: " opt
-    case $opt in
-        1) docker logs -f ghproxy ;;
-        2) docker logs -f smart-git ;;
-        *) echo "无效选择" ;;
-    esac
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" && docker compose logs -f
+    else
+        echo -e "${RED}❌ 未检测到安装目录${RESET}"
+        read -p "按回车返回菜单..."
+    fi
 }
 
 check_status() {
-    docker ps | grep -E "ghproxy|smart-git"
+    if [ -d "$APP_DIR" ]; then
+        cd "$APP_DIR" && docker compose ps
+    else
+        echo -e "${RED}❌ 未检测到运行中的服务${RESET}"
+    fi
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ 已卸载全部服务${RESET}"
+    if [ -d "$APP_DIR" ]; then
+        echo -e "${RED}⚠️ 警告：这将删除所有容器和数据且无法恢复！确定吗？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+
+        cd "$APP_DIR" && docker compose down -v
+        rm -rf "$APP_DIR"
+        echo -e "${GREEN}✅ Paperphone-plus 已彻底彻底卸载${RESET}"
+    else
+        echo -e "${RED}❌ 未检测到安装，无需卸载${RESET}"
+    fi
     read -p "按回车返回菜单..."
 }
+
+# 必须以 root 权限运行以确保存储目录和 Docker 正常操作
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 sudo 或 root 权限运行此脚本！${RESET}"
+    exit 1
+fi
 
 menu

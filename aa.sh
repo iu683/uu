@@ -1,684 +1,388 @@
-#!/bin/sh
-# 针对 Alpine Linux 深度优化，使用标准 sh 执行
-set -eu
+#!/bin/bash
+# ========================================
+# MySQL 一键管理脚本 (Docker Compose)
+# ========================================
 
-# =========================================================
-# Snell v6 + Shadow-TLS v3 一体化增强管理脚本 (Alpine 专属)
-# =========================================================
-
-# ================== 颜色与输出函数 ==================
 GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
 RESET="\033[0m"
+YELLOW="\033[33m"
+RED="\033[31m"
+APP_NAME="mysql"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.env"
+BACKUP_DIR="$APP_DIR/backup"
 
-_info() { echo -e "${GREEN}[信息] $1${RESET}"; }
-_warn() { echo -e "${YELLOW}[警告] $1${RESET}"; }
-_err()  { echo -e "${RED}[错误] $1${RESET}"; }
+# 自动适配 docker compose 语法
+if docker compose version &>/dev/null; then
+    COMPOSE_CMD="docker compose"
+else
+    COMPOSE_CMD="docker-compose"
+fi
 
-# ================== 基础变量 ==================
-SNELL_DIR="/etc/snell-tls"
-SNELL_Conf="${SNELL_DIR}/snell-server.conf"
-SNELL_File="/usr/local/bin/snell-server-v5"
-
-STLS_Env="${SNELL_DIR}/shadow-tlsn.env"
-STLS_File="/usr/local/bin/stls-integrated-shadow-tlsn"
-
-LOG_FILE="/var/log/stls-integrated-snell-managers.log"
-SNELL_DEFAULT_VERSION="6.0.0b2"
-
-TMP_DIR=$(mktemp -d -t snell-v6.XXXXXX)
-
-# ================== cleanup ==================
-cleanup() {
-    [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
+# 随机密码生成函数
+gen_pass() {
+    tr -dc A-Za-z0-9 </dev/urandom | head -c 16
 }
-trap cleanup EXIT INT TERM
 
-# ================== 日志与暂停 ==================
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null || true
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP"
 }
 
 pause() {
-    echo -n "按任意键返回菜单..."
-    read -r -n 1 -s || true
-    echo
+    read -p $'\e[32m按回车返回菜单...\e[0m'
 }
 
-# ================== 智能获取公网双栈 IP ==================
-get_public_ip() {
-    local ip
-    ip=$(curl -4fsSL --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
-    if [ -z "$ip" ]; then
-        ip=$(curl -6fsSL --max-time 3 https://api64.ipify.org 2>/dev/null || echo "")
-        [ -n "$ip" ] && echo "[$ip]" && return
-    fi
-    [ -z "$ip" ] && ip="你的服务器IP"
-    echo "$ip"
-}
-
-# ================== 检查端口 ==================
-check_port() {
-    if netstat -tln | grep -q ":$1 "; then
-        _err "端口 $1 已被占用"
-        return 1
-    fi
-    return 0
-}
-
-# ================== 辅助生成器 ==================
-random_key() {
-    tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 16 || echo "SnellPskKey12345"
-}
-
-random_port() {
-    awk 'BEGIN{srand(); print int(rand()*(65000-2000+1))+2000}'
-}
-
-get_system_dns() { 
-    grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ',' | sed 's/,$//' || echo "1.1.1.1,8.8.8.8"
-}
-
-_map_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64)  echo "amd64" ;;
-        aarch64|arm64) echo "aarch64" ;;
-        *) return 1 ;;
-    esac
-}
-
-detect_stls_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64)  echo "x86_64-unknown-linux-musl" ;;
-        aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
-        *) _err "不支持架构: $(uname -m)" && exit 1 ;;
-    esac
-}
-
-_get_snell_latest_version() {
-    local latest_version
-    latest_version=$(curl -sL -A "Mozilla/5.0" "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
-    if [ -n "$latest_version" ]; then
-        echo "${latest_version#v}"
+# 获取容器动态状态及数据库个数用于菜单显示
+get_sys_status() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        status="${RED}未安装${RESET}"
+        version="${RED}无${RESET}"
+        port_show="${RED}无${RESET}"
+        db_count="${RED}0${RESET}"
     else
-        echo "$SNELL_DEFAULT_VERSION"
-    fi
-}
-
-get_latest_stls_version() {
-    curl -fsSL --max-time 5 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" 2>/dev/null | grep tag_name | cut -d '"' -f4 || echo "v0.2.25"
-}
-
-create_user() {
-    id -u snell-tls >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin snell-tls 2>/dev/null || true
-}
-
-# 精准无误的配置提取引擎 (兼容 BusyBox awk)
-_get_conf_value() {
-    local key="$1"
-    if [ -f "$SNELL_Conf" ]; then
-        grep -E "^${key}\s*=" "$SNELL_Conf" | awk -F'=' '{print $2}' | sed 's/ //g' | tr -d '\r\n'
-    fi
-}
-
-# ================== 安全的数据提取引擎 ==================
-load_existing_config() {
-    OLD_STLS_PORT="8443"
-    OLD_SNELL_PORT=""
-    OLD_SNELL_PSK=""
-    OLD_STLS_PWD=""
-    OLD_STLS_SNI="gateway.icloud.com"
-    OLD_DNS=""
-    OLD_TFO="true"
-    OLD_DNS_PREF="default"
-
-    if [ -f "$SNELL_Conf" ]; then
-        local raw_listen=$(_get_conf_value "listen")
-        if [ -n "$raw_listen" ]; then
-            local first_listen="${raw_listen%%,*}"
-            OLD_SNELL_PORT=$(echo "$first_listen" | awk -F: '{print $NF}')
-        fi
-        OLD_SNELL_PSK=$(_get_conf_value "psk")
-        OLD_DNS=$(_get_conf_value "dns")
-        OLD_TFO=$(_get_conf_value "tfo")
-        OLD_DNS_PREF=$(_get_conf_value "dns-ip-preference")
-    fi
-
-    if [ -f "$STLS_Env" ]; then
-        OLD_STLS_PORT=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "443")
-        OLD_STLS_PWD=$(awk -F'=' '/^STLS_PASSWORD=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
+        source "$CONFIG_FILE"
+        version="8.0 (Docker)"
+        port_show="$PORT"
         
-        local raw_tls
-        raw_tls=$(awk -F'=' '/^STLS_TLS=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
-        if [ -n "$raw_tls" ]; then
-            OLD_STLS_SNI=${raw_tls%:[0-9]*}
-        fi
-        [ -z "$OLD_STLS_SNI" ] && OLD_STLS_SNI="gateway.icloud.com"
-    fi
-    return 0
-}
-
-# ================== 写配置核心引擎 ==================
-write_config() {
-    local snell_port="$1"
-    local psk="$2"
-    local dns="$3"
-    local tfo="$4"
-    local dns_pref="$5"
-    local stls_port="$6"
-    local stls_sni="$7"
-    local stls_pwd="$8"
-
-    mkdir -p "$SNELL_DIR"
-
-    # 由于 Shadow-TLS 在本机作为流量入口，Snell 内部只需要牢牢绑定本地回环 127.0.0.1 即可
-    cat > "$SNELL_Conf" <<EOF
-[snell-server]
-listen = 127.0.0.1:$snell_port
-psk = $psk
-obfs = off
-tfo = $tfo
-dns = $dns
-dns-ip-preference = $dns_pref
-EOF
-    chmod 600 "$SNELL_Conf"
-
-    cat > "$STLS_Env" <<EOF
-STLS_LISTEN=[::]:$stls_port
-STLS_SERVER=127.0.0.1:$snell_port
-STLS_TLS=$stls_sni:443
-STLS_PASSWORD=$stls_pwd
-EOF
-    chmod 600 "$STLS_Env"
-
-    create_user
-    chown -R snell-tls:snell-tls "$SNELL_DIR"
-}
-
-# ================== 生成并保存链接 ==================
-generate_links() {
-    local psk="$1"
-    local tfo="$2"
-    local stls_port="$3"
-    local stls_sni="$4"
-    local stls_pwd="$5"
-
-    IP=$(get_public_ip)
-    HOSTNAME=$(hostname -s 2>/dev/null | sed 's/ /_/g' || echo "server")
-
-    cat > "${SNELL_DIR}/surge.txt" <<EOF
-$HOSTNAME-Snell+ShadowTLS = snell, $IP, $stls_port, psk=$psk, version=6, tfo=$tfo, shadow-tls-password=$stls_pwd, shadow-tls-sni=$stls_sni, shadow-tls-version=3, reuse=true, ecn=true
-EOF
-    chown snell-tls:snell-tls "${SNELL_DIR}/surge.txt" || true
-}
-
-# ================== OpenRC 服务启动脚本构建 (Alpine专属) ==================
-service() {
-    create_user
-
-    cat > /etc/init.d/snell-tlss <<'EOF'
-#!/sbin/openrc-run
-
-description="Snell v6 Server Service"
-command="/usr/local/bin/snell-server-v5"
-command_args="-c /etc/snell-tls/snell-server.conf"
-command_background="yes"
-command_user="snell-tls:snell-tls"
-pidfile="/run/${RC_SVCNAME}.pid"
-output_log="/var/log/snell.log"
-error_log="/var/log/snell.log"
-
-depend() {
-    need net
-    after firewall
-}
-EOF
-    chmod +x /etc/init.d/snell-tlss
-    rc-update add snell-tlss default || true
-    touch /var/log/snell.log && chown snell-tls:snell-tls /var/log/snell.log || true
-    rc-service snell-tlss start || true
-}
-
-service_stls() {
-    cat > /etc/init.d/shadowtlsn <<'EOF'
-#!/sbin/openrc-run
-
-description="Shadow TLS Service v3"
-command="/usr/local/bin/stls-integrated-shadow-tlsn"
-pidfile="/run/${RC_SVCNAME}.pid"
-command_background="yes"
-output_log="/var/log/shadowtls.log"
-error_log="/var/log/shadowtls.log"
-
-start_pre() {
-    if [ -f /etc/snell-tls/shadow-tlsn.env ]; then
-        . /etc/snell-tls/shadow-tlsn.env
-    else
-        eerror "Environment file /etc/snell-tls/shadow-tlsn.env missing!"
-        return 1
-    fi
-    
-    export MONOIO_FORCE_LEGACY_DRIVER=1
-    command_args="--v3 server --password $STLS_PASSWORD --listen $STLS_LISTEN --server $STLS_SERVER --tls $STLS_TLS"
-}
-
-depend() {
-    need net snell-tlss
-    after firewall snell-tlss
-}
-EOF
-    chmod +x /etc/init.d/shadowtlsn
-    rc-update add shadowtlsn default || true
-    touch /var/log/shadowtls.log && chown root:root /var/log/shadowtls.log || true
-    rc-service shadowtlsn start || true
-    _info "OpenRC 服务部署自启配置完成！"
-}
-
-# ================== 打印配置详情 ==================
-print_node_info() {
-    IP=$(get_public_ip)
-    if [ ! -f "$STLS_Env" ] || [ ! -f "$SNELL_Conf" ]; then
-        _err "配置文件不存在，请先选择选项【1】进行安装初始化。" && return
-    fi
-    
-    local snell_port
-    local raw_listen=$(_get_conf_value "listen")
-    local first_listen="${raw_listen%%,*}"
-    snell_port=$(echo "$first_listen" | awk -F: '{print $NF}')
-    local psk=$(_get_conf_value "psk")
-    local dns_pref=$(_get_conf_value "dns-ip-preference")
-    
-    local show_listen_port=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "未知")
-    local stls_pwd=$(awk -F'=' '/^STLS_PASSWORD=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "未知")
-    
-    local raw_tls b_sni="未知"
-    raw_tls=$(awk -F'=' '/^STLS_TLS=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
-    if [ -n "$raw_tls" ]; then
-        b_sni=${raw_tls%:[0-9]*}
-    fi
-
-    echo -e "${GREEN}====== Snell v6 + Shadow-TLS v3 配置 ======${RESET}"
-    echo -e "${YELLOW} 入口公网 IP   : ${IP}${RESET}"
-    echo -e "${YELLOW} 入口公网端口   : ${show_listen_port}${RESET}"
-    echo -e "${YELLOW} Shadow-TLS 密码: ${stls_pwd}${RESET}"
-    echo -e "${YELLOW} SNI 伪装域名   : ${b_sni}${RESET}"
-    echo -e "${YELLOW} 内部 Snell 端口 : ${snell_port} ${RESET}"
-    echo -e "${YELLOW} Snell PSK 密钥 : ${psk}${RESET}"
-    echo -e "${YELLOW} DNS 家族优先级 : ${dns_pref}${RESET}"
-    echo -e "${YELLOW}-------------------------------------------------${RESET}"
-    _info "Surge 6 专属托管节点配置:"
-    if [ -f "${SNELL_DIR}/surge.txt" ]; then
-        cat "${SNELL_DIR}/surge.txt"
-        echo ""
-    else
-        echo "未生成配置"
-    fi
-    echo -e "${YELLOW}-------------------------------------------------${RESET}"
-}
-
-# ================== 动态配置交互流 ==================
-execute_configuration_flow() {
-    local is_modify_mode="$1"
-    
-    load_existing_config || true
-    
-    local snell_port psk dns tfo dns_pref stls_port stls_sni stls_pwd
-    local input_stls_port input_snell_port input_psk input_stls_pwd input_sni input_dns input_tfo input_dns_pref
-
-    while true; do
-        printf "请输入 Shadow-TLS 入口公网端口 (当前/默认: %s): " "${OLD_STLS_PORT:-443}"
-        read -r input_stls_port || input_stls_port=""
-        stls_port=${input_stls_port:-${OLD_STLS_PORT:-443}}
-
-        if echo "$stls_port" | grep -qE '^[0-9]+$' && [ "$stls_port" -ge 1 ] && [ "$stls_port" -le 65535 ]; then
-            if [ "$stls_port" != "$OLD_STLS_PORT" ]; then
-                check_port "$stls_port" || continue
-            fi
-            break
+        if [ "$(docker ps -q -f name=^mysql$)" ]; then
+            status="${GREEN}运行中${RESET}"
+            # 动态获取已创建的自定义数据库个数（剔除系统自带库）
+            db_count=$(docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SHOW DATABASES;" 2>/dev/null | grep -Ev "Database|information_schema|performance_schema|sys|mysql" | wc -l)
+            db_count="${YELLOW}${db_count//[[:space:]]/}${RESET} 个"
+        elif [ "$(docker ps -a -q -f name=^mysql$)" ]; then
+            status="${YELLOW}已停止${RESET}"
+            db_count="${YELLOW}未知 (请先启动容器)${RESET}"
         else
-            _err "端口格式不正确，必须在 1-65535 之间。"
+            status="${RED}未启动 (容器不存在)${RESET}"
+            db_count="${RED}0${RESET}"
         fi
-    done
-
-    while true; do
-        local default_snell_port=""
-        default_snell_port=${OLD_SNELL_PORT:-$(random_port || echo "38221")}
-        
-        printf "请输入内部本地 Snell 端口 (当前/随机: %s): " "$default_snell_port"
-        read -r input_snell_port || input_snell_port=""
-        snell_port=${input_snell_port:-$default_snell_port}
-
-        if echo "$snell_port" | grep -qE '^[0-9]+$' && [ "$snell_port" -ge 1 ] && [ "$snell_port" -le 65535 ]; then
-            if [ "$snell_port" -eq "$stls_port" ]; then
-                _err "内部 Snell 端口绝不能与外网公共入口端口相同！"
-                continue
-            fi
-            if [ "$snell_port" != "$OLD_SNELL_PORT" ]; then
-                check_port "$snell_port" || continue
-            fi
-            break
-        else
-            _err "端口格式不正确，必须在 1-65535 之间。"
-        fi
-    done
-
-    while true; do
-        local default_psk=""
-        default_psk=${OLD_SNELL_PSK:-$(random_key || echo "")}
-
-        printf "请输入 Snell PSK 密钥 (当前/随机: %s):\n> " "$default_psk"
-        read -r input_psk || input_psk=""
-        psk=${input_psk:-$default_psk}
-        if [ -n "$psk" ]; then break; else _err "PSK 密钥不能为空！"; fi
-    done
-
-    while true; do
-        local default_stls_pwd=""
-        default_stls_pwd=${OLD_STLS_PWD:-$(openssl rand -hex 8 2>/dev/null || echo "StlsPurePwd123456")}
-        
-        printf "请输入 Shadow-TLS 传输密码 (当前/随机: %s): " "$default_stls_pwd"
-        read -r input_stls_pwd || input_stls_pwd=""
-        stls_pwd=${input_stls_pwd:-$default_stls_pwd}
-        if [ -n "$stls_pwd" ]; then break; else _err "密码不能为空！"; fi
-    done
-
-    while true; do
-        local default_sni=${OLD_STLS_SNI:-"gateway.icloud.com"}
-        printf "请输入 Shadow-TLS SNI 伪装域名 (当前/默认: %s): " "$default_sni"
-        read -r input_sni || input_sni=""
-        stls_sni=${input_sni:-$default_sni}
-        if echo "$stls_sni" | grep -qE '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
-            break
-        else
-            _err "伪装域名格式不正确，请输入合法的域名 (如 gateway.icloud.com)"
-        fi
-    done
-
-    while true; do
-        local sys_dns=""
-        sys_dns=$(get_system_dns || echo "1.1.1.1,8.8.8.8")
-        local default_dns=${OLD_DNS:-$sys_dns}
-        
-        printf "请输入 Snell 内部自定义 DNS (当前/默认: %s): " "$default_dns"
-        read -r input_dns || input_dns=""
-        dns=${input_dns:-$default_dns}
-        if [ -n "$dns" ]; then break; else _err "DNS 不能为空！"; fi
-    done
-
-    # v6 高级 DNS 家族优先级引导
-    local default_dns_pref="${OLD_DNS_PREF:-default}"
-    echo -e "\n${YELLOW}请选择 Snell v6 DNS 解析 IP 家族优先级 (当前: $default_dns_pref)：${RESET}"
-    echo "1. default      (系统默认)"
-    echo "2. prefer-ipv4  (IPv4 优先)"
-    echo "3. prefer-ipv6  (IPv6 优先)"
-    echo "4. ipv4-only    (仅解析 IPv4)"
-    echo "5. ipv6-only    (仅解析 IPv6)"
-    printf "请选择序号 (直接回车保持不变): "
-    read -r input_dns_pref || input_dns_pref=""
-    case $input_dns_pref in
-        1) dns_pref="default" ;;
-        2) dns_pref="prefer-ipv4" ;;
-        3) dns_pref="prefer-ipv6" ;;
-        4) dns_pref="ipv4-only" ;;
-        5) dns_pref="ipv6-only" ;;
-        *) dns_pref="$default_dns_pref" ;;
-    esac
-
-    local default_tfo_str="开启"
-    [ "$OLD_TFO" = "false" ] && default_tfo_str="关闭"
-    printf "是否开启 TCP Fast Open？(当前: %s, 1.开启 2.关闭, 默认 1): " "$default_tfo_str"
-    read -r input_tfo || input_tfo=""
-    if [ "$input_tfo" = "1" ]; then tfo="true"; elif [ "$input_tfo" = "2" ]; then tfo="false"; else tfo="$OLD_TFO"; fi
-
-    write_config "$snell_port" "$psk" "$dns" "$tfo" "$dns_pref" "$stls_port" "$stls_sni" "$stls_pwd" || true
-    generate_links "$psk" "$tfo" "$stls_port" "$stls_sni" "$stls_pwd" || true
-}
-
-# ================== 核心 Alpine 部署与下载逻辑 (防 404/解压保底) ==================
-_download_and_install_binary() {
-    local sarch=$( _map_arch ) || { _err "不支持的架构"; return 1; }
-    
-    _info "正在安装 Alpine 必要系统依赖 (upx, unzip, curl, iproute2, openssl, shadow, gcompat)..."
-    apk add --no-cache upx unzip curl iproute2 openssl shadow gcompat >/dev/null 2>&1
-
-    _info "正在获取官方最新稳定版版本号..."
-    local version=$( _get_snell_latest_version )
-    version="${version#v}"
-
-    local tmp=$(mktemp -d)
-    local download_url_A="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
-    local download_url_B="https://dl.nssurge.com/snell/snell-server-${version}-linux-${sarch}.zip"
-    local download_url_C="https://dl.nssurge.com/snell/snell-server-v6.0.0b2-linux-${sarch}.zip"
-
-    _info "正在通过智能路由下载 Snell v6 核心组件..."
-    
-    if curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -o "$tmp/snell.zip" --connect-timeout 15 "$download_url_A" && unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
-        _info "方案 A (标准新版 v${version}) 下载并校验成功！"
-    elif curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o "$tmp/snell.zip" --connect-timeout 15 "$download_url_B" && unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
-        _info "方案 B (变体路径) 下载并校验成功！"
-    else
-        _warn "官方主动拦截或版本号未就绪，启动弹性回滚，下载 v6.0.0b2 保底包..."
-        if ! curl -sL -A "Mozilla/5.0" -o "$tmp/snell.zip" --connect-timeout 20 "$download_url_C" || ! unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
-            _err "所有下载源均被 Surge 防火墙拦截或网络超时，请稍后再试！"
-            rm -rf "$tmp"; return 1
-        fi
-        version="6.0.0b2"
-    fi
-
-    if unzip -oq "$tmp/snell.zip" -d "$tmp/"; then
-        _info "正在进行 UPX 壳解压兼容处理..."
-        if command -v upx >/dev/null 2>&1; then
-            upx -d "$tmp/snell-server" >/dev/null 2>&1 || _warn "UPX 脱壳失败或无需脱壳"
-        else
-            _err "UPX 工具不可用，无法完成解压"
-            rm -rf "$tmp"; return 1
-        fi
-
-        install -m 755 "$tmp/snell-server" "$SNELL_File"
-        rm -rf "$tmp"
-        echo "$version" > "${SNELL_DIR}/version.txt"
-        return 0
-    else
-        _err "解压失败"
-        rm -rf "$tmp"
-        return 1
     fi
 }
 
-# ================== 安装入口 ==================
-install_ss() {
-    _info "开始全新安装 Snell v6 & Shadow-TLS v3 核心组件..."
-    mkdir -p "$SNELL_DIR"
-
-    _download_and_install_binary
-
-    STLS_VERSION=$(get_latest_stls_version)
-    STLS_ARCH=$(detect_stls_arch)
-    _info "正在下载 Shadow-TLS ${STLS_VERSION}..."
-    wget -O "$TMP_DIR/shadow-tls" "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
-    install -m 755 "$TMP_DIR/shadow-tls" "$STLS_File"
-    echo "$STLS_VERSION" > "${SNELL_DIR}/stls_version.txt"
-
-    execute_configuration_flow false
-    service
-    service_stls
-
-    _info "服务安装部署成功，节点已启动运行！"
-    log "全新安装并初始化成功"
-    print_node_info
-}
-
-# ================== 修改现有配置 ==================
-modify_ss() {
-    _info "进入修改配置模块..."
-    if [ ! -f "$SNELL_Conf" ] || [ ! -f "$STLS_Env" ]; then
-        _err "错误：未检测到环境配置文件，请先选择选项【1】进行完整安装！"
-        return
-    fi
-    
-    _info "正在安全停止现有服务以防死锁..."
-    rc-service shadowtlsn stop >/dev/null 2>&1 || true
-    rc-service snell-tlss stop >/dev/null 2>&1 || true
-    
-    execute_configuration_flow true
-    
-    _info "正在通过 OpenRC 依赖链平滑安全启动服务..."
-    rc-service snell-tlss start || true
-    sleep 1 
-    rc-service shadowtlsn start || true
-    
-    _info "核心配置已被覆写，服务安全重启完毕！"
-    print_node_info
-    log "配置已被修改并安全应用"
-}
-
-# ================== 更新 ==================
-update_ss() {
-    _info "开始更新二进制组件..."
-    
-    _info "正在安全停止旧服务..."
-    rc-service shadowtlsn stop >/dev/null 2>&1 || true
-    rc-service snell-tlss stop >/dev/null 2>&1 || true
-    sleep 1
-
-    if [ -f "$SNELL_Conf" ]; then
-        _download_and_install_binary
-    fi
-
-    if [ -f "$STLS_Env" ]; then
-        STLS_VERSION=$(get_latest_stls_version)
-        STLS_ARCH=$(detect_stls_arch)
-        wget -O "$TMP_DIR/shadow-tls" "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
-        install -m 755 "$TMP_DIR/shadow-tls" "$STLS_File"
-        echo "$STLS_VERSION" > "${SNELL_DIR}/stls_version.txt"
-    fi
-
-    _info "正在重新拉起全新组件..."
-    rc-service snell-tlss start || true
-    sleep 1
-    rc-service shadowtlsn start || true
-    
-    _info "更新执行完毕，服务已安全重启"
-    log "更新组件成功"
-}
-
-# ================== 卸载 ==================
-uninstall_ss() {
-    _warn "正在卸载服务..."
-    rc-service shadowtlsn stop || true
-    rc-service snell-tlss stop || true
-    rc-update del shadowtlsn default || true
-    rc-update del snell-tlss default || true
-    rm -f /etc/init.d/snell-tlss /etc/init.d/shadowtlsn
-    rm -rf "$SNELL_DIR"
-    rm -f "$SNELL_File" "$STLS_File"
-    _info "卸载清理完毕"
-    log "安全卸载成功"
-}
-
-# ================== 独立日志查看子菜单 ==================
-check_logs() {
-    while true; do
-        clear
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${GREEN}         Snell + Shadow-TLS 日志面板        ${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${YELLOW}1. 查看 Snell 最新日志 (最后50行)${RESET}"
-        echo -e "${YELLOW}2. 实时追踪 Snell 日志 (Ctrl+C 退出)${RESET}"
-        echo -e "${YELLOW}-------------------------------------------${RESET}"
-        echo -e "${YELLOW}3. 查看 Shadow-TLS 最新日志 (最后50行)${RESET}"
-        echo -e "${YELLOW}4. 实时追踪 Shadow-TLS 日志 (Ctrl+C 退出)${RESET}"
-        echo -e "${YELLOW}===========================================${RESET}"
-        echo -e "${RED}0. 返回主菜单${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        printf "\033[32m请选择日志操作: \033[0m"
-        read -r log_choice || true
-        
-        case $log_choice in
-            1)
-                echo -e "\n${GREEN}====== Snell 运行日志 ======${RESET}"
-                if [ -f "/var/log/snell.log" ]; then tail -n 50 /var/log/snell.log; else _warn "暂无 Snell 日志文件"; fi
-                pause
-                ;;
-            2)
-                echo -e "\n${GREEN}====== 正在实时追踪 Snell 日志 (按 Ctrl+C 终止) ======${RESET}"
-                if [ -f "/var/log/snell.log" ]; then tail -f /var/log/snell.log; else _warn "日志文件不存在"; pause; fi
-                ;;
-            3)
-                echo -e "\n${GREEN}====== Shadow-TLS 运行日志 ======${RESET}"
-                if [ -f "/var/log/shadowtls.log" ]; then tail -n 50 /var/log/shadowtls.log; else _warn "暂无 Shadow-TLS 日志文件"; fi
-                pause
-                ;;
-            4)
-                echo -e "\n${GREEN}====== 正在实时追踪 Shadow-TLS 日志 (按 Ctrl+C 终止) ======${RESET}"
-                if [ -f "/var/log/shadowtls.log" ]; then tail -f /var/log/shadowtls.log; else _warn "日志文件不存在"; pause; fi
-                ;;
-            0) break ;;
-            *) _err "无效输入"; pause ;;
-        esac
-    done
-}
-
-# ================== 主菜单面板 ==================
-show_menu() {
+# ==================== 菜单 ====================
+function menu() {
     clear
-    local status_snell="${RED}● Snell未运行${RESET}"
-    local status_stls="${RED}● TLS未运行${RESET}"
+    get_sys_status
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     ◈  MySQL 容器管理面板 ◈     ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态       :${RESET} $status"
+    echo -e "${GREEN}版本       :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口       :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}已创数据库 :${RESET} $db_count"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1. 安装 MySQL${RESET}"
+    echo -e "${GREEN} 2. 更新 MySQL${RESET}"
+    echo -e "${GREEN} 3. 卸载 MySQL${RESET}"
+    echo -e "${GREEN} 4. 查看数据库信息${RESET}"
+    echo -e "${GREEN} 5. 启动 MySQL${RESET}"
+    echo -e "${GREEN} 6. 停止 MySQL${RESET}"
+    echo -e "${GREEN} 7. 重启 MySQL${RESET}"
+    echo -e "${GREEN} 8. 查看运行日志${RESET}"
+    echo -e "${GREEN} 9. 创建数据库${RESET}"
+    echo -e "${GREEN}10. 删除数据库${RESET}"
+    echo -e "${GREEN}11. 创建用户并授权${RESET}"
+    echo -e "${GREEN}12. 一键创建库+用户${RESET}"
+    echo -e "${GREEN}13. 修改用户密码${RESET}"
+    echo -e "${GREEN}14. 备份数据库${RESET}"
+    echo -e "${GREEN}15. 恢复数据库${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     
-    rc-service snell-tlss status >/dev/null 2>&1 && status_snell="${GREEN}● Snell运行中${RESET}"
-    rc-service shadowtlsn status >/dev/null 2>&1 && status_stls="${GREEN}● TLS运行中${RESET}"
-
-    local v_snell="未安装" && [ -f "${SNELL_DIR}/version.txt" ] && v_snell="$(cat "${SNELL_DIR}/version.txt")"
-    local v_stls="未安装" && [ -f "${SNELL_DIR}/stls_version.txt" ] && v_stls="$(cat "${SNELL_DIR}/stls_version.txt")"
-    
-    local p_stls="-"
-    if [ -f "$STLS_Env" ]; then 
-        p_stls=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "-")
-    fi
-    local p_snell="-"
-    if [ -f "$SNELL_Conf" ]; then
-        local raw_listen=$(_get_conf_value "listen")
-        local first_listen="${raw_listen%%,*}"
-        p_snell=$(echo "$first_listen" | awk -F: '{print $NF}')
-    fi
-
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}       Snell v6 + Shadow-TLS 面板 (Alpine) ${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}服务状态 :${RESET} ${status_snell} | ${status_stls}"
-    echo -e "${GREEN}组件版本 :${RESET} ${YELLOW}Snell: v${v_snell}${RESET} | ${YELLOW}Shadow-TLS: ${v_stls}${RESET}"
-    echo -e "${GREEN}运行端口 :${RESET} ${YELLOW}外网(TLS): ${p_stls}${RESET} | ${YELLOW}内部(Snell): ${p_snell}${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}1. 安装 Snell + Shadow-TLS${RESET}"
-    echo -e "${GREEN}2. 更新 Snell + Shadow-TLS${RESET}"
-    echo -e "${GREEN}3. 卸载 Snell + Shadow-TLS${RESET}"
-    echo -e "${GREEN}4. 修改配置 (高级双栈与DNS优先级)${RESET}"
-    echo -e "${GREEN}5. 启动 Snell + Shadow-TLS${RESET}"
-    echo -e "${GREEN}6. 停止 Snell + Shadow-TLS${RESET}"
-    echo -e "${GREEN}7. 重启 Snell + Shadow-TLS${RESET}"
-    echo -e "${GREEN}8. 查看运行日志 (分类排查)${RESET}"
-    echo -e "${GREEN}9. 查看节点配置 (直接复制链接)${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
+    read -p $'\e[32m请输入数字: \e[0m' num
+    case "$num" in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) show_info ;;
+        5) start_mysql ;;
+        6) stop_mysql ;;
+        7) restart_mysql ;;
+        8) view_logs ;;
+        9) create_database ;;
+        10) delete_database ;;
+        11) create_user ;;
+        12) create_db_user ;;
+        13) change_password ;;
+        14) backup_db ;;
+        15) restore_db ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+    esac
 }
 
-# ================== 主循环 ==================
-while true; do
-    show_menu
-    printf "\033[32m请输入选项: \033[0m"
-    read -r choice || true
-    case $choice in
-        1) install_ss; pause ;;
-        2) update_ss; pause ;;
-        3) uninstall_ss; pause ;;
-        4) modify_ss; pause ;;
-        5) rc-service snell-tlss start || true; rc-service shadowtlsn start || true; _info "服务已启动"; pause ;;
-        6) rc-service shadowtlsn stop || true; rc-service snell-tlss stop || true; _info "服务已停止"; pause ;;
-        7) rc-service snell-tlss restart || true; rc-service shadowtlsn restart || true; _info "服务已重启"; pause ;;
-        8) check_logs ;;
-        9) print_node_info; pause ;;
-        0) exit 0 ;;
-        *) _err "无效输入" ; pause ;;
-    esac
-done
+# ==================== 功能实现 ====================
+
+function install_app() {
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}检测到已经安装过 MySQL。${RESET}"
+        pause; menu
+    fi
+    read -p "请输入 MySQL 端口 [默认 3306]: " input_port
+    PORT=${input_port:-3306}
+    read -p "请输入 root 密码 [留空自动生成]: " input_pass
+    ROOT_PASSWORD=${input_pass:-$(gen_pass)}
+
+    mkdir -p "$APP_DIR/data" "$APP_DIR/config" "$BACKUP_DIR"
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  mysql-db:
+    container_name: mysql
+    image: mysql:8.0
+    restart: always
+    ports:
+      - "${PORT}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${ROOT_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/var/lib/mysql
+      - ./config:/etc/mysql/conf.d
+EOF
+    cat > "$CONFIG_FILE" <<EOF
+PORT=$PORT
+ROOT_PASSWORD=$ROOT_PASSWORD
+EOF
+    cd "$APP_DIR" && $COMPOSE_CMD up -d
+    echo -e "${GREEN}✅ MySQL 安装启动成功！${RESET}"
+    pause; menu
+}
+
+function update_app() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录，请先安装${RESET}"; sleep 1; menu; fi
+    cd "$APP_DIR" && $COMPOSE_CMD pull && $COMPOSE_CMD up -d
+    echo -e "${GREEN}✅ MySQL 已更新并重启${RESET}"
+    pause; menu
+}
+
+function uninstall_app() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; fi
+    read -p "确定要彻底卸载吗？数据将清空！(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" || "$confirm" == "yes" ]]; then
+        cd "$APP_DIR" && $COMPOSE_CMD down -v
+        rm -rf "$APP_DIR"
+        echo -e "${GREEN}✅ MySQL 已彻底卸载${RESET}"
+    else
+        echo -e "${YELLOW}已取消卸载${RESET}"
+    fi
+    pause; menu
+}
+
+function start_mysql() {
+    docker start mysql &>/dev/null
+    echo -e "${GREEN}✅ MySQL 容器已启动${RESET}"
+    pause; menu
+}
+
+function stop_mysql() {
+    docker stop mysql &>/dev/null
+    echo -e "${GREEN}✅ MySQL 容器已停止${RESET}"
+    pause; menu
+}
+
+function restart_mysql() {
+    docker restart mysql &>/dev/null
+    echo -e "${GREEN}✅ MySQL 容器已重启${RESET}"
+    pause; menu
+}
+
+function view_logs() {
+    echo -e "${YELLOW}提示: 朝下滚动，按下 Ctrl + C 即可退出日志回到主菜单。${RESET}"
+    sleep 1
+    docker logs --tail 100 -f mysql
+    menu
+}
+
+function show_info() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    SERVER_IP=$(get_public_ip)
+    
+    echo -e "\n${GREEN}====== MySQL 运行信息 ======${RESET}"
+    echo -e "${GREEN}连接地址 :${RESET} ${SERVER_IP}:${PORT}"
+    echo -e "${GREEN}root密码 :${RESET} ${YELLOW}${ROOT_PASSWORD}${RESET}"
+    echo -e "${GREEN}安装路径 :${RESET} $APP_DIR"
+    echo -e "${GREEN}================================${RESET}"
+    
+    echo -e "${GREEN}当前数据库列表:${RESET}"
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SHOW DATABASES;" | grep -Ev "Database|information_schema|performance_schema|sys|mysql"
+    
+    echo -e "\n${GREEN}当前自定义用户:${RESET}"
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SELECT user, host FROM mysql.user;" | grep -Ev "user|root|mysql.sys|mysql.session|mysql.infoschema"
+    echo -e "${GREEN}================================${RESET}"
+    pause; menu
+}
+
+function create_database() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    read -p "请输入新数据库名: " new_db
+    if [ -z "$new_db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
+    read -p "请输入字符集(默认 utf8mb4): " charset
+    charset=${charset:-utf8mb4}
+    
+    local collate=""
+    [ "$charset" = "utf8mb4" ] && collate="COLLATE utf8mb4_0900_ai_ci"
+
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
+CREATE DATABASE IF NOT EXISTS \`$new_db\` CHARACTER SET $charset $collate;
+EOF
+    echo -e "${YELLOW}✅ 数据库 $new_db 已尝试创建${RESET}"
+    pause; menu
+}
+
+function delete_database() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    
+    echo -e "${GREEN}当前可删除的数据库列表:${RESET}"
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SHOW DATABASES;" | grep -Ev "Database|information_schema|performance_schema|sys|mysql"
+    echo "--------------------------------"
+    read -p "请输入要删除的数据库名: " del_db
+    
+    if [ -z "$del_db" ]; then
+        echo -e "${RED}输入不能为空！${RESET}"
+        pause; menu
+    fi
+    
+    read -p "警告：确定要彻底删除数据库 [$del_db] 吗？数据将不可恢复！(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" || "$confirm" == "yes" ]]; then
+        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "DROP DATABASE \`$del_db\`;" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✅ 数据库 $del_db 删除成功。${RESET}"
+        else
+            echo -e "${RED}❌ 删除失败，请确认数据库名是否存在或属于系统关键库。${RESET}"
+        fi
+    else
+        echo -e "${YELLOW}操作已取消。${RESET}"
+    fi
+    pause; menu
+}
+
+function create_user() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    read -p "请输入新用户名: " new_user
+    if [ -z "$new_user" ]; then echo -e "${RED}用户名不能为空！${RESET}"; pause; menu; fi
+    read -p "请输入新用户密码 [留空随机]: " new_pass
+    new_pass=${new_pass:-$(gen_pass)}
+    read -p "授权数据库名 (输入 * 代表全部): " grant_db
+
+    local target="\`$grant_db\`.*"
+    [ "$grant_db" = "*" ] && target="*.*"
+
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
+CREATE USER IF NOT EXISTS '$new_user'@'%' IDENTIFIED BY '$new_pass';
+GRANT ALL PRIVILEGES ON $target TO '$new_user'@'%';
+FLUSH PRIVILEGES;
+EOF
+    echo -e "${YELLOW}✅ 用户 $new_user 创建成功。密码: $new_pass${RESET}"
+    pause; menu
+}
+
+function create_db_user() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    read -p "新数据库名: " new_db
+    read -p "新用户名: " new_user
+    if [[ -z "$new_db" || -z "$new_user" ]]; then echo -e "${RED}库名和用户名不能为空！${RESET}"; pause; menu; fi
+    read -p "密码 [留空随机]: " new_pass
+    new_pass=${new_pass:-$(gen_pass)}
+
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
+CREATE DATABASE IF NOT EXISTS \`$new_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE USER IF NOT EXISTS '$new_user'@'%' IDENTIFIED BY '$new_pass';
+GRANT ALL PRIVILEGES ON \`$new_db\`.* TO '$new_user'@'%';
+FLUSH PRIVILEGES;
+EOF
+    echo -e "${YELLOW}✅ 联动创建成功。用户: $new_user 密码: $new_pass${RESET}"
+    pause; menu
+}
+
+function change_password() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    
+    echo -e "${GREEN}当前系统中的自定义用户:${RESET}"
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SELECT user, host FROM mysql.user;" | grep -Ev "user|mysql.sys|mysql.session|mysql.infoschema"
+    echo "--------------------------------"
+    
+    read -p "请输入要修改密码的用户名 [默认 root]: " target_user
+    target_user=${target_user:-root}
+    read -p "请输入新密码 [留空随机生成]: " new_pass
+    new_pass=${new_pass:-$(gen_pass)}
+
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
+ALTER USER '$target_user'@'%' IDENTIFIED BY '$new_pass';
+FLUSH PRIVILEGES;
+EOF
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✅ 用户 '$target_user' 密码修改成功！新密码: ${YELLOW}$new_pass${RESET}"
+        
+        if [ "$target_user" = "root" ]; then
+            echo -e "${YELLOW}检测到修改了 root 密码，正在同步本地配置文件...${RESET}"
+            sed -i "s/^ROOT_PASSWORD=.*/ROOT_PASSWORD=$new_pass/g" "$CONFIG_FILE"
+            sed -i "s/MYSQL_ROOT_PASSWORD:.*/MYSQL_ROOT_PASSWORD: $new_pass/g" "$COMPOSE_FILE"
+            echo -e "${GREEN}✅ 本地配置文件已同步更新。${RESET}"
+        fi
+    else
+        echo -e "${RED}❌ 密码修改失败，请检查用户是否存在。${RESET}"
+    fi
+    pause; menu
+}
+
+function backup_db() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    mkdir -p "$BACKUP_DIR"
+    read -p "要备份的库名 (全库输入 --all-databases): " db
+    if [ -z "$db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
+    
+    local filename="$db"
+    [ "$db" = "--all-databases" ] && filename="all"
+    BACKUP_FILE="$BACKUP_DIR/${filename}_$(date +%Y%m%d_%H%M%S).sql"
+    
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysqldump -uroot --default-character-set=utf8mb4 "$db" > "$BACKUP_FILE"
+    if [ $? -eq 0 ] && [ -s "$BACKUP_FILE" ]; then
+        echo -e "${YELLOW}✅ 备份完成: $BACKUP_FILE${RESET}"
+    else
+        echo -e "${RED}❌ 备份失败，请核对数据库名是否正确。${RESET}"
+        rm -f "$BACKUP_FILE"
+    fi
+    pause; menu
+}
+
+function restore_db() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    if [ ! -d "$BACKUP_DIR" ] || [ -z "$(ls -A "$BACKUP_DIR")" ]; then
+        echo -e "${RED}❌ 没有找到备份文件${RESET}"; pause; menu
+    fi
+    echo -e "${GREEN}可用备份:${RESET}"
+    ls -1 "$BACKUP_DIR"
+    read -p "请输入完整备份文件名: " file
+    if [ ! -f "$BACKUP_DIR/$file" ]; then
+        echo -e "${RED}❌ 备份文件不存在，请重新核对！${RESET}"; pause; menu
+    fi
+    read -p "目标数据库名 (全库备份直接回车): " target_db
+
+    if [ -z "$target_db" ]; then
+        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot < "$BACKUP_DIR/$file"
+    else
+        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "CREATE DATABASE IF NOT EXISTS \`$target_db\`;"
+        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot "$target_db" < "$BACKUP_DIR/$file"
+    fi
+    echo -e "${YELLOW}✅ 导入指令执行完毕${RESET}"
+    pause; menu
+}
+
+# ==================== 启动 ====================
+menu

@@ -1,1214 +1,862 @@
 #!/bin/bash
+# ========================================
+# 🐳 一键 VPS Docker 管理工具
+# ========================================
 
-# =======================================================================
-# 🦞 OpenClaw 一键管理面板
-# =======================================================================
-
-# 终端高亮颜色定义
+# -----------------------------
+# 颜色
+# -----------------------------
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
-BLUE="\033[34m"
+CYAN="\033[36m"
+BOLD="\033[1m"
 RESET="\033[0m"
-
-gl_lv="\033[32m"
-gl_huang="\033[33m"
-gl_hong="\033[31m"
-gl_bai="\033[0m"
-
-# 全局环境静态参数
-ENABLE_STATS="true"
-gh_proxy=""
-
-# 统一获取 OpenClaw 配置文件路径
-openclaw_get_config_file() {
-    echo "${HOME}/.openclaw/openclaw.json"
+BLUE="\033[34m"
+# -----------------------------
+# 检查 root
+# -----------------------------
+root_use() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}请使用 root 用户运行脚本${RESET}"
+        exit 1
+    fi
 }
 
+# -----------------------------
+# 重启 Docker 并恢复容器端口映射
+# -----------------------------
+restart_docker() {
+    root_use
+    echo -e "${YELLOW}正在重启 Docker...${RESET}"
 
-# 辅助函数：按键返回
-break_end() {
-    echo -e "\n${GREEN}----------------------------------------${RESET}"
-    read -n 1 -s -r -p "按任意键返回主菜单..."
-    echo
-}
+    if systemctl list-unit-files | grep -q "^docker.service"; then
+        systemctl restart docker
+    else
+        pkill dockerd 2>/dev/null
+        nohup dockerd >/dev/null 2>&1 &
+        sleep 5
+    fi
 
-# 辅助函数：基础依赖检查与安装
-install() {
-    for pkg in "$@"; do
-        if ! command -v "$pkg" &>/dev/null; then
-            echo "正在安装系统依赖: $pkg..."
-            if command -v apt &>/dev/null; then
-                sudo apt update -y && sudo apt install -y "$pkg"
-            elif command -v dnf &>/dev/null; then
-                sudo dnf install -y "$pkg"
-            elif command -v yum &>/dev/null; then
-                sudo yum install -y "$pkg"
-            fi
-        fi
-    done
-}
-
-# 状态遥测发送函数
-send_stats() {
-    :
-}
-
-# 动态获取 OpenClaw 状态、配置数以及核心版本号
-get_openclaw_status() {
-    # 1. 检测运行状态
-    if command -v openclaw &>/dev/null; then
-        if pgrep -f "openclaw gateway" &>/dev/null || pgrep -f "gateway" &>/dev/null; then
-            STATUS="${GREEN}运行中${RESET}"
+    if docker info &>/dev/null; then
+        echo -e "${GREEN}✅ Docker 已成功重启${RESET}"
+        containers=$(docker ps -a -q)
+        if [ -n "$containers" ]; then
+            echo -e "${CYAN}正在重启所有容器以恢复端口映射...${RESET}"
+            docker restart $containers
+            echo -e "${GREEN}✅ 所有容器已重启并恢复端口映射${RESET}"
         else
-            STATUS="${RED}已停止${RESET}"
-        fi
-        # 2. 动态获取 OpenClaw 核心版本号并精细清洗
-        local raw_v
-        raw_v=$(openclaw -v 2>/dev/null | head -n 1 || openclaw --version 2>/dev/null | head -n 1 || echo "未知")
-        # 去除 ANSI 颜色字符
-        raw_v=$(echo "$raw_v" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g")
-        # 精准提取 "OpenClaw " 后面的所有内容
-        if [[ "$raw_v" =~ OpenClaw[[:space:]]+(.*) ]]; then
-            OPENCLAW_VERSION="${BASH_REMATCH[1]}"
-        else
-            # 如果没匹配到，则兜底取最后两列
-            OPENCLAW_VERSION=$(echo "$raw_v" | awk '{if(NF>1) print $(NF-1)" "$NF; else print $1}')
+            echo -e "${YELLOW}没有容器需要重启${RESET}"
         fi
     else
-        STATUS="${RED}未安装 (Not Installed)${RESET}"
-        OPENCLAW_VERSION="${RED}未安装${RESET}"
-    fi
-
-    # 3. 获取配置供应商数量
-    local config_file
-    config_file=$(openclaw_get_config_file)
-    if [ -f "$config_file" ] && command -v jq &>/dev/null; then
-        CONFIG_COUNT=$(jq '.models.providers | length' "$config_file" 2>/dev/null || echo "0")
-    else
-        CONFIG_COUNT="0"
+        echo -e "${RED}❌ Docker 重启失败，请检查日志${RESET}"
     fi
 }
 
-
-# 用于在机器人菜单头部展示本地状态的区块
-openclaw_show_bot_local_status_block() {
-    local config_file
-    config_file=$(openclaw_get_config_file)
-    if [ -f "$config_file" ] && command -v jq &>/dev/null; then
-        local port
-        port=$(jq -r '.gateway.port // .port // "9000"' "$config_file" 2>/dev/null)
-        echo -e " 本地网关端口: ${YELLOW}${port}${RESET}"
-        echo -n " 接口监听状态: "
-        if command -v ss &>/dev/null; then
-            if ss -tlnp | grep -q "$port"; then echo -e "${GREEN}正常监听中${RESET}"; else echo -e "${RED}未监听 (请先启动网关)${RESET}"; fi
+# -----------------------------
+# 检测 Docker 是否安装并运行
+# -----------------------------
+check_docker_running() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}❌ Docker 未安装，请先安装 Docker${RESET}"
+        return 1
+    fi
+    if ! docker info &>/dev/null; then
+        echo -e "${YELLOW} Docker 未运行，尝试启动...${RESET}"
+        if systemctl list-unit-files | grep -q "^docker.service"; then
+            systemctl start docker
         else
-            if netstat -tlnp | grep -q "$port"; then echo -e "${GREEN}正常监听中${RESET}"; else echo -e "${RED}未监听 (请先启动网关)${RESET}"; fi
+            nohup dockerd >/dev/null 2>&1 &
+            sleep 5
         fi
+    fi
+    if ! docker info &>/dev/null; then
+        echo -e "${RED}❌ Docker 启动失败，请检查日志${RESET}"
+        return 1
+    fi
+    return 0
+}
+
+# -----------------------------
+# 自动检测国内/国外
+# -----------------------------
+detect_country() {
+    local country=$(curl -s --max-time 5 ipinfo.io/country)
+    if [[ "$country" == "CN" ]]; then
+        echo "CN"
     else
-        echo -e " 提示: ${RED}未检测到有效配置，请先执行配置向导。${RESET}"
+        echo "OTHER"
     fi
 }
 
-# 重启消息网关后台
-start_gateway() {
-    echo "🔄 正在重启 OpenClaw Gateway..."
-    openclaw gateway stop >/dev/null 2>&1
-    sleep 1
-    openclaw gateway start
-    sleep 3
-}
-
-# 安装环境所依赖的 Node 及编译工具树
-install_node_and_tools() {
-    if command -v dnf &>/dev/null; then
-        curl -fsSL https://rpm.nodesource.com/setup_24.x | sudo bash -
-        sudo dnf update -y
-        sudo dnf group install -y "Development Tools" "Development Libraries"
-        sudo dnf install -y cmake libatomic nodejs
-    fi
-
-    if command -v apt &>/dev/null; then
-        curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
-        sudo apt update -y
-        sudo apt install build-essential python3 libatomic1 nodejs -y
-    fi
-}
-
-# 同步指定或全量 Sessions 默认模型
-openclaw_sync_sessions_model() {
-    local target_model="$1"
-    echo "🎯 全局会话默认模型已同步变变成: $target_model"
-}
-
-# =======================================================================
-# 核心数据操作区域 (包含 Python / JQ 以及机器人对接子选单)
-# =======================================================================
-
-# 1. 安装 OpenClaw 环境
-install_moltbot() {
-    echo "开始安装 OpenClaw..."
-    send_stats "开始安装 OpenClaw..."
-    install git jq curl python3 tmux
-
-    install_node_and_tools
-
-    local country
-    country=$(curl -s --max-time 3 ipinfo.io/country)
-    if [[ "$country" == "CN" || "$country" == "HK" ]]; then
-        npm config set registry https://registry.npmmirror.com
-    fi
-
-    git config --global url."${gh_proxy}github.com/".insteadOf ssh://git@github.com/
-    git config --global url."${gh_proxy}github.com/".insteadOf git@github.com:
-
-    sudo npm install -g openclaw@latest
-    openclaw onboard --install-daemon
-    start_gateway
-    break_end
-}
-
-# 4. 状态日志查看
-view_logs() {
-    echo "📋 查看 OpenClaw 状态日志"
-    send_stats "查看 OpenClaw 日志"
-    openclaw status
-    echo "----------------------------------------"
-    openclaw gateway status
-    echo "💡 提示: 正在加载实时日志流，按 Ctrl+C 可退出当前日志模式"
-    sleep 2
-    openclaw logs
-    break_end
-}
-
-
-# ==============================================================================
-# OpenClaw API & 模型管理核心模块 
-# ==============================================================================
-
-# 构造模型配置 JSON
-build-openclaw-provider-models-json() {
-    local provider_name="$1"
-    local model_ids="$2"
-    local models_array="["
-    local first=true
-
-    while read -r model_id; do
-        [ -z "$model_id" ] && continue
-        [[ $first == false ]] && models_array+=","
-        first=false
-
-        local context_window=1048576
-        local max_tokens=128000
-        local input_cost=0.15
-        local output_cost=0.60
-
-        case "$model_id" in
-            *opus*|*pro*|*preview*|*thinking*|*sonnet*)
-                input_cost=2.00
-                output_cost=12.00
-                ;;
-            *gpt-5*|*codex*)
-                input_cost=1.25
-                output_cost=10.00
-                ;;
-            *flash*|*lite*|*haiku*|*mini*|*nano*)
-                input_cost=0.10
-                output_cost=0.40
-                ;;
-        esac
-
-        models_array+=$(cat <<EOF
+# -----------------------------
+# 安装/更新 Docker
+# -----------------------------
+docker_install() {
+    root_use
+    local country=$(detect_country)
+    echo -e "${CYAN}检测到国家: $country${RESET}"
+    if [ "$country" = "CN" ]; then
+        echo -e "${YELLOW}使用国内源安装 Docker...${RESET}"
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sh get-docker.sh
+        mkdir -p /etc/docker
+        cat > /etc/docker/daemon.json << EOF
 {
-    "id": "$model_id",
-    "name": "$provider_name / $model_id",
-    "input": ["text", "image"],
-    "contextWindow": $context_window,
-    "maxTokens": $max_tokens,
-    "cost": {
-        "input": $input_cost,
-        "output": $output_cost,
-        "cacheRead": 0,
-        "cacheWrite": 0
-    }
+  "registry-mirrors": [
+    "https://docker.0.unsee.tech",
+    "https://docker.1panel.live",
+    "https://registry.dockermirror.com",
+    "https://docker.m.daocloud.io"
+  ]
 }
 EOF
-)
-    done <<< "$model_ids"
-
-    models_array+="]"
-    echo "$models_array"
-}
-
-# 写入 provider 与模型配置
-write-openclaw-provider-models() {
-    local provider_name="$1"
-    local base_url="$2"
-    local api_key="$3"
-    local models_array="$4"
-    local config_file
-    config_file=$(openclaw_get_config_file)
-
-    DETECTED_API="openai-completions"
-
-    [[ -f "$config_file" ]] && cp "$config_file" "${config_file}.bak.$(date +%s)"
-
-    jq --arg prov "$provider_name" \
-       --arg url "$base_url" \
-       --arg key "$api_key" \
-       --arg api "$DETECTED_API" \
-       --argjson models "$models_array" \
-    '
-    .models |= (
-        (. // { mode: "merge", providers: {} })
-        | .mode = "merge"
-        | .providers[$prov] = {
-            baseUrl: $url,
-            apiKey: $key,
-            api: $api,
-            models: $models
-        }
-    )
-    | .agents |= (. // {})
-    | .agents.defaults |= (. // {})
-    | .agents.defaults.models |= (
-        (if type == "object" then .
-         elif type == "array" then reduce .[] as $m ({}; if ($m|type) == "string" then .[$m] = {} else . end)
-         else {}
-         end) as $existing
-        | reduce ($models[]? | .id? // empty | tostring) as $mid (
-            $existing;
-            if ($mid | length) > 0 then
-                .["\($prov)/\($mid)"] //= {}
-            else
-                .
-            end
-        )
-    )
-    ' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
-}
-
-# 核心函数：获取并添加所有模型
-add-all-models-from-provider() {
-    local provider_name="$1"
-    local base_url="$2"
-    local api_key="$3"
-
-    echo "🔍 正在获取 $provider_name 的所有可用模型..."
-
-    local models_json=$(curl -s -m 10 \
-        -H "Authorization: Bearer $api_key" \
-        "${base_url}/models")
-
-    if [[ -z "$models_json" ]]; then
-        echo "❌ 无法获取模型列表"
-        return 1
-    fi
-
-    local model_ids=$(echo "$models_json" | grep -oP '"id":\s*"\K[^"]+')
-
-    if [[ -z "$model_ids" ]]; then
-        echo "❌ 未找到任何模型"
-        return 1
-    fi
-
-    local model_count=$(echo "$model_ids" | wc -l)
-    echo "✅ 发现 $model_count 个模型"
-
-    local models_array
-    models_array=$(build-openclaw-provider-models-json "$provider_name" "$model_ids")
-
-    write-openclaw-provider-models "$provider_name" "$base_url" "$api_key" "$models_array"
-
-    if [[ $? -eq 0 ]]; then
-        echo "✅ 成功添加 $model_count 个模型到 $provider_name"
-        echo "📦 模型引用格式: $provider_name/<model-id>"
-        return 0
     else
-        echo "❌ 配置注入失败"
-        return 1
+        echo -e "${YELLOW}使用官方源安装 Docker...${RESET}"
+        curl -fsSL https://get.docker.com | sh
     fi
+    systemctl enable docker
+    systemctl start docker
+    echo -e "${GREEN}Docker 安装完成并已启动（已设置开机自启）${RESET}"
 }
 
-# 仅添加默认模型并保留 provider
-add-default-model-only-to-provider() {
-    local provider_name="$1"
-    local base_url="$2"
-    local api_key="$3"
-    local default_model="$4"
+docker_update() {
+    root_use
+    echo -e "${YELLOW}正在更新 Docker...${RESET}"
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sh get-docker.sh
+    systemctl enable docker
+    systemctl restart docker
+    echo -e "${GREEN}Docker 更新完成并已启动（已设置开机自启）${RESET}"
+}
 
-    if [[ -z "$default_model" ]]; then
-        echo "❌ 默认模型不能为空"
-        return 1
-    fi
-
-    local models_array
-    models_array=$(build-openclaw-provider-models-json "$provider_name" "$default_model")
-
-    write-openclaw-provider-models "$provider_name" "$base_url" "$api_key" "$models_array"
-
-    if [[ $? -eq 0 ]]; then
-        echo "✅ 已添加 provider：$provider_name"
-        echo "✅ 仅写入默认模型：$default_model"
-        return 0
+docker_install_update() {
+    root_use
+    if command -v docker &>/dev/null; then
+        docker_update
     else
-        echo "❌ 配置注入失败"
-        return 1
+        docker_install
     fi
 }
 
-# 交互式添加 API 供应商引导
-add-openclaw-provider-interactive() {
-    send_stats "OpenClaw API添加"
-    echo "=== 交互式添加 OpenClaw Provider ==="
+# -----------------------------
+# 卸载 Docker
+# -----------------------------
+docker_uninstall() {
+    root_use
+    echo -e "${RED}正在卸载 Docker 和 Docker Compose...${RESET}"
+    systemctl stop docker 2>/dev/null
+    systemctl disable docker 2>/dev/null
+    pkill dockerd 2>/dev/null
 
-    read -erp "请输入 Provider 名称 (如: deepseek): " provider_name
-    while [[ -z "$provider_name" ]]; do
-        echo "❌ Provider 名称不能为空"
-        read -erp "请输入 Provider 名称: " provider_name
-    done
+    if command -v apt &>/dev/null; then
+        apt remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
+        apt purge -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
+        apt autoremove -y
+    elif command -v yum &>/dev/null; then
+        yum remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
+    fi
 
-    read -erp "请输入 Base URL (如: https://api.xxx.com/v1): " base_url
-    while [[ -z "$base_url" ]]; do
-        echo "❌ Base URL 不能为空"
-        read -erp "请输入 Base URL: " base_url
-    done
-    base_url="${base_url%/}"
+    rm -rf /var/lib/docker /etc/docker /var/lib/containerd /var/run/docker.sock /usr/local/bin/docker-compose
+    echo -e "${GREEN}Docker 和 Docker Compose 已卸载干净${RESET}"
+}
 
-    read -rsp "请输入 API Key (输入不显示): " api_key
-    echo
-    while [[ -z "$api_key" ]]; do
-        echo "❌ API Key 不能为空"
-        read -rsp "请输入 API Key: " api_key
-        echo
-    done
-
-    echo "🔍 正在获取可用模型列表..."
-    local models_json
-    models_json=$(curl -s -m 10 \
-        -H "Authorization: Bearer $api_key" \
-        "${base_url}/models")
-
-    local available_models=""
-    local model_count=0
-    local model_list=()
-
-    if [[ -n "$models_json" ]]; then
-        available_models=$(echo "$models_json" | grep -oP '"id":\s*"\K[^"]+' | sort)
-
-        if [[ -n "$available_models" ]]; then
-            model_count=$(echo "$available_models" | wc -l)
-            echo "✅ 发现 $model_count 个可用模型："
-            echo "--------------------------------"
-            local i=1
-            while read -r model; do
-                echo "[$i] $model"
-                model_list+=("$model")
-                ((i++))
-            done <<< "$available_models"
-            echo "--------------------------------"
+# -----------------------------
+# Docker Compose 安装/更新
+# -----------------------------
+docker_compose_install_update() {
+    root_use
+    echo -e "${CYAN}正在安装/更新 Docker Compose...${RESET}"
+    if ! command -v jq &>/dev/null; then
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y jq
+        elif command -v yum &>/dev/null; then
+            yum install -y jq
         fi
     fi
+    local latest=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
+    latest=${latest:-"v2.30.0"}
+    curl -L "https://github.com/docker/compose/releases/download/$latest/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+    echo -e "${GREEN}Docker Compose 已安装/更新到版本 $latest${RESET}"
+}
 
-    echo
-    read -erp "请输入默认 Model ID (或序号，留空则使用第一个): " input_model
-
-    local default_model=""
-    if [[ -z "$input_model" && -n "$available_models" ]]; then
-        default_model=$(echo "$available_models" | head -1)
-        echo "🎯 使用第一个模型: $default_model"
-    elif [[ "$input_model" =~ ^[0-9]+$ ]] && [ "${#model_list[@]}" -gt 0 ] && [ "$input_model" -ge 1 ] && [ "$input_model" -le "${#model_list[@]}" ]; then
-        default_model="${model_list[$((input_model-1))]}"
-        echo "🎯 已选择模型: $default_model"
+# -----------------------------
+# Docker IPv6
+# -----------------------------
+docker_ipv6_on() {
+    root_use
+    mkdir -p /etc/docker
+    if [ -f /etc/docker/daemon.json ]; then
+        jq '. + {ipv6:true,"fixed-cidr-v6":"fd00::/64"}' /etc/docker/daemon.json 2>/dev/null \
+            >/etc/docker/daemon.json.tmp || \
+            echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
     else
-        default_model="$input_model"
+        echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
     fi
+    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+    restart_docker
+    docker ps -a -q | xargs -r docker start
+    echo -e "${GREEN}✅ Docker IPv6 已开启，所有容器已恢复${RESET}"
+}
 
-    echo
-    echo "====== 确认信息 ======"
-    echo "Provider    : $provider_name"
-    echo "Base URL    : $base_url"
-    echo "API Key     : ${api_key:0:8}****"
-    echo "默认模型    : $default_model"
-    echo "模型总数    : $model_count"
-    echo "======================"
-
-    read -erp "是否同时添加其他所有可用模型？(y/N): " confirm
-
-    install jq
-    local add_result=1
-    local finish_msg=""
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        add-all-models-from-provider "$provider_name" "$base_url" "$api_key"
-        add_result=$?
-        finish_msg="✅ 完成！所有 $model_count 个模型已加载"
+docker_ipv6_off() {
+    root_use
+    if [ -f /etc/docker/daemon.json ]; then
+        jq 'del(.ipv6) | del(.["fixed-cidr-v6"])' /etc/docker/daemon.json \
+            >/etc/docker/daemon.json.tmp 2>/dev/null || \
+            cp /etc/docker/daemon.json /etc/docker/daemon.json.tmp
+        mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+        restart_docker
+        docker ps -a -q | xargs -r docker start
+        echo -e "${GREEN}✅ Docker IPv6 已关闭，所有容器已恢复${RESET}"
     else
-        add-default-model-only-to-provider "$provider_name" "$base_url" "$api_key" "$default_model"
-        add_result=$?
-        finish_msg="✅ 完成！已保留 provider，并仅加载默认模型：$default_model"
+        echo -e "${YELLOW} Docker 配置文件不存在，无法关闭 IPv6${RESET}"
     fi
-
-    if [[ $add_result -eq 0 ]]; then
-        echo
-        echo "🔄 设置默认模型并重启网关..."
-        openclaw models set "$provider_name/$default_model"
-        openclaw_sync_sessions_model "$provider_name/$default_model"
-        start_gateway
-        echo "$finish_msg"
-        echo "✅ 当前 API 协议类型: $DETECTED_API"
-    fi
-
-    break_end
 }
 
-# 打印配置的 API 列表及测速 (Python 高性能内嵌版)
-openclaw_api_manage_list() {
-    local config_file
-    config_file=$(openclaw_get_config_file)
-    send_stats "OpenClaw API列表"
+# -----------------------------
+# 开放所有端口（IPv4 + IPv6 + nftables）
+# -----------------------------
+open_all_ports() {
+    root_use
+    read -p "确认要开放所有端口吗？(Y/N): " confirm
+    [[ $confirm =~ [Yy] ]] || { echo -e "${YELLOW}操作已取消${RESET}"; return; }
+    echo -e "${YELLOW}正在检测可用防火墙工具...${RESET}"
 
-    while IFS=$'\t' read -r rec_type idx name base_url model_count api_type latency_txt latency_level; do
-        case "$rec_type" in
-            MSG)
-                echo "$idx"
-                ;;
-            ROW)
-                local latency_color="$gl_bai"
-                case "$latency_level" in
-                    low) latency_color="$gl_lv" ;;
-                    medium) latency_color="$gl_huang" ;;
-                    high|unavailable) latency_color="$gl_hong" ;;
-                    unchecked) latency_color="$gl_bai" ;;
-                esac
-
-                printf '%b\n' "[$idx] ${name} | API: ${base_url} | 协议: ${api_type} | 模型数量: ${gl_huang}${model_count}${gl_bai} | 延迟/状态: ${latency_color}${latency_txt}${gl_bai}"
-                ;;
-        esac
-    done < <(python3 - "$config_file" <<-'PY'
-import json
-import sys
-import time
-import urllib.request
-
-path = sys.argv[1]
-SUPPORTED_APIS = {'openai-completions', 'openai-responses'}
-
-def ping_models(base_url, api_key):
-    req = urllib.request.Request(
-        base_url.rstrip('/') + '/models',
-        headers={
-            'Authorization': f'Bearer {api_key}',
-            'User-Agent': 'OpenClaw-API-Manage/1.0',
-        },
-    )
-    start = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=4) as resp:
-        resp.read(2048)
-    return int((time.perf_counter() - start) * 1000)
-
-def classify_latency(latency):
-    if latency == '不可用':
-        return '不可用', 'unavailable'
-    if latency == '未检测':
-        return '未检测', 'unchecked'
-    if isinstance(latency, int):
-        if latency <= 800:
-            return f'{latency}ms', 'low'
-        elif latency <= 2000:
-            return f'{latency}ms', 'medium'
-        else:
-            return f'{latency}ms', 'high'
-    return str(latency), 'unchecked'
-
-try:
-    with open(path, 'r', encoding='utf-8') as f:
-        obj = json.load(f)
-except FileNotFoundError:
-    print('MSG\tℹ️ 未找到配置文件，请先完成安装/初始化。')
-    raise SystemExit(0)
-except Exception as e:
-    print(f'MSG\t❌ 读取配置失败: {type(e).__name__}: {e}')
-    raise SystemExit(0)
-
-providers = ((obj.get('models') or {}).get('providers') or {})
-if not isinstance(providers, dict) or not providers:
-    print('MSG\tℹ️ 当前未配置任何 API provider。')
-    raise SystemExit(0)
-
-print('MSG\t--- 已配置 API 列表 ---')
-
-for idx, name in enumerate(sorted(providers.keys()), start=1):
-    provider = providers.get(name)
-    if not isinstance(provider, dict):
-        base_url = '-'
-        model_count = 0
-        latency_raw = '不可用'
-        api = ''
-    else:
-        base_url = provider.get('baseUrl') or provider.get('url') or provider.get('endpoint') or '-'
-        models = provider.get('models') if isinstance(provider.get('models'), list) else []
-        model_count = sum(1 for m in models if isinstance(m, dict) and m.get('id'))
-        api = provider.get('api', '')
-        api_key = provider.get('apiKey')
-
-        latency_raw = '未检测'
-        if api in SUPPORTED_APIS:
-            if isinstance(base_url, str) and base_url != '-' and isinstance(api_key, str) and api_key:
-                try:
-                    latency_raw = ping_models(base_url, api_key)
-                except Exception:
-                    latency_raw = '不可用'
-            else:
-                latency_raw = '不可用'
-
-    latency_text, latency_level = classify_latency(latency_raw)
-    api_label = api if api in SUPPORTED_APIS else '-'
-    print('ROW\t' + '\t'.join([str(idx), str(name), str(base_url), str(model_count), str(api_label), str(latency_text), str(latency_level)]))
-PY
-)
+    if command -v iptables &>/dev/null; then
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+        iptables -F
+    fi
+    if command -v ip6tables &>/dev/null; then
+        ip6tables -P INPUT ACCEPT
+        ip6tables -P FORWARD ACCEPT
+        ip6tables -P OUTPUT ACCEPT
+        ip6tables -F
+    fi
+    if command -v nft &>/dev/null; then
+        nft flush ruleset 2>/dev/null || true
+    fi
+    echo -e "${GREEN}✅ 已开放所有端口${RESET}"
+    restart_docker
 }
 
-# 核心重构：支持 单渠道 & 全渠道 闭环同步模型函数
-sync-openclaw-provider-interactive() {
-    local config_file
-    config_file=$(openclaw_get_config_file)
-    send_stats "OpenClaw API同步入口"
-
-    if [ ! -f "$config_file" ]; then
-        echo "❌ 未找到配置文件: $config_file"
-        break_end
-        return 1
-    fi
-
-    read -erp "请输入要同步的 API 名称(provider)，直接回车将自动同步全部: " provider_name
-    
-    # 传递目标渠道给 Python 处理，空字符串代表同步全部
-    install jq curl >/dev/null 2>&1
-    echo "🔄 正在请求上游接口进行模型对齐比对，请稍候..."
-
-    python3 - "$config_file" "$provider_name" <<'PY_SYNC'
-import copy
-import json
-import sys
-import time
-import urllib.request
-
-path = sys.argv[1]
-target_filter = sys.argv[2].strip()
-
-with open(path, 'r', encoding='utf-8') as f:
-    obj = json.load(f)
-
-work = copy.deepcopy(obj)
-models_cfg = work.setdefault('models', {})
-providers = models_cfg.get('providers', {})
-
-if not isinstance(providers, dict) or not providers:
-    print('❌ 错误：未检测到任何已配置的 API providers')
-    sys.exit(2)
-
-# 筛选出需要同步的名单
-targets = []
-if target_filter:
-    if target_filter not in providers:
-        print(f'❌ 错误：未找到指定的 provider: {target_filter}')
-        sys.exit(2)
-    targets.append(target_filter)
-else:
-    targets = sorted(list(providers.keys()))
-
-agents = work.setdefault('agents', {})
-defaults = agents.setdefault('defaults', {})
-defaults_models_raw = defaults.get('models')
-if isinstance(defaults_models_raw, dict):
-    defaults_models = defaults_models_raw
-elif isinstance(defaults_models_raw, list):
-    defaults_models = {str(x): {} for x in defaults_models_raw if isinstance(x, str)}
-else:
-    defaults_models = {}
-defaults['models'] = defaults_models
-
-def model_ref(p_name, m_id):
-    return f"{p_name}/{m_id}"
-
-def get_primary_ref(d_obj):
-    m_obj = d_obj.get('model')
-    if isinstance(m_obj, str): return m_obj
-    if isinstance(m_obj, dict): return m_obj.get('primary')
-    return None
-
-def set_primary_ref(d_obj, new_ref):
-    m_obj = d_obj.get('model')
-    if isinstance(m_obj, str): d_obj['model'] = new_ref
-    elif isinstance(m_obj, dict): m_obj['primary'] = new_ref
-    else: d_obj['model'] = {'primary': new_ref}
-
-def fetch_remote_models(base_url, api_key):
-    req = urllib.request.Request(
-        base_url.rstrip('/') + '/models',
-        headers={'Authorization': f'Bearer {api_key}', 'User-Agent': 'Mozilla/5.0'}
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode('utf-8', 'ignore'))
-
-global_changed = False
-success_count = 0
-
-for target in targets:
-    provider = providers[target]
-    if not isinstance(provider, dict): continue
-    
-    base_url = provider.get('baseUrl')
-    api_key = provider.get('apiKey')
-    model_list = provider.get('models', [])
-    
-    if not base_url or not api_key:
-        print(f'⚠️  跳过 {target}: 缺少 baseUrl 或 apiKey 配置')
-        continue
-        
-    try:
-        data = fetch_remote_models(base_url, api_key)
-        if not (isinstance(data, dict) and isinstance(data.get('data'), list)):
-            print(f'❌ {target}: /models 返回格式无法识别')
-            continue
-            
-        remote_ids = [str(item['id']) for item in data['data'] if isinstance(item, dict) and item.get('id')]
-        remote_set = set(remote_ids)
-        if not remote_set:
-            print(f'❌ {target}: 上游返回的模型列表为空，放弃同步该通道')
-            continue
-            
-        local_models = [m for m in model_list if isinstance(m, dict) and m.get('id')]
-        local_ids = [str(m['id']) for m in local_models]
-        local_set = set(local_ids)
-        
-        template = copy.deepcopy(local_models[0]) if local_models else {
-            "id": "", "name": "", "input": ["text", "image"],
-            "contextWindow": 1048576, "maxTokens": 128000,
-            "cost": {"input": 0.15, "output": 0.60, "cacheRead": 0, "cacheWrite": 0}
-        }
-        
-        removed_ids = [mid for mid in local_ids if mid not in remote_set]
-        added_ids = [mid for mid in remote_ids if mid not in local_set]
-        
-        kept_models = [copy.deepcopy(m) for m in local_models if str(m['id']) in remote_set]
-        new_models = kept_models[:]
-        for mid in added_ids:
-            nm = copy.deepcopy(template)
-            nm['id'] = mid
-            nm['name'] = f'{target} / {mid}'
-            new_models.append(nm)
-            
-        if not new_models:
-            print(f'❌ {target}: 同步后无任何可用模型，放弃修改该通道')
-            continue
-            
-        expected_refs = {model_ref(target, str(m['id'])) for m in new_models}
-        local_refs = {model_ref(target, mid) for mid in local_ids}
-        removed_refs = local_refs - expected_refs
-        first_ref = model_ref(target, str(new_models[0]['id']))
-        
-        # 兜底清理失效引用
-        primary_ref = get_primary_ref(defaults)
-        if isinstance(primary_ref, str) and primary_ref in removed_refs:
-            set_primary_ref(defaults, first_ref)
-            print(f'🔁 {target}: 默认主模型指向已失效，降级替换为: {first_ref}')
-            global_changed = True
-            
-        for fk in ('modelFallback', 'imageModelFallback'):
-            val = defaults.get(fk)
-            if isinstance(val, str) and val in removed_refs:
-                defaults[fk] = first_ref
-                global_changed = True
-                
-        stale_refs = [r for r in list(defaults_models.keys()) if r.startswith(target + '/') and r not in expected_refs]
-        for r in stale_refs:
-            defaults_models.pop(r, None)
-            global_changed = True
-            
-        for r in sorted(expected_refs):
-            if r not in defaults_models:
-                defaults_models[r] = {}
-                global_changed = True
-                
-        if removed_ids or added_ids or len(local_models) != len(new_models):
-            provider['models'] = new_models
-            global_changed = True
-            
-        print(f'✅ {target}: 同步成功 (新增 {len(added_ids)} 个, 移除 {len(removed_ids)} 个, 当前总计 {len(new_models)} 个)')
-        success_count += 1
-        
-    except Exception as e:
-        print(f'❌ {target}: 同游连接握手失败 ({type(e).__name__})')
-
-if global_changed:
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(work, f, ensure_ascii=False, indent=2)
-        f.write('\n')
-
-if success_count > 0:
-    sys.exit(0)
-else:
-    sys.exit(5)
-PY_SYNC
-    local rc=$?
-    if [ $rc -eq 0 ]; then
-        echo "✅ 同步任务圆满执行结束"
-        start_gateway
+# -----------------------------
+# iptables 切换
+# -----------------------------
+switch_iptables_legacy() {
+    root_use
+    if [ -x /usr/sbin/iptables-legacy ] && [ -x /usr/sbin/ip6tables-legacy ]; then
+        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
+        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
+        update-alternatives --set iptables /usr/sbin/iptables-legacy
+        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+        restart_docker
+        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
+        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
+        echo -e "${GREEN}✅ 已切换到 iptables-legacy 并恢复规则${RESET}"
     else
-        echo "❌ 同步失败：未成功对齐任何供应商模型。请检查网络连接及 API /models 返回结果。"
+        echo -e "${RED}系统未安装 iptables-legacy，无法切换${RESET}"
     fi
-    break_end
 }
 
-# 销毁与卸载指定 Provider
-delete-openclaw-provider-interactive() {
-    local config_file
-    config_file=$(openclaw_get_config_file)
-    send_stats "OpenClaw API删除入口"
-
-    if [ ! -f "$config_file" ]; then
-        echo "❌ 未找到配置文件: $config_file"
-        break_end
-        return 1
+switch_iptables_nft() {
+    root_use
+    if [ -x /usr/sbin/iptables-nft ] && [ -x /usr/sbin/ip6tables-nft ]; then
+        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
+        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
+        update-alternatives --set iptables /usr/sbin/iptables-nft
+        update-alternatives --set ip6tables /usr/sbin/ip6tables-nft
+        restart_docker
+        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
+        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
+        echo -e "${GREEN}✅ 已切换到 iptables-nft 并恢复规则${RESET}"
+    else
+        echo -e "${RED}系统未安装 iptables-nft，无法切换${RESET}"
     fi
-
-    read -erp "请输入要删除的 API 名称(provider): " provider_name
-    if [ -z "$provider_name" ]; then
-        send_stats "OpenClaw API删除取消"
-        echo "❌ provider 名称不能为空"
-        break_end
-        return 1
-    fi
-
-    python3 - "$config_file" "$provider_name" <<'PY'
-import copy
-import json
-import sys
-
-path = sys.argv[1]
-name = sys.argv[2]
-
-with open(path, 'r', encoding='utf-8') as f:
-    obj = json.load(f)
-
-work = copy.deepcopy(obj)
-models_cfg = work.setdefault('models', {})
-providers = models_cfg.get('providers', {})
-if not isinstance(providers, dict) or name not in providers:
-    print(f'❌ 未找到 provider: {name}')
-    raise SystemExit(2)
-
-agents = work.setdefault('agents', {})
-defaults = agents.setdefault('defaults', {})
-defaults_models_raw = defaults.get('models')
-if isinstance(defaults_models_raw, dict):
-    defaults_models = defaults_models_raw
-elif isinstance(defaults_models_raw, list):
-    defaults_models = {str(x): {} for x in defaults_models_raw if isinstance(x, str)}
-else:
-    defaults_models = {}
-defaults['models'] = defaults_models
-
-def model_ref(provider_name, model_id):
-    return f"{provider_name}/{model_id}"
-
-def ref_provider(ref):
-    if not isinstance(ref, str) or '/' not in ref:
-        return None
-    return ref.split('/', 1)[0]
-
-def get_primary_ref(defaults_obj):
-    model_obj = defaults_obj.get('model')
-    if isinstance(model_obj, str):
-        return model_obj
-    if isinstance(model_obj, dict):
-        return model_obj.get('primary')
-    return None
-
-def set_primary_ref(defaults_obj, new_ref):
-    model_obj = defaults_obj.get('model')
-    if isinstance(model_obj, str):
-        defaults_obj['model'] = new_ref
-    elif isinstance(model_obj, dict):
-        model_obj['primary'] = new_ref
-    else:
-        defaults_obj['model'] = {'primary': new_ref}
-
-def collect_available_refs(exclude_provider=None):
-    refs = []
-    if not isinstance(providers, dict):
-        return refs
-    for pname, p in providers.items():
-        if exclude_provider and pname == exclude_provider:
-            continue
-        if not isinstance(p, dict):
-            continue
-        for m in p.get('models', []) or []:
-            if isinstance(m, dict) and m.get('id'):
-                refs.append(model_ref(pname, str(m['id'])))
-    return refs
-
-replacement_candidates = collect_available_refs(exclude_provider=name)
-replacement = replacement_candidates[0] if replacement_candidates else None
-
-primary_ref = get_primary_ref(defaults)
-if ref_provider(primary_ref) == name:
-    if not replacement:
-        print('❌ 删除中止：默认主模型指向该 provider，且无可用替代模型')
-        raise SystemExit(3)
-    set_primary_ref(defaults, replacement)
-    print(f'🔁 默认主模型切换: {primary_ref} -> {replacement}')
-
-for fk in ('modelFallback', 'imageModelFallback'):
-    val = defaults.get(fk)
-    if ref_provider(val) == name:
-        if not replacement:
-            print(f'❌ 删除中止：{fk} 指向该 provider，且无可用替代模型')
-            raise SystemExit(3)
-        defaults[fk] = replacement
-        print(f'🔁 {fk} 切换: {val} -> {replacement}')
-
-removed_refs = [r for r in list(defaults_models.keys()) if r.startswith(name + '/')]
-for r in removed_refs:
-    defaults_models.pop(r, None)
-
-providers.pop(name, None)
-
-with open(path, 'w', encoding='utf-8') as f:
-    json.dump(work, f, ensure_ascii=False, indent=2)
-    f.write('\n')
-
-print(f'🗑️ 已删除 provider: {name}')
-print(f'🧹 已清理 defaults.models 中 {len(removed_refs)} 个关联模型引用')
-PY
-    local rc=$?
-    case "$rc" in
-        0) send_stats "OpenClaw API删除确认"; echo "✅ 删除完成"; start_gateway ;;
-        2) echo "❌ 删除失败：provider 不存在" ;;
-        3) send_stats "OpenClaw API删除取消"; echo "❌ 删除失败：无可用替代模型，已保持原配置" ;;
-        *) echo "❌ 删除失败：请检查配置文件结构或日志输出" ;;
-    esac
-    break_end
 }
 
-# ==============================================================================
-#  API & 模型管理
-# ==============================================================================
-openclaw_api_manage_menu() {
-    send_stats "OpenClaw API入口"
-    local config_file
-    config_file=$(openclaw_get_config_file)
+# -----------------------------
+# Docker 状态
+# -----------------------------
+docker_status() {
+    if docker info &>/dev/null; then
+        echo "运行中"
+    else
+        echo "未运行"
+    fi
+}
 
+current_iptables() {
+    ipt=$(update-alternatives --query iptables 2>/dev/null | grep 'Value:' | awk '{print $2}')
+    if [[ $ipt == *legacy ]]; then
+        echo "legacy"
+    else
+        echo "nft"
+    fi
+}
+
+docker_container_info() {
+    total=$(docker ps -a -q | wc -l)
+    running=$(docker ps -q | wc -l)
+    echo "总容器: $total | 运行中: $running"
+}
+
+
+# -----------------------------
+# Docker 容器管理
+# -----------------------------
+docker_ps() {
+    if ! check_docker_running; then return; fi
     while true; do
         clear
-        local current_model="未设置"
-        if [ -f "$config_file" ]; then
-            current_model=$(jq -r '.agents.defaults.model.primary // "未设置"' "$config_file" 2>/dev/null)
-        fi
-
-        echo -e "${gl_lv}=======================================${gl_bai}"
-        echo -e "${gl_lv}             API & 模型管理            ${gl_bai}"
-        echo -e "${gl_lv}=======================================${gl_bai}"
-        echo -e "当前激活模型: ${gl_huang}${current_model}${gl_bai}"
-        echo -e "${gl_lv}=======================================${gl_bai}"
-        
-        # 显示实时 API 状态快照
-        openclaw_api_manage_list
-        
-        echo -e "${gl_lv}=======================================${gl_bai}"
-        echo -e "${gl_lv}1. 切换模型${gl_bai}"
-        echo -e "${gl_lv}2. 添加 API 供应商${gl_bai}"
-        echo -e "${gl_lv}3. 同步 API 供应商模型列表${gl_bai}"
-        echo -e "${gl_lv}4. 删除 API 供应商${gl_bai}"
-        echo -e "${gl_lv}5. 查看已加模型信息${gl_bai}"
-        echo -e "${gl_lv}0. 返回主菜单${gl_bai}"
-        echo -e "${gl_lv}=======================================${gl_bai}"
-        read -erp "请输入你的选择: " api_choice
-
-        case "$api_choice" in
-            1)
-                clear
-                echo -e "${gl_huang}--- 切换默认激活模型 ---${gl_bai}"
-                if [ ! -f "$config_file" ]; then
-                    echo -e "${gl_hong}❌ 配置文件不存在！${gl_bai}"; sleep 1; continue
-                fi
-
-                local models_str
-                models_str=$(jq -r '.models.providers | to_entries[] | .key as $p | .value.models[] | "\($p)/\(.id)"' "$config_file" 2>/dev/null)
-                if [ -z "$models_str" ]; then
-                    echo -e "${gl_hong}❌ 未发现可用模型，请先添加供应商！${gl_bai}"
-                    break_end; continue
-                fi
-
-                mapfile -t models_array <<< "$models_str"
-                
-                echo -e "当前可用模型列表："
-                echo -e "---------------------------------------"
-                local i=1
-                for m in "${models_array[@]}"; do
-                    echo -e " [${i}] $m"
-                    ((i++))
-                done
-                echo -e "---------------------------------------"
-                
-                read -erp "请选择目标模型序号 (输入 0 取消): " model_idx
-                if [[ "$model_idx" == "0" ]] || [ -z "$model_idx" ]; then
-                    continue
-                fi
-
-                if [[ "$model_idx" =~ ^[0-9]+$ ]] && [ "$model_idx" -ge 1 ] && [ "$model_idx" -le "${#models_array[@]}" ]; then
-                    local target_model="${models_array[$((model_idx-1))]}"
-                    
-                    echo -e "🔄 正在切换并写入配置树..."
-                    local tmp_json
-                    tmp_json=$(jq --arg p "$target_model" '.agents.defaults.model.primary = $p | .agents.defaults.models = {($p): {}}' "$config_file")
-                    echo "$tmp_json" > "$config_file"
-
-                    # 一致性序列重载
-                    openclaw models set "$target_model"
-                    openclaw_sync_sessions_model "$target_model"
-                    
-                    start_gateway
-                    echo -e "${gl_lv}✅ 成功激活并重载主模型: $target_model${gl_bai}"
-                else
-                    echo -e "${gl_hong}❌ 输入序号无效！${gl_bai}"
-                fi
-                break_end
-                ;;
-
-            2) clear; add-openclaw-provider-interactive ;;
-            3) clear; sync-openclaw-provider-interactive ;;
-            4) clear; delete-openclaw-provider-interactive ;;
-            5)
-                clear
-                echo -e "${gl_lv}=======================================${gl_bai}"
-                echo -e "${gl_lv}         已加载 API 供应商详细快照       ${gl_bai}"
-                echo -e "${gl_lv}=======================================${gl_bai}"
-                if [ ! -f "$config_file" ]; then 
-                    echo "${gl_huang}暂无配置数据)${gl_bai}"
-                else
-                    local p_detail
-                    p_detail=$(jq -c '.models.providers | to_entries[]' "$config_file" 2>/dev/null)
-                    if [ -z "$p_detail" ]; then
-                        echo -e "  ${gl_huang}(暂无任何有效配置)${gl_bai}"
-                    else
-                        while read -r row; do
-                            [ -z "$row" ] && continue
-                            local det_name=$(echo "$row" | jq -r .key)
-                            local det_url=$(echo "$row" | jq -r .value.baseUrl)
-                            local det_key=$(echo "$row" | jq -r .value.apiKey)
-                            local det_api=$(echo "$row" | jq -r '.value.api // "未指定"')
-                            local det_models=$(echo "$row" | jq -r '.value.models[].id' | tr '\n' ',' | sed 's/,$//')
-                            
-                            # ============ 替换开始：直接显示完整 Key ============
-                            local short_key=""
-                            if [[ -z "$det_key" ]] || [[ "$det_key" == "null" ]] || [[ "$det_key" == "None" ]]; then
-                                short_key="无"
-                            else
-                                short_key="$det_key"
-                            fi
-                            # ============ 替换结束 ============================
-
-                            echo -e "${gl_lv}◈ 供应商名称:${gl_bai} ${gl_huang}${det_name}${gl_bai}"
-                            echo -e "  ├─ 协议类型: ${gl_lv}${det_api}${gl_bai}"
-                            echo -e "  ├─ Base URL: ${gl_bai}${det_url}"
-                            echo -e "  ├─ API Key : ${gl_bai}${short_key}"
-                            echo -e "  └─ 包含模型: ${gl_lv}${det_models}${gl_bai}"
-                            echo -e "${gl_lv}---------------------------------------${gl_bai}"
-                        done <<< "$p_detail"
-                    fi
-                fi
-                break_end
-                ;;
-            0) return 0 ;;
-            *) echo -e "${gl_hong}❌ 无效的选择，请重试。${gl_bai}"; sleep 1 ;;
-        esac
-    done
-}
-
-# 7. 机器人连接对接交互式子选单
-bot_connection_menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN}             机器人连接对接              ${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
-        openclaw_show_bot_local_status_block
-         echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN} 1. Telegram 机器人对接"
-        echo -e "${GREEN} 2. 飞书 (Lark) 机器人对接"
-        echo -e "${GREEN} 3. WhatsApp 机器人对接"
-        echo -e "${GREEN} 4. QQ 机器人对接"
-        echo -e "${GREEN} 5. 微信机器人对接"
+        echo -e "${BOLD}${CYAN}===== Docker 容器管理 =====${RESET}"
+        docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
+        echo -e "${GREEN}01. 创建新容器${RESET}"
+        echo -e "${GREEN}02. 启动容器${RESET}"
+        echo -e "${GREEN}03. 停止容器${RESET}"
+        echo -e "${GREEN}04. 删除容器${RESET}"
+        echo -e "${GREEN}05. 重启容器${RESET}"
+        echo -e "${GREEN}06. 启动所有容器${RESET}"
+        echo -e "${GREEN}07. 停止所有容器${RESET}"
+        echo -e "${GREEN}08. 删除所有容器${RESET}"
+        echo -e "${GREEN}09. 重启所有容器${RESET}"
+        echo -e "${GREEN}10. 进入容器${RESET}"
+        echo -e "${GREEN}11. 查看日志${RESET}"
         echo -e "${GREEN} 0. 返回主菜单${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
-        read -erp "请输入你的选择: " bot_choice
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) read -p "请输入创建命令: " cmd; $cmd ;;
+            02|2) read -p "请输入容器名: " name; docker start $name ;;
+            03|3) read -p "请输入容器名: " name; docker stop $name ;;
+            04|4) read -p "请输入容器名: " name; docker rm -f $name ;;
+            05|5) read -p "请输入容器名: " name; docker restart $name ;;
+            06|6) containers=$(docker ps -a -q); [ -n "$containers" ] && docker start $containers || echo "无容器可启动" ;;
+            07|7) containers=$(docker ps -q); [ -n "$containers" ] && docker stop $containers || echo "无容器正在运行" ;;
+            08|8) read -p "确定删除所有容器? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rm -f $(docker ps -a -q) ;;
+            09|9) containers=$(docker ps -q); [ -n "$containers" ] && docker restart $containers || echo "无容器正在运行" ;;
+            10) read -p "请输入容器名: " name; docker exec -it $name /bin/bash ;;
+            11) read -p "请输入容器名: " name; docker logs -f $name ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
 
-        case $bot_choice in
+
+# -----------------------------
+# Docker 镜像管理
+# -----------------------------
+docker_image() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 镜像管理 =====${RESET}"
+        docker image ls
+        echo -e "${GREEN}01. 拉取镜像${RESET}"
+        echo -e "${GREEN}02. 更新镜像${RESET}"
+        echo -e "${GREEN}03. 删除镜像${RESET}"
+        echo -e "${GREEN}04. 删除所有镜像${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
+            02|2) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
+            03|3) read -p "请输入镜像名: " imgs; for img in $imgs; do docker rmi -f $img; done ;;
+            04|4) read -p "确定删除所有镜像? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rmi -f $(docker images -q) ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 卷管理
+# -----------------------------
+docker_volume() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 卷管理 =====${RESET}"
+        docker volume ls
+        echo -e "${GREEN}1. 创建卷${RESET}"
+        echo -e "${GREEN}2. 删除卷${RESET}"
+        echo -e "${GREEN}3. 删除所有无用卷${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            1) read -p "请输入卷名: " v; docker volume create $v ;;
+            2) read -p "请输入卷名: " v; docker volume rm $v ;;
+            3) docker volume prune -f ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# 清理所有未使用资源
+# -----------------------------
+docker_cleanup() {
+    root_use
+    echo -e "${YELLOW}清理所有未使用容器、镜像、卷...${RESET}"
+    docker system prune -af --volumes
+    echo -e "${GREEN}清理完成${RESET}"
+}
+
+# -----------------------------
+# Docker 网络管理
+# -----------------------------
+docker_network() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 网络管理 =====${RESET}"
+        docker network ls
+        echo -e "${GREEN}1. 创建网络${RESET}"
+        echo -e "${GREEN}2. 加入网络${RESET}"
+        echo -e "${GREEN}3. 退出网络${RESET}"
+        echo -e "${GREEN}4. 删除网络${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " sub_choice
+        case $sub_choice in
+            1) read -p "设置新网络名: " dockernetwork; docker network create $dockernetwork ;;
+            2) read -p "加入网络名: " dockernetwork; read -p "容器名: " dockername; docker network connect $dockernetwork $dockername ;;
+            3) read -p "退出网络名: " dockernetwork; read -p "容器名: " dockername; docker network disconnect $dockernetwork $dockername ;;
+            4) read -p "请输入要删除的网络名: " dockernetwork; docker network rm $dockernetwork || echo -e "${RED}删除失败，网络可能被容器占用${RESET}" ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 备份/恢复菜单
+# -----------------------------
+# -----------------------------
+# Docker 备份/恢复菜单（增强版）
+# -----------------------------
+docker_backup_menu() {
+    root_use
+
+    BACKUP_DIR="/opt/docker_backups"
+    LOG_FILE="$BACKUP_DIR/backup.log"
+    mkdir -p "$BACKUP_DIR"
+
+    # -----------------------------
+    # 检查 jq
+    # -----------------------------
+    if ! command -v jq &>/dev/null; then
+        echo -e "${YELLOW}未检测到 jq，正在安装...${RESET}"
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y jq
+        elif command -v yum &>/dev/null; then
+            yum install -y epel-release && yum install -y jq
+        elif command -v dnf &>/dev/null; then
+            dnf install -y jq
+        else
+            echo -e "${RED}无法检测到包管理器，请手动安装 jq${RESET}"
+            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+            return
+        fi
+    fi
+
+    # -----------------------------
+    # 检查 Docker
+    # -----------------------------
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y docker.io
+        elif command -v yum &>/dev/null; then
+            yum install -y docker
+        elif command -v dnf &>/dev/null; then
+            dnf install -y docker
+        else
+            echo -e "${RED}无法检测到包管理器，请手动安装 Docker${RESET}"
+            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+            return
+        fi
+    fi
+
+    # -----------------------------
+    # 检查 Docker 服务
+    # -----------------------------
+    if ! pgrep -x dockerd &>/dev/null; then
+        echo -e "${YELLOW}Docker 服务未运行，正在启动...${RESET}"
+        if command -v systemctl &>/dev/null; then
+            systemctl start docker
+            systemctl enable docker
+        else
+            service docker start
+        fi
+        sleep 2
+        if ! pgrep -x dockerd &>/dev/null; then
+            echo -e "${RED}Docker 启动失败，请手动检查服务${RESET}"
+            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+            return
+        fi
+    fi
+
+    # -----------------------------
+    # 检查磁盘空间
+    # -----------------------------
+    avail_space=$(df --output=avail "$BACKUP_DIR" | tail -1)
+    if (( avail_space < 1048576 )); then
+        echo -e "${RED}磁盘剩余空间不足 1GB，无法执行备份！${RESET}"
+        read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+        return
+    fi
+
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker Run备份与恢复 =====${RESET}"
+        echo -e "${GREEN}1. 备份 Docker${RESET}"
+        echo -e "${GREEN}2. 恢复 Docker${RESET}"
+        echo -e "${GREEN}3. 删除备份文件${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
             1)
-                read -erp "请输入TG机器人收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code
-                if [ "$code" = "0" ] || [ -z "$code" ]; then 
-                    [ -z "$code" ] && echo -e "${RED}错误：连接码不能为空。${RESET}" && sleep 1
-                    continue
-                fi
-                openclaw pairing approve telegram "$code"
-                break_end
+                # -----------------------------
+                # 备份逻辑
+                # -----------------------------
+                while true; do
+                    echo -e "${YELLOW}选择备份类型:${RESET}"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
+                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " btype
+                    [[ "$btype" == "0" ]] && break
+
+                    read -p "请输入备份文件名（默认 docker_backup_$(date +%F).tar.gz）: " backup_name
+                    backup_name=${backup_name:-docker_backup_$(date +%F).tar.gz}
+                    backup_path="$BACKUP_DIR/$backup_name"
+
+                    TMP_BACKUP_DIR=$(mktemp -d /tmp/docker_backup_XXXX)
+
+                    # --- 容器备份 ---
+                    if [[ "$btype" == "1" || "$btype" == "4" ]]; then
+                        echo "可用容器列表："
+                        docker ps -a --format "{{.Names}}"
+                        read -p "请输入要备份的容器名（多个用空格，留空则全部）: " selected_containers
+                        [[ -z "$selected_containers" ]] && selected_containers=$(docker ps -a --format "{{.Names}}")
+                        for cname in $selected_containers; do
+                            cid=$(docker ps -a -q -f name="^${cname}$")
+                            [[ -z "$cid" ]] && echo "容器 $cname 不存在，跳过" && continue
+                            docker inspect $cid > "$TMP_BACKUP_DIR/container_${cname}.json"
+                            docker export "$cid" -o "$TMP_BACKUP_DIR/container_${cname}.tar"
+                            echo "$(date '+%F %T') 备份容器 $cname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 镜像备份 ---
+                    if [[ "$btype" == "2" || "$btype" == "4" ]]; then
+                        echo "可用镜像列表："
+                        docker images --format "{{.Repository}}:{{.Tag}}"
+                        read -p "请输入要备份的镜像（多个用空格，留空则全部）: " selected_images
+                        [[ -z "$selected_images" ]] && selected_images=$(docker images --format "{{.Repository}}:{{.Tag}}")
+                        for iname in $selected_images; do
+                            [[ "$iname" == "<none>:<none>" ]] && continue
+                            safe_name=$(echo "$iname" | tr '/:' '_')
+                            docker save "$iname" -o "$TMP_BACKUP_DIR/image_${safe_name}.tar"
+                            echo "$(date '+%F %T') 备份镜像 $iname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 卷备份 ---
+                    if [[ "$btype" == "3" || "$btype" == "4" ]]; then
+                        echo "可用卷列表："
+                        docker volume ls -q
+                        read -p "请输入要备份的卷名（多个用空格，留空则全部）: " selected_volumes
+                        [[ -z "$selected_volumes" ]] && selected_volumes=$(docker volume ls -q)
+                        for vol in $selected_volumes; do
+                            [[ ! -d /var/lib/docker/volumes/"$vol"/_data ]] && echo "卷 $vol 不存在，跳过" && continue
+                            read -p "请确保卷 $vol 未被容器使用，按回车继续..."
+                            tar -czf "$TMP_BACKUP_DIR/volume_${vol}.tar.gz" -C /var/lib/docker/volumes/"$vol"/_data .
+                            echo "$(date '+%F %T') 备份卷 $vol 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    tar -czf "$backup_path" -C "$TMP_BACKUP_DIR" .
+                    rm -rf "$TMP_BACKUP_DIR"
+                    echo -e "${GREEN}备份完成: $backup_path${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
                 ;;
             2)
-                echo -e "${YELLOW}🔄 正在通过 npx 调度部署飞书适配通道...${RESET}"
-                npx -y @larksuite/openclaw-lark install
-                openclaw config set channels.feishu.streaming true
-                openclaw config set channels.feishu.requireMention true --json
-                echo -e "${GREEN}✅ 飞书通道参数设置成功！${RESET}"
-                break_end
+                # -----------------------------
+                # 恢复逻辑（保持原有选择逻辑）并增强安全
+                # -----------------------------
+                while true; do
+                    echo -e "${YELLOW}选择恢复类型:${RESET}"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
+                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " rtype
+                    [[ "$rtype" == "0" ]] && break
+
+                    read -p "请输入备份文件路径: " backup_file
+                    [[ ! -f "$backup_file" ]] && echo -e "${RED}备份文件不存在${RESET}" && read -p "按回车继续..." && continue
+
+                    TMP_RESTORE_DIR=$(mktemp -d /tmp/docker_restore_XXXX)
+                    tar -xzf "$backup_file" -C "$TMP_RESTORE_DIR"
+
+                    # --- 容器恢复 ---
+                    if [[ "$rtype" == "1" || "$rtype" == "4" ]]; then
+                        for cjson in "$TMP_RESTORE_DIR"/container_*.json; do
+                            [[ ! -f "$cjson" ]] && continue
+                            cname=$(basename "$cjson" | sed 's/container_\(.*\).json/\1/')
+                            image=$(jq -r '.[0].Config.Image' "$cjson")
+                            envs=$(jq -r '.[0].Config.Env | join(" -e ")' "$cjson")
+                            [[ -n "$envs" ]] && envs="-e $envs"
+                            ports=$(jq -r '.[0].HostConfig.PortBindings | to_entries | map("\(.value[0].HostPort):\(.key)") | join(" -p ")' "$cjson")
+                            [[ -n "$ports" ]] && ports="-p $ports"
+                            mounts=$(jq -r '.[0].Mounts | map("-v \(.Source):\(.Destination)") | join(" ")' "$cjson")
+                            network=$(jq -r '.[0].HostConfig.NetworkMode' "$cjson")
+                            echo "注意：如果端口已被占用，容器 $cname 启动可能失败"
+
+                            # 如果镜像不存在，尝试从备份加载
+                            safe_image_name=$(echo "$image" | tr '/:' '_')
+                            img_tar="$TMP_RESTORE_DIR/image_${safe_image_name}.tar"
+                            [[ -f "$img_tar" ]] && docker load -i "$img_tar"
+
+                            docker run -d --name "$cname" $envs $ports $mounts --network "$network" "$image"
+                            echo "$(date '+%F %T') 恢复容器 $cname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 镜像恢复 ---
+                    if [[ "$rtype" == "2" || "$rtype" == "4" ]]; then
+                        for img_file in "$TMP_RESTORE_DIR"/image_*.tar; do
+                            [[ -f "$img_file" ]] && docker load -i "$img_file"
+                        done
+                    fi
+
+                    # --- 卷恢复 ---
+                    if [[ "$rtype" == "3" || "$rtype" == "4" ]]; then
+                        for vol_file in "$TMP_RESTORE_DIR"/volume_*.tar.gz; do
+                            vol_name=$(basename "$vol_file" | sed 's/volume_\(.*\).tar.gz/\1/')
+                            if docker volume inspect "$vol_name" &>/dev/null; then
+                                read -p "卷 $vol_name 已存在，是否覆盖? (y/N): " confirm
+                                [[ "$confirm" != "y" ]] && continue
+                            fi
+                            docker volume create "$vol_name" >/dev/null 2>&1
+                            tar -xzf "$vol_file" -C /var/lib/docker/volumes/"$vol_name"/_data
+                            echo "$(date '+%F %T') 恢复卷 $vol_name 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    rm -rf "$TMP_RESTORE_DIR"
+                    echo -e "${GREEN}恢复完成${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
                 ;;
             3)
-                read -erp "请输入WhatsApp收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code
-                if [ "$code" = "0" ] || [ -z "$code" ]; then 
-                    [ -z "$code" ] && echo -e "${RED}错误：连接码不能为空。${RESET}" && sleep 1
-                    continue
-                fi
-                openclaw pairing approve whatsapp "$code"
-                break_end
+                # -----------------------------
+                # 删除备份文件（支持多选或通配符）
+                # -----------------------------
+                while true; do
+                    echo "当前备份目录：$BACKUP_DIR"
+                    ls "$BACKUP_DIR"
+                    read -p "请输入要删除的备份文件名（支持空格或*通配符，输入0返回）: " del_files
+                    [[ "$del_files" == "0" ]] && break
+                    rm -f $BACKUP_DIR/$del_files
+                    echo -e "${GREEN}删除完成${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
                 ;;
-            4)
-                echo -e "\n${GREEN}QQ 官方对接指引链接：${RESET}"
-                echo -e "${BLUE}https://q.qq.com/qqbot/openclaw/login.html${RESET}\n"
-                break_end
-                ;;
-            5)
-                echo -e "${YELLOW}🔄 正在下载并注入企业微信/微信开放平台支持组件...${RESET}"
-                npx -y @tencent-weixin/openclaw-weixin-cli@latest install
-                break_end
-                ;;
-            0)
-                return 0
-                ;;
-            *)
-                echo -e "${RED}无效的选择，请重试。${RESET}"
-                sleep 1
-                ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}"; read -p "$(echo -e ${GREEN}按回车继续...${RESET})" ;;
         esac
     done
 }
 
-# 12. 健康检测与自动环境修复
-health_doctor_fix() {
-    echo -e "${GREEN}=== OpenClaw 全自动化故障巡检与修复 ===${RESET}"
-    local config_file
-    config_file=$(openclaw_get_config_file)
+monitor_docker_containers() {
+    clear
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}          🐳 Docker 容器监控${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
 
-    echo -n "[1/3] 核心进程状态扫描: "
-    if pgrep -f "openclaw" &>/dev/null; then
-        echo -e "${GREEN}正常运行${RESET}"
+    # 获取并处理数据 (按内存排序)
+    docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | sort -k3 -hr | while IFS=$'\t' read -r name cpu mem net; do
+        
+        # 1. 获取运行时间并深度汉化
+        local raw_status
+        raw_status=$(docker ps -a --filter "name=^/${name}$" --format "{{.Status}}")
+        
+        # 汉化引擎：包含时间、单位、状态
+        local uptime
+        uptime=$(echo "$raw_status" | \
+            sed 's/Up /运行 /' | \
+            sed 's/Exited/已停止/' | \
+            sed 's/(healthy)/(健康)/' | \
+            sed 's/(unhealthy)/(非健康)/' | \
+            sed 's/(starting)/(启动中)/' | \
+            sed 's/seconds/秒/' | \
+            sed 's/second/秒/' | \
+            sed 's/minutes/分钟/' | \
+            sed 's/minute/分钟/' | \
+            sed 's/hours/小时/' | \
+            sed 's/hour/小时/' | \
+            sed 's/days/天/' | \
+            sed 's/day/天/' | \
+            sed 's/weeks/周/' | \
+            sed 's/week/周/' | \
+            sed 's/months/月/' | \
+            sed 's/month/月/' | \
+            sed 's/about //' | \
+            sed 's/ago/前/')
+        
+        # 2. 新增：获取并格式化端口信息
+        local ports
+        ports=$(docker ps -a --filter "name=^/${name}$" --format "{{.Ports}}")
+        
+        # 如果端口为空，显示“无端口映射”；否则去掉 0.0.0.0: 或 ::: 以便手机端美观显示
+        if [ -z "$ports" ]; then
+            ports="无端口映射"
+        else
+            # 将 "0.0.0.0:8080->80/tcp, :::8080->80/tcp" 简化为 "8080->80/tcp" 这样的干净格式
+            ports=$(echo "$ports" | sed 's/0.0.0.0://g' | sed 's/::://g' | sed 's/, /\n        │     /g')
+        fi
+
+        # 3. 手机端纵向块状输出
+        echo -e "${YELLOW}◈ 容器: ${RESET}${YELLOW}${name}${RESET}"
+        echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${CPU_COLOR}${cpu}${RESET}"
+        echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
+        echo -e "  ├─ ${YELLOW}网络 I/O: ${RESET}${net}"
+        echo -e "  ├─ ${YELLOW}端口映射: ${RESET}${CYAN}${ports}${RESET}"
+        echo -e "  └─ ${YELLOW}运行状态: ${RESET}${YELLOW}${uptime}${RESET}"
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+    done
+}
+
+
+# -----------------------------
+# Docker 配置修改通用函数 
+# -----------------------------
+set_docker_mirror() {
+    root_use
+    mkdir -p /etc/docker
+    
+    echo -e "${CYAN}请选择或输入镜像加速源选项:${RESET}"
+    echo -e "${GREEN}1. 使用默认高速代理${RESET}"
+    echo -e "${GREEN}2. 输入自定义加速源${RESET}"
+    read -p "请输入选项 (默认 1): " mirror_choice
+    mirror_choice=${mirror_choice:-1}
+
+    local mirrors=""
+    if [ "$mirror_choice" == "1" ]; then
+        mirrors='["https://gh-proxy.org/docker/", "https://hub.glowp.xyz", "https://docker.1panel.live"]'
     else
-        echo -e "${YELLOW}离线。正在为您强制拉起网关进程守护...${RESET}"
-        openclaw gateway start
+        read -p "请输入完整的加速地址 (例如 https://your-mirror.com , 多个用英文逗号隔开): " custom_mirror
+        # 将逗号分割的地址转换为 JSON 数组格式
+        mirrors=$(echo "[$custom_mirror]" | sed "s/[^, ]*/\"&\0\"/g" | sed 's/""/"/g')
+        # 简单转换补全
+        mirrors="[\"$(echo $custom_mirror | sed 's/,/","/g')\"]"
     fi
 
-    echo -n "[2/3] 核心配置文件格式校验: "
-    if [ -f "$config_file" ]; then
-        if jq . "$config_file" &>/dev/null; then
-            echo -e "${GREEN}结构合法 (Valid JSON)${RESET}"
+    # 检查 jq 是否存在，存在则优雅合并，不存在则直接覆盖
+    if command -v jq &>/dev/null && [ -f /etc/docker/daemon.json ]; then
+        jq --argjson m "$mirrors" '. + {"registry-mirrors": $m}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
+        if [ $? -eq 0 ]; then
+            mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
         else
-            echo -e "${RED}结构损坏！正在为您排查加载最近一次的备份恢复...${RESET}"
-            local bak
-            bak=$(ls -t "${config_file}.bak."* 2>/dev/null | head -n 1)
-            if [ -n "$bak" ]; then
-                cp "$bak" "$config_file" && echo -e "${GREEN}已成功还原历史快照配置: $bak${RESET}"
-            else
-                echo -e "${RED}无历史快照备份，建议执行选项 11 重新进行 onboard向导初始化。${RESET}"
-            fi
+            echo "{\"registry-mirrors\": $mirrors}" > /etc/docker/daemon.json
         fi
     else
-        echo -e "${RED}缺失核心配置文件${RESET}"
+        echo "{\"registry-mirrors\": $mirrors}" > /etc/docker/daemon.json
     fi
 
-    echo -n "[3/3] 全系统底层运行环境依属检测: "
-    if command -v node &>/dev/null && command -v tmux &>/dev/null; then
-        echo -e "${GREEN}环境完备${RESET}"
-    else
-        echo -e "${YELLOW}发现缺失，自动补全修复依赖项...${RESET}"
-        install tmux jq nodejs
-    fi
-    break_end
+    echo -e "${GREEN}✅ 镜像加速源配置成功！当前配置为:${RESET}"
+    cat /etc/docker/daemon.json
+    restart_docker
 }
 
-# =======================================================================
-# 主菜单及指令控制层
-# =======================================================================
-show_menu() {
-    get_openclaw_status
-    clear
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}     ◈   🦞 OpenClaw 管理工具  ◈      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}状态  : $STATUS${RESET}"
-    echo -e "${GREEN}版本  :${RESET} ${YELLOW}$OPENCLAW_VERSION${RESET}"
-    echo -e "${GREEN}数据  :${RESET} ${YELLOW}$CONFIG_COUNT 个 API 供应商${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}  1. 安装 OpenClaw"
-    echo -e "${GREEN}  2. 启动 Gateway (消息网关后台)"
-    echo -e "${GREEN}  3. 停止 Gateway (消息网关服务)"
-    echo -e "${GREEN}  4. 查看状态日志${RESET}"
-    echo -e "${GREEN}  5. API模型切换管理${RESET} "
-    echo -e "${GREEN}  6. 机器人连接对接${RESET}"
-    echo -e "${GREEN}  7. 初始化配置向导${RESET}"
-    echo -e "${GREEN}  8. 健康检测与自动故障修复${RESET}"
-    echo -e "${GREEN}  9. 终端交互式对话UI${RESET}"
-    echo -e "${GREEN} 10. 更新 OpenClaw${RESET}"
-    echo -e "${GREEN} 11. 卸载 OpenClaw${RESET}"
-    echo -e "${GREEN}  0. 退出${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    printf "${GREEN} 请输入选项: ${RESET}"
-}
 
-main() {
+# -----------------------------
+# 主菜单显示状态
+# -----------------------------
+main_menu() {
+    root_use
     while true; do
-        show_menu
-        read -r choice
-        case "$choice" in
-            1)  install_moltbot ;;
-            2)  start_gateway && echo -e "${GREEN}✅ 启动指令发送执行完成${RESET}" && break_end ;;
-            3)  
-                echo "停止 OpenClaw..."
-                send_stats "停止 OpenClaw..."
-                tmux kill-session -t gateway > /dev/null 2>&1
-                openclaw gateway stop >/dev/null 2>&1
-                echo -e "${GREEN}✅ 网关核心及守护会话已完全离线停止${RESET}"
-                break_end 
-                ;;
-            4)  view_logs ;;
-            6)  openclaw_api_manage_menu ;;
-            7)  bot_connection_menu ;;
-            11) openclaw onboard; break_end ;;
-            12) health_doctor_fix ;;
-            14) openclaw chat ;;
-            19) 
-                echo "🔄 正在为您执行 NPM 全量拉取覆写更新 OpenClaw..."
-                sudo npm install -g openclaw@latest && start_gateway
-                echo -e "${GREEN}✅ 覆写更新完成！${RESET}"
-                break_end
-                ;;
-            20) 
-                echo -e "${RED}警告：您正准备全盘卸载 OpenClaw 控制程序及清空所有配置。${RESET}"
-                read -erp "确定要继续执行强力清除吗？(y/N): " confirm
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    openclaw gateway stop >/dev/null 2>&1
-                    sudo npm uninstall -g openclaw
-                    rm -rf "${HOME}/.openclaw"
-                    echo -e "${GREEN}✅ OpenClaw 卸载完成。${RESET}"
-                else
-                    echo "❌ 操作已取消。"
-                fi
-                break_end
-                ;;
-            0)  exit 0 ;;
-            *)  echo -e "${RED}输入有误，请输入菜单中有效的数字代号！${RESET}"; sleep 1 ;;
+        clear
+        echo -e "\033[36m"
+        echo "  ____             _             "
+        echo " |  _ \  ___   ___| | _____ _ __ "
+        echo " | | |/ _ \ / __| |/ / _ \ '__|"
+        echo " | |_| | (_) | (__|   <  __/ |   "
+        echo " |____/ \___/ \___|_|\_\___|_|   "
+        # 检测 Docker 状态
+        if command -v docker &>/dev/null; then
+            docker_status=$(docker info &>/dev/null && echo "运行中" || echo "未运行")
+            total=$(docker ps -a -q 2>/dev/null | wc -l)
+            running=$(docker ps -q 2>/dev/null | wc -l)
+            echo -e "${YELLOW}🐳| Docker: $docker_status | 总容器: $total | 运行中: $running${RESET}"
+        else
+            # Docker 未安装时只显示 iptables 状态
+            echo -e "${YELLOW}🐳 iptables: $(current_iptables)${RESET}"
+        fi
+
+        echo -e "${GREEN}01. 安装/更新 Docker${RESET}"
+        echo -e "${GREEN}02. 安装/更新 Docker Compose${RESET}"
+        echo -e "${GREEN}03. 卸载 Docker & Compose${RESET}"
+        echo -e "${GREEN}04. 容器管理${RESET}"
+        echo -e "${GREEN}05. 镜像管理${RESET}"
+        echo -e "${GREEN}06. 开启 IPv6${RESET}"
+        echo -e "${GREEN}07. 关闭 IPv6${RESET}"
+        echo -e "${GREEN}08. 开放所有端口${RESET}"
+        echo -e "${GREEN}09. 网络管理${RESET}"
+        echo -e "${GREEN}10. 切换 iptables-legacy${RESET}"
+        echo -e "${GREEN}11. 切换 iptables-nft${RESET}"
+        echo -e "${GREEN}12. Docker 备份/恢复${RESET}"
+        echo -e "${GREEN}13. 重启 Docker${RESET}"
+        echo -e "${GREEN}14. 卷管理 ${RESET}"
+        echo -e "${GREEN}15. 设置Docker镜像加速源${RESET}"
+        echo -e "${GREEN}16.${RESET} ${YELLOW}一键清理所有未使用容器/镜像/卷${RESET}"
+        echo -e "${GREEN}17. Docker监控${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) docker_install_update ;;
+            02|2) docker_compose_install_update ;;
+            03|3) docker_uninstall ;;
+            04|4) check_docker_running && docker_ps ;;
+            05|5) check_docker_running && docker_image ;;
+            06|6) check_docker_running && docker_ipv6_on ;;
+            07|7) check_docker_running && docker_ipv6_off ;;
+            08|8) open_all_ports ;;
+            09|9) check_docker_running && docker_network ;;
+            10) switch_iptables_legacy ;;
+            11) switch_iptables_nft ;;
+            12) check_docker_running && docker_backup_menu ;;
+            13|13) check_docker_running && restart_docker ;;
+            14|14) check_docker_running && docker_volume ;;
+            15|15) check_docker_running && set_docker_mirror ;;
+            16|16) check_docker_running && docker_cleanup ;;
+            17|17) monitor_docker_containers ;;
+             00|0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
         esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
     done
 }
 
-# 启动执行
-main
+
+
+
+# 启动脚本
+main_menu

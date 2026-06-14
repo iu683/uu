@@ -184,6 +184,12 @@ docker_compose_install_update() {
 # -----------------------------
 # Docker IPv6
 # -----------------------------
+# -----------------------------
+# Docker IPv6
+# -----------------------------
+# -----------------------------
+# Docker IPv6
+# -----------------------------
 docker_ipv6_on() {
     root_use
     mkdir -p /etc/docker
@@ -746,10 +752,7 @@ monitor_docker_containers() {
 
 
 # -----------------------------
-# Docker 配置修改通用函数 
-# -----------------------------
-# -----------------------------
-# Docker 配置修改通用函数 (合并配置防止冲突)
+# Docker 配置修改通用函数
 # -----------------------------
 set_docker_mirror() {
     root_use
@@ -757,17 +760,17 @@ set_docker_mirror() {
     
     echo -e "${CYAN}请选择或输入镜像加速源选项:${RESET}"
     echo -e "${GREEN}1. 使用默认高速代理${RESET}"
-    echo -e "${GREEN}2. 手动输入自定义加速源${RESET}"
-    echo -e "${GREEN}3. 恢复默认设置 (清空加速源)${RESET}"
+    echo -e "${GREEN}2. 输入自定义加速源${RESET}"
+    echo -e "${GREEN}3. 恢复默认设置(清空加速源)${RESET}"
     read -p "请输入选项 (默认 1): " mirror_choice
     mirror_choice=${mirror_choice:-1}
 
     local mirrors=""
     
     if [ "$mirror_choice" == "1" ]; then
-        mirrors='["https://hub.glowp.xyz","https://gh-proxy.org/docker/", "https://docker.1panel.live"]'
+        mirrors='["https://registry.lfree.org","https://hub.glowp.xyz","https://gh-proxy.org/docker/", "https://docker.1panel.live"]'
     elif [ "$mirror_choice" == "2" ]; then
-        read -p "请输入完整的加速地址 (例如 https://your-mirror.com , 多个用英文逗号隔开): " custom_mirror
+        read -p "请输入完整的加速地址 (例如 https://hub.glowp.xyz , 多个用英文逗号隔开): " custom_mirror
         # 简单转换补全为 JSON 数组格式
         mirrors="[\"$(echo $custom_mirror | sed 's/,/","/g' | sed 's/ //g')\"]"
     elif [ "$mirror_choice" == "3" ]; then

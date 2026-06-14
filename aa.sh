@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MongoDB 容器管理面板 (Docker Compose) 
+# MariaDB 容器管理面板 (Docker Compose)
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,8 @@ RESET="\033[0m"
 YELLOW="\033[33m"
 RED="\033[31m"
 BLUE="\033[34m"
-APP_NAME="mongodb"
+CYAN="\033[36m"
+APP_NAME="mariadb"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/config.env"
@@ -56,15 +57,15 @@ get_sys_status() {
         db_count="${RED}0${RESET}"
     else
         source "$CONFIG_FILE"
-        version="6.0 (Community)"
+        version="11.4 (LTS)"
         port_show="$PORT"
         
-        if [ "$(docker ps -q -f name=^mongodb$)" ]; then
+        if [ "$(docker ps -q -f name=^mariadb$)" ]; then
             status="${GREEN}运行中${RESET}"
-            # 排除系统内置库（admin, config, local），计算用户自定义库数量
-            local raw_count=$(docker exec -i mongodb mongosh -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "db.getMongo().getDBNames().filter(d => !['admin','config','local'].includes(d)).length" 2>/dev/null)
-            db_count="${YELLOW}${raw_count//[[:space:]]/}${RESET} 个"
-        elif [ "$(docker ps -a -q -f name=^mongodb$)" ]; then
+            # 排除系统内置库（information_schema, mysql, performance_schema, sys），计算自定义库数量
+            local raw_count=$(docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys');" -s --skip-column-names 2>/dev/null)
+            db_count="${YELLOW}${raw_count//[[:space:]]/}${RESET} ${GREEN}个${RESET}"
+        elif [ "$(docker ps -a -q -f name=^mariadb$)" ]; then
             status="${YELLOW}已停止${RESET}"
             db_count="${YELLOW}未知 (请先启动容器)${RESET}"
         else
@@ -79,19 +80,19 @@ function menu() {
     clear
     get_sys_status
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈    MongoDB 管理面板    ◈  ${RESET}"
+    echo -e "${GREEN}    ◈   MariaDB 管理面板   ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态       :${RESET} $status"
     echo -e "${GREEN}版本       :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口       :${RESET} ${YELLOW}${port_show}${RESET}"
     echo -e "${GREEN}已创数据库 :${RESET} $db_count"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 MongoDB${RESET}"
-    echo -e "${GREEN} 2. 更新 MongoDB${RESET}"
-    echo -e "${GREEN} 3. 卸载 MongoDB${RESET}"
-    echo -e "${GREEN} 4. 启动 MongoDB${RESET}"
-    echo -e "${GREEN} 5. 停止 MongoDB${RESET}"
-    echo -e "${GREEN} 6. 重启 MongoDB${RESET}"
+    echo -e "${GREEN} 1. 安装 MariaDB${RESET}"
+    echo -e "${GREEN} 2. 更新 MariaDB${RESET}"
+    echo -e "${GREEN} 3. 卸载 MariaDB${RESET}"
+    echo -e "${GREEN} 4. 启动 MariaDB${RESET}"
+    echo -e "${GREEN} 5. 停止 MariaDB${RESET}"
+    echo -e "${GREEN} 6. 重启 MariaDB${RESET}"
     echo -e "${GREEN} 7. 查看 日志${RESET}"
     echo -e "${GREEN}--------------------------------${RESET}"
     echo -e "${GREEN} 8. 数据库信息${RESET}"
@@ -113,9 +114,9 @@ function menu() {
         1) install_app ;;
         2) update_app ;;
         3) uninstall_app ;;
-        4) start_mg ;;
-        5) stop_mg ;;
-        6) restart_mg ;;
+        4) start_md ;;
+        5) stop_md ;;
+        6) restart_md ;;
         7) view_logs ;;
         8) show_info ;;
         9) create_database ;;
@@ -135,12 +136,12 @@ function menu() {
 
 function install_app() {
     if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}检测到已经安装过 MongoDB。${RESET}"
+        echo -e "${RED}检测到已经安装过 MariaDB。${RESET}"
         pause; menu
     fi
     
-    read -p "请输入 MongoDB 端口 [默认 27017]: " input_port
-    PORT=${input_port:-27017}
+    read -p "请输入 MariaDB 端口 [默认 3306]: " input_port
+    PORT=${input_port:-3306}
     
     echo -e "\n请选择网络绑定策略 (IP Binding):"
     echo -e "  [1] 允许公网/局域网访问 (绑定 0.0.0.0) [默认]"
@@ -151,38 +152,37 @@ function install_app() {
     local compose_port_mapping
     local bind_status_text
     if [ "$bind_choice" = "2" ]; then
-        compose_port_mapping="127.0.0.1:${PORT}:27017"
+        compose_port_mapping="127.0.0.1:${PORT}:3306"
         bind_status_text="仅限本地 (127.0.0.1)"
     else
-        compose_port_mapping="${PORT}:27017"
+        compose_port_mapping="${PORT}:3306"
         bind_status_text="开放公网 (0.0.0.0)"
     fi
 
-    read -p "请输入 admin 根密码 [留空自动生成]: " input_pass
-    MONGO_ROOT_PASSWORD=${input_pass:-$(gen_pass)}
+    read -p "请输入 root 运行密码 [留空自动生成]: " input_pass
+    MARIADB_ROOT_PASSWORD=${input_pass:-$(gen_pass)}
 
     mkdir -p "$APP_DIR/data" "$BACKUP_DIR"
     
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  mongodb-db:
-    container_name: mongodb
-    image: mongo:6.0
+  mariadb-db:
+    container_name: mariadb
+    image: mariadb:11.4
     restart: always
     ports:
       - "${compose_port_mapping}"
-    command: mongod --auth
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     environment:
-      MONGO_INITDB_ROOT_USERNAME: admin
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
       TZ: Asia/Shanghai
     volumes:
-      - ./data:/data/db
+      - ./data:/var/lib/mysql
 EOF
 
     cat > "$CONFIG_FILE" <<EOF
 PORT=$PORT
-MONGO_ROOT_PASSWORD=$MONGO_ROOT_PASSWORD
+MARIADB_ROOT_PASSWORD=$MARIADB_ROOT_PASSWORD
 BIND_STRATEGY=$bind_choice
 EOF
 
@@ -192,7 +192,7 @@ EOF
     local local_ip=$(get_local_ip)
     
     echo -e "\n${GREEN}================================================${RESET}"
-    echo -e "${GREEN}🎉 MongoDB 安全认证版安装启动成功！运行连接信息：${RESET}"
+    echo -e "${GREEN}🎉 MariaDB 容器版安装启动成功！运行连接信息：${RESET}"
     echo -e "${GREEN}================================================${RESET}"
     echo -e "${GREEN} 网络绑定策略 :${RESET} ${YELLOW}${bind_status_text}${RESET}"
     if [ "$bind_choice" = "2" ]; then
@@ -201,9 +201,9 @@ EOF
         echo -e "${GREEN} 公网连接地址 :${RESET} ${public_ip}:${PORT}"
         echo -e "${GREEN} 内网连接地址 :${RESET} 127.0.0.1:${PORT}"
     fi
-    echo -e "${GREEN} 管理用户名   :${RESET} admin"
-    echo -e "${GREEN} 认证数据库   :${RESET} admin"
-    echo -e "${GREEN} 管理员密码   :${RESET} ${YELLOW}${MONGO_ROOT_PASSWORD}${RESET}"
+    echo -e "${GREEN} 管理用户名   :${RESET} root"
+    echo -e "${GREEN} 超级管理密码 :${RESET} ${YELLOW}${MARIADB_ROOT_PASSWORD}${RESET}"
+    echo -e "${GREEN} 标准连接串   :${RESET} ${CYAN}mysql://root:${MARIADB_ROOT_PASSWORD}@${public_ip}:${PORT}/;${RESET}"
     echo -e "${GREEN} 配置文件路径 :${RESET} ${CONFIG_FILE}"
     echo -e "${GREEN}================================================${RESET}"
     
@@ -213,56 +213,56 @@ EOF
 function update_app() {
     if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录，请先安装${RESET}"; sleep 1; menu; fi
     cd "$APP_DIR" && $COMPOSE_CMD pull && $COMPOSE_CMD up -d
-    echo -e "${GREEN}✅ MongoDB 已更新并重启${RESET}"
+    echo -e "${GREEN}✅ MariaDB 已更新并重启${RESET}"
     pause; menu
 }
 
 function uninstall_app() {
     if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; fi
-    read -p "确定要彻底卸载吗？数据将清空！(y/N): " confirm
+    read -p "确定要彻底卸载吗？所有数据表将清空！(y/N): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" || "$confirm" == "yes" ]]; then
         cd "$APP_DIR" && $COMPOSE_CMD down -v
         rm -rf "$APP_DIR"
-        echo -e "${GREEN}✅ MongoDB 已彻底卸载${RESET}"
+        echo -e "${GREEN}✅ MariaDB 已彻底卸载${RESET}"
     else
         echo -e "${YELLOW}已取消卸载${RESET}"
     fi
     pause; menu
 }
 
-function start_mg() {
-    docker start mongodb &>/dev/null
-    echo -e "${GREEN}✅ MongoDB 容器已启动${RESET}"
+function start_md() {
+    docker start mariadb &>/dev/null
+    echo -e "${GREEN}✅ MariaDB 容器已启动${RESET}"
     pause; menu
 }
 
-function stop_mg() {
-    docker stop mongodb &>/dev/null
-    echo -e "${GREEN}✅ MongoDB 容器已停止${RESET}"
+function stop_md() {
+    docker stop mariadb &>/dev/null
+    echo -e "${GREEN}✅ MariaDB 容器已停止${RESET}"
     pause; menu
 }
 
-function restart_mg() {
-    docker restart mongodb &>/dev/null
-    echo -e "${GREEN}✅ MongoDB 容器已重启${RESET}"
+function restart_md() {
+    docker restart mariadb &>/dev/null
+    echo -e "${GREEN}✅ MariaDB 容器已重启${RESET}"
     pause; menu
 }
 
 function view_logs() {
     echo -e "${YELLOW}提示: 朝下滚动，按下 Ctrl + C 即可退出日志回到主菜单。${RESET}"
     sleep 1
-    docker logs --tail 100 -f mongodb
+    docker logs --tail 100 -f mariadb
     menu
 }
 
 function show_info() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MongoDB${RESET}"; sleep 1; menu; fi
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     SERVER_IP=$(get_public_ip)
     local local_ip=$(get_local_ip)
     BIND_STRATEGY=${BIND_STRATEGY:-1}
     
-    echo -e "\n${GREEN}====== MongoDB 运行信息 ======${RESET}"
+    echo -e "\n${GREEN}====== MariaDB 运行信息 ======${RESET}"
     if [ "$BIND_STRATEGY" = "2" ]; then
         echo -e "${GREEN}绑定状态 :${RESET} ${YELLOW}仅限本地监听 (127.0.0.1)${RESET}"
         echo -e "${GREEN}连接地址 :${RESET} 127.0.0.1:${PORT}"
@@ -271,54 +271,44 @@ function show_info() {
         echo -e "${GREEN}公网地址 :${RESET} ${SERVER_IP}:${PORT}"
         echo -e "${GREEN}内网地址 :${RESET} 127.0.0.1:${PORT}"
     fi
-    echo -e "${GREEN}超级管理员:${RESET} admin"
-    echo -e "${GREEN}超级密码  :${RESET} ${YELLOW}${MONGO_ROOT_PASSWORD}${RESET}"
-    echo -e "${GREEN}安装路径  :${RESET} $APP_DIR"
-    echo -e "${GREEN}标准连接串:${RESET} ${CYAN}mongodb://admin:${MONGO_ROOT_PASSWORD}@${SERVER_IP}:${PORT}/?authSource=admin${RESET}"
+    echo -e "${GREEN}超级管理员:${RESET} root"
+    echo -e "${GREEN}超级密码  :${RESET} ${YELLOW}${MARIADB_ROOT_PASSWORD}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     
-    echo -e "${GREEN}当前用户自定义数据库及集合统计:${RESET}"
-    docker exec -i mongodb mongosh -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "
-    db.getMongo().getDBNames().forEach(function(d) {
-        if(!['admin','config','local'].includes(d)){
-            var dbInstance = db.getSiblingDB(d);
-            print(' 📂 数据库: ' + d + ' (含有 ' + dbInstance.getCollectionNames().length + ' 个集合)');
-        }
-    });"
+    echo -e "${GREEN}当前用户自定义数据库列表:${RESET}"
+    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "
+    SELECT SCHEMA_NAME as '📂 数据库名称' FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys');"
     
-    echo -e "\n${GREEN}当前数据库系统用户角色列表:${RESET}"
-    docker exec -i mongodb mongosh -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "
-    db.getSiblingDB('admin').getUsers().forEach(function(u) {
-        print(' 👤 用户: ' + u.user + ' | 认证库: ' + u.db + ' | 角色: ' + JSON.stringify(u.roles.map(r => r.role + '@' + r.db)));
-    });"
+    echo -e "\n${GREEN}当前系统用户及允许连入的主机列表:${RESET}"
+    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "
+    SELECT User as '👤 用户', Host as '🌐 允许连入主机' FROM mysql.user;"
     echo -e "${GREEN}================================${RESET}"
     pause; menu
 }
 
 function create_database() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MongoDB${RESET}"; sleep 1; menu; fi
-    echo -e "${YELLOW}提示：MongoDB 的机制是不需要显式创建空库。当你在新库里插入第一条数据（或创建用户）时，数据库会被自动创建。${RESET}"
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
     read -p "请输入你想创建的数据库名: " new_db
     if [ -z "$new_db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
     
-    # 建立一个临时集合以固化库
-    docker exec -i mongodb mongosh -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "db.getSiblingDB('$new_db').createCollection('init_holder')" &>/dev/null
-    echo -e "${GREEN}✅ 数据库 $new_db 初始化占位成功。${RESET}"
+    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "CREATE DATABASE \`$new_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" &>/dev/null
+    echo -e "${GREEN}✅ 数据库 $new_db 创建成功（默认采用 utf8mb4 现代全字符编码）。${RESET}"
     pause; menu
 }
 
 function delete_database() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MongoDB${RESET}"; sleep 1; menu; fi
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     
     read -p "请输入要彻底删除的数据库名: " del_db
     if [ -z "$del_db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    if [[ "$del_db" =~ ^(admin|config|local)$ ]]; then echo -e "${RED}❌ 安全限制：拒绝删除系统保留库！${RESET}"; pause; menu; fi
+    if [[ "$del_db" =~ ^(information_schema|mysql|performance_schema|sys)$ ]]; then echo -e "${RED}❌ 安全限制：拒绝删除系统保留核心库！${RESET}"; pause; menu; fi
     
-    read -p "警告：确定要彻底删除 MongoDB 数据库 [$del_db] 吗？集合及数据将瞬间蒸发！(y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" || "$confirm" == "yes" ]]; then
-        docker exec -i mongodb mongosh -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "db.getSiblingDB('$del_db').dropDatabase()" &>/dev/null
-        echo -e "${GREEN}✅ 数据库 $del_db 移除动作完成。${RESET}"
+    read -p "警告：确定要彻底删除数据库 [$del_db] 吗？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "DROP DATABASE \`$del_db\`;" &>/dev/null
+        echo -e "${GREEN}✅ 数据库 $del_db 已成功擦除。${RESET}"
     else
         echo -e "${YELLOW}操作已取消。${RESET}"
     fi
@@ -326,44 +316,41 @@ function delete_database() {
 }
 
 function create_user() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MongoDB${RESET}"; sleep 1; menu; fi
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     read -p "请输入新用户名: " new_user
     if [ -z "$new_user" ]; then echo -e "${RED}用户名不能为空！${RESET}"; pause; menu; fi
     read -p "请输入新用户密码 [留空随机]: " new_pass
     new_pass=${new_pass:-$(gen_pass)}
-    read -p "该用户需要读写哪一个数据库: " grant_db
+    read -p "该用户需要拥有哪一个数据库的权限: " grant_db
     if [ -z "$grant_db" ]; then echo -e "${RED}数据库名不能为空！${RESET}"; pause; menu; fi
 
-    # 在目标库创建拥有 readWrite 权限的业务账号
-    docker exec -i mongodb mongosh -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "
-    db.getSiblingDB('$grant_db').createUser({
-        user: '$new_user',
-        pwd: '$new_pass',
-        roles: [{ role: 'readWrite', db: '$grant_db' }]
-    })" &>/dev/null
+    # 创建支持任意 IP 远程访问的独立业务账号并授予权限
+    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "
+    CREATE USER '$new_user'@'%' IDENTIFIED BY '$new_pass';
+    GRANT ALL PRIVILEGES ON \`$grant_db\`.* TO '$new_user'@'%';
+    FLUSH PRIVILEGES;" &>/dev/null
 
-    echo -e "${YELLOW}✅ 业务用户 $new_user 创建成功。密码: $new_pass (拥有 $grant_db 的独占读写权限)${RESET}"
+    echo -e "${YELLOW}✅ 业务用户 $new_user 创建成功。密码: $new_pass (已拥有 $grant_db 的全部操作权限)${RESET}"
     pause; menu
 }
 
 function delete_user() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MongoDB${RESET}"; sleep 1; menu; fi
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     
     read -p "请输入要删除的用户名: " del_user
-    read -p "该用户所属的认证数据库名: " user_db
-    if [[ -z "$del_user" || -z "$user_db" ]]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    if [ "$del_user" = "admin" ]; then echo -e "${RED}❌ 安全限制：拒绝删除根超级管理员 admin！${RESET}"; pause; menu; fi
+    if [ -z "$del_user" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
+    if [[ "$del_user" = "root" ]]; then echo -e "${RED}❌ 安全限制：拒绝删除超级管理员 root！${RESET}"; pause; menu; phi
 
-    docker exec -i mongodb mongosh -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "db.getSiblingDB('$user_db').dropUser('$del_user')" &>/dev/null
-    echo -e "${GREEN}✅ 尝试卸载用户 '$del_user' 结束。${RESET}"
+    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "DROP USER '$del_user'@'%'; FLUSH PRIVILEGES;" &>/dev/null
+    echo -e "${GREEN}✅ 用户 '$del_user' 已成功卸载。${RESET}"
     pause; menu
 }
 
-# 13. 一键联动的最高所有权创建
+# 13. 一键联动的一键建库+建用户
 function create_db_user() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MongoDB${RESET}"; sleep 1; menu; fi
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     read -p "新数据库名: " new_db
     read -p "新用户名: " new_user
@@ -371,14 +358,11 @@ function create_db_user() {
     read -p "密码 [留空随机]: " new_pass
     new_pass=${new_pass:-$(gen_pass)}
 
-    # 同时初始化数据库和高权限业务账号
-    docker exec -i mongodb mongosh -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "
-    db.getSiblingDB('$new_db').createCollection('init_holder');
-    db.getSiblingDB('$new_db').createUser({
-        user: '$new_user',
-        pwd: '$new_pass',
-        roles: [{ role: 'dbOwner', db: '$new_db' }]
-    });" &>/dev/null
+    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "
+    CREATE DATABASE \`$new_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    CREATE USER '$new_user'@'%' IDENTIFIED BY '$new_pass';
+    GRANT ALL PRIVILEGES ON \`$new_db\`.* TO '$new_user'@'%';
+    FLUSH PRIVILEGES;" &>/dev/null
 
     echo -e "${YELLOW}✅ 联动深度创建成功！${RESET}"
     echo -e "${GREEN} 🚀 用户名 :${RESET} $new_user"
@@ -388,117 +372,83 @@ function create_db_user() {
 }
 
 function change_password() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MongoDB${RESET}"; sleep 1; menu; fi
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     
-    read -p "请输入要修改密码的用户名 [默认 admin]: " target_user
-    target_user=${target_user:-admin}
-    read -p "该用户所在的认证数据库 [默认 admin]: " user_db
-    user_db=${user_db:-admin}
-    read -p "请输入新密码 [留空随机生成]: " new_pass
+    read -p "请输入要修改密码的用户名 [默认 root]: " target_user
+    target_user=${target_user:-root}
+    read -p "请输入新密码 [留空随机]: " new_pass
     new_pass=${new_pass:-$(gen_pass)}
 
-    docker exec -i mongodb mongosh -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "db.getSiblingDB('$user_db').updateUser('$target_user', {pwd: '$new_pass'})" &>/dev/null
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✅ 用户 '$target_user' 密码修改成功！新密码: ${YELLOW}$new_pass${RESET}"
-        if [ "$target_user" = "admin" ] && [ "$user_db" = "admin" ]; then
-            sed -i "s/^MONGO_ROOT_PASSWORD=.*/MONGO_ROOT_PASSWORD=$new_pass/g" "$CONFIG_FILE"
-            sed -i "s/MONGO_INITDB_ROOT_PASSWORD:.*/MONGO_INITDB_ROOT_PASSWORD: $new_pass/g" "$COMPOSE_FILE"
-            echo -e "${GREEN}✅ 本地安全配置文件已全量同步更新。${RESET}"
-        fi
-    else
-        echo -e "${RED}❌ 密码修改失败，请确保用户与认证库匹配。${RESET}"
+    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "ALTER USER '$target_user'@'$( [ "$target_user" = "root" ] && echo "localhost' IDENTIFIED BY '$new_pass';" || echo "%' IDENTIFIED BY '$new_pass';" ) FLUSH PRIVILEGES;" &>/dev/null
+    
+    # 针对 root 远程连接也同步更新一次密码
+    if [ "$target_user" = "root" ]; then
+        docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "ALTER USER 'root'@'%' IDENTIFIED BY '$new_pass'; FLUSH PRIVILEGES;" &>/dev/null
+        sed -i "s/^MARIADB_ROOT_PASSWORD=.*/MARIADB_ROOT_PASSWORD=$new_pass/g" "$CONFIG_FILE"
+        sed -i "s/MARIADB_ROOT_PASSWORD:.*/MARIADB_ROOT_PASSWORD: $new_pass/g" "$COMPOSE_FILE"
+        echo -e "${GREEN}✅ 本地安全配置文件已全量同步更新。${RESET}"
     fi
+
+    echo -e "${GREEN}✅ 用户 '$target_user' 密码更新成功！新密码: ${YELLOW}$new_pass${RESET}"
     pause; menu
 }
 
 function backup_db() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MongoDB${RESET}"; sleep 1; menu; fi
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     
-    local target_dir=""
-    echo -e "\n请选择备份文件导出目标："
-    echo -e "  [1] 导出到脚本默认备份目录 (${BACKUP_DIR})"
-    echo -e "  [2] 导出到自定义外部目录的绝对路径"
-    read -p "请选择 [1-2, 默认 1]: " path_choice
-    path_choice=${path_choice:-1}
-
-    if [ "$path_choice" = "1" ]; then
-        target_dir="$BACKUP_DIR"
-        mkdir -p "$target_dir"
-    else
-        read -p "请输入要保存备份的目录绝对路径 (如 /root/): " custom_dir
-        if [ -z "$custom_dir" ]; then echo -e "${RED}目录不能为空！${RESET}"; pause; menu; fi
-        target_dir="$custom_dir"
-        mkdir -p "$target_dir"
-    fi
-
-    read -p "要备份的单个库名 (全库物理备份请输入 all): " db
+    read -p "请输入你想单独备份的库名 (全库备份请输入 all): " db
     if [ -z "$db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
     
-    # 采用更安全的官方高压缩比格式
-    BACKUP_FILE="${target_dir%/}/${db}_$(date +%Y%m%d_%H%M%S).archive"
+    BACKUP_FILE="$BACKUP_DIR/${db}_$(date +%Y%m%d_%H%M%S).sql"
     
     if [ "$db" = "all" ]; then
-        docker exec -i mongodb mongodump -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --archive > "$BACKUP_FILE"
+        docker exec -i mariadb mariadb-dump -u root -p"$MARIADB_ROOT_PASSWORD" --all-databases > "$BACKUP_FILE"
     else
-        docker exec -i mongodb mongodump -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin -d "$db" --archive > "$BACKUP_FILE"
+        docker exec -i mariadb mariadb-dump -u root -p"$MARIADB_ROOT_PASSWORD" --databases "$db" > "$BACKUP_FILE"
     fi
 
     if [ $? -eq 0 ] && [ -s "$BACKUP_FILE" ]; then
-        echo -e "${YELLOW}✅ MongoDB 二进制存档备份完成，文件存放在: $BACKUP_FILE${RESET}"
+        echo -e "${YELLOW}✅ SQL 结构及数据备份成功，存放于: $BACKUP_FILE${RESET}"
     else
-        echo -e "${RED}❌ 备份失败，请核对权限或磁盘容量。${RESET}"
+        echo -e "${RED}❌ 备份失败。${RESET}"
         rm -f "$BACKUP_FILE"
     fi
     pause; menu
 }
 
 function restore_db() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MongoDB${RESET}"; sleep 1; menu; fi
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     
-    local archive_absolute_path=""
-
-    echo -e "\n请选择备份文件来源路径："
-    echo -e "  [1] 从脚本默认备份目录恢复 (${BACKUP_DIR})"
-    echo -e "  [2] 输入自定义外部 .archive 文件的绝对路径"
-    read -p "请选择 [1-2, 默认 1]: " path_choice
-    path_choice=${path_choice:-1}
-
-    if [ "$path_choice" = "1" ]; then
-        if [ ! -d "$BACKUP_DIR" ] || [ -z "$(ls -A "$BACKUP_DIR")" ]; then
-            echo -e "${RED}❌ 默认备份目录下没有找到任何备份存档${RESET}"; pause; menu
-        fi
-        echo -e "${GREEN}可用历史备份:${RESET}"
-        ls -1 "$BACKUP_DIR"
-        read -p "请输入完整备份文件名: " file
-        archive_absolute_path="$BACKUP_DIR/$file"
-    else
-        read -p "请输入 .archive 文件的绝对路径 (如 /root/data.archive): " custom_path
-        archive_absolute_path="$custom_path"
+    if [ ! -d "$BACKUP_DIR" ] || [ -z "$(ls -A "$BACKUP_DIR")" ]; then
+        echo -e "${RED}❌ 默认备份目录下没有找到任何 SQL 备份文件${RESET}"; pause; menu
+    fi
+    
+    echo -e "${GREEN}可用历史备份列表:${RESET}"
+    ls -1 "$BACKUP_DIR"
+    read -p "请输入完整备份文件名: " file
+    local backup_path="$BACKUP_DIR/$file"
+    
+    if [ ! -f "$backup_path" ]; then
+        echo -e "${RED}❌ 错误：未找到指定的备份文件！${RESET}"; pause; menu
     fi
 
-    if [ ! -f "$archive_absolute_path" ]; then
-        echo -e "${RED}❌ 错误：未找到指定的备份文件！[ $archive_absolute_path ]${RESET}"
-        pause; menu
-    fi
-
-    # --nsInclude 可以自动映射恢复，如果是全库直接回车
-    read -p "目标数据库名 (如果是通过 all 备份的全库文件，直接敲回车): " target_db
+    read -p "将此备份文件覆盖恢复入哪一个数据库 (如果是通过 all 备份的全库文件，直接敲回车): " target_db
 
     if [ -z "$target_db" ]; then
-        docker exec -i mongodb mongorestore -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --archive < "$archive_absolute_path"
+        docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" < "$backup_path"
     else
-        # 智能重定向单库
-        docker exec -i mongodb mongorestore -u admin -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --archive --nsFrom '.*' --nsTo "$target_db.*" < "$archive_absolute_path"
+        # 如果单库没有创建，自动前置补建
+        docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$target_db\`;"
+        docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" "$target_db" < "$backup_path"
     fi
     
     if [ $? -eq 0 ]; then
-        echo -e "${YELLOW}✅ MongoDB 数据存档恢复成功！${RESET}"
+        echo -e "${YELLOW}✅ MariaDB 数据覆盖恢复成功！${RESET}"
     else
-        echo -e "${RED}❌ 恢复失败，请检查报错日志。${RESET}"
+        echo -e "${RED}❌ 恢复失败，请检查脚本内容。${RESET}"
     fi
     pause; menu
 }

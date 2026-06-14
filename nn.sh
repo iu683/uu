@@ -1,183 +1,260 @@
 #!/bin/bash
 # ========================================
-# yt-dlp 一键管理脚本 PRO (多系统兼容版)
+# Komari Traffic Hub 一键管理脚本
 # ========================================
 
-VIDEO_DIR="/opt/yt-dlp"
-URL_FILE="$VIDEO_DIR/urls.txt"
-COOKIE_FILE="$VIDEO_DIR/cookies.txt"
-
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-mkdir -p "$VIDEO_DIR"
+APP_NAME="komari-hub"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+ENV_FILE="$APP_DIR/.env"
 
-# 自动构建 Cookie 参数
-get_cookie_args() {
-    if [ -f "$COOKIE_FILE" ]; then
-        echo "--cookies $COOKIE_FILE"
-    else
-        echo ""
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-install_yt() {
-    echo -e "${GREEN}正在检测系统架构并安装依赖 (包含 ffmpeg & JS 运行环境)...${RESET}"
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
+    fi
+}
+
+menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}=== Komari Traffic Hub 管理菜单 ===${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新服务${RESET}"
+        echo -e "${GREEN}3) 重启服务${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR/data"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装配置？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    # 交互式收集配置
+    echo -e "${YELLOW}--- 请输入基础配置信息 ---${RESET}"
     
-    if command -v apt &> /dev/null; then
-        # Debian / Ubuntu
-        apt update -y
-        apt install -y ffmpeg curl nano quickjs
-    elif command -v dnf &> /dev/null; then
-        # CentOS 8+ / Fedora / Rocky Linux / AlmaLinux
-        dnf install -y epel-release 2>/dev/null
-        dnf install -y ffmpeg curl nano quickjs-devel || dnf install -y ffmpeg curl nano nodejs
-    elif command -v yum &> /dev/null; then
-        # CentOS 7
-        yum install -y epel-release 2>/dev/null
-        yum install -y ffmpeg curl nano quickjs-devel || yum install -y ffmpeg curl nano nodejs
-    elif command -v apk &> /dev/null; then
-        # Alpine Linux
-        apk update
-        apk add ffmpeg curl nano quickjs nodejs
-    else
-        echo -e "${RED}未找到支持的包管理器 (apt/yum/dnf/apk)，请手动安装 ffmpeg 和 quickjs/nodejs。${RESET}"
-    fi
+    read -p "请输入 Komari 面板地址 (例: https://komari.example): " komari_url
+    KOMARI_BASE_URL=${komari_url:-"https://your-komari.example"}
 
-    echo -e "${GREEN}正在下载最新版 yt-dlp...${RESET}"
-    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-    chmod a+rx /usr/local/bin/yt-dlp
-    echo -e "${GREEN}安装与依赖配置完成！${RESET}"
+    read -p "请输入 Telegram Bot Token: " tg_token
+    TELEGRAM_BOT_TOKEN=${tg_token:-"123456:YOUR_BOT_TOKEN"}
+
+    read -p "请输入 Telegram Chat ID: " tg_chat_id
+    TELEGRAM_CHAT_ID=${tg_chat_id:-"123456789"}
+
+    read -p "请输入 Web 面板访问端口 [默认:8080]: " input_port
+    PORT=${input_port:-8080}
+    check_port "$PORT" || return
+
+    read -p "请输入 Web 面板管理员密码 (必填): " web_pass
+    while [ -z "$web_pass" ]; do
+        read -p "${RED}密码不能为空，请重新输入:${RESET} " web_pass
+    done
+
+    # 自动生成随机 Session 密钥
+    WEB_SESSION_SECRET=$(openssl rand -hex 16)
+
+    # 1. 写入 .env 配置文件
+    cat > "$ENV_FILE" <<EOF
+# Komari 面板地址（不要以 / 结尾）
+KOMARI_BASE_URL=${KOMARI_BASE_URL}
+
+# Komari API 超时（秒）
+KOMARI_TIMEOUT_SECONDS=15
+
+# Komari API 鉴权（可选）
+KOMARI_API_TOKEN=
+KOMARI_API_TOKEN_HEADER=Authorization
+KOMARI_API_TOKEN_PREFIX=Bearer
+
+# Komari 节点并发请求数
+KOMARI_FETCH_WORKERS=6
+
+# Telegram
+TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+
+# 允许接收命令的 chat（可选，逗号分隔）
+TELEGRAM_ALLOWED_CHAT_IDS=
+
+# 管理员 chat（可选，逗号分隔）
+TELEGRAM_ADMIN_CHAT_IDS=
+
+# AI（可选，启用 /ask 与 /ai）
+AI_API_BASE=
+AI_API_KEY=
+AI_MODEL=
+
+# AI 数据包缓存时长（秒），默认 3600；设为 0 关闭缓存
+AI_PACK_CACHE_TTL_SECONDS=3600
+
+# Web 面板
+WEB_USERNAME=admin
+WEB_PASSWORD=${web_pass}
+WEB_SESSION_SECRET=${WEB_SESSION_SECRET}
+WEB_PORT=${PORT}
+
+# 启动通知
+BOT_START_NOTIFY=1
+BOT_INSTANCE_NAME=Komari-Hub-Server
+
+# 容器内数据目录（固定）
+DATA_DIR=/data
+
+# 统计时区（默认 Asia/Shanghai）
+STAT_TZ=Asia/Shanghai
+
+# Top 榜数量
+TOP_N=3
+
+# 连续快照设置
+SAMPLE_INTERVAL_SECONDS=300
+SAMPLE_RETENTION_HOURS=2
+TRAFFIC_SNAPSHOT_RETENTION_DAYS=45
+
+# 历史数据策略
+HISTORY_HOT_DAYS=60
+HISTORY_RETENTION_DAYS=400
+TASK_RUN_RETENTION_DAYS=90
+NODE_DAILY_USAGE_RETENTION_DAYS=365
+
+# 智能告警
+ALERTS_ENABLED=1
+TELEGRAM_ALERT_CHAT_ID=
+ALERT_COOLDOWN_SECONDS=1800
+ALERT_SILENCE_WINDOWS=
+ALERT_NODE_MISSING_SAMPLES=2
+ALERT_WINDOW_MINUTES=60
+ALERT_TOTAL_WINDOW_BYTES=
+ALERT_NODE_WINDOW_BYTES=
+ALERT_DAILY_TOTAL_BYTES=
+ALERT_DAILY_NODE_BYTES=
+ALERT_RECOVERY_NOTIFY=1
+
+# 日志
+LOG_LEVEL=INFO
+LOG_FILE=
+EOF
+
+    # 2. 写入 docker-compose.yml 配置文件
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  bot:
+    image: ghcr.io/wirelouis/komari-traffic-hub:latest
+    env_file: .env
+    environment:
+      - TZ=Asia/Shanghai
+      - STAT_TZ=Asia/Shanghai
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "/app/komari_traffic_report.py", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command: ["python", "/app/komari_traffic_report.py", "listen"]
+
+  web:
+    image: ghcr.io/wirelouis/komari-traffic-hub:latest
+    env_file: .env
+    environment:
+      - TZ=Asia/Shanghai
+      - STAT_TZ=Asia/Shanghai
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:\${WEB_PORT:-8080}:8080"
+    restart: unless-stopped
+    command: ["uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8080"]
+EOF
+
+    # 启动服务
+    cd "$APP_DIR" || exit
+    docker compose up -d
+
+    echo
+    echo -e "${GREEN}✅ Komari Traffic Hub 部署成功！${RESET}"
+    echo -e "${YELLOW}🌐 Web 面板访问地址: http://127.0.0.1:${PORT}${RESET}"
+    echo -e "${GREEN}📂 数据挂载目录: $APP_DIR/data${RESET}"
+    echo -e "${GREEN}📄 完整配置文件: $ENV_FILE (如需微调高级告警参数可稍后自行编辑此文件)${RESET}"
+
+    read -p "按回车返回菜单..."
 }
 
-update_yt() {
-    echo -e "${GREEN}正在更新 yt-dlp...${RESET}"
-    yt-dlp -U
+update_app() {
+    cd "$APP_DIR" || return
+    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ 服务已更新并重启${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-uninstall_yt() {
-    rm -f /usr/local/bin/yt-dlp
-    rm -rf /opt/yt-dlp
-    echo -e "${GREEN}已卸载 yt-dlp${RESET}"
-    exit 0
+restart_app() {
+    cd "$APP_DIR" || return
+    docker compose restart
+    echo -e "${GREEN}✅ 所有服务已重启${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-download_single() {
-    read -e -p "$(echo -e ${GREEN}请输入视频链接: ${RESET})" url
-    COOKIE_ARGS=$(get_cookie_args)
-    yt-dlp -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
-        $COOKIE_ARGS \
-        --write-subs --sub-langs all \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites "$url"
+view_logs() {
+    cd "$APP_DIR" || return
+    docker compose logs -f
 }
 
-download_batch() {
-    if [ ! -f "$URL_FILE" ]; then
-        echo -e "# 一行一个视频链接" > "$URL_FILE"
-    fi
-    nano "$URL_FILE"
-    COOKIE_ARGS=$(get_cookie_args)
-    yt-dlp -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
-        $COOKIE_ARGS \
-        --write-subs --sub-langs all \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -a "$URL_FILE" \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites
+check_status() {
+    cd "$APP_DIR" || return
+    docker compose ps
+    echo
+    read -p "按回车返回菜单..."
 }
 
-download_custom() {
-    read -e -p "$(echo -e ${GREEN}请输入完整 yt-dlp 参数（不含 yt-dlp）: ${RESET})" custom
-    COOKIE_ARGS=$(get_cookie_args)
-    yt-dlp -P "$VIDEO_DIR" $COOKIE_ARGS $custom \
-        --write-subs --sub-langs all \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites
+uninstall_app() {
+   
+    docker compose down -v
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ 卸载完成！${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-download_mp3() {
-    read -e -p "$(echo -e ${GREEN}请输入视频链接: ${RESET})" url
-    COOKIE_ARGS=$(get_cookie_args)
-    yt-dlp -P "$VIDEO_DIR" -x --audio-format mp3 \
-        $COOKIE_ARGS \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites "$url"
-}
-
-delete_video() {
-    echo -e "${GREEN}当前视频目录：${RESET}"
-    ls "$VIDEO_DIR"
-    read -e -p "$(echo -e ${GREEN}请输入要删除的目录名称: ${RESET})" name
-    rm -rf "$VIDEO_DIR/$name"
-    echo -e "${GREEN}已删除${RESET}"
-}
-
-show_list() {
-    echo -e "${GREEN}已下载视频列表：${RESET}"
-    ls -td "$VIDEO_DIR"/*/ 2>/dev/null || echo -e "${GREEN}暂无视频${RESET}"
-}
-
-while true; do
-    clear
-    # 检查安装状态与获取版本号
-    if [ -x "/usr/local/bin/yt-dlp" ]; then
-        STATUS="${YELLOW}已安装${RESET}"
-        VERSION_NUM=$(/usr/local/bin/yt-dlp --version 2>/dev/null)
-        VERSION="${YELLOW}${VERSION_NUM}${RESET}"
-    else
-        STATUS="${RED}未安装${RESET}"
-        VERSION="${RED}--${RESET}"
-    fi
-
-    # 检查 Cookie 状态
-    if [ -f "$COOKIE_FILE" ]; then
-        COOKIE_STATUS="${GREEN}已载入 (cookies.txt)${RESET}"
-    else
-        COOKIE_STATUS="${RED}未检测到 (建议配置)${RESET}"
-    fi
-
-    echo -e "${GREEN}=================================================${RESET}"
-    echo -e "${GREEN}             yt-dlp 管理工具                     ${RESET}"
-    echo -e "${GREEN}=================================================${RESET}"
-    echo -e "${GREEN} 状态: $STATUS    |   当前版本: $VERSION${RESET}"
-    echo -e "${GREEN} Cookie 状态: $COOKIE_STATUS${RESET}"
-    echo -e "${GREEN}=================================================${RESET}"
-    echo -e "${GREEN}  1. 安装/修复依赖环境 (智能识别系统)${RESET}"
-    echo -e "${GREEN}  2. 更新 yt-dlp${RESET}"
-    echo -e "${GREEN}  3. 卸载 yt-dlp${RESET}"
-    echo -e "${GREEN}  5. 单个视频下载${RESET}"
-    echo -e "${GREEN}  6. 批量视频下载${RESET}"
-    echo -e "${GREEN}  7. 自定义参数下载${RESET}"
-    echo -e "${GREEN}  8. 下载为 MP3${RESET}"
-    echo -e "${GREEN}  9. 删除视频目录${RESET}"
-    echo -e "${GREEN} 10. 查看下载列表${RESET}"
-    echo -e "${GREEN}  0. 退出${RESET}"
-    echo -e "${GREEN}=================================================${RESET}"
-    read -e -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
-
-    case $choice in
-        1) install_yt ;;
-        2) update_yt ;;
-        3) uninstall_yt ;;
-        5) download_single ;;
-        6) download_batch ;;
-        7) download_custom ;;
-        8) download_mp3 ;;
-        9) delete_video ;;
-        10) show_list ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
-
-    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-done
+# 运行菜单
+menu

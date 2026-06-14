@@ -1,460 +1,135 @@
 #!/bin/bash
-# ========================================
-# MariaDB 容器管理面板 (Docker Compose) - 最终精简美化版
-# ========================================
 
-GREEN="\033[32m"
-RESET="\033[0m"
-YELLOW="\033[33m"
-RED="\033[31m"
-BLUE="\033[34m"
-CYAN="\033[36m"
-APP_NAME="mariadb"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
-BACKUP_DIR="$APP_DIR/backup"
+GREEN='\e[0;32m'
+YELLOW='\e[1;33m'
+RED='\e[0;31m'
+CYAN='\e[0;36m'
+RESET='\e[0m'
 
-# 自动适配 docker compose 语法
-if docker compose version &>/dev/null; then
-    COMPOSE_CMD="docker compose"
-else
-    COMPOSE_CMD="docker-compose"
+export PROJECT_DIR="/opt/telebox"
+
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}错误: 请使用 sudo 或 root 权限运行此脚本！${RESET}"
+    exit 1
 fi
 
-# 随机密码生成函数
-gen_pass() {
-    tr -dc A-Za-z0-9 </dev/urandom | head -c 16
-}
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP"
-}
-
-get_local_ip() {
-    local ip
-    ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+')
-    [ -z "$ip" ] && ip=$(hostname -I | awk '{print $1}')
-    echo "${ip:-127.0.0.1}"
-}
-
-pause() {
-    read -p $'\e[32m按回车返回菜单...\e[0m'
-}
-
-# 获取容器动态状态及自定义数据库个数
-get_sys_status() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        status="${RED}未安装${RESET}"
-        version="${RED}无${RESET}"
-        port_show="${RED}无${RESET}"
-        db_count="${RED}0${RESET}"
+get_status() {
+    if command -v node >/dev/null 2>&1; then
+        version=$(node -v)
     else
-        source "$CONFIG_FILE"
-        version="11.4 (LTS)"
-        port_show="$PORT"
-        
-        if [ "$(docker ps -q -f name=^mariadb$)" ]; then
-            status="${GREEN}运行中${RESET}"
-            # 兼容 11.4+ 镜像，使用 mariadb 替代 mysql 命令
-            local raw_count=$(docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys');" -s --skip-column-names 2>/dev/null)
-            if [ -z "$raw_count" ]; then
-                db_count="${RED}获取失败${RESET}"
-            else
-                db_count="${YELLOW}${raw_count//[[:space:]]/}${RESET} 个"
-            fi
-        elif [ "$(docker ps -a -q -f name=^mariadb$)" ]; then
-            status="${YELLOW}已停止${RESET}"
-            db_count="${YELLOW}未知 (请先启动容器)${RESET}"
-        else
-            status="${RED}未启动 (容器不存在)${RESET}"
-            db_count="${RED}0${RESET}"
+        version="${RED}未安装${RESET}"
+    fi
+
+    # 1. 优先、绝对信任 PM2 的判断，彻底解决 npm/node 后台进程被误判为前台的问题
+    if command -v pm2 >/dev/null 2>&1; then
+        pm2_status=$(pm2 jlist 2>/dev/null | grep -o '"name":"telebox"[^}]*' | grep -o '"status":"[^"]*"' | head -n1 | cut -d'"' -f4)
+        if [ "$pm2_status" = "online" ]; then
+            status="${GREEN}运行中 (PM2 守护)${RESET}"
+            port_show="${GREEN}生产环境活跃 (ID: 0)${RESET}"
+            return
         fi
+    fi
+
+    # 2. 只有当 PM2 没在跑时，才去排查有没有真正的前台孤儿进程
+    if ps aux | grep "node" | grep "$PROJECT_DIR" | grep -v "pm2" | grep -v "bin/npm" | grep -v "grep" >/dev/null 2>&1; then
+        status="${YELLOW}前台运行中 (未加入PM2)${RESET}"
+        port_show="${YELLOW}有真实前台进程活跃，请确认是否未关闭登录窗口${RESET}"
+    else
+        status="${RED}已停止${RESET}"
+        port_show="${RED}无${RESET}"
     fi
 }
 
-# ==================== 菜单 ====================
-function menu() {
+while true; do
+    get_status
     clear
-    get_sys_status
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈     MariaDB 管理面板     ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  TeleBox 统一管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态       :${RESET} $status"
-    echo -e "${GREEN}版本       :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口       :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}已创数据库 :${RESET} $db_count"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}路径   :${RESET} ${CYAN}${PROJECT_DIR}${RESET}"
+    echo -e "${GREEN}提示   :${RESET} ${port_show}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 MariaDB${RESET}"
-    echo -e "${GREEN} 2. 更新 MariaDB${RESET}"
-    echo -e "${GREEN} 3. 卸载 MariaDB${RESET}"
-    echo -e "${GREEN} 4. 启动 MariaDB${RESET}"
-    echo -e "${GREEN} 5. 停止 MariaDB${RESET}"
-    echo -e "${GREEN} 6. 重启 MariaDB${RESET}"
-    echo -e "${GREEN} 7. 查看 日志${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${GREEN} 8. 数据库信息${RESET}"
-    echo -e "${GREEN} 9. 创建数据库${RESET}"
-    echo -e "${GREEN}10. 删除数据库${RESET}"
-    echo -e "${GREEN}11. 创建用户${RESET}"
-    echo -e "${GREEN}12. 删除用户${RESET}"
-    echo -e "${GREEN}13.${RESET} ${YELLOW}创建数据库+用户${RESET}"
-    echo -e "${GREEN}14. 修改用户密码${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${GREEN}15. 备份数据库${RESET}"
-    echo -e "${GREEN}16. 恢复数据库${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${GREEN} 1. 安装基础环境与 Node.js 24.x${RESET}"
+    echo -e "${GREEN} 2. 统一克隆项目并安装依赖${RESET}"
+    echo -e "${GREEN} 3. 首次启动与配置 (交互登录)${RESET}"
+    echo -e "${GREEN} 4. 部署至生产环境 (PM2)${RESET}"
+    echo -e "${GREEN} 5. 启动 TeleBox (PM2)${RESET}"
+    echo -e "${GREEN} 6. 停止 TeleBox (PM2)${RESET}"
+    echo -e "${GREEN} 7. 重启 TeleBox (PM2)${RESET}"
+    echo -e "${GREEN} 8. 查看实时运行日志${RESET}"
+    echo -e "${GREEN} 9. 强制清理并重构依赖${RESET}"
+    echo -e "${GREEN}10. 彻底卸载 TeleBox 服务${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     
     read -p $'\e[32m请输入数字: \e[0m' num
+
     case "$num" in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) start_md ;;
-        5) stop_md ;;
-        6) restart_md ;;
-        7) view_logs ;;
-        8) show_info ;;
-        9) create_database ;;
-        10) delete_database ;;
-        11) create_user ;;
-        12) delete_user ;;
-        13) create_db_user ;;
-        14) change_password ;;
-        15) backup_db ;;
-        16) restore_db ;;
+        1)
+            apt update && apt install -y curl git build-essential python3
+            curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+            apt-get install -y nodejs
+            read -p "按回车键返回菜单..."
+            ;;
+        2)
+            mkdir -p "$PROJECT_DIR"
+            if [ -d "$PROJECT_DIR/.git" ]; then
+                cd "$PROJECT_DIR" && git pull
+            else
+                git clone https://github.com/TeleBoxOrg/TeleBox.git "$PROJECT_DIR"
+            fi
+            cd "$PROJECT_DIR" && npm install
+            read -p "按回车键返回菜单..."
+            ;;
+        3)
+            if [ ! -d "$PROJECT_DIR" ]; then
+                echo -e "${RED}错误: 请先执行步骤 2！${RESET}"
+            else
+                pm2 delete telebox >/dev/null 2>&1
+                ps aux | grep "node" | grep "$PROJECT_DIR" | grep -v "grep" | awk '{print $2}' | xargs kill -9 >/dev/null 2>&1
+                echo -e "${YELLOW}登录成功后，请等待 5 秒让配置写入，再按 CTRL+C 退出。${RESET}"
+                read -p "按回车键进入前台登录..."
+                cd "$PROJECT_DIR" && npm start
+            fi
+            read -p "已退出，按回车键返回菜单..."
+            ;;
+        4)
+            if [ ! -d "$PROJECT_DIR" ]; then
+                echo -e "${RED}错误: 请先克隆项目！${RESET}"
+            else
+                npm install -g pm2
+                pm2 delete telebox >/dev/null 2>&1
+                cd "$PROJECT_DIR"
+                pm2 start npm --name "telebox" -- run start
+                pm2 save
+                pm2 startup systemd
+                echo -e "${GREEN}生产环境 PM2 部署完成！${RESET}"
+            fi
+            read -p "按回车键返回菜单..."
+            ;;
+        5) pm2 start telebox; read -p "按回车..." ;;
+        6) pm2 stop telebox; read -p "按回车..." ;;
+        7) pm2 restart telebox; read -p "按回车..." ;;
+        8) pm2 logs telebox ;;
+        9)
+            if [ -d "$PROJECT_DIR" ]; then
+                cd "$PROJECT_DIR" && npm cache clean --force && rm -rf node_modules package-lock.json && npm install
+            fi
+            read -p "按回车键返回菜单..."
+            ;;
+        10)
+            read -p "确定要彻底删除吗？(y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                pm2 delete telebox >/dev/null 2>&1
+                pm2 save
+                rm -rf "$PROJECT_DIR"
+                echo -e "${GREEN}卸载完成！${RESET}"
+            fi
+            read -p "按回车..."
+            ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+        *) echo -e "${RED}输入有误！${RESET}"; sleep 1 ;;
     esac
-}
-
-# ==================== 功能实现 ====================
-
-function install_app() {
-    if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}⚠️ 检测到已经安装过 MariaDB。${RESET}"
-        pause; menu
-    fi
-    
-    read -p "请输入 MariaDB 端口 [默认 3306]: " input_port
-    PORT=${input_port:-3306}
-    
-    echo -e "\n请选择网络绑定策略 (IP Binding):"
-    echo -e "  [1] 允许公网/局域网访问 (绑定 0.0.0.0) [默认]"
-    echo -e "  [2] 仅允许本地访问     (绑定 127.0.0.1)"
-    read -p "请输入数字 [1-2, 默认 1]: " bind_choice
-    bind_choice=${bind_choice:-1}
-    
-    local compose_port_mapping
-    local bind_status_text
-    if [ "$bind_choice" = "2" ]; then
-        compose_port_mapping="127.0.0.1:${PORT}:3306"
-        bind_status_text="仅限本地 (127.0.0.1)"
-    else
-        compose_port_mapping="${PORT}:3306"
-        bind_status_text="开放公网 (0.0.0.0)"
-    fi
-
-    read -p "请输入 root 运行密码 [留空自动生成]: " input_pass
-    MARIADB_ROOT_PASSWORD=${input_pass:-$(gen_pass)}
-
-    mkdir -p "$APP_DIR/data" "$BACKUP_DIR"
-    
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  mariadb-db:
-    container_name: mariadb
-    image: mariadb:11.4
-    restart: always
-    ports:
-      - "${compose_port_mapping}"
-    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
-    environment:
-      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
-      TZ: Asia/Shanghai
-    volumes:
-      - ./data:/var/lib/mysql
-EOF
-
-    cat > "$CONFIG_FILE" <<EOF
-PORT=$PORT
-MARIADB_ROOT_PASSWORD=$MARIADB_ROOT_PASSWORD
-BIND_STRATEGY=$bind_choice
-EOF
-
-    季="$APP_DIR" && cd "$APP_DIR" && $COMPOSE_CMD up -d
-    
-    local public_ip=$(get_public_ip)
-    local local_ip=$(get_local_ip)
-    
-    echo -e "\n${GREEN}================================================${RESET}"
-    echo -e "${GREEN}🎉 MariaDB 容器版安装启动成功！运行连接信息：${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN} 网络绑定策略 :${RESET} ${YELLOW}${bind_status_text}${RESET}"
-    if [ "$bind_choice" = "2" ]; then
-        echo -e "${GREEN} 唯一连接地址 :${RESET} 127.0.0.1:${PORT}"
-    else
-        echo -e "${GREEN} 公网连接地址 :${RESET} ${public_ip}:${PORT}"
-        echo -e "${GREEN} 内网连接地址 :${RESET} ${local_ip}:${PORT}"
-    fi
-    echo -e "${GREEN} 管理用户名   :${RESET} root"
-    echo -e "${GREEN} 超级管理密码 :${RESET} ${YELLOW}${MARIADB_ROOT_PASSWORD}${RESET}"
-    echo -e "${GREEN} 标准连接串   :${RESET} ${CYAN}mysql://root:${MARIADB_ROOT_PASSWORD}@${public_ip}:${PORT}/;${RESET}"
-    echo -e "${GREEN} 配置文件路径 :${RESET} ${CONFIG_FILE}"
-    echo -e "${GREEN}================================================${RESET}"
-    
-    pause; menu
-}
-
-function update_app() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录，请先安装${RESET}"; sleep 1; menu; fi
-    cd "$APP_DIR" && $COMPOSE_CMD pull && $COMPOSE_CMD up -d
-    echo -e "${GREEN}✅ MariaDB 已更新并重启${RESET}"
-    pause; menu
-}
-
-function uninstall_app() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; fi
-    read -p "确定要彻底卸载吗？所有数据表将清空！(y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" || "$confirm" == "yes" ]]; then
-        cd "$APP_DIR" && $COMPOSE_CMD down -v
-        rm -rf "$APP_DIR"
-        echo -e "${GREEN}✅ MariaDB 已彻底卸载${RESET}"
-    else
-        echo -e "${YELLOW}已取消卸载${RESET}"
-    fi
-    pause; menu
-}
-
-function start_md() {
-    docker start mariadb &>/dev/null
-    echo -e "${GREEN}✅ MariaDB 容器已启动${RESET}"
-    pause; menu
-}
-
-function stop_md() {
-    docker stop mariadb &>/dev/null
-    echo -e "${GREEN}✅ MariaDB 容器已停止${RESET}"
-    pause; menu
-}
-
-function restart_md() {
-    docker restart mariadb &>/dev/null
-    echo -e "${GREEN}✅ MariaDB 容器已重启${RESET}"
-    pause; menu
-}
-
-function view_logs() {
-    echo -e "${YELLOW}提示: 朝下滚动，按下 Ctrl + C 即可退出日志回到主菜单。${RESET}"
-    sleep 1
-    docker logs --tail 100 -f mariadb
-    menu
-}
-
-function show_info() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    SERVER_IP=$(get_public_ip)
-    local local_ip=$(get_local_ip)
-    BIND_STRATEGY=${BIND_STRATEGY:-1}
-    
-    echo -e "\n${GREEN}====== MariaDB 运行信息 ======${RESET}"
-    if [ "$BIND_STRATEGY" = "2" ]; then
-        echo -e "${GREEN}绑定状态 :${RESET} ${YELLOW}仅限本地监听 (127.0.0.1)${RESET}"
-        echo -e "${GREEN}连接地址 :${RESET} 127.0.0.1:${PORT}"
-    else
-        echo -e "${GREEN}绑定状态 :${RESET} ${GREEN}开放公网/局域网 (0.0.0.0)${RESET}"
-        echo -e "${GREEN}公网地址 :${RESET} ${SERVER_IP}:${PORT}"
-        echo -e "${GREEN}内网地址 :${RESET} ${local_ip}:${PORT}"
-    fi
-    echo -e "${GREEN}超级管理员:${RESET} root"
-    echo -e "${GREEN}超级密码  :${RESET} ${YELLOW}${MARIADB_ROOT_PASSWORD}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    
-    echo -e "${GREEN}当前用户自定义数据库列表:${RESET}"
-    docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "
-    SELECT SCHEMA_NAME as '📂 数据库名称' FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys');"
-    
-    echo -e "\n${GREEN}当前系统用户及允许连入的主机列表:${RESET}"
-    docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "
-    SELECT User as '👤 用户', Host as '🌐 允许连入主机' FROM mysql.user;"
-    echo -e "${GREEN}================================${RESET}"
-    pause; menu
-}
-
-function create_database() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    read -p "请输入你想创建的数据库名: " new_db
-    if [ -z "$new_db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    
-    docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "CREATE DATABASE \`$new_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" &>/dev/null
-    echo -e "${GREEN}✅ 数据库 $new_db 创建成功（默认采用 utf8mb4 现代全字符编码）。${RESET}"
-    pause; menu
-}
-
-function delete_database() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    
-    read -p "请输入要彻底删除的数据库名: " del_db
-    if [ -z "$del_db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    if [[ "$del_db" =~ ^(information_schema|mysql|performance_schema|sys)$ ]]; then echo -e "${RED}❌ 安全限制：拒绝删除系统保留核心库！${RESET}"; pause; menu; fi
-    
-    read -p "⚠️ 警告：确定要彻底删除数据库 [$del_db] 吗？数据将灰飞烟灭！(y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "DROP DATABASE \`$del_db\`;" &>/dev/null
-        echo -e "${GREEN}✅ 数据库 $del_db 已成功擦除。${RESET}"
-    else
-        echo -e "${YELLOW}操作已取消。${RESET}"
-    fi
-    pause; menu
-}
-
-function create_user() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    read -p "请输入新用户名: " new_user
-    if [ -z "$new_user" ]; then echo -e "${RED}用户名不能为空！${RESET}"; pause; menu; fi
-    read -p "请输入新用户密码 [留空随机]: " new_pass
-    new_pass=${new_pass:-$(gen_pass)}
-    read -p "该用户需要拥有哪一个数据库的权限: " grant_db
-    if [ -z "$grant_db" ]; then echo -e "${RED}数据库名不能为空！${RESET}"; pause; menu; fi
-
-    # 创建支持任意 IP 远程访问的独立业务账号并授予权限
-    docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "
-    CREATE USER '$new_user'@'%' IDENTIFIED BY '$new_pass';
-    GRANT ALL PRIVILEGES ON \`$grant_db\`.* TO '$new_user'@'%';
-    FLUSH PRIVILEGES;" &>/dev/null
-
-    echo -e "${YELLOW}✅ 业务用户 $new_user 创建成功。密码: $new_pass (已拥有 $grant_db 的全部操作权限)${RESET}"
-    pause; menu
-}
-
-function delete_user() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    
-    read -p "请输入要删除的用户名: " del_user
-    if [ -z "$del_user" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    if [[ "$del_user" = "root" ]]; then echo -e "${RED}❌ 安全限制：拒绝删除超级管理员 root！${RESET}"; pause; menu; fi
-
-    docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "DROP USER '$del_user'@'%'; FLUSH PRIVILEGES;" &>/dev/null
-    echo -e "${GREEN}✅ 用户 '$del_user' 已成功卸载。${RESET}"
-    pause; menu
-}
-
-# 13. 一键联动的一键建库+建用户
-function create_db_user() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    read -p "新数据库名: " new_db
-    read -p "新用户名: " new_user
-    if [[ -z "$new_db" || -z "$new_user" ]]; then echo -e "${RED}库名和用户名不能为空！${RESET}"; pause; menu; fi
-    read -p "密码 [留空随机]: " new_pass
-    new_pass=${new_pass:-$(gen_pass)}
-
-    docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "
-    CREATE DATABASE \`$new_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-    CREATE USER '$new_user'@'%' IDENTIFIED BY '$new_pass';
-    GRANT ALL PRIVILEGES ON \`$new_db\`.* TO '$new_user'@'%';
-    FLUSH PRIVILEGES;" &>/dev/null
-
-    echo -e "${YELLOW}✅ 联动深度创建成功！${RESET}"
-    echo -e "${GREEN} 🚀 用户名 :${RESET} $new_user"
-    echo -e "${GREEN} 🚀 密  码 :${RESET} ${YELLOW}$new_pass${RESET}"
-    echo -e "${GREEN} 🚀 数据库 :${RESET} $new_db"
-    pause; menu
-}
-
-function change_password() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    
-    read -p "请输入要修改密码的用户名 [默认 root]: " target_user
-    target_user=${target_user:-root}
-    read -p "请输入新密码 [留空随机]: " new_pass
-    new_pass=${new_pass:-$(gen_pass)}
-
-    if [ "$target_user" = "root" ]; then
-        docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$new_pass'; ALTER USER 'root'@'%' IDENTIFIED BY '$new_pass'; FLUSH PRIVILEGES;" &>/dev/null
-        sed -i "s/^MARIADB_ROOT_PASSWORD=.*/MARIADB_ROOT_PASSWORD=$new_pass/g" "$CONFIG_FILE"
-        sed -i "s/MARIADB_ROOT_PASSWORD:.*/MARIADB_ROOT_PASSWORD: $new_pass/g" "$COMPOSE_FILE"
-        echo -e "${GREEN}✅ 本地安全配置文件已全量同步更新。${RESET}"
-    else
-        docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "ALTER USER '$target_user'@'%' IDENTIFIED BY '$new_pass'; FLUSH PRIVILEGES;" &>/dev/null
-    fi
-
-    echo -e "${GREEN}✅ 用户 '$target_user' 密码更新成功！新密码: ${YELLOW}$new_pass${RESET}"
-    pause; menu
-}
-
-function backup_db() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    
-    read -p "请输入你想单独备份的库名 (全库备份请输入 all): " db
-    if [ -z "$db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    
-    BACKUP_FILE="$BACKUP_DIR/${db}_$(date +%Y%m%d_%H%M%S).sql"
-    
-    if [ "$db" = "all" ]; then
-        docker exec -i mariadb mariadb-dump -u root -p"$MARIADB_ROOT_PASSWORD" --all-databases > "$BACKUP_FILE"
-    else
-        docker exec -i mariadb mariadb-dump -u root -p"$MARIADB_ROOT_PASSWORD" --databases "$db" > "$BACKUP_FILE"
-    fi
-
-    if [ $? -eq 0 ] && [ -s "$BACKUP_FILE" ]; then
-        echo -e "${YELLOW}✅ SQL 结构及数据脚本备份成功，存放于: $BACKUP_FILE${RESET}"
-    else
-        echo -e "${RED}❌ 备份失败。${RESET}"
-        rm -f "$BACKUP_FILE"
-    fi
-    pause; menu
-}
-
-function restore_db() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    
-    if [ ! -d "$BACKUP_DIR" ] || [ -z "$(ls -A "$BACKUP_DIR")" ]; then
-        echo -e "${RED}❌ 默认备份目录下没有找到任何 SQL 备份文件${RESET}"; pause; menu
-    fi
-    
-    echo -e "${GREEN}可用历史备份列表:${RESET}"
-    ls -1 "$BACKUP_DIR"
-    read -p "请输入完整备份文件名: " file
-    local backup_path="$BACKUP_DIR/$file"
-    
-    if [ ! -f "$backup_path" ]; then
-        echo -e "${RED}❌ 错误：未找到指定的备份文件！${RESET}"; pause; menu
-    fi
-
-    read -p "将此备份文件覆盖恢复入哪一个数据库 (如果是通过 all 备份的全库文件，直接敲回车): " target_db
-
-    if [ -z "$target_db" ]; then
-        docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" < "$backup_path"
-    else
-        # 如果单库没有创建，自动前置补建
-        docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$target_db\`;"
-        docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" "$target_db" < "$backup_path"
-    fi
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${YELLOW}✅ MariaDB 数据脚本覆盖恢复成功！${RESET}"
-    else
-        echo -e "${RED}❌ 恢复失败，请检查脚本内容。${RESET}"
-    fi
-    pause; menu
-}
-
-# ==================== 启动 ====================
-menu
+done

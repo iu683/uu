@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# MariaDB 容器管理面板 (Docker Compose) - 最终精简美化版
+# MariaDB 容器管理面板 (Docker Compose) 
 # ========================================
 
 GREEN="\033[32m"
@@ -13,7 +13,7 @@ APP_NAME="mariadb"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/config.env"
-BACKUP_DIR="$APP_DIR/backup"
+DEFAULT_BACKUP_DIR="$APP_DIR/backup"
 
 # 自动适配 docker compose 语法
 if docker compose version &>/dev/null; then
@@ -62,12 +62,11 @@ get_sys_status() {
         
         if [ "$(docker ps -q -f name=^mariadb$)" ]; then
             status="${GREEN}运行中${RESET}"
-            # 兼容 11.4+ 镜像，使用 mariadb 替代 mysql 命令获取自定义库数量
             local raw_count=$(docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys');" -s --skip-column-names 2>/dev/null)
             if [ -z "$raw_count" ]; then
-                db_count="${RED}获取失败${RESET}"
+                db_count="${YELLOW}未知 (请先启动容器)${RESET}"
             else
-                db_count="${YELLOW}${raw_count//[[:space:]]/}${RESET} 个"
+                db_count="${YELLOW}${raw_count//[[:space:]]/}${RESET} ${GREEN}个${RESET}"
             fi
         elif [ "$(docker ps -a -q -f name=^mariadb$)" ]; then
             status="${YELLOW}已停止${RESET}"
@@ -79,12 +78,28 @@ get_sys_status() {
     fi
 }
 
+# 内部辅助函数：美观地打印当前非系统数据库列表
+_list_custom_dbs() {
+    echo -e "${CYAN}--- 当前服务器上已创自定义数据库列表 ---${RESET}"
+    docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "
+    SELECT SCHEMA_NAME as '数据库名称' FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys');"
+    echo -e "${CYAN}---------------------------------------${RESET}"
+}
+
+# 内部辅助函数：美观地打印当前普通业务用户列表
+_list_custom_users() {
+    echo -e "${CYAN}--- 当前服务器上已创业务用户列表 ---${RESET}"
+    docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "
+    SELECT User as '用户名', Host as '允许连入主机' FROM mysql.user WHERE User NOT IN ('root', 'healthcheck', 'mariadb.sys', '');"
+    echo -e "${CYAN}------------------------------------${RESET}"
+}
+
 # ==================== 菜单 ====================
 function menu() {
     clear
     get_sys_status
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈     MariaDB 管理面板     ◈    ${RESET}"
+    echo -e "${GREEN}   ◈    MariaDB 管理面板    ◈  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态       :${RESET} $status"
     echo -e "${GREEN}版本       :${RESET} ${YELLOW}${version}${RESET}"
@@ -113,7 +128,7 @@ function menu() {
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     
-    read -p $'\e[32m请输入数字: \e[0m' num
+    read -p $'\e[32m请输入选项: \e[0m' num
     case "$num" in
         1) install_app ;;
         2) update_app ;;
@@ -140,7 +155,7 @@ function menu() {
 
 function install_app() {
     if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}⚠️ 检测到已经安装过 MariaDB。${RESET}"
+        echo -e "${RED}检测到已经安装过 MariaDB。${RESET}"
         pause; menu
     fi
     
@@ -166,7 +181,7 @@ function install_app() {
     read -p "请输入 root 运行密码 [留空自动生成]: " input_pass
     MARIADB_ROOT_PASSWORD=${input_pass:-$(gen_pass)}
 
-    mkdir -p "$APP_DIR/data" "$BACKUP_DIR"
+    mkdir -p "$APP_DIR/data" "$DEFAULT_BACKUP_DIR"
     
     cat > "$COMPOSE_FILE" <<EOF
 services:
@@ -203,7 +218,7 @@ EOF
         echo -e "${GREEN} 唯一连接地址 :${RESET} 127.0.0.1:${PORT}"
     else
         echo -e "${GREEN} 公网连接地址 :${RESET} ${public_ip}:${PORT}"
-        echo -e "${GREEN} 内网连接地址 :${RESET} ${local_ip}:${PORT}"
+        echo -e "${GREEN} 内网连接地址 :${RESET} 127.0.0.1:${PORT}"
     fi
     echo -e "${GREEN} 管理用户名   :${RESET} root"
     echo -e "${GREEN} 超级管理密码 :${RESET} ${YELLOW}${MARIADB_ROOT_PASSWORD}${RESET}"
@@ -273,19 +288,17 @@ function show_info() {
     else
         echo -e "${GREEN}绑定状态 :${RESET} ${GREEN}开放公网/局域网 (0.0.0.0)${RESET}"
         echo -e "${GREEN}公网地址 :${RESET} ${SERVER_IP}:${PORT}"
-        echo -e "${GREEN}内网地址 :${RESET} ${local_ip}:${PORT}"
+        echo -e "${GREEN}内网地址 :${RESET} 127.0.0.1:${PORT}"
     fi
     echo -e "${GREEN}超级管理员:${RESET} root"
     echo -e "${GREEN}超级密码  :${RESET} ${YELLOW}${MARIADB_ROOT_PASSWORD}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     
-    echo -e "${GREEN}当前用户自定义数据库列表:${RESET}"
-    docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "
-    SELECT SCHEMA_NAME as '📂 数据库名称' FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys');"
+    _list_custom_dbs
     
-    echo -e "\n${GREEN}当前系统用户及允许连入的主机列表:${RESET}"
+    echo -e "\n${GREEN}当前系统全量用户及连入限制清单:${RESET}"
     docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "
-    SELECT User as '👤 用户', Host as '🌐 允许连入主机' FROM mysql.user;"
+    SELECT User as '用户', Host as '允许连入主机' FROM mysql.user;"
     echo -e "${GREEN}================================${RESET}"
     pause; menu
 }
@@ -297,22 +310,26 @@ function create_database() {
     if [ -z "$new_db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
     
     docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "CREATE DATABASE \`$new_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" &>/dev/null
-    echo -e "${GREEN}✅ 数据库 $new_db 创建成功（默认采用 utf8mb4 现代全字符编码）。${RESET}"
+    echo -e "${GREEN}✅ 数据库 $new_db 创建成功。${RESET}"
     pause; menu
 }
 
+# 💡 升级 10：先列出已创数据库，再执行交互删除
 function delete_database() {
     if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
+    
+    echo -e "\n${YELLOW}[🔥 准备执行删除库操作]${RESET}"
+    _list_custom_dbs
     
     read -p "请输入要彻底删除的数据库名: " del_db
     if [ -z "$del_db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
     if [[ "$del_db" =~ ^(information_schema|mysql|performance_schema|sys)$ ]]; then echo -e "${RED}❌ 安全限制：拒绝删除系统保留核心库！${RESET}"; pause; menu; fi
     
-    read -p "⚠️ 警告：确定要彻底删除数据库 [$del_db] 吗？数据将灰飞烟灭！(y/N): " confirm
+    read -p "危险警告：确定要彻底删除自定义库 [$del_db] 吗？(y/N): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "DROP DATABASE \`$del_db\`;" &>/dev/null
-        echo -e "${GREEN}✅ 数据库 $del_db 已成功擦除。${RESET}"
+        echo -e "${GREEN}✅ 数据库 $del_db 已成功从内存与磁盘彻底擦除。${RESET}"
     else
         echo -e "${YELLOW}操作已取消。${RESET}"
     fi
@@ -329,7 +346,6 @@ function create_user() {
     read -p "该用户需要拥有哪一个数据库的权限: " grant_db
     if [ -z "$grant_db" ]; then echo -e "${RED}数据库名不能为空！${RESET}"; pause; menu; fi
 
-    # 创建支持任意 IP 远程访问的独立业务账号并授予权限
     docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "
     CREATE USER '$new_user'@'%' IDENTIFIED BY '$new_pass';
     GRANT ALL PRIVILEGES ON \`$grant_db\`.* TO '$new_user'@'%';
@@ -339,20 +355,30 @@ function create_user() {
     pause; menu
 }
 
+# 💡 升级 12：先列出已创业务用户，再执行交互删除
 function delete_user() {
     if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     
+    echo -e "\n${YELLOW}[🔥 准备执行删除用户操作]${RESET}"
+    _list_custom_users
+    
     read -p "请输入要删除的用户名: " del_user
     if [ -z "$del_user" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    if [[ "$del_user" = "root" ]]; then echo -e "${RED}❌ 安全限制：拒绝删除超级管理员 root！${RESET}"; pause; menu; fi
+    if [[ "$del_user" = "root" || "$del_user" = "healthcheck" || "$del_user" = "mariadb.sys" ]]; then 
+        echo -e "${RED}❌ 安全限制：拒绝删除系统级保留核心账户！${RESET}"; pause; menu; 
+    fi
 
-    docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "DROP USER '$del_user'@'%'; FLUSH PRIVILEGES;" &>/dev/null
-    echo -e "${GREEN}✅ 用户 '$del_user' 已成功卸载。${RESET}"
+    read -p "确定要注销业务用户 '$del_user' 吗？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "DROP USER '$del_user'@'%'; FLUSH PRIVILEGES;" &>/dev/null
+        echo -e "${GREEN}✅ 业务用户 '$del_user' 已成功注销。${RESET}"
+    else
+        echo -e "${YELLOW}操作已取消。${RESET}"
+    fi
     pause; menu
 }
 
-# 13. 一键联动的一键建库+建用户
 function create_db_user() {
     if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
@@ -397,6 +423,7 @@ function change_password() {
     pause; menu
 }
 
+# 💡 升级 15：备份数据库（支持任意自定义路径映射）
 function backup_db() {
     if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
@@ -404,7 +431,14 @@ function backup_db() {
     read -p "请输入你想单独备份的库名 (全库备份请输入 all): " db
     if [ -z "$db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
     
-    BACKUP_FILE="$BACKUP_DIR/${db}_$(date +%Y%m%d_%H%M%S).sql"
+    # 允许自定目录交互
+    read -p "请输入备份文件存放目录 [默认 $DEFAULT_BACKUP_DIR]: " user_dir
+    local tgt_dir=${user_dir:-$DEFAULT_BACKUP_DIR}
+    
+    # 自动建立目录（支持多级）
+    mkdir -p "$tgt_dir"
+    
+    local BACKUP_FILE="$tgt_dir/${db}_$(date +%Y%m%d_%H%M%S).sql"
     
     if [ "$db" = "all" ]; then
         docker exec -i mariadb mariadb-dump -u root -p"$MARIADB_ROOT_PASSWORD" --all-databases > "$BACKUP_FILE"
@@ -413,45 +447,50 @@ function backup_db() {
     fi
 
     if [ $? -eq 0 ] && [ -s "$BACKUP_FILE" ]; then
-        echo -e "${YELLOW}✅ SQL 结构及数据脚本备份成功，存放于: $BACKUP_FILE${RESET}"
+        echo -e "${YELLOW}✅ SQL 结构及数据备份成功，存放于: $BACKUP_FILE${RESET}"
     else
-        echo -e "${RED}❌ 备份失败。${RESET}"
+        echo -e "${RED}❌ 备份失败，请检查目标目录权限。${RESET}"
         rm -f "$BACKUP_FILE"
     fi
     pause; menu
 }
 
+# 💡 升级 16：恢复数据库（支持从任意自定义路径加载 SQL）
 function restore_db() {
     if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     
-    if [ ! -d "$BACKUP_DIR" ] || [ -z "$(ls -A "$BACKUP_DIR")" ]; then
-        echo -e "${RED}❌ 默认备份目录下没有找到任何 SQL 备份文件${RESET}"; pause; menu
+    read -p "请输入备份文件所在的扫描目录 [默认 $DEFAULT_BACKUP_DIR]: " user_dir
+    local tgt_dir=${user_dir:-$DEFAULT_BACKUP_DIR}
+    
+    if [ ! -d "$tgt_dir" ] || [ -z "$(ls -A "$tgt_dir" 2>/dev/null)" ]; then
+        echo -e "${RED}❌ 错误：在指定目录 [$tgt_dir] 下没有找到任何 SQL 备份文件！${RESET}"; pause; menu
     fi
     
-    echo -e "${GREEN}可用历史备份列表:${RESET}"
-    ls -1 "$BACKUP_DIR"
+    echo -e "${GREEN}--- 指定目录下的可用历史备份列表 ---${RESET}"
+    ls -1 "$tgt_dir" | grep '\.sql$'
+    echo -e "${GREEN}------------------------------------${RESET}"
+    
     read -p "请输入完整备份文件名: " file
-    local backup_path="$BACKUP_DIR/$file"
+    local backup_path="$tgt_dir/$file"
     
     if [ ! -f "$backup_path" ]; then
         echo -e "${RED}❌ 错误：未找到指定的备份文件！${RESET}"; pause; menu
     fi
 
-    read -p "将此备份文件覆盖恢复入哪一个数据库 (如果是通过 all 备份的全库文件，直接敲回车): " target_db
+    read -p "将此备份覆盖恢复入哪一个数据库 (如果是通过 all 备份的全库文件，直接敲回车): " target_db
 
     if [ -z "$target_db" ]; then
         docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" < "$backup_path"
     else
-        # 如果单库没有创建，自动前置补建
         docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$target_db\`;"
         docker exec -i mariadb mariadb -u root -p"$MARIADB_ROOT_PASSWORD" "$target_db" < "$backup_path"
     fi
     
     if [ $? -eq 0 ]; then
-        echo -e "${YELLOW}✅ MariaDB 数据脚本覆盖恢复成功！${RESET}"
+        echo -e "${YELLOW}✅ 数据恢复流在目标实例中覆盖执行成功！${RESET}"
     else
-        echo -e "${RED}❌ 恢复失败，请检查脚本内容。${RESET}"
+        echo -e "${RED}❌ 恢复失败，请检查 SQL 内容合法性。${RESET}"
     fi
     pause; menu
 }

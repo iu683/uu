@@ -1,138 +1,135 @@
 #!/bin/bash
-# ========================================
-# yt-dlp 一键管理脚本 PRO (含版本显示)
-# ========================================
 
-VIDEO_DIR="/opt/yt-dlp"
-URL_FILE="$VIDEO_DIR/urls.txt"
+GREEN='\e[0;32m'
+YELLOW='\e[1;33m'
+RED='\e[0;31m'
+CYAN='\e[0;36m'
+RESET='\e[0m'
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+export PROJECT_DIR="/opt/telebox"
 
-mkdir -p "$VIDEO_DIR"
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}错误: 请使用 sudo 或 root 权限运行此脚本！${RESET}"
+    exit 1
+fi
 
-install_yt() {
-    echo -e "${GREEN}正在安装 yt-dlp...${RESET}"
-    apt update -y
-    apt install -y ffmpeg curl nano
-    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-    chmod a+rx /usr/local/bin/yt-dlp
-    echo -e "${GREEN}安装完成！${RESET}"
-}
-
-update_yt() {
-    echo -e "${GREEN}正在更新 yt-dlp...${RESET}"
-    yt-dlp -U
-}
-
-uninstall_yt() {
-    rm -f /usr/local/bin/yt-dlp
-    rm -rf /opt/yt-dlp
-    echo -e "${GREEN}已卸载 yt-dlp${RESET}"
-    exit 0
-}
-
-download_single() {
-    read -e -p "$(echo -e ${GREEN}请输入视频链接: ${RESET})" url
-    yt-dlp -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
-        --write-subs --sub-langs all \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites "$url"
-}
-
-download_batch() {
-    if [ ! -f "$URL_FILE" ]; then
-        echo -e "# 一行一个视频链接" > "$URL_FILE"
+get_status() {
+    if command -v node >/dev/null 2>&1; then
+        version=$(node -v)
+    else
+        version="${RED}未安装${RESET}"
     fi
-    nano "$URL_FILE"
-    yt-dlp -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
-        --write-subs --sub-langs all \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -a "$URL_FILE" \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites
-}
 
-download_custom() {
-    read -e -p "$(echo -e ${GREEN}请输入完整 yt-dlp 参数（不含 yt-dlp）: ${RESET})" custom
-    yt-dlp -P "$VIDEO_DIR" $custom \
-        --write-subs --sub-langs all \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites
-}
+    # 1. 优先、绝对信任 PM2 的判断
+    if command -v pm2 >/dev/null 2>&1; then
+        pm2_status=$(pm2 jlist 2>/dev/null | grep -o '"name":"telebox"[^}]*' | grep -o '"status":"[^"]*"' | head -n1 | cut -d'"' -f4)
+        if [ "$pm2_status" = "online" ]; then
+            status="${GREEN}运行中 (PM2 守护)${RESET}"
+            port_show="${GREEN}生产环境活跃 (ID: 0)${RESET}"
+            return
+        fi
+    fi
 
-download_mp3() {
-    read -e -p "$(echo -e ${GREEN}请输入视频链接: ${RESET})" url
-    yt-dlp -P "$VIDEO_DIR" -x --audio-format mp3 \
-        --write-thumbnail --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites "$url"
-}
-
-delete_video() {
-    echo -e "${GREEN}当前视频目录：${RESET}"
-    ls "$VIDEO_DIR"
-    read -e -p "$(echo -e ${GREEN}请输入要删除的目录名称: ${RESET})" name
-    rm -rf "$VIDEO_DIR/$name"
-    echo -e "${GREEN}已删除${RESET}"
-}
-
-show_list() {
-    echo -e "${GREEN}已下载视频列表：${RESET}"
-    ls -td "$VIDEO_DIR"/*/ 2>/dev/null || echo -e "${GREEN}暂无视频${RESET}"
+    # 2. 只有当 PM2 没在跑时，才去排查有没有前台孤儿进程（排除 PM2 自身的执行特征）
+    if ps aux | grep "node" | grep "$PROJECT_DIR" | grep -v "pm2" | grep -v "bin/npm" | grep -v "grep" >/dev/null 2>&1; then
+        status="${YELLOW}前台运行中 (未加入PM2)${RESET}"
+        port_show="${YELLOW}有真实前台进程活跃，请确认是否未关闭登录窗口${RESET}"
+    else
+        status="${RED}已停止${RESET}"
+        port_show="${RED}无${RESET}"
+    fi
 }
 
 while true; do
+    get_status
     clear
-    # 检查安装状态与获取版本号
-    if [ -x "/usr/local/bin/yt-dlp" ]; then
-        STATUS="${YELLOW}已安装${RESET}"
-        VERSION_NUM=$(/usr/local/bin/yt-dlp --version 2>/dev/null)
-        VERSION="${YELLOW}${VERSION_NUM}${RESET}"
-    else
-        STATUS="${RED}未安装${RESET}"
-        VERSION="${RED}--${RESET}"
-    fi
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    ◈  TeleBox 统一管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}路径   :${RESET} ${CYAN}${PROJECT_DIR}${RESET}"
+    echo -e "${GREEN}提示   :${RESET} ${port_show}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1. 安装基础环境与 Node.js 24.x${RESET}"
+    echo -e "${GREEN} 2. 统一克隆项目并安装依赖${RESET}"
+    echo -e "${GREEN} 3. 首次启动与配置 (交互登录)${RESET}"
+    echo -e "${GREEN} 4. 部署至生产环境 (PM2)${RESET}"
+    echo -e "${GREEN} 5. 启动 TeleBox (PM2)${RESET}"
+    echo -e "${GREEN} 6. 停止 TeleBox (PM2)${RESET}"
+    echo -e "${GREEN} 7. 重启 TeleBox (PM2)${RESET}"
+    echo -e "${GREEN} 8. 查看实时运行日志${RESET}"
+    echo -e "${GREEN} 9. 强制清理并重构依赖${RESET}"
+    echo -e "${GREEN}10. 彻底卸载 TeleBox 服务${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    
+    read -p $'\e[32m请输入数字: \e[0m' num
 
-    echo -e "${GREEN}=========================================${RESET}"
-    echo -e "${GREEN}             yt-dlp 管理工具             ${RESET}"
-    echo -e "${GREEN}=========================================${RESET}"
-    echo -e "${GREEN} 状态: $STATUS    |   当前版本: $VERSION${RESET}"
-    echo -e "${GREEN}=========================================${RESET}"
-    echo -e "${GREEN}  1. 安装 yt-dlp${RESET}"
-    echo -e "${GREEN}  2. 更新 yt-dlp${RESET}"
-    echo -e "${GREEN}  3. 卸载 yt-dlp${RESET}"
-    echo -e "${GREEN}  5. 单个视频下载${RESET}"
-    echo -e "${GREEN}  6. 批量视频下载${RESET}"
-    echo -e "${GREEN}  7. 自定义参数下载${RESET}"
-    echo -e "${GREEN}  8. 下载为 MP3${RESET}"
-    echo -e "${GREEN}  9. 删除视频目录${RESET}"
-    echo -e "${GREEN} 10. 查看下载列表${RESET}"
-    echo -e "${GREEN}  0. 退出${RESET}"
-    echo -e "${GREEN}=========================================${RESET}"
-    read -e -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
-
-    case $choice in
-        1) install_yt ;;
-        2) update_yt ;;
-        3) uninstall_yt ;;
-        5) download_single ;;
-        6) download_batch ;;
-        7) download_custom ;;
-        8) download_mp3 ;;
-        9) delete_video ;;
-        10) show_list ;;
+    case "$num" in
+        1)
+            apt update && apt install -y curl git build-essential python3
+            curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+            apt-get install -y nodejs
+            read -p "按回车键返回菜单..."
+            ;;
+        2)
+            mkdir -p "$PROJECT_DIR"
+            if [ -d "$PROJECT_DIR/.git" ]; then
+                cd "$PROJECT_DIR" && git pull
+            else
+                git clone https://github.com/TeleBoxOrg/TeleBox.git "$PROJECT_DIR"
+            fi
+            cd "$PROJECT_DIR" && npm install
+            read -p "按回车键返回菜单..."
+            ;;
+        3)
+            if [ ! -d "$PROJECT_DIR" ]; then
+                echo -e "${RED}错误: 请先执行步骤 2！${RESET}"
+            else
+                pm2 delete telebox >/dev/null 2>&1
+                ps aux | grep "node" | grep "$PROJECT_DIR" | grep -v "grep" | awk '{print $2}' | xargs kill -9 >/dev/null 2>&1
+                echo -e "${YELLOW}登录成功后，请等待 5 秒让配置写入，再按 CTRL+C 退出。${RESET}"
+                read -p "按回车键进入前台登录..."
+                cd "$PROJECT_DIR" && npm start
+            fi
+            read -p "已退出，按回车键返回菜单..."
+            ;;
+        4)
+            if [ ! -d "$PROJECT_DIR" ]; then
+                echo -e "${RED}错误: 请先克隆项目！${RESET}"
+            else
+                npm install -g pm2
+                pm2 delete telebox >/dev/null 2>&1
+                cd "$PROJECT_DIR"
+                pm2 start npm --name "telebox" -- run start
+                pm2 save
+                pm2 startup systemd
+                echo -e "${GREEN}生产环境 PM2 部署完成！${RESET}"
+            fi
+            read -p "按回车键返回菜单..."
+            ;;
+        5) pm2 start telebox; read -p "按回车..." ;;
+        6) pm2 stop telebox; read -p "按回车..." ;;
+        7) pm2 restart telebox; read -p "按回车..." ;;
+        8) pm2 logs telebox ;;
+        9)
+            if [ -d "$PROJECT_DIR" ]; then
+                cd "$PROJECT_DIR" && npm cache clean --force && rm -rf node_modules package-lock.json && npm install
+            fi
+            read -p "按回车键返回菜单..."
+            ;;
+        10)
+            read -p "确定要彻底删除吗？(y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                pm2 delete telebox >/dev/null 2>&1
+                pm2 save
+                rm -rf "$PROJECT_DIR"
+                echo -e "${GREEN}卸载完成！${RESET}"
+            fi
+            read -p "按回车..."
+            ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
+        *) echo -e "${RED}输入有误！${RESET}"; sleep 1 ;;
     esac
-
-    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
 done

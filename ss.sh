@@ -1,456 +1,543 @@
-#!/bin/sh
-set -e
+#!/bin/bash
+# ========================================
+# MySQL 一键管理脚本 (Docker Compose)
+# ========================================
 
-# =========================================================
-# Snell v6 (双栈+DNS增强) Alpine OpenRC 深度升级脚本
-# =========================================================
-
-# ================== 颜色与输出函数 ==================
 GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
 RESET="\033[0m"
+YELLOW="\033[33m"
+RED="\033[31m"
+APP_NAME="mysql"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONFIG_FILE="$APP_DIR/config.env"
+BACKUP_DIR="$APP_DIR/backup"
 
-_ok()   { echo -e "${GREEN}[OK] $1${RESET}"; }
-_warn() { echo -e "${YELLOW}[WARN] $1${RESET}"; }
-_err()  { echo -e "${RED}[ERROR] $1${RESET}"; return 1; }
-_info() { echo -e "${GREEN}[INFO] $1${RESET}"; }
+# 自动适配 docker compose 语法
+if docker compose version &>/dev/null; then
+    COMPOSE_CMD="docker compose"
+else
+    COMPOSE_CMD="docker-compose"
+fi
 
-# ================== 变量 ==================
-SNELL_DIR="/etc/snell"
-SNELL_CONFIG="$SNELL_DIR/snell-server.conf"
-SNELL_RC_SERVICE="/etc/init.d/snell"
-SNELL_LOG="/var/log/snell.log"
-LOG_FILE="/var/log/snell_manager.log"
-SNELL_DEFAULT_VERSION="6.0.0b2" # 升级默认池到 v6 世代
-
-# ================== 工具函数 ==================
-create_user() {
-    id -u snell >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin snell 2>/dev/null || true
+# 随机密码生成函数
+gen_pass() {
+    tr -dc A-Za-z0-9 </dev/urandom | head -c 16
 }
 
 get_public_ip() {
     local ip
     for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
         for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    # 如果 v4 拿不到，尝试获取公网 v6 地址
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
-        done
-    done
-    echo "你的服务器IP"
+    echo "无法获取公网 IP"
 }
 
-check_port() {
-    if netstat -tln | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
-random_key() {
-    cat /dev/urandom | tr -dc A-Za-z0-9 | head -c 16
-}
-
-random_port() {
-    awk 'BEGIN{srand();print int(rand()*(65000-2000+1))+2000}'
-}
-
-get_system_dns() {
-    grep -E "^nameserver" /etc/resolv.conf | awk '{print $2}' | paste -sd "," -
+get_local_ip() {
+    local ip
+    ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+')
+    [ -z "$ip" ] && ip=$(hostname -I | awk '{print $1}')
+    echo "${ip:-127.0.0.1}"
 }
 
 pause() {
-    echo -n "按任意键返回菜单..."
-    read -r -n 1 arg
-    echo
+    read -p $'\e[32m按回车返回菜单...\e[0m'
 }
 
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
-}
-
-_map_arch() {
-    local raw_arch=$(uname -m)
-    case "$raw_arch" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "aarch64" ;;
-        *) return 1 ;;
-    esac
-}
-
-_get_snell_latest_version() {
-    local latest_version
-    latest_version=$(curl -sL -A "Mozilla/5.0" "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
-    if [ -n "$latest_version" ]; then
-        echo "${latest_version#v}"
+# 获取容器动态状态及数据库个数用于菜单显示
+get_sys_status() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        status="${RED}未安装${RESET}"
+        version="${RED}无${RESET}"
+        port_show="${RED}无${RESET}"
+        db_count="${RED}0${RESET}"
     else
-        echo "$SNELL_DEFAULT_VERSION"
-    fi
-}
-
-# ================== 精准无误的配置提取引擎 ==================
-_get_conf_value() {
-    local key="$1"
-    if [ -f "$SNELL_CONFIG" ]; then
-        # 严格限制行首锚定与等号占位，防止 dns 和 dns-ip-preference 相互粘连
-        grep -E "^${key}\s*=" "$SNELL_CONFIG" | awk -F'=' '{print $2}' | sed 's/ //g' | tr -d '\r\n'
-    fi
-}
-
-# ================== 配置 Snell (全面重构 v6 交互) ==================
-configure_snell() {
-    mkdir -p "$SNELL_DIR"
-    echo -e "${GREEN}[信息] 开始配置 Snell v6 增强参数...${RESET}"
-
-    # 读取并解析旧配置
-    local old_listen=$(_get_conf_value "listen")
-    local old_port=""
-    if [ -n "$old_listen" ]; then
-        # 提取多监听地址里的第一个端口
-        local first_listen="${old_listen%%,*}"
-        old_port=$(echo "$first_listen" | awk -F: '{print $NF}')
-    fi
-    local old_key=$(_get_conf_value "psk")
-    local old_obfs=$(_get_conf_value "obfs")
-    local old_dns_pref=$(_get_conf_value "dns-ip-preference")
-    local old_tfo=$(_get_conf_value "tfo")
-    local old_dns=$(_get_conf_value "dns")
-
-    # 1. 端口引导
-    local default_port="${old_port:-$(random_port)}"
-    echo -n "请输入端口 (当前/默认: $default_port): "
-    read -r input_port
-    port=${input_port:-$default_port}
-    if [ "$port" != "$old_port" ]; then
-        check_port "$port" || return 1
-    fi
-
-    # 2. 密钥引导
-    local default_key="${old_key:-$(random_key)}"
-    echo -n "请输入 Snell 核心密钥 (当前/默认: $default_key): "
-    read -r input_key
-    key=${input_key:-$default_key}
-
-    # 3. OBFS 引导
-    local current_obfs_str="${old_obfs:-off}"
-    echo -e "${YELLOW}配置 OBFS 混淆 (当前配置: $current_obfs_str)：[注意] 无特殊需求不建议启用${RESET}"
-    echo "1. TLS   2. HTTP   3. 关闭"
-    echo -n "请选择 (直接回车保持当前不变): "
-    read -r obfs_choice
-    case $obfs_choice in
-        1) obfs="tls" ;;
-        2) obfs="http" ;;
-        3) obfs="off" ;;
-        *) obfs="$current_obfs_str" ;;
-    esac
-
-    # 4. DNS IP 家族优先级引导 (Snell v6 新特性)
-    local current_dns_pref="${old_dns_pref:-default}"
-    echo -e "${YELLOW}请选择 Snell v6 DNS 解析 IP 家族优先级 (当前配置: $current_dns_pref)：${RESET}"
-    echo "1. default      (系统默认)"
-    echo "2. prefer-ipv4  (IPv4 优先)"
-    echo "3. prefer-ipv6  (IPv6 优先)"
-    echo "4. ipv4-only    (仅解析 IPv4)"
-    echo "5. ipv6-only    (仅解析 IPv6)"
-    echo -n "请选择序号 (直接回车保持当前不变): "
-    read -r dns_pref_choice
-    case $dns_pref_choice in
-        1) dns_pref="default" ;;
-        2) dns_pref="prefer-ipv4" ;;
-        3) dns_pref="prefer-ipv6" ;;
-        4) dns_pref="ipv4-only" ;;
-        5) dns_pref="ipv6-only" ;;
-        *) dns_pref="$current_dns_pref" ;;
-    esac
-
-    # 5. TFO 引导
-    local current_tfo_str="开启"
-    [ "$old_tfo" = "0" ] || [ "$old_tfo" = "false" ] && current_tfo_str="关闭"
-    echo -e "${YELLOW}是否开启 TCP Fast Open (TFO)？(当前配置: $current_tfo_str)${RESET}"
-    echo "1. 开启   2. 关闭"
-    echo -n "请选择 (直接回车保持当前不变): "
-    read -r tfo_choice
-    case $tfo_choice in
-        1) tfo="true" ;;
-        2) tfo="false" ;;
-        *) tfo="${old_tfo:-true}" ;;
-    esac
-
-    # 6. DNS 引导
-    local system_dns=$(get_system_dns)
-    local default_dns="${old_dns:-${system_dns:-1.1.1.1,8.8.8.8}}"
-    echo -n "请输入自定义 DNS (当前/默认: $default_dns): "
-    read -r input_dns
-    dns=${input_dns:-$default_dns}
-
-    # Snell v6 升级：同时监听 IPv4 与 IPv6 全栈地址，废弃旧的 ipv6 独立开关
-    LISTEN="0.0.0.0:$port,[::]:$port"
-
-    # 规范化 TFO 的值供配置文件消费
-    local conf_tfo="true"
-    if [ "$tfo" = "0" ] || [ "$tfo" = "false" ]; then conf_tfo="false"; fi
-
-    # 写入 v6 新规范配置文件
-    cat > "$SNELL_CONFIG" <<EOF
-[snell-server]
-listen = $LISTEN
-psk = $key
-obfs = $obfs
-tfo = $conf_tfo
-dns = $dns
-dns-ip-preference = $dns_pref
-EOF
-
-    IP=$(get_public_ip)
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-
-    # 生成符合 Surge 6 标准的单行节点托管配置
-    cat <<EOF > "$SNELL_DIR/config.txt"
-$HOSTNAME-Snell-v6 = snell, $IP, $port, psk=$key, version=6, tfo=$conf_tfo, reuse=true, ecn=true
-EOF
-
-    _ok "配置已成功安全写入 $SNELL_CONFIG"
-    log "Snell v6 配置已成功同步更新。"
-}
-
-# ================== 核心 Alpine 部署逻辑 ==================
-_download_and_install_binary() {
-    local sarch=$( _map_arch ) || { _err "不支持的架构"; return 1; }
-    
-    _info "正在安装 Alpine 必要系统依赖 (upx, unzip, curl, gcompat)..."
-    apk add --no-cache upx unzip curl gcompat >/dev/null 2>&1
-
-    _info "正在获取官方最新稳定版版本号..."
-    local version=$( _get_snell_latest_version )
-    version="${version#v}"
-
-    local tmp=$(mktemp -d)
-    local download_url="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
-
-    _info "正在下载 Snell v$version (架构: $sarch)..."
-    if curl -sLo "$tmp/snell.zip" --connect-timeout 60 "$download_url"; then
-        if unzip -oq "$tmp/snell.zip" -d "$tmp/"; then
-            _info "检测到 Alpine 环境，正在进行 UPX 壳解压兼容处理..."
-            if command -v upx >/dev/null 2>&1; then
-                upx -d "$tmp/snell-server" >/dev/null 2>&1 || _warn "UPX 脱壳失败或无需脱壳"
-            else
-                _err "UPX 工具不可用，无法完成解压"
-                rm -rf "$tmp"; return 1
-            fi
-
-            install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server-v5
-            rm -rf "$tmp"
-            echo "$version"
-            return 0
+        source "$CONFIG_FILE"
+        version="8.0"
+        port_show="$PORT"
+        
+        if [ "$(docker ps -q -f name=^mysql$)" ]; then
+            status="${GREEN}运行中${RESET}"
+            db_count=$(docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SHOW DATABASES;" 2>/dev/null | grep -Ev "Database|information_schema|performance_schema|sys|mysql" | wc -l)
+            db_count="${YELLOW}${db_count//[[:space:]]/}${RESET} ${GREEN}个${RESET}"
+        elif [ "$(docker ps -a -q -f name=^mysql$)" ]; then
+            status="${YELLOW}已停止${RESET}"
+            db_count="${YELLOW}未知 (请先启动容器)${RESET}"
         else
-            _err "解压失败"
+            status="${RED}未启动 (容器不存在)${RESET}"
+            db_count="${RED}0${RESET}"
+        fi
+    fi
+}
+
+# ==================== 菜单 ====================
+function menu() {
+    clear
+    get_sys_status
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     ◈  MySQL 容器管理面板 ◈     ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态       :${RESET} $status"
+    echo -e "${GREEN}版本       :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口       :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}已创数据库 :${RESET} $db_count"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1. 安装 MySQL${RESET}"
+    echo -e "${GREEN} 2. 更新 MySQL${RESET}"
+    echo -e "${GREEN} 3. 卸载 MySQL${RESET}"
+    echo -e "${GREEN} 4. 启动 MySQL${RESET}"
+    echo -e "${GREEN} 5. 停止 MySQL${RESET}"
+    echo -e "${GREEN} 6. 重启 MySQL${RESET}"
+    echo -e "${GREEN} 7. 查看运行日志${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${GREEN} 8. 数据库信息${RESET}"
+    echo -e "${GREEN} 9. 创建数据库${RESET}"
+    echo -e "${GREEN}10. 删除数据库${RESET}"
+    echo -e "${GREEN}11. 创建用户并授权${RESET}"
+    echo -e "${GREEN}12. 创建数据库+用户${RESET}"
+    echo -e "${GREEN}13. 修改用户密码${RESET}"
+    echo -e "${GREEN}14. 删除已有用户${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${GREEN}15. 备份数据库${RESET}"
+    echo -e "${GREEN}16. 恢复数据库${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    
+    read -p $'\e[32m请输入选项: \e[0m' num
+    case "$num" in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) start_mysql ;;
+        5) stop_mysql ;;
+        6) restart_mysql ;;
+        7) view_logs ;;
+        8) show_info ;;
+        9) create_database ;;
+        10) delete_database ;;
+        11) create_user ;;
+        12) create_db_user ;;
+        13) change_password ;;
+        14) delete_user ;;
+        15) backup_db ;;
+        16) restore_db ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+    esac
+}
+
+# ==================== 功能实现 ====================
+
+function install_app() {
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}检测到已经安装过 MySQL。${RESET}"
+        pause; menu
+    fi
+    
+    # 1. 输入端口
+    read -p "请输入 MySQL 端口 [默认 3306]: " input_port
+    PORT=${input_port:-3306}
+    
+    # 2. 选择 IP 绑定策略
+    echo -e "\n请选择网络绑定策略 (IP Binding):"
+    echo -e "  [1] 允许公网/局域网访问 (绑定 0.0.0.0) [默认]"
+    echo -e "  [2] 仅允许本地访问     (绑定 127.0.0.1)"
+    read -p "请输入数字 [1-2, 默认 1]: " bind_choice
+    bind_choice=${bind_choice:-1}
+    
+    local compose_port_mapping
+    local bind_status_text
+    if [ "$bind_choice" = "2" ]; then
+        compose_port_mapping="127.0.0.1:${PORT}:3306"
+        bind_status_text="仅限本地 (127.0.0.1)"
+    else
+        compose_port_mapping="${PORT}:3306"
+        bind_status_text="开放公网 (0.0.0.0)"
+    fi
+
+    # 3. 输入或生成密码
+    read -p "请输入 root 密码 [留空自动生成]: " input_pass
+    ROOT_PASSWORD=${input_pass:-$(gen_pass)}
+
+    # 创建必要的目录
+    mkdir -p "$APP_DIR/data" "$APP_DIR/config" "$BACKUP_DIR"
+    
+    # 4. 生成 docker-compose.yml
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  mysql-db:
+    container_name: mysql
+    image: mysql:8.0
+    restart: always
+    ports:
+      - "${compose_port_mapping}"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${ROOT_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/var/lib/mysql
+      - ./config:/etc/mysql/conf.d
+EOF
+
+    # 5. 生成本地环境记录文件
+    cat > "$CONFIG_FILE" <<EOF
+PORT=$PORT
+ROOT_PASSWORD=$ROOT_PASSWORD
+BIND_STRATEGY=$bind_choice
+EOF
+
+    # 6. 部署容器
+    cd "$APP_DIR" && $COMPOSE_CMD up -d
+    
+    # 获取展示需要的 IP
+    local public_ip=$(get_public_ip)
+    local local_ip=$(get_local_ip)
+    
+    # 7. 输出精美的连接卡片
+    echo -e "\n${GREEN}================================================${RESET}"
+    echo -e "${GREEN}🎉 MySQL 安装启动成功！运行连接信息如下：${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${GREEN} 网络绑定策略 :${RESET} ${YELLOW}${bind_status_text}${RESET}"
+    if [ "$bind_choice" = "2" ]; then
+        echo -e "${GREEN} 唯一连接地址 :${RESET} 127.0.0.1:${PORT}"
+    else
+        echo -e "${GREEN} 公网连接地址 :${RESET} ${public_ip}:${PORT}"
+        echo -e "${GREEN} 内网连接地址 :${RESET} 127.0.0.1:${PORT}"
+    fi
+    echo -e "${GREEN} 管理用户名   :${RESET} root"
+    echo -e "${GREEN} 管理员密码   :${RESET} ${YELLOW}${ROOT_PASSWORD}${RESET}"
+    echo -e "${GREEN} 配置文件路径 :${RESET} ${CONFIG_FILE}"
+    echo -e "${GREEN}================================================${RESET}"
+    
+    if [ "$bind_choice" = "1" ]; then
+        echo -e "${YELLOW}提示：由于你开启了公网访问，请务必前往云服务器控制台放行 ${PORT} 端口！${RESET}\n"
+    else
+        echo -e "${BLUE}提示：由于你选择了仅本地访问，外部任何 IP (包括Navicat远程) 将无法连接，这非常安全。${RESET}\n"
+    fi
+    
+    pause; menu
+}
+
+function update_app() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录，请先安装${RESET}"; sleep 1; menu; fi
+    cd "$APP_DIR" && $COMPOSE_CMD pull && $COMPOSE_CMD up -d
+    echo -e "${GREEN}✅ MySQL 已更新并重启${RESET}"
+    pause; menu
+}
+
+function uninstall_app() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; fi
+    read -p "确定要彻底卸载吗？数据将清空！(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" || "$confirm" == "yes" ]]; then
+        cd "$APP_DIR" && $COMPOSE_CMD down -v
+        rm -rf "$APP_DIR"
+        echo -e "${GREEN}✅ MySQL 已彻底卸载${RESET}"
+    else
+        echo -e "${YELLOW}已取消卸载${RESET}"
+    fi
+    pause; menu
+}
+
+function start_mysql() {
+    docker start mysql &>/dev/null
+    echo -e "${GREEN}✅ MySQL 容器已启动${RESET}"
+    pause; menu
+}
+
+function stop_mysql() {
+    docker stop mysql &>/dev/null
+    echo -e "${GREEN}✅ MySQL 容器已停止${RESET}"
+    pause; menu
+}
+
+function restart_mysql() {
+    docker restart mysql &>/dev/null
+    echo -e "${GREEN}✅ MySQL 容器已重启${RESET}"
+    pause; menu
+}
+
+function view_logs() {
+    echo -e "${YELLOW}提示: 朝下滚动，按下 Ctrl + C 即可退出日志回到主菜单。${RESET}"
+    sleep 1
+    docker logs --tail 100 -f mysql
+    menu
+}
+
+function show_info() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    SERVER_IP=$(get_public_ip)
+    local local_ip=$(get_local_ip)
+    
+    # 兼容处理未记录绑定策略的历史版本
+    BIND_STRATEGY=${BIND_STRATEGY:-1}
+    
+    echo -e "\n${GREEN}====== MySQL 运行信息 ======${RESET}"
+    if [ "$BIND_STRATEGY" = "2" ]; then
+        echo -e "${GREEN}绑定状态 :${RESET} ${YELLOW}仅限本地监听 (127.0.0.1)${RESET}"
+        echo -e "${GREEN}连接地址 :${RESET} 127.0.0.1:${PORT}"
+    else
+        echo -e "${GREEN}绑定状态 :${RESET} ${GREEN}开放公网/局域网 (0.0.0.0)${RESET}"
+        echo -e "${GREEN}公网地址 :${RESET} ${SERVER_IP}:${PORT}"
+        echo -e "${GREEN}内网地址 :${RESET} ${local_ip}:${PORT}"
+    fi
+    echo -e "${GREEN}root密码 :${RESET} ${YELLOW}${ROOT_PASSWORD}${RESET}"
+    echo -e "${GREEN}安装路径 :${RESET} $APP_DIR"
+    echo -e "${GREEN}================================${RESET}"
+    
+    echo -e "${GREEN}当前数据库列表:${RESET}"
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SHOW DATABASES;" | grep -Ev "Database|information_schema|performance_schema|sys|mysql"
+    
+    echo -e "\n${GREEN}当前自定义用户:${RESET}"
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SELECT user, host FROM mysql.user;" | grep -Ev "user|root|mysql.sys|mysql.session|mysql.infoschema"
+    echo -e "${GREEN}================================${RESET}"
+    pause; menu
+}
+
+function create_database() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    read -p "请输入新数据库名: " new_db
+    if [ -z "$new_db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
+    read -p "请输入字符集(默认 utf8mb4): " charset
+    charset=${charset:-utf8mb4}
+    
+    local collate=""
+    [ "$charset" = "utf8mb4" ] && collate="COLLATE utf8mb4_0900_ai_ci"
+
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
+CREATE DATABASE IF NOT EXISTS \`$new_db\` CHARACTER SET $charset $collate;
+EOF
+    echo -e "${YELLOW}✅ 数据库 $new_db 已尝试创建${RESET}"
+    pause; menu
+}
+
+function delete_database() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    
+    echo -e "${GREEN}当前可删除的数据库列表:${RESET}"
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SHOW DATABASES;" | grep -Ev "Database|information_schema|performance_schema|sys|mysql"
+    echo "--------------------------------"
+    read -p "请输入要删除的数据库名: " del_db
+    
+    if [ -z "$del_db" ]; then
+        echo -e "${RED}输入不能为空！${RESET}"
+        pause; menu
+    fi
+    
+    read -p "警告：确定要彻底删除数据库 [$del_db] 吗？数据将不可恢复！(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" || "$confirm" == "yes" ]]; then
+        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "DROP DATABASE \`$del_db\`;" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✅ 数据库 $del_db 删除成功。${RESET}"
+        else
+            echo -e "${RED}❌ 删除失败，请确认数据库名是否存在或属于系统关键库。${RESET}"
         fi
     else
-        _err "下载失败: $download_url"
+        echo -e "${YELLOW}操作已取消。${RESET}"
     fi
-    rm -rf "$tmp"
-    return 1
+    pause; menu
 }
 
-_deploy_openrc_service() {
-    _info "正在写入 Alpine OpenRC 服务管理配置..."
-    cat > "$SNELL_RC_SERVICE" <<'EOF'
-#!/sbin/openrc-run
+function create_user() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    read -p "请输入新用户名: " new_user
+    if [ -z "$new_user" ]; then echo -e "${RED}用户名不能为空！${RESET}"; pause; menu; fi
+    read -p "请输入新用户密码 [留空随机]: " new_pass
+    new_pass=${new_pass:-$(gen_pass)}
+    read -p "授权数据库名 (输入 * 代表全部): " grant_db
 
-description="Snell Server v6"
-command="/usr/local/bin/snell-server-v5"
-command_args="-c /etc/snell/snell-server.conf"
-command_background="yes"
-pidfile="/run/snell.pid"
-output_log="/var/log/snell.log"
-error_log="/var/log/snell.log"
+    local target="\`$grant_db\`.*"
+    [ "$grant_db" = "*" ] && target="*.*"
 
-depend() {
-    need net
-    after firewall
-}
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
+CREATE USER IF NOT EXISTS '$new_user'@'%' IDENTIFIED BY '$new_pass';
+GRANT ALL PRIVILEGES ON $target TO '$new_user'@'%';
+FLUSH PRIVILEGES;
 EOF
-    chmod +x "$SNELL_RC_SERVICE"
-    rc-update add snell default >/dev/null 2>&1 || true
+    echo -e "${YELLOW}✅ 用户 $new_user 创建成功。密码: $new_pass${RESET}"
+    pause; menu
 }
 
-install_snell_v5() {
-    if [ -x /usr/local/bin/snell-server-v5 ]; then
-        _ok "Snell 已安装，如需更新请使用选项 2，修改配置请用选项 4。"; return 0
-    fi
+function create_db_user() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    read -p "新数据库名: " new_db
+    read -p "新用户名: " new_user
+    if [[ -z "$new_db" || -z "$new_user" ]]; then echo -e "${RED}库名和用户名不能为空！${RESET}"; pause; menu; fi
+    read -p "密码 [留空随机]: " new_pass
+    new_pass=${new_pass:-$(gen_pass)}
 
-    local ver=$(_download_and_install_binary)
-    [ -z "$ver" ] && return 1
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
+CREATE DATABASE IF NOT EXISTS \`$new_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE USER IF NOT EXISTS '$new_user'@'%' IDENTIFIED BY '$new_pass';
+GRANT ALL PRIVILEGES ON \`$new_db\`.* TO '$new_user'@'%';
+FLUSH PRIVILEGES;
+EOF
+    echo -e "${YELLOW}✅ 联动创建成功。用户: $new_user 密码: $new_pass${RESET}"
+    pause; menu
+}
 
-    create_user
-    configure_snell || return 1
-    _deploy_openrc_service
+function change_password() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
     
-    rc-service snell restart >/dev/null 2>&1 || true
-    _ok "Snell v6 已在 Alpine Linux 上成功部署并全栈运行！"
-    log "Alpine Snell v6 安装成功"
+    echo -e "${GREEN}当前系统中的自定义用户:${RESET}"
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SELECT user, host FROM mysql.user;" | grep -Ev "user|mysql.sys|mysql.session|mysql.infoschema"
+    echo "--------------------------------"
+    
+    read -p "请输入要修改密码的用户名 [默认 root]: " target_user
+    target_user=${target_user:-root}
+    read -p "请输入新密码 [留空随机生成]: " new_pass
+    new_pass=${new_pass:-$(gen_pass)}
 
-    echo
-    echo -e "${GREEN}===============================================${RESET}"
-    echo -e "${GREEN}                🎉 Snell v6 安装成功 🎉         ${RESET}"
-    echo -e "${GREEN}===============================================${RESET}"
-    echo -e "${YELLOW}📄 提示：如果是纯 IPv6 VPS 架构，Surge配置里直接将IP换为中括号IPv6形式即可 ★${RESET}"
-    echo -e "${GREEN}👉 请复制以下配置到你的 Surge 6 配置文件中：${RESET}"
-    echo
-    if [ -f "$SNELL_DIR/config.txt" ]; then
-        echo -e "${YELLOW}(cat "$SNELL_DIR/config.txt")${RESET}"
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
+ALTER USER '$target_user'@'%' IDENTIFIED BY '$new_pass';
+FLUSH PRIVILEGES;
+EOF
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✅ 用户 '$target_user' 密码修改成功！新密码: ${YELLOW}$new_pass${RESET}"
+        
+        if [ "$target_user" = "root" ]; then
+            echo -e "${YELLOW}检测到修改了 root 密码，正在同步本地配置文件...${RESET}"
+            sed -i "s/^ROOT_PASSWORD=.*/ROOT_PASSWORD=$new_pass/g" "$CONFIG_FILE"
+            sed -i "s/MYSQL_ROOT_PASSWORD:.*/MYSQL_ROOT_PASSWORD: $new_pass/g" "$COMPOSE_FILE"
+            echo -e "${GREEN}✅ 本地配置文件已完美同步更新。${RESET}"
+        fi
     else
-        _warn "未找到节点配置文件文本。"
+        echo -e "${RED}❌ 密码修改失败，请检查用户是否存在。${RESET}"
     fi
-    echo -e "${GREEN}===============================================${RESET}"
-    echo
+    pause; menu
 }
 
-update_snell_v5() {
-    if [ ! -x /usr/local/bin/snell-server-v5 ]; then
-        _err "检测到系统未安装 Snell，请先选择选项 1 进行安装！"; return 1
+# 14. 删除用户功能
+function delete_user() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    
+    echo -e "${GREEN}当前系统可删除的用户列表:${RESET}"
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SELECT user, host FROM mysql.user;" | grep -Ev "user|root|mysql.sys|mysql.session|mysql.infoschema"
+    echo "--------------------------------"
+    read -p "请输入要删除的用户名: " del_user
+    
+    if [ -z "$del_user" ]; then
+        echo -e "${RED}输入不能为空！${RESET}"
+        pause; menu
+    fi
+    if [ "$del_user" = "root" ]; then
+        echo -e "${RED}❌ 安全限制：拒绝删除超级管理员 root 用户！${RESET}"
+        pause; menu
     fi
 
-    _info "开始检查并更新 Snell v6 二进制程序..."
-    local ver=$(_download_and_install_binary)
-    [ -z "$ver" ] && return 1
-
-    _deploy_openrc_service
-    _restart_snell_process
-    _ok "Snell 已成功更新至 v6，且当前配置已完好保留并重启完毕！"
-    log "Alpine Snell 成功更新"
-}
-
-uninstall_snell() {
-    echo -e "${RED}[警告] 正在彻底从 Alpine 卸载 Snell 服务...${RESET}"
-    rc-service snell stop >/dev/null 2>&1 || true
-    rc-update del snell >/dev/null 2>&1 || true
-    pkill -f snell-server-v5 || true
-    rm -f "$SNELL_RC_SERVICE"
-    rm -f /usr/local/bin/snell-server-v5
-    rm -rf "$SNELL_DIR"
-    rm -f "$SNELL_LOG"
-    _ok "Alpine Snell 服务已完全卸载。"
-}
-
-_restart_snell_process() {
-    rc-service snell restart >/dev/null 2>&1 || {
-        pkill -f snell-server-v5 || true
-        touch "$SNELL_LOG"
-        nohup /usr/local/bin/snell-server-v5 -c "$SNELL_CONFIG" >> "$SNELL_LOG" 2>&1 &
-    }
-}
-
-# ================== 菜单 ==================
-show_menu() {
-    clear
-    if rc-service snell status 2>&1 | grep -q "started" || pgrep -x "snell-server-v5" >/dev/null; then
-        STATUS="${GREEN}● 运行中 (双栈全监听)${RESET}"
+    read -p "确定要彻底删除用户 '$del_user' 吗？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" || "$confirm" == "yes" ]]; then
+        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
+DROP USER '$del_user'@'%';
+FLUSH PRIVILEGES;
+EOF
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✅ 用户 '$del_user' 已成功卸载并删除权限。${RESET}"
+        else
+            echo -e "${RED}❌ 删除失败，请确认该用户名是否存在。${RESET}"
+        fi
     else
-        STATUS="${RED}● 未运行${RESET}"
+        echo -e "${YELLOW}操作已取消。${RESET}"
     fi
-
-    VERSION_SHOW="未安装"
-    if [ -x /usr/local/bin/snell-server-v5 ]; then
-        VERSION_SHOW=$(/usr/local/bin/snell-server-v5 -v 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?' || echo "v6.x")
-    fi
-
-    PORT_SHOW="-"
-    if [ -f "$SNELL_CONFIG" ]; then
-        local raw_listen=$(_get_conf_value "listen")
-        local first_listen="${raw_listen%%,*}"
-        PORT_SHOW=$(echo "$first_listen" | awk -F: '{print $NF}')
-    fi
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Snell v6 管理面板 (Alpine) ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $STATUS"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}$PORT_SHOW${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Snell v6${RESET}"
-    echo -e "${GREEN}2. 更新 Snell v6${RESET}"
-    echo -e "${GREEN}3. 卸载 Snell${RESET}"
-    echo -e "${GREEN}4. 修改协议栈与配置${RESET}"
-    echo -e "${GREEN}5. 启动 Snell${RESET}"
-    echo -e "${GREEN}6. 停止 Snell${RESET}"
-    echo -e "${GREEN}7. 重启 Snell${RESET}"
-    echo -e "${GREEN}8. 查看运行日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置 (Surge 6 格式)${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    pause; menu
 }
 
-# ================== 主循环 ==================
-while true; do
-    show_menu
-    echo -e -n "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case $choice in
-        1) install_snell_v5; pause ;;
-        2) update_snell_v5; pause ;;
-        3) uninstall_snell; pause ;;
-        4) 
-            if [ ! -f "$SNELL_CONFIG" ]; then 
-                _err "未找到配置文件，请先安装！"
-            else
-                configure_snell
-                _restart_snell_process
-                _ok "配置已重载，Snell v6 服务已平滑重启！"
-                echo -e "\n${GREEN}👉 最新 Surge 6 节点配置：${RESET}"
-                echo -e "${YELLOW}📄 提示：双栈环境下该节点会根据客户端策略自动调度 ★${RESET}"
-                [ -f "$SNELL_DIR/config.txt" ] && echo -e "${YELLOW}$(cat "$SNELL_DIR/config.txt")${RESET}\n"
-            fi
-            pause ;;
-        5) 
-            rc-service snell start >/dev/null 2>&1 || { 
-                if ! pgrep -x "snell-server-v5" >/dev/null; then
-                    touch "$SNELL_LOG"
-                    nohup /usr/local/bin/snell-server-v5 -c "$SNELL_CONFIG" >> "$SNELL_LOG" 2>&1 &
-                fi
-            }
-            _ok "Snell 已成功启动"
-            pause ;;
-        6) 
-            rc-service snell stop >/dev/null 2>&1 || pkill -f snell-server-v5 || true
-            _ok "Snell 已停止"
-            pause ;;
-        7) 
-            _restart_snell_process
-            _ok "Snell 已重启"
-            pause ;;
-        8)
-            echo -e "${GREEN}--- Snell 核心运行日志 (最新50行) ---${RESET}"
-            if [ -f "$SNELL_LOG" ] && [ -s "$SNELL_LOG" ]; then
-                tail -n 50 "$SNELL_LOG"
-                echo -e "${YELLOW}------------------------------------------------${RESET}"
-                echo -n "是否需要实时追踪新日志输出？(y/n, 默认 n): "
-                read -r watch_choice
-                if [ "$watch_choice" = "y" ] || [ "$watch_choice" = "Y" ]; then
-                    echo -e "${YELLOW}提示: 按 Ctrl+C 即可退出日志实时追踪并返回菜单${RESET}"
-                    tail -f "$SNELL_LOG"
-                fi
-            else
-                _warn "暂无 Snell 运行日志或日志文件为空。"
-            fi
-            pause ;;
-        9)
-            if [ -f "$SNELL_CONFIG" ]; then
-                echo -e "${GREEN}====== 当前 Snell v6 内部配置 ======${RESET}"
-                cat "$SNELL_CONFIG"
-                echo -e "${GREEN}====== Surge 6 专属配置 ======${RESET}"
-                [ -f "$SNELL_DIR/config.txt" ] && cat "$SNELL_DIR/config.txt" || echo "暂无配置文本"
-            else
-                echo -e "${RED}配置文件不存在，请先安装！${RESET}"
-            fi
-            pause ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效输入${RESET}"; pause ;;
-    esac
-done
+function backup_db() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    
+    local target_dir=""
+    echo -e "\n请选择备份文件导出目标："
+    echo -e "  [1] 导出默认备份目录 (${BACKUP_DIR})"
+    echo -e "  [2] 导出到自定义外部目录的绝对路径"
+    read -p "请选择 [1-2, 默认 1]: " path_choice
+    path_choice=${path_choice:-1}
+
+    if [ "$path_choice" = "1" ]; then
+        target_dir="$BACKUP_DIR"
+        mkdir -p "$target_dir"
+    else
+        read -p "请输入要保存备份的目录绝对路径 (如 /root/ 或 /home/backup/): " custom_dir
+        if [ -z "$custom_dir" ]; then echo -e "${RED}目录不能为空！${RESET}"; pause; menu; fi
+        target_dir="$custom_dir"
+        # 智能创建目录
+        mkdir -p "$target_dir"
+    fi
+
+    read -p "要备份的库名 (全库输入 --all-databases): " db
+    if [ -z "$db" ] || [[ "$db" =~ ^[[:space:]]+$ ]]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
+    
+    local filename="$db"
+    [ "$db" = "--all-databases" ] && filename="all"
+    BACKUP_FILE="${target_dir%/}/${filename}_$(date +%Y%m%d_%H%M%S).sql"
+    
+    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysqldump -uroot --default-character-set=utf8mb4 "$db" > "$BACKUP_FILE"
+    if [ $? -eq 0 ] && [ -s "$BACKUP_FILE" ]; then
+        echo -e "${YELLOW}✅ 备份完成，文件已安全存放在: $BACKUP_FILE${RESET}"
+    else
+        echo -e "${RED}❌ 备份失败，请核对数据库名或目录是否有写入权限。${RESET}"
+        rm -f "$BACKUP_FILE"
+    fi
+    pause; menu
+}
+
+function restore_db() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    source "$CONFIG_FILE"
+    
+    local sql_absolute_path=""
+
+    echo -e "\n请选择备份文件来源路径："
+    echo -e "  [1] 默认备份目录恢复 (${BACKUP_DIR})"
+    echo -e "  [2] 输入自定义外部 SQL 文件的绝对路径"
+    read -p "请选择 [1-2, 默认 1]: " path_choice
+    path_choice=${path_choice:-1}
+
+    if [ "$path_choice" = "1" ]; then
+        if [ ! -d "$BACKUP_DIR" ] || [ -z "$(ls -A "$BACKUP_DIR")" ]; then
+            echo -e "${RED}❌ 默认备份目录下没有找到任何备份文件${RESET}"; pause; menu
+        fi
+        echo -e "${GREEN}可用历史备份:${RESET}"
+        ls -1 "$BACKUP_DIR"
+        read -p "请输入完整备份文件名: " file
+        sql_absolute_path="$BACKUP_DIR/$file"
+    else
+        read -p "请输入 SQL 文件的绝对路径 (如 /root/data.sql): " custom_path
+        sql_absolute_path="$custom_path"
+    fi
+
+    # 安全检查文件是否存在
+    if [ ! -f "$sql_absolute_path" ]; then
+        echo -e "${RED}❌ 错误：未找到 SQL 文件，请重新检查路径 [ $sql_absolute_path ] 是否正确！${RESET}"
+        pause; menu
+    fi
+
+    read -p "目标数据库名 (若是包含全库备份的 SQL 文件，可直接回车): " target_db
+
+    if [ -z "$target_db" ]; then
+        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot < "$sql_absolute_path"
+    else
+        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "CREATE DATABASE IF NOT EXISTS \`$target_db\`;"
+        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot "$target_db" < "$sql_absolute_path"
+    fi
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${YELLOW}✅ 数据库恢复指令执行成功！${RESET}"
+    else
+        echo -e "${RED}❌ 恢复失败，请查看是否有报错输出。${RESET}"
+    fi
+    pause; menu
+}
+
+# ==================== 启动 ====================
+menu

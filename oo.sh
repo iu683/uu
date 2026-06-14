@@ -1,13 +1,15 @@
 #!/bin/bash
 # ========================================
-# MySQL 一键管理脚本 (Docker Compose)
+# Redis 容器管理面板 (Docker Compose) 
 # ========================================
 
 GREEN="\033[32m"
 RESET="\033[0m"
 YELLOW="\033[33m"
 RED="\033[31m"
-APP_NAME="mysql"
+BLUE="\033[34m"
+CYAN="\033[36m"
+APP_NAME="redis"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 CONFIG_FILE="$APP_DIR/config.env"
@@ -46,28 +48,29 @@ pause() {
     read -p $'\e[32m按回车返回菜单...\e[0m'
 }
 
-# 获取容器动态状态及数据库个数用于菜单显示
+# 获取容器动态状态及内存使用量
 get_sys_status() {
     if [ ! -f "$CONFIG_FILE" ]; then
         status="${RED}未安装${RESET}"
         version="${RED}无${RESET}"
         port_show="${RED}无${RESET}"
-        db_count="${RED}0${RESET}"
+        mem_show="${RED}0B${RESET}"
     else
         source "$CONFIG_FILE"
-        version="8.0"
+        version="7.2 (Alpine)"
         port_show="$PORT"
         
-        if [ "$(docker ps -q -f name=^mysql$)" ]; then
+        if [ "$(docker ps -q -f name=^redis$)" ]; then
             status="${GREEN}运行中${RESET}"
-            db_count=$(docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SHOW DATABASES;" 2>/dev/null | grep -Ev "Database|information_schema|performance_schema|sys|mysql" | wc -l)
-            db_count="${YELLOW}${db_count//[[:space:]]/}${RESET} ${GREEN}个${RESET}"
-        elif [ "$(docker ps -a -q -f name=^mysql$)" ]; then
+            # 通过 redis-cli 实时获取已用内存
+            local raw_mem=$(docker exec -i redis redis-cli -a "$REDIS_PASSWORD" info memory 2>/dev/null | grep "used_memory_human" | cut -d':' -f2)
+            mem_show="${YELLOW}${raw_mem//[[:space:]]/}${RESET}"
+        elif [ "$(docker ps -a -q -f name=^redis$)" ]; then
             status="${YELLOW}已停止${RESET}"
-            db_count="${YELLOW}未知 (请先启动容器)${RESET}"
+            mem_show="${YELLOW}未知 (请先启动容器)${RESET}"
         else
             status="${RED}未启动 (容器不存在)${RESET}"
-            db_count="${RED}0${RESET}"
+            mem_show="${RED}0B${RESET}"
         fi
     fi
 }
@@ -77,48 +80,49 @@ function menu() {
     clear
     get_sys_status
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  MySQL 容器管理面板 ◈     ${RESET}"
+    echo -e "${GREEN}   ◈    Redis 管理面板    ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态       :${RESET} $status"
     echo -e "${GREEN}版本       :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}端口       :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}已创数据库 :${RESET} $db_count"
+    echo -e "${GREEN}内存占用   :${RESET} $mem_show"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 MySQL${RESET}"
-    echo -e "${GREEN} 2. 更新 MySQL${RESET}"
-    echo -e "${GREEN} 3. 卸载 MySQL${RESET}"
-    echo -e "${GREEN} 4. 数据库信息${RESET}"
-    echo -e "${GREEN} 5. 启动 MySQL${RESET}"
-    echo -e "${GREEN} 6. 停止 MySQL${RESET}"
-    echo -e "${GREEN} 7. 重启 MySQL${RESET}"
-    echo -e "${GREEN} 8. 查看运行日志${RESET}"
-    echo -e "${GREEN} 9. 创建数据库${RESET}"
-    echo -e "${GREEN}10. 删除数据库${RESET}"
-    echo -e "${GREEN}11. 创建用户并授权${RESET}"
-    echo -e "${GREEN}12. 创建数据库库+用户${RESET}"
-    echo -e "${GREEN}13. 修改用户密码${RESET}"
-    echo -e "${GREEN}14. 备份数据库${RESET}"
-    echo -e "${GREEN}15. 恢复数据库${RESET}"
+    echo -e "${GREEN} 1. 安装 Redis${RESET}"
+    echo -e "${GREEN} 2. 更新 Redis${RESET}"
+    echo -e "${GREEN} 3. 卸载 Redis${RESET}"
+    echo -e "${GREEN} 4. 启动 Redis${RESET}"
+    echo -e "${GREEN} 5. 停止 Redis${RESET}"
+    echo -e "${GREEN} 6. 重启 Redis${RESET}"
+    echo -e "${GREEN} 7. 查看 日志${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${GREEN} 8. 运行信息 (INFO)${RESET}"
+    echo -e "${GREEN} 9. 连入命令行 (CLI)${RESET}"
+    echo -e "${GREEN}10. 清空当前库 (FLUSHDB)${RESET}"
+    echo -e "${GREEN}11. 清空所有库 (FLUSHALL)${RESET}"
+    echo -e "${GREEN}12. 修改连接密码${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${GREEN}13. 备份快照 (SAVE)${RESET}"
+    echo -e "${GREEN}14. 恢复快照 (RESTORE)${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     
-    read -p $'\e[32m请输入选项: \e[0m' num
+    read -p $'\e[32m请输入数字: \e[0m' num
     case "$num" in
         1) install_app ;;
         2) update_app ;;
         3) uninstall_app ;;
-        4) show_info ;;
-        5) start_mysql ;;
-        6) stop_mysql ;;
-        7) restart_mysql ;;
-        8) view_logs ;;
-        9) create_database ;;
-        10) delete_database ;;
-        11) create_user ;;
-        12) create_db_user ;;
-        13) change_password ;;
-        14) backup_db ;;
-        15) restore_db ;;
+        4) start_rd ;;
+        5) stop_rd ;;
+        6) restart_rd ;;
+        7) view_logs ;;
+        8) show_info ;;
+        9) enter_cli ;;
+        10) flush_db ;;
+        11) flush_all ;;
+        12) change_password ;;
+        13) backup_db ;;
+        14) restore_db ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
     esac
@@ -128,90 +132,75 @@ function menu() {
 
 function install_app() {
     if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}⚠️ 检测到已经安装过 MySQL。${RESET}"
+        echo -e "${RED}检测到已经安装过 Redis。${RESET}"
         pause; menu
     fi
     
-    # 1. 输入端口
-    read -p "请输入 MySQL 端口 [默认 3306]: " input_port
-    PORT=${input_port:-3306}
+    read -p "请输入 Redis 端口 [默认 6379]: " input_port
+    PORT=${input_port:-6379}
     
-    # 2. 选择 IP 绑定策略
     echo -e "\n请选择网络绑定策略 (IP Binding):"
     echo -e "  [1] 允许公网/局域网访问 (绑定 0.0.0.0) [默认]"
     echo -e "  [2] 仅允许本地访问     (绑定 127.0.0.1)"
-    read -p "请输入数字 [1-2, 默认 1]: " bind_choice
+    read -p "请输入数字 [1-2, 2]: " bind_choice
     bind_choice=${bind_choice:-1}
     
     local compose_port_mapping
     local bind_status_text
     if [ "$bind_choice" = "2" ]; then
-        compose_port_mapping="127.0.0.1:${PORT}:3306"
+        compose_port_mapping="127.0.0.1:${PORT}:6379"
         bind_status_text="仅限本地 (127.0.0.1)"
     else
-        compose_port_mapping="${PORT}:3306"
+        compose_port_mapping="${PORT}:6379"
         bind_status_text="开放公网 (0.0.0.0)"
     fi
 
-    # 3. 输入或生成密码
-    read -p "请输入 root 密码 [留空自动生成]: " input_pass
-    ROOT_PASSWORD=${input_pass:-$(gen_pass)}
+    read -p "请输入 Redis 连接密码 [留空自动生成]: " input_pass
+    REDIS_PASSWORD=${input_pass:-$(gen_pass)}
 
-    # 创建必要的目录
-    mkdir -p "$APP_DIR/data" "$APP_DIR/config" "$BACKUP_DIR"
+    mkdir -p "$APP_DIR/data" "$BACKUP_DIR"
     
-    # 4. 生成 docker-compose.yml
     cat > "$COMPOSE_FILE" <<EOF
 services:
-  mysql-db:
-    container_name: mysql
-    image: mysql:8.0
+  redis-cache:
+    container_name: redis
+    image: redis:7.2-alpine
     restart: always
     ports:
       - "${compose_port_mapping}"
+    command: redis-server --requirepass "${REDIS_PASSWORD}" --appendonly yes
     environment:
-      MYSQL_ROOT_PASSWORD: ${ROOT_PASSWORD}
       TZ: Asia/Shanghai
     volumes:
-      - ./data:/var/lib/mysql
-      - ./config:/etc/mysql/conf.d
+      - ./data:/data
 EOF
 
-    # 5. 生成本地环境记录文件
     cat > "$CONFIG_FILE" <<EOF
 PORT=$PORT
-ROOT_PASSWORD=$ROOT_PASSWORD
+REDIS_PASSWORD=$REDIS_PASSWORD
 BIND_STRATEGY=$bind_choice
 EOF
 
-    # 6. 部署容器
     cd "$APP_DIR" && $COMPOSE_CMD up -d
     
-    # 获取展示需要的 IP
     local public_ip=$(get_public_ip)
     local local_ip=$(get_local_ip)
     
-    # 7. 输出精美的连接卡片
     echo -e "\n${GREEN}================================================${RESET}"
-    echo -e "${GREEN}🎉 MySQL 安装启动成功！运行连接信息如下：${RESET}"
+    echo -e "${GREEN}🎉 Redis 安全认证版安装启动成功！运行连接信息：${RESET}"
     echo -e "${GREEN}================================================${RESET}"
     echo -e "${GREEN} 网络绑定策略 :${RESET} ${YELLOW}${bind_status_text}${RESET}"
     if [ "$bind_choice" = "2" ]; then
         echo -e "${GREEN} 唯一连接地址 :${RESET} 127.0.0.1:${PORT}"
     else
         echo -e "${GREEN} 公网连接地址 :${RESET} ${public_ip}:${PORT}"
-        echo -e "${GREEN} 内网连接地址 :${RESET} ${local_ip}:${PORT}"
+        echo -e "${GREEN} 内网连接地址 :${RESET} 127.0.0.1:${PORT}"
     fi
-    echo -e "${GREEN} 管理用户名   :${RESET} root"
-    echo -e "${GREEN} 管理员密码   :${RESET} ${YELLOW}${ROOT_PASSWORD}${RESET}"
+    echo -e "${GREEN} 默认连接索引 :${RESET} db0 ~ db15 (共16个)"
+    echo -e "${GREEN} 认证连接密码 :${RESET} ${YELLOW}${REDIS_PASSWORD}${RESET}"
+    echo -e "${GREEN} 标准连接串   :${RESET} ${CYAN}redis://:${REDIS_PASSWORD}@${public_ip}:${PORT}/0${RESET}"
     echo -e "${GREEN} 配置文件路径 :${RESET} ${CONFIG_FILE}"
     echo -e "${GREEN}================================================${RESET}"
-    
-    if [ "$bind_choice" = "1" ]; then
-        echo -e "${YELLOW}提示：由于你开启了公网访问，请务必前往云服务器控制台放行 ${PORT} 端口！${RESET}\n"
-    else
-        echo -e "${BLUE}提示：由于你选择了仅本地访问，外部任何 IP (包括Navicat远程) 将无法连接，这非常安全。${RESET}\n"
-    fi
     
     pause; menu
 }
@@ -219,240 +208,181 @@ EOF
 function update_app() {
     if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录，请先安装${RESET}"; sleep 1; menu; fi
     cd "$APP_DIR" && $COMPOSE_CMD pull && $COMPOSE_CMD up -d
-    echo -e "${GREEN}✅ MySQL 已更新并重启${RESET}"
+    echo -e "${GREEN}✅ Redis 镜像已更新并重启容器${RESET}"
     pause; menu
 }
 
 function uninstall_app() {
     if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; fi
-    read -p "确定要彻底卸载吗？数据将清空！(y/N): " confirm
+    read -p "确定要彻底卸载吗？内存持久化数据(RDB/AOF)将清空！(y/N): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" || "$confirm" == "yes" ]]; then
         cd "$APP_DIR" && $COMPOSE_CMD down -v
         rm -rf "$APP_DIR"
-        echo -e "${GREEN}✅ MySQL 已彻底卸载${RESET}"
+        echo -e "${GREEN}✅ Redis 已从本系统彻底卸载${RESET}"
     else
         echo -e "${YELLOW}已取消卸载${RESET}"
     fi
     pause; menu
 }
 
-function start_mysql() {
-    docker start mysql &>/dev/null
-    echo -e "${GREEN}✅ MySQL 容器已启动${RESET}"
+function start_rd() {
+    docker start redis &>/dev/null
+    echo -e "${GREEN}✅ Redis 容器已启动${RESET}"
     pause; menu
 }
 
-function stop_mysql() {
-    docker stop mysql &>/dev/null
-    echo -e "${GREEN}✅ MySQL 容器已停止${RESET}"
+function stop_rd() {
+    docker stop redis &>/dev/null
+    echo -e "${GREEN}✅ Redis 容器已停止${RESET}"
     pause; menu
 }
 
-function restart_mysql() {
-    docker restart mysql &>/dev/null
-    echo -e "${GREEN}✅ MySQL 容器已重启${RESET}"
+function restart_rd() {
+    docker restart redis &>/dev/null
+    echo -e "${GREEN}✅ Redis 容器已重启${RESET}"
     pause; menu
 }
 
 function view_logs() {
     echo -e "${YELLOW}提示: 朝下滚动，按下 Ctrl + C 即可退出日志回到主菜单。${RESET}"
     sleep 1
-    docker logs --tail 100 -f mysql
+    docker logs --tail 100 -f redis
     menu
 }
 
 function show_info() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 Redis${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     SERVER_IP=$(get_public_ip)
     local local_ip=$(get_local_ip)
-    
-    # 兼容处理未记录绑定策略的历史版本
     BIND_STRATEGY=${BIND_STRATEGY:-1}
     
-    echo -e "\n${GREEN}====== MySQL 运行信息 ======${RESET}"
+    echo -e "\n${GREEN}====== Redis 运行状态信息 ======${RESET}"
     if [ "$BIND_STRATEGY" = "2" ]; then
         echo -e "${GREEN}绑定状态 :${RESET} ${YELLOW}仅限本地监听 (127.0.0.1)${RESET}"
         echo -e "${GREEN}连接地址 :${RESET} 127.0.0.1:${PORT}"
     else
         echo -e "${GREEN}绑定状态 :${RESET} ${GREEN}开放公网/局域网 (0.0.0.0)${RESET}"
         echo -e "${GREEN}公网地址 :${RESET} ${SERVER_IP}:${PORT}"
-        echo -e "${GREEN}内网地址 :${RESET} ${local_ip}:${PORT}"
+        echo -e "${GREEN}内网地址 :${RESET} 127.0.0.1:${PORT}"
     fi
-    echo -e "${GREEN}root密码 :${RESET} ${YELLOW}${ROOT_PASSWORD}${RESET}"
+    echo -e "${GREEN}连接密码 :${RESET} ${YELLOW}${REDIS_PASSWORD}${RESET}"
     echo -e "${GREEN}安装路径 :${RESET} $APP_DIR"
     echo -e "${GREEN}================================${RESET}"
     
-    echo -e "${GREEN}当前数据库列表:${RESET}"
-    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SHOW DATABASES;" | grep -Ev "Database|information_schema|performance_schema|sys|mysql"
-    
-    echo -e "\n${GREEN}当前自定义用户:${RESET}"
-    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SELECT user, host FROM mysql.user;" | grep -Ev "user|root|mysql.sys|mysql.session|mysql.infoschema"
+    echo -e "${GREEN}核心性能指标摘要 (Engine INFO):${RESET}"
+    docker exec -i redis redis-cli -a "$REDIS_PASSWORD" info stats 2>/dev/null | grep -E "(total_connections_received|total_commands_processed|instantaneous_ops_per_sec)"
+    docker exec -i redis redis-cli -a "$REDIS_PASSWORD" info keyspace 2>/dev/null
     echo -e "${GREEN}================================${RESET}"
     pause; menu
 }
 
-function create_database() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+function enter_cli() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 Redis${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
-    read -p "请输入新数据库名: " new_db
-    if [ -z "$new_db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    read -p "请输入字符集(默认 utf8mb4): " charset
-    charset=${charset:-utf8mb4}
-    
-    local collate=""
-    [ "$charset" = "utf8mb4" ] && collate="COLLATE utf8mb4_0900_ai_ci"
-
-    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
-CREATE DATABASE IF NOT EXISTS \`$new_db\` CHARACTER SET $charset $collate;
-EOF
-    echo -e "${YELLOW}✅ 数据库 $new_db 已尝试创建${RESET}"
-    pause; menu
+    echo -e "${YELLOW}提示：已成功为你带密码切入交互命令行。输入 'exit' 退出交互回到面板。${RESET}"
+    sleep 1
+    docker exec -it redis redis-cli -a "$REDIS_PASSWORD"
+    menu
 }
 
-function delete_database() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+function flush_db() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 Redis${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
-    
-    echo -e "${GREEN}当前可删除的数据库列表:${RESET}"
-    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SHOW DATABASES;" | grep -Ev "Database|information_schema|performance_schema|sys|mysql"
-    echo "--------------------------------"
-    read -p "请输入要删除的数据库名: " del_db
-    
-    if [ -z "$del_db" ]; then
-        echo -e "${RED}输入不能为空！${RESET}"
-        pause; menu
-    fi
-    
-    read -p "⚠️ 警告：确定要彻底删除数据库 [$del_db] 吗？数据将不可恢复！(y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" || "$confirm" == "yes" ]]; then
-        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "DROP DATABASE \`$del_db\`;" 2>/dev/null
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✅ 数据库 $del_db 删除成功。${RESET}"
-        else
-            echo -e "${RED}❌ 删除失败，请确认数据库名是否存在或属于系统关键库。${RESET}"
-        fi
-    else
-        echo -e "${YELLOW}操作已取消。${RESET}"
+    read -p "确定要清空当前选中数据库索引里的所有 Key 吗？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        docker exec -i redis redis-cli -a "$REDIS_PASSWORD" FLUSHDB &>/dev/null
+        echo -e "${GREEN}✅ 当前单库数据清除成功。${RESET}"
     fi
     pause; menu
 }
 
-function create_user() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+function flush_all() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 Redis${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
-    read -p "请输入新用户名: " new_user
-    if [ -z "$new_user" ]; then echo -e "${RED}用户名不能为空！${RESET}"; pause; menu; fi
-    read -p "请输入新用户密码 [留空随机]: " new_pass
-    new_pass=${new_pass:-$(gen_pass)}
-    read -p "授权数据库名 (输入 * 代表全部): " grant_db
-
-    local target="\`$grant_db\`.*"
-    [ "$grant_db" = "*" ] && target="*.*"
-
-    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
-CREATE USER IF NOT EXISTS '$new_user'@'%' IDENTIFIED BY '$new_pass';
-GRANT ALL PRIVILEGES ON $target TO '$new_user'@'%';
-FLUSH PRIVILEGES;
-EOF
-    echo -e "${YELLOW}✅ 用户 $new_user 创建成功。密码: $new_pass${RESET}"
-    pause; menu
-}
-
-function create_db_user() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    read -p "新数据库名: " new_db
-    read -p "新用户名: " new_user
-    if [[ -z "$new_db" || -z "$new_user" ]]; then echo -e "${RED}库名和用户名不能为空！${RESET}"; pause; menu; fi
-    read -p "密码 [留空随机]: " new_pass
-    new_pass=${new_pass:-$(gen_pass)}
-
-    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
-CREATE DATABASE IF NOT EXISTS \`$new_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
-CREATE USER IF NOT EXISTS '$new_user'@'%' IDENTIFIED BY '$new_pass';
-GRANT ALL PRIVILEGES ON \`$new_db\`.* TO '$new_user'@'%';
-FLUSH PRIVILEGES;
-EOF
-    echo -e "${YELLOW}✅ 联动创建成功。用户: $new_user 密码: $new_pass${RESET}"
+    read -p "🚨 极度危险：确定要格式化整个 Redis、摧毁全部 16 个库里的所有 Key 吗？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        docker exec -i redis redis-cli -a "$REDIS_PASSWORD" FLUSHALL &>/dev/null
+        echo -e "${GREEN}✅ 整个 Redis 内存空间已被彻底抹净。${RESET}"
+    fi
     pause; menu
 }
 
 function change_password() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 Redis${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
     
-    echo -e "${GREEN}当前系统中的自定义用户:${RESET}"
-    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "SELECT user, host FROM mysql.user;" | grep -Ev "user|mysql.sys|mysql.session|mysql.infoschema"
-    echo "--------------------------------"
-    
-    read -p "请输入要修改密码的用户名 [默认 root]: " target_user
-    target_user=${target_user:-root}
-    read -p "请输入新密码 [留空随机生成]: " new_pass
+    read -p "请输入新 Redis 连接密码 [留空随机生成]: " new_pass
     new_pass=${new_pass:-$(gen_pass)}
 
-    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot <<EOF
-ALTER USER '$target_user'@'%' IDENTIFIED BY '$new_pass';
-FLUSH PRIVILEGES;
-EOF
+    # 在不重启容器的情况下，利用 CONFIG SET 动态热生效密码
+    docker exec -i redis redis-cli -a "$REDIS_PASSWORD" CONFIG SET requirepass "$new_pass" &>/dev/null
 
     if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✅ 用户 '$target_user' 密码修改成功！新密码: ${YELLOW}$new_pass${RESET}"
-        
-        if [ "$target_user" = "root" ]; then
-            echo -e "${YELLOW}检测到修改了 root 密码，正在同步本地配置文件...${RESET}"
-            sed -i "s/^ROOT_PASSWORD=.*/ROOT_PASSWORD=$new_pass/g" "$CONFIG_FILE"
-            sed -i "s/MYSQL_ROOT_PASSWORD:.*/MYSQL_ROOT_PASSWORD: $new_pass/g" "$COMPOSE_FILE"
-            echo -e "${GREEN}✅ 本地配置文件已完美同步更新。${RESET}"
-        fi
+        sed -i "s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=$new_pass/g" "$CONFIG_FILE"
+        sed -i 's|--requirepass "[^"]*"|--requirepass "'"${new_pass}"'"|g' "$COMPOSE_FILE"
+        echo -e "${GREEN}✅ Redis 密码修改并动态热生效成功！${RESET}"
+        echo -e "${GREEN}新密码: ${YELLOW}$new_pass${RESET}（配置文件及持久化配置已同步）"
     else
-        echo -e "${RED}❌ 密码修改失败，请检查用户是否存在。${RESET}"
+        echo -e "${RED}❌ 密码修改失败，请确保容器正常运行。${RESET}"
     fi
     pause; menu
 }
 
 function backup_db() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 Redis${RESET}"; sleep 1; menu; fi
     source "$CONFIG_FILE"
-    mkdir -p "$BACKUP_DIR"
-    read -p "要备份的库名 (全库输入 --all-databases): " db
-    if [ -z "$db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
     
-    local filename="$db"
-    [ "$db" = "--all-databases" ] && filename="all"
-    BACKUP_FILE="$BACKUP_DIR/${filename}_$(date +%Y%m%d_%H%M%S).sql"
+    echo -e "${YELLOW}正在通知 Redis 引擎对内存进行内存全量物理盘落快照 (BGSAVE)...${RESET}"
+    docker exec -i redis redis-cli -a "$REDIS_PASSWORD" BGSAVE &>/dev/null
+    sleep 2 # 给予引擎磁盘落盘缓冲时间
     
-    docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysqldump -uroot --default-character-set=utf8mb4 "$db" > "$BACKUP_FILE"
-    if [ $? -eq 0 ] && [ -s "$BACKUP_FILE" ]; then
-        echo -e "${YELLOW}✅ 备份完成: $BACKUP_FILE${RESET}"
+    local stamp=$(date +%Y%m%d_%H%M%S)
+    local target_file="$BACKUP_DIR/redis_dump_${stamp}.rdb"
+    
+    # 将挂载目录下的物理 dump.rdb 复制作为安全存档
+    if [ -f "$APP_DIR/data/dump.rdb" ]; then
+        cp "$APP_DIR/data/dump.rdb" "$target_file"
+        echo -e "${GREEN}✅ Redis 物理级原子快照备份成功！${RESET}"
+        echo -e "${GREEN}存档路径 :${RESET} $target_file"
     else
-        echo -e "${RED}❌ 备份失败，请核对数据库名是否正确。${RESET}"
-        rm -f "$BACKUP_FILE"
+        echo -e "${RED}❌ 错误：未在数据目录下检测到持久化物理快照文件。${RESET}"
     fi
     pause; menu
 }
 
 function restore_db() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MySQL${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 Redis${RESET}"; sleep 1; menu; fi
+    
     if [ ! -d "$BACKUP_DIR" ] || [ -z "$(ls -A "$BACKUP_DIR")" ]; then
-        echo -e "${RED}❌ 没有找到备份文件${RESET}"; pause; menu
+        echo -e "${RED}❌ 默认备份目录下没有找到任何 .rdb 快照存档${RESET}"; pause; menu
     fi
-    echo -e "${GREEN}可用备份:${RESET}"
+    
+    echo -e "${GREEN}可用历史快照备份列表:${RESET}"
     ls -1 "$BACKUP_DIR"
-    read -p "请输入完整备份文件名: " file
-    if [ ! -f "$BACKUP_DIR/$file" ]; then
-        echo -e "${RED}❌ 备份文件不存在，请重新核对！${RESET}"; pause; menu
+    read -p "请输入你想恢复的完整快照文件名: " file
+    local src_file="$BACKUP_DIR/$file"
+    
+    if [ ! -f "$src_file" ]; then
+        echo -e "${RED}❌ 错误：未找到指定的备份快照文件！${RESET}"; pause; menu
     fi
-    read -p "目标数据库名 (全库备份直接回车): " target_db
 
-    if [ -z "$target_db" ]; then
-        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot < "$BACKUP_DIR/$file"
+    read -p "恢复快照需要临时关停并覆盖当前 Redis 内存，确定继续吗？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        echo -e "${YELLOW}1. 正在停止当前 Redis 引擎...${RESET}"
+        docker stop redis &>/dev/null
+        
+        echo -e "${YELLOW}2. 正在进行底层物理 RDB 数据替换归位...${RESET}"
+        # 清除现有 aof 增量日志，防止恢复后被 aof 污染重写
+        rm -f "$APP_DIR/data/appendonly.aof" "$APP_DIR/data/appendonlydir/"* 2>/dev/null
+        cp "$src_file" "$APP_DIR/data/dump.rdb"
+        
+        echo -e "${YELLOW}3. 重新唤醒并拉起 Redis 服务...${RESET}"
+        docker start redis &>/dev/null
+        echo -e "${GREEN}✅ Redis 物理内存快照已成功全量复原入内存！${RESET}"
     else
-        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot -e "CREATE DATABASE IF NOT EXISTS \`$target_db\`;"
-        docker exec -i -e MYSQL_PWD="$ROOT_PASSWORD" mysql mysql -uroot "$target_db" < "$BACKUP_DIR/$file"
+        echo -e "${YELLOW}操作已取消。${RESET}"
     fi
-    echo -e "${YELLOW}✅ 导入指令执行完毕${RESET}"
     pause; menu
 }
 

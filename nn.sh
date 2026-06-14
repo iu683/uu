@@ -1,456 +1,183 @@
 #!/bin/bash
 # ========================================
-# MariaDB 容器管理面板 (Docker Compose)
+# yt-dlp 一键管理脚本 PRO (多系统兼容版)
 # ========================================
 
+VIDEO_DIR="/opt/yt-dlp"
+URL_FILE="$VIDEO_DIR/urls.txt"
+COOKIE_FILE="$VIDEO_DIR/cookies.txt"
+
 GREEN="\033[32m"
-RESET="\033[0m"
-YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[34m"
-CYAN="\033[36m"
-APP_NAME="mariadb"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-CONFIG_FILE="$APP_DIR/config.env"
-BACKUP_DIR="$APP_DIR/backup"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-# 自动适配 docker compose 语法
-if docker compose version &>/dev/null; then
-    COMPOSE_CMD="docker compose"
-else
-    COMPOSE_CMD="docker-compose"
-fi
+mkdir -p "$VIDEO_DIR"
 
-# 随机密码生成函数
-gen_pass() {
-    tr -dc A-Za-z0-9 </dev/urandom | head -c 16
-}
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP"
-}
-
-get_local_ip() {
-    local ip
-    ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+')
-    [ -z "$ip" ] && ip=$(hostname -I | awk '{print $1}')
-    echo "${ip:-127.0.0.1}"
-}
-
-pause() {
-    read -p $'\e[32m按回车返回菜单...\e[0m'
-}
-
-# 获取容器动态状态及自定义数据库个数
-get_sys_status() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        status="${RED}未安装${RESET}"
-        version="${RED}无${RESET}"
-        port_show="${RED}无${RESET}"
-        db_count="${RED}0${RESET}"
+# 自动构建 Cookie 参数
+get_cookie_args() {
+    if [ -f "$COOKIE_FILE" ]; then
+        echo "--cookies $COOKIE_FILE"
     else
-        source "$CONFIG_FILE"
-        version="11.4 (LTS)"
-        port_show="$PORT"
-        
-        if [ "$(docker ps -q -f name=^mariadb$)" ]; then
-            status="${GREEN}运行中${RESET}"
-            # 排除系统内置库（information_schema, mysql, performance_schema, sys），计算自定义库数量
-            local raw_count=$(docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys');" -s --skip-column-names 2>/dev/null)
-            db_count="${YELLOW}${raw_count//[[:space:]]/}${RESET} ${GREEN}个${RESET}"
-        elif [ "$(docker ps -a -q -f name=^mariadb$)" ]; then
-            status="${YELLOW}已停止${RESET}"
-            db_count="${YELLOW}未知 (请先启动容器)${RESET}"
-        else
-            status="${RED}未启动 (容器不存在)${RESET}"
-            db_count="${RED}0${RESET}"
-        fi
+        echo ""
     fi
 }
 
-# ==================== 菜单 ====================
-function menu() {
+install_yt() {
+    echo -e "${GREEN}正在检测系统架构并安装依赖 (包含 ffmpeg & JS 运行环境)...${RESET}"
+    
+    if command -v apt &> /dev/null; then
+        # Debian / Ubuntu
+        apt update -y
+        apt install -y ffmpeg curl nano quickjs
+    elif command -v dnf &> /dev/null; then
+        # CentOS 8+ / Fedora / Rocky Linux / AlmaLinux
+        dnf install -y epel-release 2>/dev/null
+        dnf install -y ffmpeg curl nano quickjs-devel || dnf install -y ffmpeg curl nano nodejs
+    elif command -v yum &> /dev/null; then
+        # CentOS 7
+        yum install -y epel-release 2>/dev/null
+        yum install -y ffmpeg curl nano quickjs-devel || yum install -y ffmpeg curl nano nodejs
+    elif command -v apk &> /dev/null; then
+        # Alpine Linux
+        apk update
+        apk add ffmpeg curl nano quickjs nodejs
+    else
+        echo -e "${RED}未找到支持的包管理器 (apt/yum/dnf/apk)，请手动安装 ffmpeg 和 quickjs/nodejs。${RESET}"
+    fi
+
+    echo -e "${GREEN}正在下载最新版 yt-dlp...${RESET}"
+    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+    chmod a+rx /usr/local/bin/yt-dlp
+    echo -e "${GREEN}安装与依赖配置完成！${RESET}"
+}
+
+update_yt() {
+    echo -e "${GREEN}正在更新 yt-dlp...${RESET}"
+    yt-dlp -U
+}
+
+uninstall_yt() {
+    rm -f /usr/local/bin/yt-dlp
+    rm -rf /opt/yt-dlp
+    echo -e "${GREEN}已卸载 yt-dlp${RESET}"
+    exit 0
+}
+
+download_single() {
+    read -e -p "$(echo -e ${GREEN}请输入视频链接: ${RESET})" url
+    COOKIE_ARGS=$(get_cookie_args)
+    yt-dlp -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
+        $COOKIE_ARGS \
+        --write-subs --sub-langs all \
+        --write-thumbnail --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites "$url"
+}
+
+download_batch() {
+    if [ ! -f "$URL_FILE" ]; then
+        echo -e "# 一行一个视频链接" > "$URL_FILE"
+    fi
+    nano "$URL_FILE"
+    COOKIE_ARGS=$(get_cookie_args)
+    yt-dlp -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
+        $COOKIE_ARGS \
+        --write-subs --sub-langs all \
+        --write-thumbnail --embed-thumbnail \
+        --write-info-json \
+        -a "$URL_FILE" \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites
+}
+
+download_custom() {
+    read -e -p "$(echo -e ${GREEN}请输入完整 yt-dlp 参数（不含 yt-dlp）: ${RESET})" custom
+    COOKIE_ARGS=$(get_cookie_args)
+    yt-dlp -P "$VIDEO_DIR" $COOKIE_ARGS $custom \
+        --write-subs --sub-langs all \
+        --write-thumbnail --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites
+}
+
+download_mp3() {
+    read -e -p "$(echo -e ${GREEN}请输入视频链接: ${RESET})" url
+    COOKIE_ARGS=$(get_cookie_args)
+    yt-dlp -P "$VIDEO_DIR" -x --audio-format mp3 \
+        $COOKIE_ARGS \
+        --write-thumbnail --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites "$url"
+}
+
+delete_video() {
+    echo -e "${GREEN}当前视频目录：${RESET}"
+    ls "$VIDEO_DIR"
+    read -e -p "$(echo -e ${GREEN}请输入要删除的目录名称: ${RESET})" name
+    rm -rf "$VIDEO_DIR/$name"
+    echo -e "${GREEN}已删除${RESET}"
+}
+
+show_list() {
+    echo -e "${GREEN}已下载视频列表：${RESET}"
+    ls -td "$VIDEO_DIR"/*/ 2>/dev/null || echo -e "${GREEN}暂无视频${RESET}"
+}
+
+while true; do
     clear
-    get_sys_status
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   MariaDB 管理面板   ◈    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态       :${RESET} $status"
-    echo -e "${GREEN}版本       :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口       :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}已创数据库 :${RESET} $db_count"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} 1. 安装 MariaDB${RESET}"
-    echo -e "${GREEN} 2. 更新 MariaDB${RESET}"
-    echo -e "${GREEN} 3. 卸载 MariaDB${RESET}"
-    echo -e "${GREEN} 4. 启动 MariaDB${RESET}"
-    echo -e "${GREEN} 5. 停止 MariaDB${RESET}"
-    echo -e "${GREEN} 6. 重启 MariaDB${RESET}"
-    echo -e "${GREEN} 7. 查看 日志${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${GREEN} 8. 数据库信息${RESET}"
-    echo -e "${GREEN} 9. 创建数据库${RESET}"
-    echo -e "${GREEN}10. 删除数据库${RESET}"
-    echo -e "${GREEN}11. 创建用户${RESET}"
-    echo -e "${GREEN}12. 删除用户${RESET}"
-    echo -e "${GREEN}13.${RESET} ${YELLOW}创建数据库+用户${RESET}"
-    echo -e "${GREEN}14. 修改用户密码${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${GREEN}15. 备份数据库${RESET}"
-    echo -e "${GREEN}16. 恢复数据库${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    
-    read -p $'\e[32m请输入数字: \e[0m' num
-    case "$num" in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) start_md ;;
-        5) stop_md ;;
-        6) restart_md ;;
-        7) view_logs ;;
-        8) show_info ;;
-        9) create_database ;;
-        10) delete_database ;;
-        11) create_user ;;
-        12) delete_user ;;
-        13) create_db_user ;;
-        14) change_password ;;
-        15) backup_db ;;
-        16) restore_db ;;
+    # 检查安装状态与获取版本号
+    if [ -x "/usr/local/bin/yt-dlp" ]; then
+        STATUS="${YELLOW}已安装${RESET}"
+        VERSION_NUM=$(/usr/local/bin/yt-dlp --version 2>/dev/null)
+        VERSION="${YELLOW}${VERSION_NUM}${RESET}"
+    else
+        STATUS="${RED}未安装${RESET}"
+        VERSION="${RED}--${RESET}"
+    fi
+
+    # 检查 Cookie 状态
+    if [ -f "$COOKIE_FILE" ]; then
+        COOKIE_STATUS="${GREEN}已载入 (cookies.txt)${RESET}"
+    else
+        COOKIE_STATUS="${RED}未检测到 (建议配置)${RESET}"
+    fi
+
+    echo -e "${GREEN}=================================================${RESET}"
+    echo -e "${GREEN}             yt-dlp 管理工具                     ${RESET}"
+    echo -e "${GREEN}=================================================${RESET}"
+    echo -e "${GREEN} 状态: $STATUS    |   当前版本: $VERSION${RESET}"
+    echo -e "${GREEN} Cookie 状态: $COOKIE_STATUS${RESET}"
+    echo -e "${GREEN}=================================================${RESET}"
+    echo -e "${GREEN}  1. 安装/修复依赖环境 (智能识别系统)${RESET}"
+    echo -e "${GREEN}  2. 更新 yt-dlp${RESET}"
+    echo -e "${GREEN}  3. 卸载 yt-dlp${RESET}"
+    echo -e "${GREEN}  5. 单个视频下载${RESET}"
+    echo -e "${GREEN}  6. 批量视频下载${RESET}"
+    echo -e "${GREEN}  7. 自定义参数下载${RESET}"
+    echo -e "${GREEN}  8. 下载为 MP3${RESET}"
+    echo -e "${GREEN}  9. 删除视频目录${RESET}"
+    echo -e "${GREEN} 10. 查看下载列表${RESET}"
+    echo -e "${GREEN}  0. 退出${RESET}"
+    echo -e "${GREEN}=================================================${RESET}"
+    read -e -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
+
+    case $choice in
+        1) install_yt ;;
+        2) update_yt ;;
+        3) uninstall_yt ;;
+        5) download_single ;;
+        6) download_batch ;;
+        7) download_custom ;;
+        8) download_mp3 ;;
+        9) delete_video ;;
+        10) show_list ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1; menu ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
-}
 
-# ==================== 功能实现 ====================
-
-function install_app() {
-    if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}检测到已经安装过 MariaDB。${RESET}"
-        pause; menu
-    fi
-    
-    read -p "请输入 MariaDB 端口 [默认 3306]: " input_port
-    PORT=${input_port:-3306}
-    
-    echo -e "\n请选择网络绑定策略 (IP Binding):"
-    echo -e "  [1] 允许公网/局域网访问 (绑定 0.0.0.0) [默认]"
-    echo -e "  [2] 仅允许本地访问     (绑定 127.0.0.1)"
-    read -p "请输入数字 [1-2, 默认 1]: " bind_choice
-    bind_choice=${bind_choice:-1}
-    
-    local compose_port_mapping
-    local bind_status_text
-    if [ "$bind_choice" = "2" ]; then
-        compose_port_mapping="127.0.0.1:${PORT}:3306"
-        bind_status_text="仅限本地 (127.0.0.1)"
-    else
-        compose_port_mapping="${PORT}:3306"
-        bind_status_text="开放公网 (0.0.0.0)"
-    fi
-
-    read -p "请输入 root 运行密码 [留空自动生成]: " input_pass
-    MARIADB_ROOT_PASSWORD=${input_pass:-$(gen_pass)}
-
-    mkdir -p "$APP_DIR/data" "$BACKUP_DIR"
-    
-    cat > "$COMPOSE_FILE" <<EOF
-services:
-  mariadb-db:
-    container_name: mariadb
-    image: mariadb:11.4
-    restart: always
-    ports:
-      - "${compose_port_mapping}"
-    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
-    environment:
-      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
-      TZ: Asia/Shanghai
-    volumes:
-      - ./data:/var/lib/mysql
-EOF
-
-    cat > "$CONFIG_FILE" <<EOF
-PORT=$PORT
-MARIADB_ROOT_PASSWORD=$MARIADB_ROOT_PASSWORD
-BIND_STRATEGY=$bind_choice
-EOF
-
-    cd "$APP_DIR" && $COMPOSE_CMD up -d
-    
-    local public_ip=$(get_public_ip)
-    local local_ip=$(get_local_ip)
-    
-    echo -e "\n${GREEN}================================================${RESET}"
-    echo -e "${GREEN}🎉 MariaDB 容器版安装启动成功！运行连接信息：${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN} 网络绑定策略 :${RESET} ${YELLOW}${bind_status_text}${RESET}"
-    if [ "$bind_choice" = "2" ]; then
-        echo -e "${GREEN} 唯一连接地址 :${RESET} 127.0.0.1:${PORT}"
-    else
-        echo -e "${GREEN} 公网连接地址 :${RESET} ${public_ip}:${PORT}"
-        echo -e "${GREEN} 内网连接地址 :${RESET} 127.0.0.1:${PORT}"
-    fi
-    echo -e "${GREEN} 管理用户名   :${RESET} root"
-    echo -e "${GREEN} 超级管理密码 :${RESET} ${YELLOW}${MARIADB_ROOT_PASSWORD}${RESET}"
-    echo -e "${GREEN} 标准连接串   :${RESET} ${CYAN}mysql://root:${MARIADB_ROOT_PASSWORD}@${public_ip}:${PORT}/;${RESET}"
-    echo -e "${GREEN} 配置文件路径 :${RESET} ${CONFIG_FILE}"
-    echo -e "${GREEN}================================================${RESET}"
-    
-    pause; menu
-}
-
-function update_app() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录，请先安装${RESET}"; sleep 1; menu; fi
-    cd "$APP_DIR" && $COMPOSE_CMD pull && $COMPOSE_CMD up -d
-    echo -e "${GREEN}✅ MariaDB 已更新并重启${RESET}"
-    pause; menu
-}
-
-function uninstall_app() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}未检测到安装目录${RESET}"; sleep 1; menu; fi
-    read -p "确定要彻底卸载吗？所有数据表将清空！(y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" || "$confirm" == "yes" ]]; then
-        cd "$APP_DIR" && $COMPOSE_CMD down -v
-        rm -rf "$APP_DIR"
-        echo -e "${GREEN}✅ MariaDB 已彻底卸载${RESET}"
-    else
-        echo -e "${YELLOW}已取消卸载${RESET}"
-    fi
-    pause; menu
-}
-
-function start_md() {
-    docker start mariadb &>/dev/null
-    echo -e "${GREEN}✅ MariaDB 容器已启动${RESET}"
-    pause; menu
-}
-
-function stop_md() {
-    docker stop mariadb &>/dev/null
-    echo -e "${GREEN}✅ MariaDB 容器已停止${RESET}"
-    pause; menu
-}
-
-function restart_md() {
-    docker restart mariadb &>/dev/null
-    echo -e "${GREEN}✅ MariaDB 容器已重启${RESET}"
-    pause; menu
-}
-
-function view_logs() {
-    echo -e "${YELLOW}提示: 朝下滚动，按下 Ctrl + C 即可退出日志回到主菜单。${RESET}"
-    sleep 1
-    docker logs --tail 100 -f mariadb
-    menu
-}
-
-function show_info() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    SERVER_IP=$(get_public_ip)
-    local local_ip=$(get_local_ip)
-    BIND_STRATEGY=${BIND_STRATEGY:-1}
-    
-    echo -e "\n${GREEN}====== MariaDB 运行信息 ======${RESET}"
-    if [ "$BIND_STRATEGY" = "2" ]; then
-        echo -e "${GREEN}绑定状态 :${RESET} ${YELLOW}仅限本地监听 (127.0.0.1)${RESET}"
-        echo -e "${GREEN}连接地址 :${RESET} 127.0.0.1:${PORT}"
-    else
-        echo -e "${GREEN}绑定状态 :${RESET} ${GREEN}开放公网/局域网 (0.0.0.0)${RESET}"
-        echo -e "${GREEN}公网地址 :${RESET} ${SERVER_IP}:${PORT}"
-        echo -e "${GREEN}内网地址 :${RESET} 127.0.0.1:${PORT}"
-    fi
-    echo -e "${GREEN}超级管理员:${RESET} root"
-    echo -e "${GREEN}超级密码  :${RESET} ${YELLOW}${MARIADB_ROOT_PASSWORD}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    
-    echo -e "${GREEN}当前用户自定义数据库列表:${RESET}"
-    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "
-    SELECT SCHEMA_NAME as '📂 数据库名称' FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys');"
-    
-    echo -e "\n${GREEN}当前系统用户及允许连入的主机列表:${RESET}"
-    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "
-    SELECT User as '👤 用户', Host as '🌐 允许连入主机' FROM mysql.user;"
-    echo -e "${GREEN}================================${RESET}"
-    pause; menu
-}
-
-function create_database() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    read -p "请输入你想创建的数据库名: " new_db
-    if [ -z "$new_db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    
-    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "CREATE DATABASE \`$new_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" &>/dev/null
-    echo -e "${GREEN}✅ 数据库 $new_db 创建成功（默认采用 utf8mb4 现代全字符编码）。${RESET}"
-    pause; menu
-}
-
-function delete_database() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    
-    read -p "请输入要彻底删除的数据库名: " del_db
-    if [ -z "$del_db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    if [[ "$del_db" =~ ^(information_schema|mysql|performance_schema|sys)$ ]]; then echo -e "${RED}❌ 安全限制：拒绝删除系统保留核心库！${RESET}"; pause; menu; fi
-    
-    read -p "警告：确定要彻底删除数据库 [$del_db] 吗？数据将灰飞烟灭！(y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "DROP DATABASE \`$del_db\`;" &>/dev/null
-        echo -e "${GREEN}✅ 数据库 $del_db 已成功擦除。${RESET}"
-    else
-        echo -e "${YELLOW}操作已取消。${RESET}"
-    fi
-    pause; menu
-}
-
-function create_user() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    read -p "请输入新用户名: " new_user
-    if [ -z "$new_user" ]; then echo -e "${RED}用户名不能为空！${RESET}"; pause; menu; fi
-    read -p "请输入新用户密码 [留空随机]: " new_pass
-    new_pass=${new_pass:-$(gen_pass)}
-    read -p "该用户需要拥有哪一个数据库的权限: " grant_db
-    if [ -z "$grant_db" ]; then echo -e "${RED}数据库名不能为空！${RESET}"; pause; menu; fi
-
-    # 创建支持任意 IP 远程访问的独立业务账号并授予权限
-    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "
-    CREATE USER '$new_user'@'%' IDENTIFIED BY '$new_pass';
-    GRANT ALL PRIVILEGES ON \`$grant_db\`.* TO '$new_user'@'%';
-    FLUSH PRIVILEGES;" &>/dev/null
-
-    echo -e "${YELLOW}✅ 业务用户 $new_user 创建成功。密码: $new_pass (已拥有 $grant_db 的全部操作权限)${RESET}"
-    pause; menu
-}
-
-function delete_user() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    
-    read -p "请输入要删除的用户名: " del_user
-    if [ -z "$del_user" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    if [[ "$del_user" = "root" ]]; then echo -e "${RED}❌ 安全限制：拒绝删除超级管理员 root！${RESET}"; pause; menu; fi
-
-    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "DROP USER '$del_user'@'%'; FLUSH PRIVILEGES;" &>/dev/null
-    echo -e "${GREEN}✅ 用户 '$del_user' 已成功卸载。${RESET}"
-    pause; menu
-}
-
-# 13. 一键联动的一键建库+建用户
-function create_db_user() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    read -p "新数据库名: " new_db
-    read -p "新用户名: " new_user
-    if [[ -z "$new_db" || -z "$new_user" ]]; then echo -e "${RED}库名和用户名不能为空！${RESET}"; pause; menu; fi
-    read -p "密码 [留空随机]: " new_pass
-    new_pass=${new_pass:-$(gen_pass)}
-
-    docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "
-    CREATE DATABASE \`$new_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-    CREATE USER '$new_user'@'%' IDENTIFIED BY '$new_pass';
-    GRANT ALL PRIVILEGES ON \`$new_db\`.* TO '$new_user'@'%';
-    FLUSH PRIVILEGES;" &>/dev/null
-
-    echo -e "${YELLOW}✅ 联动深度创建成功！${RESET}"
-    echo -e "${GREEN} 🚀 用户名 :${RESET} $new_user"
-    echo -e "${GREEN} 🚀 密  码 :${RESET} ${YELLOW}$new_pass${RESET}"
-    echo -e "${GREEN} 🚀 数据库 :${RESET} $new_db"
-    pause; menu
-}
-
-function change_password() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    
-    read -p "请输入要修改密码的用户名 [默认 root]: " target_user
-    target_user=${target_user:-root}
-    read -p "请输入新密码 [留空随机]: " new_pass
-    new_pass=${new_pass:-$(gen_pass)}
-
-    if [ "$target_user" = "root" ]; then
-        docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$new_pass'; ALTER USER 'root'@'%' IDENTIFIED BY '$new_pass'; FLUSH PRIVILEGES;" &>/dev/null
-        sed -i "s/^MARIADB_ROOT_PASSWORD=.*/MARIADB_ROOT_PASSWORD=$new_pass/g" "$CONFIG_FILE"
-        sed -i "s/MARIADB_ROOT_PASSWORD:.*/MARIADB_ROOT_PASSWORD: $new_pass/g" "$COMPOSE_FILE"
-        echo -e "${GREEN}✅ 本地安全配置文件已全量同步更新。${RESET}"
-    else
-        docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "ALTER USER '$target_user'@'%' IDENTIFIED BY '$new_pass'; FLUSH PRIVILEGES;" &>/dev/null
-    fi
-
-    echo -e "${GREEN}✅ 用户 '$target_user' 密码更新成功！新密码: ${YELLOW}$new_pass${RESET}"
-    pause; menu
-}
-
-function backup_db() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    
-    read -p "请输入你想单独备份的库名 (全库备份请输入 all): " db
-    if [ -z "$db" ]; then echo -e "${RED}输入不能为空！${RESET}"; pause; menu; fi
-    
-    BACKUP_FILE="$BACKUP_DIR/${db}_$(date +%Y%m%d_%H%M%S).sql"
-    
-    if [ "$db" = "all" ]; then
-        docker exec -i mariadb mariadb-dump -u root -p"$MARIADB_ROOT_PASSWORD" --all-databases > "$BACKUP_FILE"
-    else
-        docker exec -i mariadb mariadb-dump -u root -p"$MARIADB_ROOT_PASSWORD" --databases "$db" > "$BACKUP_FILE"
-    fi
-
-    if [ $? -eq 0 ] && [ -s "$BACKUP_FILE" ]; then
-        echo -e "${YELLOW}✅ SQL 结构及数据备份成功，存放于: $BACKUP_FILE${RESET}"
-    else
-        echo -e "${RED}❌ 备份失败。${RESET}"
-        rm -f "$BACKUP_FILE"
-    fi
-    pause; menu
-}
-
-function restore_db() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}请先安装 MariaDB${RESET}"; sleep 1; menu; fi
-    source "$CONFIG_FILE"
-    
-    if [ ! -d "$BACKUP_DIR" ] || [ -z "$(ls -A "$BACKUP_DIR")" ]; then
-        echo -e "${RED}❌ 默认备份目录下没有找到任何 SQL 备份文件${RESET}"; pause; menu
-    fi
-    
-    echo -e "${GREEN}可用历史备份列表:${RESET}"
-    ls -1 "$BACKUP_DIR"
-    read -p "请输入完整备份文件名: " file
-    local backup_path="$BACKUP_DIR/$file"
-    
-    if [ ! -f "$backup_path" ]; then
-        echo -e "${RED}❌ 错误：未找到指定的备份文件！${RESET}"; pause; menu
-    fi
-
-    read -p "将此备份文件覆盖恢复入哪一个数据库 (如果是通过 all 备份的全库文件，直接敲回车): " target_db
-
-    if [ -z "$target_db" ]; then
-        docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" < "$backup_path"
-    else
-        # 如果单库没有创建，自动前置补建
-        docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$target_db\`;"
-        docker exec -i mariadb mysql -u root -p"$MARIADB_ROOT_PASSWORD" "$target_db" < "$backup_path"
-    fi
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${YELLOW}✅ MariaDB 数据覆盖恢复成功！${RESET}"
-    else
-        echo -e "${RED}❌ 恢复失败，请检查内容。${RESET}"
-    fi
-    pause; menu
-}
-
-# ==================== 启动 ====================
-menu
+    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+done

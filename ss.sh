@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =======================================================================
-# 🦞 OpenClaw 一键管理面板
+# OpenClaw 一键管理面板
 # =======================================================================
 
 # 终端高亮颜色定义
@@ -17,7 +17,6 @@ gl_hong="\033[31m"
 gl_bai="\033[0m"
 
 # 全局环境静态参数
-SCRIPT_VERSION="1.3.5"
 ENABLE_STATS="true"
 gh_proxy=""
 
@@ -26,12 +25,10 @@ openclaw_get_config_file() {
     echo "${HOME}/.openclaw/openclaw.json"
 }
 
-# 请根据实际情况修改你的 OpenClaw 配置文件绝对或相对路径
-OPENCLAW_CONFIG="${HOME}/.openclaw/openclaw.json"
 
 # 辅助函数：按键返回
 break_end() {
-    echo -e "\n${BLUE}----------------------------------------${RESET}"
+    echo -e "\n${GREEN}----------------------------------------${RESET}"
     read -n 1 -s -r -p "按任意键返回主菜单..."
     echo
 }
@@ -62,9 +59,9 @@ get_openclaw_status() {
     # 1. 检测运行状态
     if command -v openclaw &>/dev/null; then
         if pgrep -f "openclaw gateway" &>/dev/null || pgrep -f "gateway" &>/dev/null; then
-            STATUS="${GREEN}运行中 (Running)${RESET}"
+            STATUS="${GREEN}运行中${RESET}"
         else
-            STATUS="${RED}已停止 (Stopped)${RESET}"
+            STATUS="${RED}已停止${RESET}"
         fi
         # 2. 动态获取 OpenClaw 核心版本号并精细清洗
         local raw_v
@@ -178,16 +175,15 @@ view_logs() {
     openclaw status
     echo "----------------------------------------"
     openclaw gateway status
-    echo "💡 提示: 正在加载实时日志流，按 Ctrl+C 可退出当前日志模式"
+    echo "${YELLOW}💡 提示: 正在加载实时日志流，按 Ctrl+C 可退出当前日志模式${RESET}"
     sleep 2
     openclaw logs
     break_end
 }
 
 
-
 # ==============================================================================
-# OpenClaw API & 模型管理核心模块 (完整版)
+# OpenClaw API & 模型管理核心模块 
 # ==============================================================================
 
 # 构造模型配置 JSON
@@ -572,11 +568,11 @@ PY
 )
 }
 
-# 同步指定或全量 Provider 模型
+# 核心重构：支持 单渠道 & 全渠道 闭环同步模型函数
 sync-openclaw-provider-interactive() {
     local config_file
     config_file=$(openclaw_get_config_file)
-    send_stats "OpenClaw API按Provider同步"
+    send_stats "OpenClaw API同步入口"
 
     if [ ! -f "$config_file" ]; then
         echo "❌ 未找到配置文件: $config_file"
@@ -584,21 +580,13 @@ sync-openclaw-provider-interactive() {
         return 1
     fi
 
-    read -erp "请输入要同步的 API 名称(provider)，直接回车同步全部: " provider_name
-    if [ -z "$provider_name" ]; then
-        if sync_openclaw_api_models; then
-            start_gateway
-        else
-            echo "❌ API 模型同步失败，已中止重启网关。请检查 provider /models 返回后重试。"
-            return 1
-        fi
-        break_end
-        return 0
-    fi
-
+    read -erp "请输入要同步的 API 名称(provider)，直接回车将自动同步全部: " provider_name
+    
+    # 传递目标渠道给 Python 处理，空字符串代表同步全部
     install jq curl >/dev/null 2>&1
+    echo "🔄 正在请求上游接口进行模型对齐比对，请稍候..."
 
-    python3 - "$config_file" "$provider_name" <<'PY2'
+    python3 - "$config_file" "$provider_name" <<'PY_SYNC'
 import copy
 import json
 import sys
@@ -606,8 +594,7 @@ import time
 import urllib.request
 
 path = sys.argv[1]
-target = sys.argv[2]
-SUPPORTED_APIS = {'openai-completions', 'openai-responses'}
+target_filter = sys.argv[2].strip()
 
 with open(path, 'r', encoding='utf-8') as f:
     obj = json.load(f)
@@ -615,14 +602,20 @@ with open(path, 'r', encoding='utf-8') as f:
 work = copy.deepcopy(obj)
 models_cfg = work.setdefault('models', {})
 providers = models_cfg.get('providers', {})
-if not isinstance(providers, dict) or not providers:
-    print('❌ 未检测到 API providers，无法同步')
-    raise SystemExit(2)
 
-provider = providers.get(target)
-if not isinstance(provider, dict):
-    print(f'❌ 未找到 provider: {target}')
-    raise SystemExit(2)
+if not isinstance(providers, dict) or not providers:
+    print('❌ 错误：未检测到任何已配置的 API providers')
+    sys.exit(2)
+
+# 筛选出需要同步的名单
+targets = []
+if target_filter:
+    if target_filter not in providers:
+        print(f'❌ 错误：未找到指定的 provider: {target_filter}')
+        sys.exit(2)
+    targets.append(target_filter)
+else:
+    targets = sorted(list(providers.keys()))
 
 agents = work.setdefault('agents', {})
 defaults = agents.setdefault('defaults', {})
@@ -635,147 +628,136 @@ else:
     defaults_models = {}
 defaults['models'] = defaults_models
 
-def model_ref(provider_name, model_id):
-    return f"{provider_name}/{model_id}"
+def model_ref(p_name, m_id):
+    return f"{p_name}/{m_id}"
 
-def get_primary_ref(defaults_obj):
-    model_obj = defaults_obj.get('model')
-    if isinstance(model_obj, str):
-        return model_obj
-    if isinstance(model_obj, dict):
-        return model_obj.get('primary')
+def get_primary_ref(d_obj):
+    m_obj = d_obj.get('model')
+    if isinstance(m_obj, str): return m_obj
+    if isinstance(m_obj, dict): return m_obj.get('primary')
     return None
 
-def set_primary_ref(defaults_obj, new_ref):
-    model_obj = defaults_obj.get('model')
-    if isinstance(model_obj, str):
-        defaults_obj['model'] = new_ref
-    elif isinstance(model_obj, dict):
-        model_obj['primary'] = new_ref
-    else:
-        defaults_obj['model'] = {'primary': new_ref}
+def set_primary_ref(d_obj, new_ref):
+    m_obj = d_obj.get('model')
+    if isinstance(m_obj, str): d_obj['model'] = new_ref
+    elif isinstance(m_obj, dict): m_obj['primary'] = new_ref
+    else: d_obj['model'] = {'primary': new_ref}
 
-def fetch_remote_models_with_retry(base_url, api_key, retries=3):
-    last_error = None
-    for attempt in range(1, retries + 1):
-        req = urllib.request.Request(
-            base_url.rstrip('/') + '/models',
-            headers={
-                'Authorization': f'Bearer {api_key}',
-                'User-Agent': 'Mozilla/5.0',
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                payload = resp.read().decode('utf-8', 'ignore')
-            return json.loads(payload), None, attempt
-        except Exception as e:
-            last_error = e
-            if attempt < retries:
-                time.sleep(1)
-    return None, last_error, retries
+def fetch_remote_models(base_url, api_key):
+    req = urllib.request.Request(
+        base_url.rstrip('/') + '/models',
+        headers={'Authorization': f'Bearer {api_key}', 'User-Agent': 'Mozilla/5.0'}
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode('utf-8', 'ignore'))
 
-api = provider.get('api', '')
-base_url = provider.get('baseUrl')
-api_key = provider.get('apiKey')
-model_list = provider.get('models', [])
+global_changed = False
+success_count = 0
 
-if not base_url or not api_key or not isinstance(model_list, list) or not model_list:
-    print(f'❌ provider {target} 缺少 baseUrl/apiKey/models，无法执行同步')
-    raise SystemExit(3)
+for target in targets:
+    provider = providers[target]
+    if not isinstance(provider, dict): continue
+    
+    base_url = provider.get('baseUrl')
+    api_key = provider.get('apiKey')
+    model_list = provider.get('models', [])
+    
+    if not base_url or not api_key:
+        print(f'⚠️  跳过 {target}: 缺少 baseUrl 或 apiKey 配置')
+        continue
+        
+    try:
+        data = fetch_remote_models(base_url, api_key)
+        if not (isinstance(data, dict) and isinstance(data.get('data'), list)):
+            print(f'❌ {target}: /models 返回格式无法识别')
+            continue
+            
+        remote_ids = [str(item['id']) for item in data['data'] if isinstance(item, dict) and item.get('id')]
+        remote_set = set(remote_ids)
+        if not remote_set:
+            print(f'❌ {target}: 上游返回的模型列表为空，放弃同步该通道')
+            continue
+            
+        local_models = [m for m in model_list if isinstance(m, dict) and m.get('id')]
+        local_ids = [str(m['id']) for m in local_models]
+        local_set = set(local_ids)
+        
+        template = copy.deepcopy(local_models[0]) if local_models else {
+            "id": "", "name": "", "input": ["text", "image"],
+            "contextWindow": 1048576, "maxTokens": 128000,
+            "cost": {"input": 0.15, "output": 0.60, "cacheRead": 0, "cacheWrite": 0}
+        }
+        
+        removed_ids = [mid for mid in local_ids if mid not in remote_set]
+        added_ids = [mid for mid in remote_ids if mid not in local_set]
+        
+        kept_models = [copy.deepcopy(m) for m in local_models if str(m['id']) in remote_set]
+        new_models = kept_models[:]
+        for mid in added_ids:
+            nm = copy.deepcopy(template)
+            nm['id'] = mid
+            nm['name'] = f'{target} / {mid}'
+            new_models.append(nm)
+            
+        if not new_models:
+            print(f'❌ {target}: 同步后无任何可用模型，放弃修改该通道')
+            continue
+            
+        expected_refs = {model_ref(target, str(m['id'])) for m in new_models}
+        local_refs = {model_ref(target, mid) for mid in local_ids}
+        removed_refs = local_refs - expected_refs
+        first_ref = model_ref(target, str(new_models[0]['id']))
+        
+        # 兜底清理失效引用
+        primary_ref = get_primary_ref(defaults)
+        if isinstance(primary_ref, str) and primary_ref in removed_refs:
+            set_primary_ref(defaults, first_ref)
+            print(f'🔁 {target}: 默认主模型指向已失效，降级替换为: {first_ref}')
+            global_changed = True
+            
+        for fk in ('modelFallback', 'imageModelFallback'):
+            val = defaults.get(fk)
+            if isinstance(val, str) and val in removed_refs:
+                defaults[fk] = first_ref
+                global_changed = True
+                
+        stale_refs = [r for r in list(defaults_models.keys()) if r.startswith(target + '/') and r not in expected_refs]
+        for r in stale_refs:
+            defaults_models.pop(r, None)
+            global_changed = True
+            
+        for r in sorted(expected_refs):
+            if r not in defaults_models:
+                defaults_models[r] = {}
+                global_changed = True
+                
+        if removed_ids or added_ids or len(local_models) != len(new_models):
+            provider['models'] = new_models
+            global_changed = True
+            
+        print(f'✅ {target}: 同步成功 (新增 {len(added_ids)} 个, 移除 {len(removed_ids)} 个, 当前总计 {len(new_models)} 个)')
+        success_count += 1
+        
+    except Exception as e:
+        print(f'❌ {target}: 同游连接握手失败 ({type(e).__name__})')
 
-data, err, attempts = fetch_remote_models_with_retry(base_url, api_key, retries=3)
-if err is not None:
-    print(f'❌ {target}: /models 探测失败，已重试 {attempts} 次 ({type(err).__name__}: {err})')
-    raise SystemExit(4)
-
-if not (isinstance(data, dict) and isinstance(data.get('data'), list)):
-    print(f'❌ {target}: /models 返回结构不可识别')
-    raise SystemExit(4)
-
-remote_ids = []
-for item in data['data']:
-    if isinstance(item, dict) and item.get('id'):
-        remote_ids.append(str(item['id']))
-remote_set = set(remote_ids)
-if not remote_set:
-    print(f'❌ {target}: 上游 /models 为空，已中止同步')
-    raise SystemExit(5)
-
-local_models = [m for m in model_list if isinstance(m, dict) and m.get('id')]
-local_ids = [str(m['id']) for m in local_models]
-local_set = set(local_ids)
-
-template = copy.deepcopy(local_models[0]) if local_models else None
-if template is None:
-    print(f'❌ {target}: 本地 models 无有效模板模型，无法补全新增模型')
-    raise SystemExit(3)
-
-removed_ids = [mid for mid in local_ids if mid not in remote_set]
-added_ids = [mid for mid in remote_ids if mid not in local_set]
-
-kept_models = [copy.deepcopy(m) for m in local_models if str(m['id']) in remote_set]
-new_models = kept_models[:]
-for mid in added_ids:
-    nm = copy.deepcopy(template)
-    nm['id'] = mid
-    if isinstance(nm.get('name'), str):
-        nm['name'] = f'{target} / {mid}'
-    new_models.append(nm)
-
-if not new_models:
-    print(f'❌ {target}: 同步后无可用模型，已中止写入')
-    raise SystemExit(5)
-
-expected_refs = {model_ref(target, str(m['id'])) for m in new_models if isinstance(m, dict) and m.get('id')}
-local_refs = {model_ref(target, mid) for mid in local_ids}
-removed_refs = local_refs - expected_refs
-first_ref = model_ref(target, str(new_models[0]['id']))
-
-changed = False
-primary_ref = get_primary_ref(defaults)
-if isinstance(primary_ref, str) and primary_ref in removed_refs:
-    set_primary_ref(defaults, first_ref)
-    changed = True
-    print(f'🔁 默认模型已兜底替换: {primary_ref} -> {first_ref}')
-
-for fk in ('modelFallback', 'imageModelFallback'):
-    val = defaults.get(fk)
-    if isinstance(val, str) and val in removed_refs:
-        defaults[fk] = first_ref
-        changed = True
-        print(f'🔁 {fk} 已兜底替换: {val} -> {first_ref}')
-
-stale_refs = [r for r in list(defaults_models.keys()) if r.startswith(target + '/') and r not in expected_refs]
-for r in stale_refs:
-    defaults_models.pop(r, None)
-    changed = True
-
-for r in sorted(expected_refs):
-    if r not in defaults_models:
-        defaults_models[r] = {}
-        changed = True
-
-if removed_ids or added_ids or len(local_models) != len(new_models):
-    provider['models'] = new_models
-    changed = True
-
-if changed:
+if global_changed:
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(work, f, ensure_ascii=False, indent=2)
         f.write('\n')
 
-print(f'✅ {target}: 新增 {len(added_ids)} 个，删除 {len(removed_ids)} 个，当前 {len(new_models)} 个')
-PY2
+if success_count > 0:
+    sys.exit(0)
+else:
+    sys.exit(5)
+PY_SYNC
     local rc=$?
-    case "$rc" in
-        0) echo "✅ 同步执行完成"; start_gateway ;;
-        2) echo "❌ 同步失败：provider 不存在或未配置" ;;
-        3) echo "❌ 同步失败：provider 配置不完整或类型不支持" ;;
-        4) echo "❌ 同步失败：上游 /models 请求失败" ;;
-        5) echo "❌ 同步失败：上游模型为空或同步后无可用模型" ;;
-        *) echo "❌ 同步失败：请检查配置文件结构或日志输出" ;;
-    esac
+    if [ $rc -eq 0 ]; then
+        echo "✅ 同步任务圆满执行结束"
+        start_gateway
+    else
+        echo "❌ 同步失败：未成功对齐任何供应商模型。请检查网络连接及 API /models 返回结果。"
+    fi
     break_end
 }
 
@@ -911,7 +893,7 @@ PY
 }
 
 # ==============================================================================
-# 🎯 核心重构：6 标准选项 API 管理主菜单
+#  API & 模型管理
 # ==============================================================================
 openclaw_api_manage_menu() {
     send_stats "OpenClaw API入口"
@@ -929,23 +911,23 @@ openclaw_api_manage_menu() {
         echo -e "${gl_lv}             API & 模型管理            ${gl_bai}"
         echo -e "${gl_lv}=======================================${gl_bai}"
         echo -e "当前激活模型: ${gl_huang}${current_model}${gl_bai}"
-        echo -e "${gl_lv}---------------------------------------${gl_bai}"
+        echo -e "${gl_lv}=======================================${gl_bai}"
         
         # 显示实时 API 状态快照
         openclaw_api_manage_list
         
-        echo -e "${gl_lv}---------------------------------------${gl_bai}"
+        echo -e "${gl_lv}=======================================${gl_bai}"
         echo -e "${gl_lv}1. 切换模型${gl_bai}"
         echo -e "${gl_lv}2. 添加 API 供应商${gl_bai}"
         echo -e "${gl_lv}3. 同步 API 供应商模型列表${gl_bai}"
         echo -e "${gl_lv}4. 删除 API 供应商${gl_bai}"
         echo -e "${gl_lv}5. 查看已加模型信息${gl_bai}"
         echo -e "${gl_lv}0. 返回主菜单${gl_bai}"
-        echo -e "${gl_lv}---------------------------------------${gl_bai}"
+        echo -e "${gl_lv}=======================================${gl_bai}"
         read -erp "请输入你的选择: " api_choice
 
         case "$api_choice" in
-            1) # 1. 切换模型 (联动探测、缓存清理与会话路由同步)
+            1)
                 clear
                 echo -e "${gl_huang}--- 切换默认激活模型 ---${gl_bai}"
                 if [ ! -f "$config_file" ]; then
@@ -983,44 +965,28 @@ openclaw_api_manage_menu() {
                     tmp_json=$(jq --arg p "$target_model" '.agents.defaults.model.primary = $p | .agents.defaults.models = {($p): {}}' "$config_file")
                     echo "$tmp_json" > "$config_file"
 
-                    # 执行原生同步逻辑
+                    # 一致性序列重载
                     openclaw models set "$target_model"
                     openclaw_sync_sessions_model "$target_model"
                     
-                    echo -e "⚡ 正在执行新模型上游可用性握手检测..."
-                    openclaw_model_probe "$target_model"
-                    openclaw_probe_status_line "$OPENCLAW_PROBE_STATUS"
-                    
                     start_gateway
-                    echo -e "${gl_lv}✅ 成功激活主模型: $target_model${gl_bai}"
+                    echo -e "${gl_lv}✅ 成功激活并重载主模型: $target_model${gl_bai}"
                 else
                     echo -e "${gl_hong}❌ 输入序号无效！${gl_bai}"
                 fi
                 break_end
                 ;;
 
-            2) # 2. 添加 API 供应商
-                clear
-                add-openclaw-provider-interactive
-                ;;
-
-            3) # 3. 同步 API 供应商模型列表
-                clear
-                sync-openclaw-provider-interactive
-                ;;
-
-            4) # 4. 删除 API 供应商
-                clear
-                delete-openclaw-provider-interactive
-                ;;
-
-            5) # 5. 查看已加模型信息
+            2) clear; add-openclaw-provider-interactive ;;
+            3) clear; sync-openclaw-provider-interactive ;;
+            4) clear; delete-openclaw-provider-interactive ;;
+            5)
                 clear
                 echo -e "${gl_lv}=======================================${gl_bai}"
-                echo -e "         已加载 API 供应商详细快照       "
+                echo -e "${gl_lv}         已加载 API 供应商详细快照       ${gl_bai}"
                 echo -e "${gl_lv}=======================================${gl_bai}"
                 if [ ! -f "$config_file" ]; then 
-                    echo "暂无配置数据"
+                    echo "${gl_huang}暂无配置数据)${gl_bai}"
                 else
                     local p_detail
                     p_detail=$(jq -c '.models.providers | to_entries[]' "$config_file" 2>/dev/null)
@@ -1035,8 +1001,14 @@ openclaw_api_manage_menu() {
                             local det_api=$(echo "$row" | jq -r '.value.api // "未指定"')
                             local det_models=$(echo "$row" | jq -r '.value.models[].id' | tr '\n' ',' | sed 's/,$//')
                             
-                            local short_key="${det_key:0:8}****"
-                            [ -z "$det_key" ] || [ "$det_key" = "null" ] && short_key="无"
+                            # ============ 替换开始：直接显示完整 Key ============
+                            local short_key=""
+                            if [[ -z "$det_key" ]] || [[ "$det_key" == "null" ]] || [[ "$det_key" == "None" ]]; then
+                                short_key="无"
+                            else
+                                short_key="$det_key"
+                            fi
+                            # ============ 替换结束 ============================
 
                             echo -e "${gl_lv}◈ 供应商名称:${gl_bai} ${gl_huang}${det_name}${gl_bai}"
                             echo -e "  ├─ 协议类型: ${gl_lv}${det_api}${gl_bai}"
@@ -1049,37 +1021,28 @@ openclaw_api_manage_menu() {
                 fi
                 break_end
                 ;;
-
-            0) 
-                return 0 
-                ;;
-
-            *)
-                echo -e "${gl_hong}❌ 无效的选择，请重试。${gl_bai}"
-                sleep 1
-                ;;
+            0) return 0 ;;
+            *) echo -e "${gl_hong}❌ 无效的选择，请重试。${gl_bai}"; sleep 1 ;;
         esac
     done
 }
-
 
 # 7. 机器人连接对接交互式子选单
 bot_connection_menu() {
     while true; do
         clear
         echo -e "${GREEN}========================================${RESET}"
-        echo -e "             机器人连接对接             "
+        echo -e "${GREEN}             机器人连接对接              ${RESET}"
         echo -e "${GREEN}========================================${RESET}"
         openclaw_show_bot_local_status_block
-        echo "----------------------------------------"
-        echo -e " 1. Telegram 机器人对接"
-        echo -e " 2. 飞书 (Lark) 机器人对接"
-        echo -e " 3. WhatsApp 机器人对接"
-        echo -e " 4. QQ 机器人对接"
-        echo -e " 5. 微信机器人对接"
-        echo "----------------------------------------"
-        echo -e " ${YELLOW}0. 返回上一级选单${RESET}"
-        echo "----------------------------------------"
+         echo -e "${GREEN}========================================${RESET}"
+        echo -e "${GREEN} 1. Telegram 机器人对接${RESET}"
+        echo -e "${GREEN} 2. 飞书 (Lark) 机器人对接${RESET}"
+        echo -e "${GREEN} 3. WhatsApp 机器人对接${RESET}"
+        echo -e "${GREEN} 4. QQ 机器人对接${RESET}"
+        echo -e "${GREEN} 5. 微信机器人对接${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        echo -e "${GREEN}========================================${RESET}"
         read -erp "请输入你的选择: " bot_choice
 
         case $bot_choice in
@@ -1179,29 +1142,26 @@ show_menu() {
     get_openclaw_status
     clear
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}     ◈   🦞 OPENCLAW 管理工具  ◈      ${RESET}"
+    echo -e "${GREEN}     ◈    OpenClaw 管理工具    ◈       ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}核心状态 : $STATUS${RESET}"
-    echo -e "${GREEN}核心版本 :${RESET} ${YELLOW}$OPENCLAW_VERSION${RESET}"
-    echo -e "${GREEN}集群数据 :${RESET} ${YELLOW}$CONFIG_COUNT 个 API 供应商${RESET}"
+    echo -e "${GREEN}状态  : $STATUS${RESET}"
+    echo -e "${GREEN}版本  :${RESET} ${YELLOW}$OPENCLAW_VERSION${RESET}"
+    echo -e "${GREEN}模型  :${RESET} ${YELLOW}$CONFIG_COUNT 个 API 供应商${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "  1. 安装 环境依赖与 OpenClaw"
-    echo -e "  2. 启动 Gateway (消息网关后台)"
-    echo -e "  3. 停止 Gateway (消息网关服务)"
-    echo -e " -------------------------------------"
-    echo -e "  4. 状态日志查看"
-    echo -e "  6. API 管理 "
-    echo -e "  7. 机器人连接对接窗口"
-    echo -e " -------------------------------------"
-    echo -e " 11. 配置向导 (Onboard 初始化)"
-    echo -e " 12. 健康检测与自动故障修复"
-    echo -e " 14. TUI 命令行窗口本地对话"
-    echo -e " 19. 更新 OpenClaw 核心程序"
-    echo -e " 20. 卸载 清理全部运行环境"
-    echo -e " -------------------------------------"
-    echo -e "  0. 退出"
+    echo -e "${GREEN}  1. 安装 OpenClaw${RESET}"
+    echo -e "${GREEN}  2. 启动 Gateway (消息网关后台)${RESET}"
+    echo -e "${GREEN}  3. 停止 Gateway (消息网关服务)${RESET}"
+    echo -e "${GREEN}  4. 查看状态日志${RESET}"
+    echo -e "${GREEN}  5. API模型切换管理${RESET} "
+    echo -e "${GREEN}  6. 机器人连接对接${RESET}"
+    echo -e "${GREEN}  7. 初始化配置向导${RESET}"
+    echo -e "${GREEN}  8. 健康检测与自动故障修复${RESET}"
+    echo -e "${GREEN}  9. 终端交互式对话UI${RESET}"
+    echo -e "${GREEN} 10. 更新 OpenClaw${RESET}"
+    echo -e "${GREEN} 11. 卸载 OpenClaw${RESET}"
+    echo -e "${GREEN}  0. 退出${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
-    printf " 请输入选项并回车: "
+    printf "${GREEN} 请输入选项: ${RESET}"
 }
 
 main() {
@@ -1220,31 +1180,31 @@ main() {
                 break_end 
                 ;;
             4)  view_logs ;;
-            6)  openclaw_api_manage_menu ;;
-            7)  bot_connection_menu ;;
-            11) openclaw onboard; break_end ;;
-            12) health_doctor_fix ;;
-            14) openclaw chat ;;
-            19) 
+            5)  openclaw_api_manage_menu ;;
+            6)  bot_connection_menu ;;
+            7) openclaw onboard; break_end ;;
+            8) health_doctor_fix ;;
+            9) openclaw chat ;;
+            10) 
                 echo "🔄 正在为您执行 NPM 全量拉取覆写更新 OpenClaw..."
                 sudo npm install -g openclaw@latest && start_gateway
                 echo -e "${GREEN}✅ 覆写更新完成！${RESET}"
                 break_end
                 ;;
-            20) 
-                echo -e "${RED}⚠️ 警告：您正准备全盘卸载 OpenClaw 控制程序及清空所有配置。${RESET}"
+            11) 
+                echo -e "${RED}警告：您正准备全盘卸载 OpenClaw 控制程序及清空所有配置。${RESET}"
                 read -erp "确定要继续执行强力清除吗？(y/N): " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
                     openclaw gateway stop >/dev/null 2>&1
                     sudo npm uninstall -g openclaw
                     rm -rf "${HOME}/.openclaw"
-                    echo -e "${GREEN}✅ OpenClaw 卸载洗刷完成。${RESET}"
+                    echo -e "${GREEN}✅ OpenClaw 卸载完成。${RESET}"
                 else
                     echo "❌ 操作已取消。"
                 fi
                 break_end
                 ;;
-            0)  echo "退出 OpenClaw 管理面板，再见！"; exit 0 ;;
+            0)  exit 0 ;;
             *)  echo -e "${RED}输入有误，请输入菜单中有效的数字代号！${RESET}"; sleep 1 ;;
         esac
     done

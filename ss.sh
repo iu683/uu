@@ -1,8 +1,6 @@
 #!/bin/bash
 
-# ==============================================================================
-# 兼容性转义颜色定义
-# ==============================================================================
+# 颜色定义
 GREEN='\e[0;32m'
 YELLOW='\e[1;33m'
 RED='\e[0;31m'
@@ -17,27 +15,28 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 get_status() {
-    # 1. 检查 Node.js 版本
+    # 1. 提取 Node 版本
     if command -v node >/dev/null 2>&1; then
         version=$(node -v)
     else
         version="${RED}未安装${RESET}"
     fi
 
-    # 2. 严格状态判定
+    # 2. 精准判定 PM2（不通过复杂的 JSON 解析，直接看 pm2 status 的纯文本输出，最稳妥）
     if command -v pm2 >/dev/null 2>&1; then
-        pm2_status=$(pm2 jlist 2>/dev/null | grep -o '"name":"telebox"[^}]*' | grep -o '"status":"[^"]*"' | head -n1 | cut -d'"' -f4)
-        if [ "$pm2_status" = "online" ]; then
+        # 直接用 pm2 status 匹配活跃状态，完全免疫变量和环境带来的干扰
+        if pm2 status telebox 2>/dev/null | grep -q "online"; then
             status="${GREEN}运行中 (PM2 守护)${RESET}"
             port_show="${GREEN}生产环境活跃 (ID: 0)${RESET}"
             return
         fi
     fi
 
-    # 如果 PM2 没在跑，再看前台
-    if pgrep -f "node.*telebox" >/dev/null; then
+    # 3. 判定前台（只有当 PM2 确定没在跑时，才去查有没有人偷偷在用普通的 npm start 跑）
+    # 我们只抓命令里含有 "npm start" 或 "run-tsx" 且没有被 PM2 托管的纯前台特征
+    if ps aux | grep -E "npm start|run-tsx" | grep -v "pm2" | grep -v "grep" >/dev/null 2>&1; then
         status="${YELLOW}前台运行中 (未加入PM2)${RESET}"
-        port_show="${YELLOW}前台活跃，请去前台按 CTRL+C 关闭${RESET}"
+        port_show="${YELLOW}有交互式前台进程活跃，请前往处理${RESET}"
     else
         status="${RED}已停止${RESET}"
         port_show="${RED}无${RESET}"
@@ -92,7 +91,7 @@ while true; do
                 echo -e "${RED}错误: 请先执行步骤 2！${RESET}"
             else
                 pm2 delete telebox >/dev/null 2>&1
-                kill -9 $(pgrep -f "node.*telebox") >/dev/null 2>&1
+                ps aux | grep "node" | grep "$PROJECT_DIR" | grep -v "grep" | awk '{print $2}' | xargs kill -9 >/dev/null 2>&1
                 echo -e "${YELLOW}登录成功后，请等待 5 秒让配置写入，再按 CTRL+C 退出。${RESET}"
                 read -p "按回车键进入前台登录..."
                 cd "$PROJECT_DIR" && npm start

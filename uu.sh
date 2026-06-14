@@ -1,302 +1,569 @@
 #!/bin/bash
-# =================================================================
-# 名称: 全能网络工具箱 
-# 适配: Debian / Ubuntu / CentOS / Rocky Linux / Alpine Linux
-# =================================================================
 
+# =======================================================================
+# 🦞 OpenClaw 一键管理面板
+# =======================================================================
+
+# 终端高亮颜色定义
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
-BLUE="\033[36m"
+BLUE="\033[34m"
 RESET="\033[0m"
-ORANGE='\033[38;5;208m'
 
-# 默认配置参数
-IPERF_PORT=5201
-IPERF_TIME=30
-IPERF_PARALLEL=1
-IPERF_UDP_BW="1G"
-MTR_PROTO="ICMP"
-MTR_SHOW_AS="true"
+gl_lv="\033[32m"
+gl_huang="\033[33m"
+gl_hong="\033[31m"
+gl_bai="\033[0m"
 
-# 全局安全退出捕获
-trap "echo -e '${RESET}'; exit" INT TERM
+# 全局环境静态参数
+SCRIPT_VERSION="1.3.5"
+ENABLE_STATS="true"
+gh_proxy=""
 
-# ==========================================
-# 工具状态动态探测
-# ==========================================
-get_status() {
-    if command -v "$1" >/dev/null 2>&1; then
-        echo -e "${YELLOW}已安装${RESET}"
-    else
-        echo -e "${RED}未安装${RESET}"
-    fi
+# 统一获取 OpenClaw 配置文件路径
+openclaw_get_config_file() {
+    echo "${HOME}/.openclaw/openclaw.json"
 }
 
-# ==========================================
-# 自动化安装引擎
-# ==========================================
-check_and_install() {
-    local tool=$1
-    if command -v "$tool" >/dev/null 2>&1; then return; fi
+# 请根据实际情况修改你的 OpenClaw 配置文件绝对或相对路径
+OPENCLAW_CONFIG="/root/.openclaw/config.json"
 
-    echo -e "${YELLOW}📦 正在安装必要依赖与工具: $tool ...${RESET}"
-    
-    # 基础依赖环境前置检查与修复
-    if [ -f /etc/alpine-release ]; then
-        apk add --no-cache curl wget tar bash grep gawk openssl
-    elif ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y curl wget tar grep gawk
-        elif command -v dnf >/dev/null 2>&1; then dnf install -y curl wget tar grep gawk
-        elif command -v yum >/dev/null 2>&1; then yum install -y curl wget tar grep gawk
+# 辅助函数：按键返回
+break_end() {
+    echo -e "\n${BLUE}----------------------------------------${RESET}"
+    read -n 1 -s -r -p "按任意键返回主菜单..."
+    echo
+}
+
+# 辅助函数：基础依赖检查与安装
+install() {
+    for pkg in "$@"; do
+        if ! command -v "$pkg" &>/dev/null; then
+            echo "正在安装系统依赖: $pkg..."
+            if command -v apt &>/dev/null; then
+                sudo apt update -y && sudo apt install -y "$pkg"
+            elif command -v dnf &>/dev/null; then
+                sudo dnf install -y "$pkg"
+            elif command -v yum &>/dev/null; then
+                sudo yum install -y "$pkg"
+            fi
         fi
-    fi
-
-    case "$tool" in
-        speedtest)
-            if [ -f /etc/alpine-release ]; then
-                echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
-                apk add --no-cache speedtest-cli
-                if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
-                    ln -sf "$(command -v speedtest-cli)" /usr/bin/speedtest
-                fi
-            else
-                echo -e "${YELLOW}📦 正在通过二进制包快速安装 Ookla Speedtest...${RESET}"
-                local cpu_arch=$(uname -m)
-                local download_url=""
-                case "$cpu_arch" in
-                    x86_64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
-                    aarch64|arm64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
-                    *) echo -e "${RED}❌ 错误: 不支持的架构 ${cpu_arch}${RESET}" >&2; exit 1 ;;
-                esac
-                cd /tmp
-                wget -q "$download_url" -O speedtest.tgz && \
-                tar -xzf speedtest.tgz && \
-                mv -f speedtest /usr/local/bin/ && \
-                rm -f speedtest.tgz speedtest.5 speedtest.md LICENSE.md
-            fi
-            mkdir -p "$HOME/.ookla"
-            echo '{"license_accepted": true, "gdpr_accepted": true}' > "$HOME/.ookla/speedtest-cli.json" 2>/dev/null || true
-            ;;
-        nexttrace)
-            curl -fsSL nxtrace.org/nt | bash || true
-            ;;
-        iperf3)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache iperf3
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y iperf3
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release 2>/dev/null || true; dnf install -y iperf3
-            elif command -v yum >/dev/null 2>&1; then yum install -y epel-release 2>/dev/null || true; yum install -y iperf3
-            fi
-            ;;
-        mtr)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache mtr
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y mtr-tiny || apt-get install -y mtr
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y mtr
-            elif command -v yum >/dev/null 2>&1; then yum install -y mtr
-            fi
-            ;;
-    esac
-    hash -r 2>/dev/null
+    done
 }
 
-# ==========================================
-# 1) Speedtest 模块 (双保险免提示版)
-# ==========================================
-run_speedtest() {
-    clear
-    check_and_install speedtest
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   Speedtest 网速测试   ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}🚀 开始测速...${RESET}"
-    echo "-------------------------------------"
-    if speedtest --help 2>&1 | grep -q "accept-license"; then
-        echo "YES" | speedtest --accept-license --accept-gdpr --force || true
+# 状态遥测发送函数
+send_stats() {
+    :
+}
+
+# 动态获取 OpenClaw 状态、配置数以及核心版本号
+get_openclaw_status() {
+    # 1. 检测运行状态
+    if command -v openclaw &>/dev/null; then
+        if pgrep -f "openclaw gateway" &>/dev/null || pgrep -f "gateway" &>/dev/null; then
+            STATUS="${GREEN}运行中 (Running)${RESET}"
+        else
+            STATUS="${RED}已停止 (Stopped)${RESET}"
+        fi
+        # 2. 动态获取 OpenClaw 核心版本号并精细清洗
+        local raw_v
+        raw_v=$(openclaw -v 2>/dev/null | head -n 1 || openclaw --version 2>/dev/null | head -n 1 || echo "未知")
+        # 去除 ANSI 颜色字符
+        raw_v=$(echo "$raw_v" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g")
+        # 精准提取 "OpenClaw " 后面的所有内容
+        if [[ "$raw_v" =~ OpenClaw[[:space:]]+(.*) ]]; then
+            OPENCLAW_VERSION="${BASH_REMATCH[1]}"
+        else
+            # 如果没匹配到，则兜底取最后两列
+            OPENCLAW_VERSION=$(echo "$raw_v" | awk '{if(NF>1) print $(NF-1)" "$NF; else print $1}')
+        fi
     else
-        speedtest || speedtest-cli || true
+        STATUS="${RED}未安装 (Not Installed)${RESET}"
+        OPENCLAW_VERSION="${RED}未安装${RESET}"
     fi
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
-}
 
-# ==========================================
-# 2) NextTrace 模块
-# ==========================================
-run_nexttrace() {
-    clear
-    check_and_install nexttrace
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   NextTrace 路由追踪   ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p "请输入目标IP或域名: " target
-    if [ -z "$target" ]; then return; fi
-    echo -e "--------------------------------"
-    nexttrace "$target" || true
-    echo -e "${GREEN}================================${RESET}"
-    read -p "追踪完成，按回车返回面板..." dummy
-}
-
-# ==========================================
-# 3) iperf3 
-# ==========================================
-get_iperf_ip() {
-    read -p "请输入远端服务器 IP/域名: " SERVER_IP
-    if [ -z "$SERVER_IP" ]; then
-        echo -e "${RED}❌ 未输入有效 IP，操作取消。${RESET}"
-        sleep 1.5
-        return 1
+    # 3. 获取配置供应商数量
+    local config_file
+    config_file=$(openclaw_get_config_file)
+    if [ -f "$config_file" ] && command -v jq &>/dev/null; then
+        CONFIG_COUNT=$(jq '.models.providers | length' "$config_file" 2>/dev/null || echo "0")
+    else
+        CONFIG_COUNT="0"
     fi
-    return 0
 }
 
-run_iperf3() {
-    check_and_install iperf3
+
+# 用于在机器人菜单头部展示本地状态的区块
+openclaw_show_bot_local_status_block() {
+    local config_file
+    config_file=$(openclaw_get_config_file)
+    if [ -f "$config_file" ] && command -v jq &>/dev/null; then
+        local port
+        port=$(jq -r '.gateway.port // .port // "9000"' "$config_file" 2>/dev/null)
+        echo -e " 本地网关端口: ${YELLOW}${port}${RESET}"
+        echo -n " 接口监听状态: "
+        if command -v ss &>/dev/null; then
+            if ss -tlnp | grep -q "$port"; then echo -e "${GREEN}正常监听中${RESET}"; else echo -e "${RED}未监听 (请先启动网关)${RESET}"; fi
+        else
+            if netstat -tlnp | grep -q "$port"; then echo -e "${GREEN}正常监听中${RESET}"; else echo -e "${RED}未监听 (请先启动网关)${RESET}"; fi
+        fi
+    else
+        echo -e " 提示: ${RED}未检测到有效配置，请先执行配置向导。${RESET}"
+    fi
+}
+
+# 重启消息网关后台
+start_gateway() {
+    echo "🔄 正在重启 OpenClaw Gateway..."
+    openclaw gateway stop >/dev/null 2>&1
+    sleep 1
+    openclaw gateway start
+    sleep 3
+}
+
+# 安装环境所依赖的 Node 及编译工具树
+install_node_and_tools() {
+    if command -v dnf &>/dev/null; then
+        curl -fsSL https://rpm.nodesource.com/setup_24.x | sudo bash -
+        sudo dnf update -y
+        sudo dnf group install -y "Development Tools" "Development Libraries"
+        sudo dnf install -y cmake libatomic nodejs
+    fi
+
+    if command -v apt &>/dev/null; then
+        curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+        sudo apt update -y
+        sudo apt install build-essential python3 libatomic1 nodejs -y
+    fi
+}
+
+# 同步指定或全量 Sessions 默认模型
+openclaw_sync_sessions_model() {
+    local target_model="$1"
+    echo "🎯 全局会话默认模型已同步变变成: $target_model"
+}
+
+# =======================================================================
+# 核心数据操作区域 (包含 Python / JQ 以及机器人对接子选单)
+# =======================================================================
+
+# 1. 安装 OpenClaw 环境
+install_moltbot() {
+    echo "开始安装 OpenClaw..."
+    send_stats "开始安装 OpenClaw..."
+    install git jq curl python3 tmux
+
+    install_node_and_tools
+
+    local country
+    country=$(curl -s --max-time 3 ipinfo.io/country)
+    if [[ "$country" == "CN" || "$country" == "HK" ]]; then
+        npm config set registry https://registry.npmmirror.com
+    fi
+
+    git config --global url."${gh_proxy}github.com/".insteadOf ssh://git@github.com/
+    git config --global url."${gh_proxy}github.com/".insteadOf git@github.com:
+
+    sudo npm install -g openclaw@latest
+    openclaw onboard --install-daemon
+    start_gateway
+    break_end
+}
+
+# 4. 状态日志查看
+view_logs() {
+    echo "📋 查看 OpenClaw 状态日志"
+    send_stats "查看 OpenClaw 日志"
+    openclaw status
+    echo "----------------------------------------"
+    openclaw gateway status
+    echo "💡 提示: 正在加载实时日志流，按 Ctrl+C 可退出当前日志模式"
+    sleep 2
+    openclaw logs
+    break_end
+}
+
+
+
+api_management_submenu() {
+    if [ ! -f "$OPENCLAW_CONFIG" ]; then
+        echo -e "${RED}错误: 未找到 OpenClaw 配置文件 ($OPENCLAW_CONFIG)${NC}"
+        sleep 2
+        return
+    fi
+
     while true; do
         clear
-        echo -e "${GREEN}===================================${RESET}"
-        echo -e "${GREEN}     ◈   iperf3 测速管理   ◈      ${RESET}"
-        echo -e "${GREEN}===================================${RESET}"
-        echo -e "${YELLOW}端口 = $IPERF_PORT  | 时长 = ${IPERF_TIME}s ${RESET}"
-        echo -e "${YELLOW}线程 = $IPERF_PARALLEL     | UDP带宽 = $IPERF_UDP_BW${RESET}"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}1) 启动 iperf3 本地服务端"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}2) 发起 TCP 下载 (↓) 测试${RESET}"
-        echo -e " ${GREEN}3) 发起 TCP 上传 (↑) 测试${RESET}"
-        echo -e " ${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}4) 发起 UDP 下载 (↓) 测试${RESET}"
-        echo -e " ${GREEN}5) 发起 UDP 上传 (↑) 测试${RESET}"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}6) 修改测试参数${RESET}"
-        echo -e " ${GREEN}0) 退出${RESET}"
-        echo -e "${GREEN}===================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
+        # 1. 获取当前激活的 primary 模型
+        local current_model=$(jq -r '.agents.defaults.model.primary // "未设置"' "$OPENCLAW_CONFIG")
+
+        echo -e "${GREEN}=======================================${NC}"
+        echo -e "${GREEN}             API & 模型管理            ${NC}"
+        echo -e "${GREEN}=======================================${NC}"
+        echo -e "${CYAN}当前激活模型:${NC} ${YELLOW}${current_model}${NC}"
+        echo -e "${GREEN}---------------------------------------${NC}"
+        echo -e "${CYAN}已配置 API 列表:${NC}"
         
-        case "$choice" in
-            1)
+        # 2. 遍历打印所有的 providers 以及各自持有的模型数量
+        local providers_json=$(jq -c '.models.providers | to_entries[]' "$OPENCLAW_CONFIG" 2>/dev/null)
+        if [ -z "$providers_json" ]; then
+            echo -e "  ${YELLOW}(暂无配置)${NC}"
+        else
+            while read -r row; do
+                [ -z "$row" ] && continue
+                local p_key=$(echo "$row" | jq -r .key)
+                local m_count=$(echo "$row" | jq -r '.value.models | length')
+                echo -e "${YELLOW}  ● [${p_key}] (${m_count} 个模型)${NC}"
+            done <<< "$providers_json"
+        fi
+
+        echo -e "${GREEN}---------------------------------------${NC}"
+        echo -e "${GREEN}1. 切换模型${NC}"
+        echo -e "${GREEN}2. 添加 API 供应商${NC}"
+        echo -e "${GREEN}3. 同步 API 供应商模型列表${NC}"
+        echo -e "${GREEN}4. 删除 API 供应商${NC}"
+        echo -e "${GREEN}5. 查看已加模型信息${NC}"
+        echo -e "${GREEN}0. 返回主菜单${NC}"
+        echo -e "${GREEN}---------------------------------------${NC}"
+        echo -ne "${GREEN}选择序号: ${NC}"
+        read -r sub_choice
+
+        case "$sub_choice" in
+            1) # 1. 切换模型
                 clear
-                echo -e "${ORANGE}===================================${RESET}"
-                echo -e "${GREEN}  iperf3 服务器已启动 (监听端口: $IPERF_PORT)${RESET}"
-                echo -e "${YELLOW}  👉 提示: 测速完毕后，按 Ctrl+C 可安全返回菜单${RESET}"
-                echo -e "${ORANGE}===================================${RESET}\n"
-                (trap 'echo -e "${YELLOW}服务端已安全关闭。${RESET}"; exit 0' INT; iperf3 -s -i 10 -p "$IPERF_PORT")
-                echo "-----------------------------------"
-                read -p "按回车继续..." dummy
+                echo -e "${YELLOW}--- 切换激活模型 ---${NC}"
+                
+                # 提取底层 providers 里定义的所有模型的全路径 (例如: custom-qianxing-ai-cc-cd/codex-auto-review)
+                local models_str=$(jq -r '.models.providers | to_entries[] | .key as $p | .value.models[] | "\($p)/\(.id)"' "$OPENCLAW_CONFIG" 2>/dev/null)
+                if [ -z "$models_str" ]; then
+                    echo -e "${RED}配置中没有发现任何可用模型！${NC}"; sleep 1; continue
+                fi
+                
+                mapfile -t models_array <<< "$models_str"
+                PS3=$(echo -e "${GREEN}请选择模型序号 (输入 0 退出): ${NC}")
+                select selected_model in "${models_array[@]}"; do
+                    [ "$REPLY" = "0" ] && break
+                    [ -n "$selected_model" ] && break
+                done
+                
+                if [ -n "$selected_model" ] && [ "$REPLY" != "0" ]; then
+                    # 剥离出短模型 ID
+                    local short_model_id="${selected_model#*/}"
+                    
+                    # 使用 jq 同时更新 primary、agents.defaults.models 树结构
+                    local tmp_json=$(jq \
+                        --arg p "$selected_model" \
+                        --arg sm "$short_model_id" \
+                        '.agents.defaults.model.primary = $p | .agents.defaults.models = {($p): {}}' \
+                        "$OPENCLAW_CONFIG")
+                    echo "$tmp_json" > "$OPENCLAW_CONFIG"
+                    
+                    echo -e "${GREEN}✅ 模型已成功切换为: $selected_model${NC}"
+                    restart_openclaw_service
+                fi
+                ;;
+
+            2) # 2. 添加 API 供应商
+                clear
+                echo -e "${CYAN}--- 添加新 API 供应商 ---${NC}"
+                read -r -p "请输入供应商别名 (如: deepseek): " n; [ -z "$n" ] && continue
+                read -r -p "请输入 Base URL: " u; [ -z "$u" ] && continue
+                echo -ne "${YELLOW}请输入 API Key: ${NC}"; read -r k; [ -z "$k" ] && continue
+                read -r -p "请输入模型 ID (多个请用逗号隔开，如: gpt-4o,gpt-4o-mini): " ms
+                [ -z "$ms" ] && continue
+                
+                # 将逗号隔开的模型组装成 OpenClaw 要求的 JSON 对象数组格式
+                local models_json_arr="[]"
+                IFS=',' read -r -a m_ids <<< "$ms"
+                for m_id in "${m_ids[@]}"; do
+                    m_id=$(echo "$m_id" | xargs) # 去空格
+                    models_json_arr=$(echo "$models_json_arr" | jq --arg id "$m_id" '. += [{"id": $id, "name": "\($id) (Custom)", "contextWindow": 128000, "maxTokens": 4096, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "reasoning": false}]')
+                done
+                
+                # 构建 provider 对象并合并进原 JSON
+                local new_provider_json=$(jq -n \
+                    --arg bu "${u%/}" \
+                    --arg key "$k" \
+                    --argjson mods "$models_json_arr" \
+                    '{"baseUrl": $bu, "api": "openai-completions", "apiKey": $key, "models": $mods}')
+                
+                local tmp_json=$(jq --argjson np "$new_provider_json" --arg name "$n" '.models.providers[$name] = $np' "$OPENCLAW_CONFIG")
+                echo "$tmp_json" > "$OPENCLAW_CONFIG"
+                
+                echo -e "${GREEN}✅ 供应商 [${n}] 已成功添加！${NC}"
+                restart_openclaw_service
+                ;;
+
+            3) # 3. 同步 API 供应商模型列表
+                clear
+                echo -e "${CYAN}--- 同步 API 供应商模型列表 ---${NC}"
+                echo -e "${YELLOW}正在重新拉起网关重载本地配置文件路由...${NC}"
+                restart_openclaw_service
+                ;;
+
+            4) # 4. 删除 API 供应商
+                clear
+                echo -e "${CYAN}--- 删除 API 供应商 ---${NC}"
+                local p_list=$(jq -r '.models.providers | keys[]' "$OPENCLAW_CONFIG" 2>/dev/null)
+                if [ -z "$p_list" ]; then
+                    echo -e "${RED}当前无已配置的供应商。${NC}"; sleep 1; continue
+                fi
+                
+                mapfile -t p_array <<< "$p_list"
+                PS3="选择要删除的供应商序号 (输入 0 取消): "
+                select del_name in "${p_array[@]}"; do
+                    [ "$REPLY" = "0" ] && break
+                    [ -n "$del_name" ] && break
+                done
+                
+                if [ -n "$del_name" ] && [ "$REPLY" != "0" ]; then
+                    read -r -p "确认删除供应商 [$del_name] 及其名下所有模型? (y/N): " del_confirm
+                    if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
+                        # 使用 jq del 剔除对应的路径
+                        local tmp_json=$(jq --arg name "$del_name" 'del(.models.providers[$name])' "$OPENCLAW_CONFIG")
+                        echo "$tmp_json" > "$OPENCLAW_CONFIG"
+                        
+                        echo -e "${RED}🗑️ 已删除供应商: $del_name${NC}"
+                        restart_openclaw_service
+                    fi
+                fi
+                ;;
+
+            5) # 5. 查看已加模型信息
+                clear
+                echo -e "${CYAN}--- 已加模型详细信息列表 ---${NC}"
+                echo -e "${YELLOW}----------------------------------------${NC}"
+                
+                local p_detail=$(jq -c '.models.providers | to_entries[]' "$OPENCLAW_CONFIG" 2>/dev/null)
+                if [ -z "$p_detail" ]; then
+                    echo -e "  ${YELLOW}(暂无任何模型配置信息)${NC}"
+                else
+                    while read -r row; do
+                        [ -z "$row" ] && continue
+                        local det_name=$(echo "$row" | jq -r .key)
+                        local det_url=$(echo "$row" | jq -r .value.baseUrl)
+                        local det_key=$(echo "$row" | jq -r .value.apiKey)
+                        local det_models=$(echo "$row" | jq -r '.value.models[].id' | tr '\n' ',' | sed 's/,$//')
+                        
+                        [ -z "$det_key" ] || [ "$det_key" = "null" ] && det_key="无"
+
+                        echo -e "${YELLOW}◈ 别名: ${NC}${YELLOW}${det_name}${NC}"
+                        echo -e "  ├─ 包含模型: ${GREEN}${det_models}${NC}"
+                        echo -e "  ├─ Base URL: ${CYAN}${det_url}${NC}"
+                        echo -e "  └─ API Key: ${CYAN}${det_key}${NC}"
+                        echo -e "${YELLOW}----------------------------------------${NC}"
+                    done <<< "$p_detail"
+                fi
+                echo ""
+                read -r -p "按回车键继续..."
+                ;;
+
+            0) break ;;
+        esac
+    done
+}
+
+# 辅助函数：安全重启 OpenClaw 网关
+restart_openclaw_service() {
+    echo -e "${YELLOW}正在重启 OpenClaw 服务...${NC}"
+    # 查找并结束之前的 OpenClaw 进程
+    local pid=$(pgrep -f "openclaw")
+    [ -n "$pid" ] && kill "$pid" && sleep 1
+    
+    # 根据你的配置，重新后台拉起服务并生成日志
+    nohup ./openclaw > openclaw.log 2>&1 &
+    
+    echo -e "${GREEN}✅ OpenClaw 配置重载并重启完毕！${NC}"
+    sleep 1.5
+}
+
+# 7. 机器人连接对接交互式子选单
+bot_connection_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}========================================${RESET}"
+        echo -e "             机器人连接对接             "
+        echo -e "${GREEN}========================================${RESET}"
+        openclaw_show_bot_local_status_block
+        echo "----------------------------------------"
+        echo -e " 1. Telegram 机器人对接"
+        echo -e " 2. 飞书 (Lark) 机器人对接"
+        echo -e " 3. WhatsApp 机器人对接"
+        echo -e " 4. QQ 机器人对接"
+        echo -e " 5. 微信机器人对接"
+        echo "----------------------------------------"
+        echo -e " ${YELLOW}0. 返回上一级选单${RESET}"
+        echo "----------------------------------------"
+        read -erp "请输入你的选择: " bot_choice
+
+        case $bot_choice in
+            1)
+                read -erp "请输入TG机器人收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code
+                if [ "$code" = "0" ] || [ -z "$code" ]; then 
+                    [ -z "$code" ] && echo -e "${RED}错误：连接码不能为空。${RESET}" && sleep 1
+                    continue
+                fi
+                openclaw pairing approve telegram "$code"
+                break_end
                 ;;
             2)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -R -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
+                echo -e "${YELLOW}🔄 正在通过 npx 调度部署飞书适配通道...${RESET}"
+                npx -y @larksuite/openclaw-lark install
+                openclaw config set channels.feishu.streaming true
+                openclaw config set channels.feishu.requireMention true --json
+                echo -e "${GREEN}✅ 飞书通道参数设置成功！${RESET}"
+                break_end
                 ;;
             3)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
+                read -erp "请输入WhatsApp收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code
+                if [ "$code" = "0" ] || [ -z "$code" ]; then 
+                    [ -z "$code" ] && echo -e "${RED}错误：连接码不能为空。${RESET}" && sleep 1
+                    continue
+                fi
+                openclaw pairing approve whatsapp "$code"
+                break_end
                 ;;
             4)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -R -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
+                echo -e "\n${GREEN}QQ 官方对接指引链接：${RESET}"
+                echo -e "${BLUE}https://q.qq.com/qqbot/openclaw/login.html${RESET}\n"
+                break_end
                 ;;
             5)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
+                echo -e "${YELLOW}🔄 正在下载并注入企业微信/微信开放平台支持组件...${RESET}"
+                npx -y @tencent-weixin/openclaw-weixin-cli@latest install
+                break_end
                 ;;
-            6)
-                echo -e "${YELLOW}>>> 修改 iperf3 临时参数 <<<${RESET}"
-                read -p "修改端口 (当前 $IPERF_PORT): " in_p; IPERF_PORT=${in_p:-$IPERF_PORT}
-                read -p "修改时长 (当前 $IPERF_TIME): " in_t; IPERF_TIME=${in_t:-$IPERF_TIME}
-                read -p "修改线程 (当前 $IPERF_PARALLEL): " in_pa; IPERF_PARALLEL=${in_pa:-$IPERF_PARALLEL}
-                read -p "修改UDP带宽 (当前 $IPERF_UDP_BW): " in_b; IPERF_UDP_BW=${in_b:-$IPERF_UDP_BW}
+            0)
+                return 0
                 ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+            *)
+                echo -e "${RED}无效的选择，请重试。${RESET}"
+                sleep 1
+                ;;
         esac
     done
 }
 
-# ==========================================
-# 4) MTR 面板模块
-# ==========================================
-run_mtr() {
-    check_and_install mtr
-    while true; do
-        clear
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}    ◈   MTR 链路诊断面板   ◈    ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}探测协议 :${RESET} ${YELLOW}$(echo "$MTR_PROTO" | tr 'a-z' 'A-Z')${RESET}"
-        echo -e "${GREEN}AS号展示 :${RESET} ${YELLOW}$([ "$MTR_SHOW_AS" = "true" ] && echo "开启" || echo "关闭")${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1) 实时动态检测${RESET}"
-        echo -e "${GREEN} 2) 静态报告模式${RESET}"
-        echo -e "${GREEN} 0) 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
-        
-        local args=""
-        [ "$MTR_SHOW_AS" = "true" ] && args="$args -z"
+# 12. 健康检测与自动环境修复
+health_doctor_fix() {
+    echo -e "${GREEN}=== OpenClaw 全自动化故障巡检与修复 ===${RESET}"
+    local config_file
+    config_file=$(openclaw_get_config_file)
 
-        case "$choice" in
-            1)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                echo -e "--------------------------------"
-                mtr $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "检测结束，按回车返回..." dummy
-                ;;
-            2)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                clear
-                echo -e "${GREEN}报告生成中(发送100个包)...${RESET}\n"
-                mtr -r -c 100 $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "分析结束，按回车返回..." dummy
-                ;;
-            0) exit 0 ;;
-        esac
-    done
+    echo -n "[1/3] 核心进程状态扫描: "
+    if pgrep -f "openclaw" &>/dev/null; then
+        echo -e "${GREEN}正常运行${RESET}"
+    else
+        echo -e "${YELLOW}离线。正在为您强制拉起网关进程守护...${RESET}"
+        openclaw gateway start
+    fi
+
+    echo -n "[2/3] 核心配置文件格式校验: "
+    if [ -f "$config_file" ]; then
+        if jq . "$config_file" &>/dev/null; then
+            echo -e "${GREEN}结构合法 (Valid JSON)${RESET}"
+        else
+            echo -e "${RED}结构损坏！正在为您排查加载最近一次的备份恢复...${RESET}"
+            local bak
+            bak=$(ls -t "${config_file}.bak."* 2>/dev/null | head -n 1)
+            if [ -n "$bak" ]; then
+                cp "$bak" "$config_file" && echo -e "${GREEN}已成功还原历史快照配置: $bak${RESET}"
+            else
+                echo -e "${RED}无历史快照备份，建议执行选项 11 重新进行 onboard向导初始化。${RESET}"
+            fi
+        fi
+    else
+        echo -e "${RED}缺失核心配置文件${RESET}"
+    fi
+
+    echo -n "[3/3] 全系统底层运行环境依属检测: "
+    if command -v node &>/dev/null && command -v tmux &>/dev/null; then
+        echo -e "${GREEN}环境完备${RESET}"
+    else
+        echo -e "${YELLOW}发现缺失，自动补全修复依赖项...${RESET}"
+        install tmux jq nodejs
+    fi
+    break_end
 }
 
-
-# ==========================================
-# 工具箱主面板循环
-# ==========================================
-while true; do
+# =======================================================================
+# 主菜单及指令控制层
+# =======================================================================
+show_menu() {
+    get_openclaw_status
     clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   网络管理 综合面板   ◈    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}Speedtest :${RESET} $(get_status speedtest)"
-    echo -e "${GREEN}NextTrace :${RESET} $(get_status nexttrace)"
-    echo -e "${GREEN}iperf3    :${RESET} $(get_status iperf3)"
-    echo -e "${GREEN}MTR       :${RESET} $(get_status mtr)"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e " ${GREEN}1) 运行 Speedtest 网速测试${RESET}"
-    echo -e " ${GREEN}2) 运行 NextTrace 路由追踪${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}3) 运行 iperf3 测速${RESET}"
-    echo -e " ${GREEN}4) 运行 MTR 链路诊断${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p $'\033[32m 请选择: \033[0m' choice
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}     ◈   🦞 OPENCLAW 管理工具  ◈      ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}核心状态 : $STATUS${RESET}"
+    echo -e "${GREEN}核心版本 :${RESET} ${YELLOW}$OPENCLAW_VERSION${RESET}"
+    echo -e "${GREEN}集群数据 :${RESET} ${YELLOW}$CONFIG_COUNT 个 API 供应商${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "  1. 安装 环境依赖与 OpenClaw"
+    echo -e "  2. 启动 Gateway (消息网关后台)"
+    echo -e "  3. 停止 Gateway (消息网关服务)"
+    echo -e " -------------------------------------"
+    echo -e "  4. 状态日志查看"
+    echo -e "  6. API 管理 "
+    echo -e "  7. 机器人连接对接窗口"
+    echo -e " -------------------------------------"
+    echo -e " 11. 配置向导 (Onboard 初始化)"
+    echo -e " 12. 健康检测与自动故障修复"
+    echo -e " 14. TUI 命令行窗口本地对话"
+    echo -e " 19. 更新 OpenClaw 核心程序"
+    echo -e " 20. 卸载 清理全部运行环境"
+    echo -e " -------------------------------------"
+    echo -e "  0. 退出"
+    echo -e "${GREEN}=======================================${RESET}"
+    printf " 请输入选项并回车: "
+}
 
-    case "$choice" in
-        1) run_speedtest ;;
-        2) run_nexttrace ;;
-        3) run_iperf3 ;;
-        4) run_mtr ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入错误。${RESET}"; sleep 1 ;;
-    esac
-done
+main() {
+    while true; do
+        show_menu
+        read -r choice
+        case "$choice" in
+            1)  install_moltbot ;;
+            2)  start_gateway && echo -e "${GREEN}✅ 启动指令发送执行完成${RESET}" && break_end ;;
+            3)  
+                echo "停止 OpenClaw..."
+                send_stats "停止 OpenClaw..."
+                tmux kill-session -t gateway > /dev/null 2>&1
+                openclaw gateway stop >/dev/null 2>&1
+                echo -e "${GREEN}✅ 网关核心及守护会话已完全离线停止${RESET}"
+                break_end 
+                ;;
+            4)  view_logs ;;
+            6)  api_management_submenu ;;
+            7)  bot_connection_menu ;;
+            11) openclaw onboard; break_end ;;
+            12) health_doctor_fix ;;
+            14) openclaw chat ;;
+            19) 
+                echo "🔄 正在为您执行 NPM 全量拉取覆写更新 OpenClaw..."
+                sudo npm install -g openclaw@latest && start_gateway
+                echo -e "${GREEN}✅ 覆写更新完成！${RESET}"
+                break_end
+                ;;
+            20) 
+                echo -e "${RED}⚠️ 警告：您正准备全盘卸载 OpenClaw 控制程序及清空所有配置。${RESET}"
+                read -erp "确定要继续执行强力清除吗？(y/N): " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    openclaw gateway stop >/dev/null 2>&1
+                    sudo npm uninstall -g openclaw
+                    rm -rf "${HOME}/.openclaw"
+                    echo -e "${GREEN}✅ OpenClaw 卸载洗刷完成。${RESET}"
+                else
+                    echo "❌ 操作已取消。"
+                fi
+                break_end
+                ;;
+            0)  echo "退出 OpenClaw 管理面板，再见！"; exit 0 ;;
+            *)  echo -e "${RED}输入有误，请输入菜单中有效的数字代号！${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# 启动执行
+main

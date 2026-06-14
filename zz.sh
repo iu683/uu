@@ -1,234 +1,138 @@
 #!/bin/bash
-# =========================================================================
-# Cron 定时任务智能管理面板（跨系统自适配）
-# =========================================================================
+# ========================================
+# yt-dlp 一键管理脚本 PRO (含版本显示)
+# ========================================
 
-# 严格的 Root 权限检查
-if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[31m❌ 错误：请使用 root 权限（或通过 sudo）运行此脚本！\033[0m"
-    exit 1
-fi
+VIDEO_DIR="/opt/yt-dlp"
+URL_FILE="$VIDEO_DIR/urls.txt"
 
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 自动精确识别发行版
-get_os_type() {
-    if [ -f /etc/alpine-release ]; then
-        echo "Alpine"
-    elif [ -f /etc/os-release ]; then
-        . /etc/os-release
-        case "$ID" in
-            ubuntu) echo "Ubuntu" ;;
-            debian) echo "Debian" ;;
-            centos|rhel|rocky|almalinux) echo "RedHat" ;;
-            *) echo "Linux" ;;
-        esac
-    else
-        echo "Linux"
+mkdir -p "$VIDEO_DIR"
+
+install_yt() {
+    echo -e "${GREEN}正在安装 yt-dlp...${RESET}"
+    apt update -y
+    apt install -y ffmpeg curl nano
+    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+    chmod a+rx /usr/local/bin/yt-dlp
+    echo -e "${GREEN}安装完成！${RESET}"
+}
+
+update_yt() {
+    echo -e "${GREEN}正在更新 yt-dlp...${RESET}"
+    yt-dlp -U
+}
+
+uninstall_yt() {
+    rm -f /usr/local/bin/yt-dlp
+    rm -rf /opt/yt-dlp
+    echo -e "${GREEN}已卸载 yt-dlp${RESET}"
+    exit 0
+}
+
+download_single() {
+    read -e -p "$(echo -e ${GREEN}请输入视频链接: ${RESET})" url
+    yt-dlp -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
+        --write-subs --sub-langs all \
+        --write-thumbnail --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites "$url"
+}
+
+download_batch() {
+    if [ ! -f "$URL_FILE" ]; then
+        echo -e "# 一行一个视频链接" > "$URL_FILE"
     fi
+    nano "$URL_FILE"
+    yt-dlp -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
+        --write-subs --sub-langs all \
+        --write-thumbnail --embed-thumbnail \
+        --write-info-json \
+        -a "$URL_FILE" \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites
 }
 
-OS=$(get_os_type)
-
-# 安装并启动 crontab 服务 
-install_crontab_if_missing() {
-    if ! command -v crontab >/dev/null 2>&1; then
-        echo -e "${YELLOW}🔧 未检测到 crontab 组件，正在为您自动补全...${RESET}"
-        case "$OS" in
-            Alpine)
-                apk add --no-cache dcron >/dev/null 2>&1
-                rc-update add crond default >/dev/null 2>&1
-                rc-service crond start >/dev/null 2>&1
-                ;;
-            Ubuntu|Debian)
-                apt-get update -y >/dev/null 2>&1
-                apt-get install -y cron >/dev/null 2>&1
-                systemctl enable --now cron >/dev/null 2>&1
-                ;;
-            RedHat)
-                yum install -y cronie >/dev/null 2>&1 || dnf install -y cronie >/dev/null 2>&1
-                systemctl enable --now crond >/dev/null 2>&1
-                ;;
-            *)
-                echo -e "${RED}❌ 无法自动识别系统类型，请手动安装 crontab！${RESET}"
-                read -rp "按回车键退出..."
-                exit 1
-                ;;
-        esac
-        echo -e "${GREEN}✅ crontab 安装完成并已自动启动服务！${RESET}"
-        sleep 1
-    else
-        # 服务保活，确保其运行
-        if [ "$OS" = "Alpine" ]; then
-            rc-service crond start >/dev/null 2>&1
-        elif command -v systemctl >/dev/null 2>&1; then
-            systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1
-        fi
-    fi
+download_custom() {
+    read -e -p "$(echo -e ${GREEN}请输入完整 yt-dlp 参数（不含 yt-dlp）: ${RESET})" custom
+    yt-dlp -P "$VIDEO_DIR" $custom \
+        --write-subs --sub-langs all \
+        --write-thumbnail --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites
 }
 
-# 校验数字范围 
-validate_number() {
-    local value="$1" local min="$2" local max="$3" local name="$4"
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
-        echo -e "${RED}❌ 错误：${name} 输入无效，应在 $min 到 $max 之间！${RESET}"
-        return 1
-    fi
-    return 0
+download_mp3() {
+    read -e -p "$(echo -e ${GREEN}请输入视频链接: ${RESET})" url
+    yt-dlp -P "$VIDEO_DIR" -x --audio-format mp3 \
+        --write-thumbnail --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites "$url"
 }
 
-# 添加任务 
-add_cron_task() {
-    echo -e "\n${YELLOW}=== ➕ 添加新定时任务 ===${RESET}"
-    echo -ne "${GREEN}请输入新任务要执行的 Shell 命令: ${RESET}"
-    read -r newquest
-    [ -z "$newquest" ] && return
-
-    echo -e "\n${YELLOW}------ ⏰ 选择触发周期 ------${RESET}"
-    echo -e "${GREEN}  1) 每月任务 (指定某天 00:00 执行)${RESET}"            
-    echo -e "${GREEN}  2) 每周任务 (指定周几 00:00 执行)${RESET}"
-    echo -e "${GREEN}  3) 每天任务 (指定每天几点 00分 执行)${RESET}"  
-    echo -e "${GREEN}  4) 每小时任务 (指定每小时第几分钟 执行)${RESET}"
-    echo -e "${YELLOW}----------------------------${RESET}"
-    echo -ne "${GREEN}请选择时间类型: ${RESET}"
-    read -r dingshi
-
-    case "$dingshi" in
-        1)
-            echo -ne "${YELLOW}每月的几号执行任务？ (1-31): ${RESET}"
-            read -r day
-            validate_number "$day" 1 31 "日期" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "0 0 $day * * $newquest") | crontab -
-            ;;
-        2)
-            echo -ne "${YELLOW}周几执行任务？ (0-6, 0=周日): ${RESET}"
-            read -r weekday
-            validate_number "$weekday" 0 6 "星期" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "0 0 * * $weekday $newquest") | crontab -
-            ;;
-        3)
-            echo -ne "${YELLOW}每天几点执行任务？（小时，0-23）: ${RESET}"
-            read -r hour
-            validate_number "$hour" 0 23 "小时" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "0 $hour * * * $newquest") | crontab -
-            ;;
-        4)
-            echo -ne "${YELLOW}每小时第几分钟执行任务？（分钟，0-59）: ${RESET}"
-            read -r minute
-            validate_number "$minute" 0 59 "分钟" || { read -rp "按回车键返回..."; return; }
-            (crontab -l 2>/dev/null; echo "$minute * * * * $newquest") | crontab -
-            ;;
-        *)
-            echo -e "${RED}❌ 无效选择${RESET}"
-            sleep 1
-            return
-            ;;
-    esac
-    echo -e "\n${GREEN}✅ 任务已成功持久化写入 crontab 定时列表！${RESET}"
-    read -rp "按回车键返回菜单..."
+delete_video() {
+    echo -e "${GREEN}当前视频目录：${RESET}"
+    ls "$VIDEO_DIR"
+    read -e -p "$(echo -e ${GREEN}请输入要删除的目录名称: ${RESET})" name
+    rm -rf "$VIDEO_DIR/$name"
+    echo -e "${GREEN}已删除${RESET}"
 }
 
-# 删除任务
-delete_cron_task() {
-    echo -e "\n${YELLOW}=== ➖ 删除定时任务 ===${RESET}"
-    local tmp_cron="/tmp/cron_list_tmp"
-    
-    # 安全导出，避免因 crontab 为空触发 set -e 崩溃（虽然新脚本已经拿掉了 set -e，但安全第一）
-    crontab -l 2>/dev/null > "$tmp_cron" || true
-    
-    if [ ! -s "$tmp_cron" ]; then
-        echo -e "${YELLOW}💡 当前系统中没有任何运行中的定时任务。${RESET}"
-        rm -f "$tmp_cron"
-        read -rp "按回车键返回菜单..."
-        return
-    fi
-
-    echo -e "${GREEN}当前可删除的任务列表:${RESET}"
-    awk '{print "  " NR") " $0}' "$tmp_cron"
-    echo -e "${YELLOW}---------------------------------------${RESET}"
-    echo -ne "${YELLOW}请输入要删除的任务序号（多个用空格分隔）: ${RESET}"
-    read -r indices
-    [ -z "$indices" ] && { rm -f "$tmp_cron"; return; }
-
-    # 倒序排列序号，从后往前删，避免行号因动态缩减而错位
-    local sorted_indices=$(echo "$indices" | tr ' ' '\n' | sort -rn)
-    
-    for idx in $sorted_indices; do
-        if [[ "$idx" =~ ^[0-9]+$ ]]; then
-            # 兼容适配：使用通用的 sed 行为，完美契合 Alpine Busybox 与 传统 Linux
-            sed -i "${idx}d" "$tmp_cron" 2>/dev/null || sed -i "" "${idx}d" "$tmp_cron" 2>/dev/null
-        fi
-    done
-
-    crontab "$tmp_cron"
-    rm -f "$tmp_cron"
-    echo -e "\n${GREEN}✅ 选定任务已成功删除！${RESET}"
-    read -rp "按回车键返回菜单..."
+show_list() {
+    echo -e "${GREEN}已下载视频列表：${RESET}"
+    ls -td "$VIDEO_DIR"/*/ 2>/dev/null || echo -e "${GREEN}暂无视频${RESET}"
 }
 
-# 编辑任务 
-edit_cron_task() {
-    echo -e "\n${YELLOW}=== 📝 手动编辑定时任务 ===${RESET}"
-    if ! command -v nano >/dev/null 2>&1 && ! command -v vim >/dev/null 2>&1; then
-        echo -e "${YELLOW}🔧 正在安装轻量文本编辑器 nano...${RESET}"
-        case "$OS" in
-            Alpine) apk add --no-cache nano >/dev/null 2>&1 ;;
-            Ubuntu|Debian) apt-get update -y >/dev/null 2>&1 && apt-get install -y nano >/dev/null 2>&1 ;;
-            *) yum install -y nano >/dev/null 2>&1 || dnf install -y nano >/dev/null 2>&1 ;;
-        esac
-    fi
-    export EDITOR=$(command -v nano || command -v vim || command -v vi)
-    crontab -e
-}
-
-# 预检安装
-install_crontab_if_missing
-
-# 主循环面板
 while true; do
     clear
-
-
-    if crontab -l >/dev/null 2>&1; then
-        TASK_COUNT=$(crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^[A-Za-z0-9_]+=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | wc -l | tr -d ' ')
+    # 检查安装状态与获取版本号
+    if [ -x "/usr/local/bin/yt-dlp" ]; then
+        STATUS="${YELLOW}已安装${RESET}"
+        VERSION_NUM=$(/usr/local/bin/yt-dlp --version 2>/dev/null)
+        VERSION="${YELLOW}${VERSION_NUM}${RESET}"
     else
-        TASK_COUNT=0
+        STATUS="${RED}未安装${RESET}"
+        VERSION="${RED}--${RESET}"
     fi
 
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}       ◈  Cron 定时任务管理面板  ◈      ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN} 当前系统环境 : ${YELLOW}${OS}${RESET}"
-    echo -e "${GREEN} 活跃任务总数 : ${YELLOW}${YELLOW}${TASK_COUNT} 条${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN} 📋 当前系统定时任务快照：${RESET}"
-    
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN}             yt-dlp 管理工具             ${RESET}"
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN} 状态: $STATUS    |   当前版本: $VERSION${RESET}"
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN}  1. 安装 yt-dlp${RESET}"
+    echo -e "${GREEN}  2. 更新 yt-dlp${RESET}"
+    echo -e "${GREEN}  3. 卸载 yt-dlp${RESET}"
+    echo -e "${GREEN}  5. 单个视频下载${RESET}"
+    echo -e "${GREEN}  6. 批量视频下载${RESET}"
+    echo -e "${GREEN}  7. 自定义参数下载${RESET}"
+    echo -e "${GREEN}  8. 下载为 MP3${RESET}"
+    echo -e "${GREEN}  9. 删除视频目录${RESET}"
+    echo -e "${GREEN} 10. 查看下载列表${RESET}"
+    echo -e "${GREEN}  0. 退出${RESET}"
+    echo -e "${GREEN}=========================================${RESET}"
+    read -e -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
 
-    if [ "$TASK_COUNT" -gt 0 ]; then
-        crontab -l 2>/dev/null | grep -v '^\s*#' | grep -vE '^[A-Za-z0-9_]+=' | grep -v 'run-parts' | grep -v '/etc/periodic' | grep '[^\s]' | awk '{print "   • " $0}'
-    else
-        echo -e "   ${YELLOW}(暂无用户自定义的定时任务)${RESET}"
-    fi
-    
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  1) 快速添加定时任务(引导式)${RESET}"
-    echo -e "${GREEN}  2) 精准删除定时任务(支持多选)${RESET}"
-    echo -e "${GREEN}  3) 深度手动编辑任务(打开编辑器)${RESET}"
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${GREEN}  0) 退出${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    
-    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
-    read -r choice
-
-    case "$choice" in
-        1) add_cron_task ;;
-        2) delete_cron_task ;;
-        3) edit_cron_task ;;
+    case $choice in
+        1) install_yt ;;
+        2) update_yt ;;
+        3) uninstall_yt ;;
+        5) download_single ;;
+        6) download_batch ;;
+        7) download_custom ;;
+        8) download_mp3 ;;
+        9) delete_video ;;
+        10) show_list ;;
         0) exit 0 ;;
-        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+
+    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
 done

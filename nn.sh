@@ -1,1214 +1,709 @@
 #!/bin/bash
+# ========================================================
+#  SNIProxy & SmartDNS 流媒体解锁一键集成管理脚本
+# ========================================================
 
-# =======================================================================
-# OpenClaw 一键管理面板
-# =======================================================================
+# 参数配置
+LISTEN_PORT="443"
+FIREWALL_CHAIN="SNIPROXY_CLIENT_ALLOWLIST"
+BINARY_NAME="sniproxy"
+SNI_BASE_DIR="$(pwd)/sniproxy"
+ALLOWLIST_FILE="$SNI_BASE_DIR/allowed_client_ips.txt"
+SNI_SERVICE_FILE="/etc/systemd/system/sniproxy.service"
 
-# 终端高亮颜色定义
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-BLUE="\033[34m"
-RESET="\033[0m"
+SMARTDNS_CONF_URL="https://raw.githubusercontent.com/pymumu/smartdns/master/etc/smartdns/smartdns.conf"
+DOMAIN_LIST_URL="https://raw.githubusercontent.com/1-stream/1stream-public-utils/refs/heads/main/stream.text.list"
+OUTPUT_FILE="smartdns.conf"
+TEMP_DOMAIN_FILE="/tmp/domain_list.txt"
+RESOLV_BACKUP_DIR="/etc/systemd/resolved.conf.d"
+UNLOCK_IP="" 
 
-gl_lv="\033[32m"
-gl_huang="\033[33m"
-gl_hong="\033[31m"
-gl_bai="\033[0m"
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # 无颜色
 
-# 全局环境静态参数
-ENABLE_STATS="true"
-gh_proxy=""
+# ==================== 基础打印与通用工具函数 ====================
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
-# 统一获取 OpenClaw 配置文件路径
-openclaw_get_config_file() {
-    echo "${HOME}/.openclaw/openclaw.json"
-}
-
-
-# 辅助函数：按键返回
-break_end() {
-    echo -e "\n${GREEN}----------------------------------------${RESET}"
-    read -n 1 -s -r -p "按任意键返回主菜单..."
-    echo
-}
-
-# 辅助函数：基础依赖检查与安装
-install() {
-    for pkg in "$@"; do
-        if ! command -v "$pkg" &>/dev/null; then
-            echo "正在安装系统依赖: $pkg..."
-            if command -v apt &>/dev/null; then
-                sudo apt update -y && sudo apt install -y "$pkg"
-            elif command -v dnf &>/dev/null; then
-                sudo dnf install -y "$pkg"
-            elif command -v yum &>/dev/null; then
-                sudo yum install -y "$pkg"
-            fi
-        fi
-    done
-}
-
-# 状态遥测发送函数
-send_stats() {
-    :
-}
-
-# 动态获取 OpenClaw 状态、配置数以及核心版本号
-get_openclaw_status() {
-    # 1. 检测运行状态
-    if command -v openclaw &>/dev/null; then
-        if pgrep -f "openclaw gateway" &>/dev/null || pgrep -f "gateway" &>/dev/null; then
-            STATUS="${GREEN}运行中${RESET}"
-        else
-            STATUS="${RED}已停止${RESET}"
-        fi
-        # 2. 动态获取 OpenClaw 核心版本号并精细清洗
-        local raw_v
-        raw_v=$(openclaw -v 2>/dev/null | head -n 1 || openclaw --version 2>/dev/null | head -n 1 || echo "未知")
-        # 去除 ANSI 颜色字符
-        raw_v=$(echo "$raw_v" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g")
-        # 精准提取 "OpenClaw " 后面的所有内容
-        if [[ "$raw_v" =~ OpenClaw[[:space:]]+(.*) ]]; then
-            OPENCLAW_VERSION="${BASH_REMATCH[1]}"
-        else
-            # 如果没匹配到，则兜底取最后两列
-            OPENCLAW_VERSION=$(echo "$raw_v" | awk '{if(NF>1) print $(NF-1)" "$NF; else print $1}')
-        fi
-    else
-        STATUS="${RED}未安装 (Not Installed)${RESET}"
-        OPENCLAW_VERSION="${RED}未安装${RESET}"
-    fi
-
-    # 3. 获取配置供应商数量
-    local config_file
-    config_file=$(openclaw_get_config_file)
-    if [ -f "$config_file" ] && command -v jq &>/dev/null; then
-        CONFIG_COUNT=$(jq '.models.providers | length' "$config_file" 2>/dev/null || echo "0")
-    else
-        CONFIG_COUNT="0"
+ensure_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        print_error "此操作需要 root 权限。请使用 sudo 或以 root 用户身份运行。"
+        exit 1
     fi
 }
 
-
-# 用于在机器人菜单头部展示本地状态的区块
-openclaw_show_bot_local_status_block() {
-    local config_file
-    config_file=$(openclaw_get_config_file)
-    if [ -f "$config_file" ] && command -v jq &>/dev/null; then
-        local port
-        port=$(jq -r '.gateway.port // .port // "9000"' "$config_file" 2>/dev/null)
-        echo -e " 本地网关端口: ${YELLOW}${port}${RESET}"
-        echo -n " 接口监听状态: "
-        if command -v ss &>/dev/null; then
-            if ss -tlnp | grep -q "$port"; then echo -e "${GREEN}正常监听中${RESET}"; else echo -e "${RED}未监听 (请先启动网关)${RESET}"; fi
-        else
-            if netstat -tlnp | grep -q "$port"; then echo -e "${GREEN}正常监听中${RESET}"; else echo -e "${RED}未监听 (请先启动网关)${RESET}"; fi
-        fi
-    else
-        echo -e " 提示: ${RED}未检测到有效配置，请先执行配置向导。${RESET}"
+check_command() {
+    if ! command -v "$1" &> /dev/null; then
+        print_error "命令 '$1' 未找到。请先安装它 (例如: apt install -y $1 或 yum install -y $1)"
+        exit 1
     fi
 }
 
-# 重启消息网关后台
-start_gateway() {
-    echo "🔄 正在重启 OpenClaw Gateway..."
-    openclaw gateway stop >/dev/null 2>&1
-    sleep 1
-    openclaw gateway start
-    sleep 3
+read_user_input() {
+    local var_name=$1
+    if [ -r /dev/tty ]; then
+        { read -r "$var_name" < /dev/tty; } 2>/dev/null && return 0
+    fi
+    read -r "$var_name"
 }
 
-# 安装环境所依赖的 Node 及编译工具树
-install_node_and_tools() {
-    if command -v dnf &>/dev/null; then
-        curl -fsSL https://rpm.nodesource.com/setup_24.x | sudo bash -
-        sudo dnf update -y
-        sudo dnf group install -y "Development Tools" "Development Libraries"
-        sudo dnf install -y cmake libatomic nodejs
-    fi
-
-    if command -v apt &>/dev/null; then
-        curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
-        sudo apt update -y
-        sudo apt install build-essential python3 libatomic1 nodejs -y
+read_required_input() {
+    local var_name=$1
+    if ! read_user_input "$var_name"; then
+        print_error "未读取到输入。请在交互式终端运行脚本。"
+        exit 1
     fi
 }
 
-# 同步指定或全量 Sessions 默认模型
-openclaw_sync_sessions_model() {
-    local target_model="$1"
-    echo "🎯 全局会话默认模型已同步变变成: $target_model"
-}
-
-# =======================================================================
-# 核心数据操作区域 (包含 Python / JQ 以及机器人对接子选单)
-# =======================================================================
-
-# 1. 安装 OpenClaw 环境
-install_moltbot() {
-    echo "开始安装 OpenClaw..."
-    send_stats "开始安装 OpenClaw..."
-    install git jq curl python3 tmux
-
-    install_node_and_tools
-
-    local country
-    country=$(curl -s --max-time 3 ipinfo.io/country)
-    if [[ "$country" == "CN" || "$country" == "HK" ]]; then
-        npm config set registry https://registry.npmmirror.com
-    fi
-
-    git config --global url."${gh_proxy}github.com/".insteadOf ssh://git@github.com/
-    git config --global url."${gh_proxy}github.com/".insteadOf git@github.com:
-
-    sudo npm install -g openclaw@latest
-    openclaw onboard --install-daemon
-    start_gateway
-    break_end
-}
-
-# 4. 状态日志查看
-view_logs() {
-    echo "📋 查看 OpenClaw 状态日志"
-    send_stats "查看 OpenClaw 日志"
-    openclaw status
-    echo "----------------------------------------"
-    openclaw gateway status
-    echo "💡 提示: 正在加载实时日志流，按 Ctrl+C 可退出当前日志模式"
-    sleep 2
-    openclaw logs
-    break_end
-}
-
-
-# ==============================================================================
-# OpenClaw API & 模型管理核心模块 
-# ==============================================================================
-
-# 构造模型配置 JSON
-build-openclaw-provider-models-json() {
-    local provider_name="$1"
-    local model_ids="$2"
-    local models_array="["
-    local first=true
-
-    while read -r model_id; do
-        [ -z "$model_id" ] && continue
-        [[ $first == false ]] && models_array+=","
-        first=false
-
-        local context_window=1048576
-        local max_tokens=128000
-        local input_cost=0.15
-        local output_cost=0.60
-
-        case "$model_id" in
-            *opus*|*pro*|*preview*|*thinking*|*sonnet*)
-                input_cost=2.00
-                output_cost=12.00
-                ;;
-            *gpt-5*|*codex*)
-                input_cost=1.25
-                output_cost=10.00
-                ;;
-            *flash*|*lite*|*haiku*|*mini*|*nano*)
-                input_cost=0.10
-                output_cost=0.40
-                ;;
-        esac
-
-        models_array+=$(cat <<EOF
-{
-    "id": "$model_id",
-    "name": "$provider_name / $model_id",
-    "input": ["text", "image"],
-    "contextWindow": $context_window,
-    "maxTokens": $max_tokens,
-    "cost": {
-        "input": $input_cost,
-        "output": $output_cost,
-        "cacheRead": 0,
-        "cacheWrite": 0
-    }
-}
-EOF
-)
-    done <<< "$model_ids"
-
-    models_array+="]"
-    echo "$models_array"
-}
-
-# 写入 provider 与模型配置
-write-openclaw-provider-models() {
-    local provider_name="$1"
-    local base_url="$2"
-    local api_key="$3"
-    local models_array="$4"
-    local config_file
-    config_file=$(openclaw_get_config_file)
-
-    DETECTED_API="openai-completions"
-
-    [[ -f "$config_file" ]] && cp "$config_file" "${config_file}.bak.$(date +%s)"
-
-    jq --arg prov "$provider_name" \
-       --arg url "$base_url" \
-       --arg key "$api_key" \
-       --arg api "$DETECTED_API" \
-       --argjson models "$models_array" \
-    '
-    .models |= (
-        (. // { mode: "merge", providers: {} })
-        | .mode = "merge"
-        | .providers[$prov] = {
-            baseUrl: $url,
-            apiKey: $key,
-            api: $api,
-            models: $models
-        }
-    )
-    | .agents |= (. // {})
-    | .agents.defaults |= (. // {})
-    | .agents.defaults.models |= (
-        (if type == "object" then .
-         elif type == "array" then reduce .[] as $m ({}; if ($m|type) == "string" then .[$m] = {} else . end)
-         else {}
-         end) as $existing
-        | reduce ($models[]? | .id? // empty | tostring) as $mid (
-            $existing;
-            if ($mid | length) > 0 then
-                .["\($prov)/\($mid)"] //= {}
-            else
-                .
-            end
-        )
-    )
-    ' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
-}
-
-# 核心函数：获取并添加所有模型
-add-all-models-from-provider() {
-    local provider_name="$1"
-    local base_url="$2"
-    local api_key="$3"
-
-    echo "🔍 正在获取 $provider_name 的所有可用模型..."
-
-    local models_json=$(curl -s -m 10 \
-        -H "Authorization: Bearer $api_key" \
-        "${base_url}/models")
-
-    if [[ -z "$models_json" ]]; then
-        echo "❌ 无法获取模型列表"
-        return 1
-    fi
-
-    local model_ids=$(echo "$models_json" | grep -oP '"id":\s*"\K[^"]+')
-
-    if [[ -z "$model_ids" ]]; then
-        echo "❌ 未找到任何模型"
-        return 1
-    fi
-
-    local model_count=$(echo "$model_ids" | wc -l)
-    echo "✅ 发现 $model_count 个模型"
-
-    local models_array
-    models_array=$(build-openclaw-provider-models-json "$provider_name" "$model_ids")
-
-    write-openclaw-provider-models "$provider_name" "$base_url" "$api_key" "$models_array"
-
-    if [[ $? -eq 0 ]]; then
-        echo "✅ 成功添加 $model_count 个模型到 $provider_name"
-        echo "📦 模型引用格式: $provider_name/<model-id>"
+validate_ip() {
+    local ip=$1
+    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS='.'
+        local -a octets=($ip)
+        for octet in "${octets[@]}"; do
+            if ((octet > 255)); then return 1; fi
+        done
         return 0
+    fi
+    return 1
+}
+
+validate_ip_or_cidr() {
+    local value=$1
+    local ip="${value%/*}"
+    if [[ "$value" == */* ]]; then
+        local cidr="${value#*/}"
+        if ! [[ "$cidr" =~ ^[0-9]+$ ]] || ((cidr < 0 || cidr > 32)); then return 1; fi
+    fi
+    validate_ip "$ip"
+}
+
+detect_arch() {
+    local machine=$(uname -m)
+    if [ "$machine" = "x86_64" ]; then
+        echo "amd64"
+    elif [ "$machine" = "aarch64" ] || [ "$machine" = "arm64" ]; then
+        echo "arm64"
     else
-        echo "❌ 配置注入失败"
-        return 1
+        echo "unknown"
     fi
 }
 
-# 仅添加默认模型并保留 provider
-add-default-model-only-to-provider() {
-    local provider_name="$1"
-    local base_url="$2"
-    local api_key="$3"
-    local default_model="$4"
-
-    if [[ -z "$default_model" ]]; then
-        echo "❌ 默认模型不能为空"
-        return 1
-    fi
-
-    local models_array
-    models_array=$(build-openclaw-provider-models-json "$provider_name" "$default_model")
-
-    write-openclaw-provider-models "$provider_name" "$base_url" "$api_key" "$models_array"
-
-    if [[ $? -eq 0 ]]; then
-        echo "✅ 已添加 provider：$provider_name"
-        echo "✅ 仅写入默认模型：$default_model"
-        return 0
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$ID"
+    elif [ -f /etc/redhat-release ]; then
+        echo "centos"
     else
-        echo "❌ 配置注入失败"
-        return 1
+        echo "unknown"
     fi
 }
 
-# 交互式添加 API 供应商引导
-add-openclaw-provider-interactive() {
-    send_stats "OpenClaw API添加"
-    echo "=== 交互式添加 OpenClaw Provider ==="
-
-    read -erp "请输入 Provider 名称 (如: deepseek): " provider_name
-    while [[ -z "$provider_name" ]]; do
-        echo "❌ Provider 名称不能为空"
-        read -erp "请输入 Provider 名称: " provider_name
-    done
-
-    read -erp "请输入 Base URL (如: https://api.xxx.com/v1): " base_url
-    while [[ -z "$base_url" ]]; do
-        echo "❌ Base URL 不能为空"
-        read -erp "请输入 Base URL: " base_url
-    done
-    base_url="${base_url%/}"
-
-    read -rsp "请输入 API Key (输入不显示): " api_key
-    echo
-    while [[ -z "$api_key" ]]; do
-        echo "❌ API Key 不能为空"
-        read -rsp "请输入 API Key: " api_key
-        echo
-    done
-
-    echo "🔍 正在获取可用模型列表..."
-    local models_json
-    models_json=$(curl -s -m 10 \
-        -H "Authorization: Bearer $api_key" \
-        "${base_url}/models")
-
-    local available_models=""
-    local model_count=0
-    local model_list=()
-
-    if [[ -n "$models_json" ]]; then
-        available_models=$(echo "$models_json" | grep -oP '"id":\s*"\K[^"]+' | sort)
-
-        if [[ -n "$available_models" ]]; then
-            model_count=$(echo "$available_models" | wc -l)
-            echo "✅ 发现 $model_count 个可用模型："
-            echo "--------------------------------"
-            local i=1
-            while read -r model; do
-                echo "[$i] $model"
-                model_list+=("$model")
-                ((i++))
-            done <<< "$available_models"
-            echo "--------------------------------"
-        fi
-    fi
-
-    echo
-    read -erp "请输入默认 Model ID (或序号，留空则使用第一个): " input_model
-
-    local default_model=""
-    if [[ -z "$input_model" && -n "$available_models" ]]; then
-        default_model=$(echo "$available_models" | head -1)
-        echo "🎯 使用第一个模型: $default_model"
-    elif [[ "$input_model" =~ ^[0-9]+$ ]] && [ "${#model_list[@]}" -gt 0 ] && [ "$input_model" -ge 1 ] && [ "$input_model" -le "${#model_list[@]}" ]; then
-        default_model="${model_list[$((input_model-1))]}"
-        echo "🎯 已选择模型: $default_model"
-    else
-        default_model="$input_model"
-    fi
-
-    echo
-    echo "====== 确认信息 ======"
-    echo "Provider    : $provider_name"
-    echo "Base URL    : $base_url"
-    echo "API Key     : ${api_key:0:8}****"
-    echo "默认模型    : $default_model"
-    echo "模型总数    : $model_count"
-    echo "======================"
-
-    read -erp "是否同时添加其他所有可用模型？(y/N): " confirm
-
-    install jq
-    local add_result=1
-    local finish_msg=""
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        add-all-models-from-provider "$provider_name" "$base_url" "$api_key"
-        add_result=$?
-        finish_msg="✅ 完成！所有 $model_count 个模型已加载"
-    else
-        add-default-model-only-to-provider "$provider_name" "$base_url" "$api_key" "$default_model"
-        add_result=$?
-        finish_msg="✅ 完成！已保留 provider，并仅加载默认模型：$default_model"
-    fi
-
-    if [[ $add_result -eq 0 ]]; then
-        echo
-        echo "🔄 设置默认模型并重启网关..."
-        openclaw models set "$provider_name/$default_model"
-        openclaw_sync_sessions_model "$provider_name/$default_model"
-        start_gateway
-        echo "$finish_msg"
-        echo "✅ 当前 API 协议类型: $DETECTED_API"
-    fi
-
-    break_end
-}
-
-# 打印配置的 API 列表及测速 (Python 高性能内嵌版)
-openclaw_api_manage_list() {
-    local config_file
-    config_file=$(openclaw_get_config_file)
-    send_stats "OpenClaw API列表"
-
-    while IFS=$'\t' read -r rec_type idx name base_url model_count api_type latency_txt latency_level; do
-        case "$rec_type" in
-            MSG)
-                echo "$idx"
-                ;;
-            ROW)
-                local latency_color="$gl_bai"
-                case "$latency_level" in
-                    low) latency_color="$gl_lv" ;;
-                    medium) latency_color="$gl_huang" ;;
-                    high|unavailable) latency_color="$gl_hong" ;;
-                    unchecked) latency_color="$gl_bai" ;;
-                esac
-
-                printf '%b\n' "[$idx] ${name} | API: ${base_url} | 协议: ${api_type} | 模型数量: ${gl_huang}${model_count}${gl_bai} | 延迟/状态: ${latency_color}${latency_txt}${gl_bai}"
-                ;;
-        esac
-    done < <(python3 - "$config_file" <<-'PY'
-import json
-import sys
-import time
-import urllib.request
-
-path = sys.argv[1]
-SUPPORTED_APIS = {'openai-completions', 'openai-responses'}
-
-def ping_models(base_url, api_key):
-    req = urllib.request.Request(
-        base_url.rstrip('/') + '/models',
-        headers={
-            'Authorization': f'Bearer {api_key}',
-            'User-Agent': 'OpenClaw-API-Manage/1.0',
-        },
-    )
-    start = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=4) as resp:
-        resp.read(2048)
-    return int((time.perf_counter() - start) * 1000)
-
-def classify_latency(latency):
-    if latency == '不可用':
-        return '不可用', 'unavailable'
-    if latency == '未检测':
-        return '未检测', 'unchecked'
-    if isinstance(latency, int):
-        if latency <= 800:
-            return f'{latency}ms', 'low'
-        elif latency <= 2000:
-            return f'{latency}ms', 'medium'
-        else:
-            return f'{latency}ms', 'high'
-    return str(latency), 'unchecked'
-
-try:
-    with open(path, 'r', encoding='utf-8') as f:
-        obj = json.load(f)
-except FileNotFoundError:
-    print('MSG\tℹ️ 未找到配置文件，请先完成安装/初始化。')
-    raise SystemExit(0)
-except Exception as e:
-    print(f'MSG\t❌ 读取配置失败: {type(e).__name__}: {e}')
-    raise SystemExit(0)
-
-providers = ((obj.get('models') or {}).get('providers') or {})
-if not isinstance(providers, dict) or not providers:
-    print('MSG\tℹ️ 当前未配置任何 API provider。')
-    raise SystemExit(0)
-
-print('MSG\t--- 已配置 API 列表 ---')
-
-for idx, name in enumerate(sorted(providers.keys()), start=1):
-    provider = providers.get(name)
-    if not isinstance(provider, dict):
-        base_url = '-'
-        model_count = 0
-        latency_raw = '不可用'
-        api = ''
-    else:
-        base_url = provider.get('baseUrl') or provider.get('url') or provider.get('endpoint') or '-'
-        models = provider.get('models') if isinstance(provider.get('models'), list) else []
-        model_count = sum(1 for m in models if isinstance(m, dict) and m.get('id'))
-        api = provider.get('api', '')
-        api_key = provider.get('apiKey')
-
-        latency_raw = '未检测'
-        if api in SUPPORTED_APIS:
-            if isinstance(base_url, str) and base_url != '-' and isinstance(api_key, str) and api_key:
-                try:
-                    latency_raw = ping_models(base_url, api_key)
-                except Exception:
-                    latency_raw = '不可用'
-            else:
-                latency_raw = '不可用'
-
-    latency_text, latency_level = classify_latency(latency_raw)
-    api_label = api if api in SUPPORTED_APIS else '-'
-    print('ROW\t' + '\t'.join([str(idx), str(name), str(base_url), str(model_count), str(api_label), str(latency_text), str(latency_level)]))
-PY
-)
-}
-
-# 核心重构：支持 单渠道 & 全渠道 闭环同步模型函数
-sync-openclaw-provider-interactive() {
-    local config_file
-    config_file=$(openclaw_get_config_file)
-    send_stats "OpenClaw API同步入口"
-
-    if [ ! -f "$config_file" ]; then
-        echo "❌ 未找到配置文件: $config_file"
-        break_end
-        return 1
-    fi
-
-    read -erp "请输入要同步的 API 名称(provider)，直接回车将自动同步全部: " provider_name
+install_dependency() {
+    local pkg=$1
+    if command -v "$pkg" &> /dev/null; then return 0; fi
     
-    # 传递目标渠道给 Python 处理，空字符串代表同步全部
-    install jq curl >/dev/null 2>&1
-    echo "🔄 正在请求上游接口进行模型对齐比对，请稍候..."
+    print_info "正在安装依赖 $pkg..."
+    local os_type=$(detect_os)
+    if [[ "$os_type" == "ubuntu" || "$os_type" == "debian" ]]; then
+        apt-get update -qq && apt-get install -y "$pkg"
+    elif [[ "$os_type" == "centos" || "$os_type" == "rhel" || "$os_type" == "fedora" ]]; then
+        yum install -y "$pkg"
+    else
+        print_error "未知的系统组件，请手动安装 $pkg 后重试。"
+        exit 1
+    fi
+}
 
-    python3 - "$config_file" "$provider_name" <<'PY_SYNC'
-import copy
-import json
-import sys
-import time
-import urllib.request
+# ==================== 核心模块 1：SNIProxy 管理 ====================
+persist_firewall_rules() {
+    if command -v netfilter-persistent &> /dev/null; then
+        netfilter-persistent save >/dev/null 2>&1 && print_success "防火墙规则已持久化。"
+    elif command -v iptables-save &> /dev/null && [ -d /etc/iptables ]; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null && print_success "iptables 规则已保存至 /etc/iptables/rules.v4。"
+    else
+        print_warning "未检测到 iptables 持久化工具，重启后白名单可能会失效。"
+    fi
+}
 
-path = sys.argv[1]
-target_filter = sys.argv[2].strip()
+clear_client_allowlist() {
+    ensure_root
+    print_info "正在清空客户端 IP 白名单，恢复为允许所有 IP 访问..."
+    if command -v iptables &> /dev/null; then
+        while iptables -C INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN" 2>/dev/null; do
+            iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN"
+        done
+        iptables -F "$FIREWALL_CHAIN" 2>/dev/null || true
+        iptables -X "$FIREWALL_CHAIN" 2>/dev/null || true
+    fi
+    rm -f "$ALLOWLIST_FILE"
+    persist_firewall_rules
+    if systemctl is-active --quiet sniproxy; then
+        systemctl restart sniproxy
+    fi
+    print_success "已恢复为允许所有 IP 访问 SNIProxy。"
+}
 
-with open(path, 'r', encoding='utf-8') as f:
-    obj = json.load(f)
-
-work = copy.deepcopy(obj)
-models_cfg = work.setdefault('models', {})
-providers = models_cfg.get('providers', {})
-
-if not isinstance(providers, dict) or not providers:
-    print('❌ 错误：未检测到任何已配置的 API providers')
-    sys.exit(2)
-
-# 筛选出需要同步的名单
-targets = []
-if target_filter:
-    if target_filter not in providers:
-        print(f'❌ 错误：未找到指定的 provider: {target_filter}')
-        sys.exit(2)
-    targets.append(target_filter)
-else:
-    targets = sorted(list(providers.keys()))
-
-agents = work.setdefault('agents', {})
-defaults = agents.setdefault('defaults', {})
-defaults_models_raw = defaults.get('models')
-if isinstance(defaults_models_raw, dict):
-    defaults_models = defaults_models_raw
-elif isinstance(defaults_models_raw, list):
-    defaults_models = {str(x): {} for x in defaults_models_raw if isinstance(x, str)}
-else:
-    defaults_models = {}
-defaults['models'] = defaults_models
-
-def model_ref(p_name, m_id):
-    return f"{p_name}/{m_id}"
-
-def get_primary_ref(d_obj):
-    m_obj = d_obj.get('model')
-    if isinstance(m_obj, str): return m_obj
-    if isinstance(m_obj, dict): return m_obj.get('primary')
-    return None
-
-def set_primary_ref(d_obj, new_ref):
-    m_obj = d_obj.get('model')
-    if isinstance(m_obj, str): d_obj['model'] = new_ref
-    elif isinstance(m_obj, dict): m_obj['primary'] = new_ref
-    else: d_obj['model'] = {'primary': new_ref}
-
-def fetch_remote_models(base_url, api_key):
-    req = urllib.request.Request(
-        base_url.rstrip('/') + '/models',
-        headers={'Authorization': f'Bearer {api_key}', 'User-Agent': 'Mozilla/5.0'}
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode('utf-8', 'ignore'))
-
-global_changed = False
-success_count = 0
-
-for target in targets:
-    provider = providers[target]
-    if not isinstance(provider, dict): continue
+apply_client_allowlist() {
+    local allowed_ips=("$@")
+    check_command "iptables"
     
-    base_url = provider.get('baseUrl')
-    api_key = provider.get('apiKey')
-    model_list = provider.get('models', [])
-    
-    if not base_url or not api_key:
-        print(f'⚠️  跳过 {target}: 缺少 baseUrl 或 apiKey 配置')
-        continue
-        
-    try:
-        data = fetch_remote_models(base_url, api_key)
-        if not (isinstance(data, dict) and isinstance(data.get('data'), list)):
-            print(f'❌ {target}: /models 返回格式无法识别')
-            continue
-            
-        remote_ids = [str(item['id']) for item in data['data'] if isinstance(item, dict) and item.get('id')]
-        remote_set = set(remote_ids)
-        if not remote_set:
-            print(f'❌ {target}: 上游返回的模型列表为空，放弃同步该通道')
-            continue
-            
-        local_models = [m for m in model_list if isinstance(m, dict) and m.get('id')]
-        local_ids = [str(m['id']) for m in local_models]
-        local_set = set(local_ids)
-        
-        template = copy.deepcopy(local_models[0]) if local_models else {
-            "id": "", "name": "", "input": ["text", "image"],
-            "contextWindow": 1048576, "maxTokens": 128000,
-            "cost": {"input": 0.15, "output": 0.60, "cacheRead": 0, "cacheWrite": 0}
-        }
-        
-        removed_ids = [mid for mid in local_ids if mid not in remote_set]
-        added_ids = [mid for mid in remote_ids if mid not in local_set]
-        
-        kept_models = [copy.deepcopy(m) for m in local_models if str(m['id']) in remote_set]
-        new_models = kept_models[:]
-        for mid in added_ids:
-            nm = copy.deepcopy(template)
-            nm['id'] = mid
-            nm['name'] = f'{target} / {mid}'
-            new_models.append(nm)
-            
-        if not new_models:
-            print(f'❌ {target}: 同步后无任何可用模型，放弃修改该通道')
-            continue
-            
-        expected_refs = {model_ref(target, str(m['id'])) for m in new_models}
-        local_refs = {model_ref(target, mid) for mid in local_ids}
-        removed_refs = local_refs - expected_refs
-        first_ref = model_ref(target, str(new_models[0]['id']))
-        
-        # 兜底清理失效引用
-        primary_ref = get_primary_ref(defaults)
-        if isinstance(primary_ref, str) and primary_ref in removed_refs:
-            set_primary_ref(defaults, first_ref)
-            print(f'🔁 {target}: 默认主模型指向已失效，降级替换为: {first_ref}')
-            global_changed = True
-            
-        for fk in ('modelFallback', 'imageModelFallback'):
-            val = defaults.get(fk)
-            if isinstance(val, str) and val in removed_refs:
-                defaults[fk] = first_ref
-                global_changed = True
-                
-        stale_refs = [r for r in list(defaults_models.keys()) if r.startswith(target + '/') and r not in expected_refs]
-        for r in stale_refs:
-            defaults_models.pop(r, None)
-            global_changed = True
-            
-        for r in sorted(expected_refs):
-            if r not in defaults_models:
-                defaults_models[r] = {}
-                global_changed = True
-                
-        if removed_ids or added_ids or len(local_models) != len(new_models):
-            provider['models'] = new_models
-            global_changed = True
-            
-        print(f'✅ {target}: 同步成功 (新增 {len(added_ids)} 个, 移除 {len(removed_ids)} 个, 当前总计 {len(new_models)} 个)')
-        success_count += 1
-        
-    except Exception as e:
-        print(f'❌ {target}: 同游连接握手失败 ({type(e).__name__})')
+    print_info "正在应用客户端 IP 白名单..."
+    iptables -N "$FIREWALL_CHAIN" 2>/dev/null || true
+    iptables -F "$FIREWALL_CHAIN"
 
-if global_changed:
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(work, f, ensure_ascii=False, indent=2)
-        f.write('\n')
-
-if success_count > 0:
-    sys.exit(0)
-else:
-    sys.exit(5)
-PY_SYNC
-    local rc=$?
-    if [ $rc -eq 0 ]; then
-        echo "✅ 同步任务圆满执行结束"
-        start_gateway
-    else
-        echo "❌ 同步失败：未成功对齐任何供应商模型。请检查网络连接及 API /models 返回结果。"
-    fi
-    break_end
-}
-
-# 销毁与卸载指定 Provider
-delete-openclaw-provider-interactive() {
-    local config_file
-    config_file=$(openclaw_get_config_file)
-    send_stats "OpenClaw API删除入口"
-
-    if [ ! -f "$config_file" ]; then
-        echo "❌ 未找到配置文件: $config_file"
-        break_end
-        return 1
-    fi
-
-    read -erp "请输入要删除的 API 名称(provider): " provider_name
-    if [ -z "$provider_name" ]; then
-        send_stats "OpenClaw API删除取消"
-        echo "❌ provider 名称不能为空"
-        break_end
-        return 1
-    fi
-
-    python3 - "$config_file" "$provider_name" <<'PY'
-import copy
-import json
-import sys
-
-path = sys.argv[1]
-name = sys.argv[2]
-
-with open(path, 'r', encoding='utf-8') as f:
-    obj = json.load(f)
-
-work = copy.deepcopy(obj)
-models_cfg = work.setdefault('models', {})
-providers = models_cfg.get('providers', {})
-if not isinstance(providers, dict) or name not in providers:
-    print(f'❌ 未找到 provider: {name}')
-    raise SystemExit(2)
-
-agents = work.setdefault('agents', {})
-defaults = agents.setdefault('defaults', {})
-defaults_models_raw = defaults.get('models')
-if isinstance(defaults_models_raw, dict):
-    defaults_models = defaults_models_raw
-elif isinstance(defaults_models_raw, list):
-    defaults_models = {str(x): {} for x in defaults_models_raw if isinstance(x, str)}
-else:
-    defaults_models = {}
-defaults['models'] = defaults_models
-
-def model_ref(provider_name, model_id):
-    return f"{provider_name}/{model_id}"
-
-def ref_provider(ref):
-    if not isinstance(ref, str) or '/' not in ref:
-        return None
-    return ref.split('/', 1)[0]
-
-def get_primary_ref(defaults_obj):
-    model_obj = defaults_obj.get('model')
-    if isinstance(model_obj, str):
-        return model_obj
-    if isinstance(model_obj, dict):
-        return model_obj.get('primary')
-    return None
-
-def set_primary_ref(defaults_obj, new_ref):
-    model_obj = defaults_obj.get('model')
-    if isinstance(model_obj, str):
-        defaults_obj['model'] = new_ref
-    elif isinstance(model_obj, dict):
-        model_obj['primary'] = new_ref
-    else:
-        defaults_obj['model'] = {'primary': new_ref}
-
-def collect_available_refs(exclude_provider=None):
-    refs = []
-    if not isinstance(providers, dict):
-        return refs
-    for pname, p in providers.items():
-        if exclude_provider and pname == exclude_provider:
-            continue
-        if not isinstance(p, dict):
-            continue
-        for m in p.get('models', []) or []:
-            if isinstance(m, dict) and m.get('id'):
-                refs.append(model_ref(pname, str(m['id'])))
-    return refs
-
-replacement_candidates = collect_available_refs(exclude_provider=name)
-replacement = replacement_candidates[0] if replacement_candidates else None
-
-primary_ref = get_primary_ref(defaults)
-if ref_provider(primary_ref) == name:
-    if not replacement:
-        print('❌ 删除中止：默认主模型指向该 provider，且无可用替代模型')
-        raise SystemExit(3)
-    set_primary_ref(defaults, replacement)
-    print(f'🔁 默认主模型切换: {primary_ref} -> {replacement}')
-
-for fk in ('modelFallback', 'imageModelFallback'):
-    val = defaults.get(fk)
-    if ref_provider(val) == name:
-        if not replacement:
-            print(f'❌ 删除中止：{fk} 指向该 provider，且无可用替代模型')
-            raise SystemExit(3)
-        defaults[fk] = replacement
-        print(f'🔁 {fk} 切换: {val} -> {replacement}')
-
-removed_refs = [r for r in list(defaults_models.keys()) if r.startswith(name + '/')]
-for r in removed_refs:
-    defaults_models.pop(r, None)
-
-providers.pop(name, None)
-
-with open(path, 'w', encoding='utf-8') as f:
-    json.dump(work, f, ensure_ascii=False, indent=2)
-    f.write('\n')
-
-print(f'🗑️ 已删除 provider: {name}')
-print(f'🧹 已清理 defaults.models 中 {len(removed_refs)} 个关联模型引用')
-PY
-    local rc=$?
-    case "$rc" in
-        0) send_stats "OpenClaw API删除确认"; echo "✅ 删除完成"; start_gateway ;;
-        2) echo "❌ 删除失败：provider 不存在" ;;
-        3) send_stats "OpenClaw API删除取消"; echo "❌ 删除失败：无可用替代模型，已保持原配置" ;;
-        *) echo "❌ 删除失败：请检查配置文件结构或日志输出" ;;
-    esac
-    break_end
-}
-
-# ==============================================================================
-#  API & 模型管理
-# ==============================================================================
-openclaw_api_manage_menu() {
-    send_stats "OpenClaw API入口"
-    local config_file
-    config_file=$(openclaw_get_config_file)
-
-    while true; do
-        clear
-        local current_model="未设置"
-        if [ -f "$config_file" ]; then
-            current_model=$(jq -r '.agents.defaults.model.primary // "未设置"' "$config_file" 2>/dev/null)
-        fi
-
-        echo -e "${gl_lv}=======================================${gl_bai}"
-        echo -e "${gl_lv}             API & 模型管理            ${gl_bai}"
-        echo -e "${gl_lv}=======================================${gl_bai}"
-        echo -e "当前激活模型: ${gl_huang}${current_model}${gl_bai}"
-        echo -e "${gl_lv}=======================================${gl_bai}"
-        
-        # 显示实时 API 状态快照
-        openclaw_api_manage_list
-        
-        echo -e "${gl_lv}=======================================${gl_bai}"
-        echo -e "${gl_lv}1. 切换模型${gl_bai}"
-        echo -e "${gl_lv}2. 添加 API 供应商${gl_bai}"
-        echo -e "${gl_lv}3. 同步 API 供应商模型列表${gl_bai}"
-        echo -e "${gl_lv}4. 删除 API 供应商${gl_bai}"
-        echo -e "${gl_lv}5. 查看已加模型信息${gl_bai}"
-        echo -e "${gl_lv}0. 返回主菜单${gl_bai}"
-        echo -e "${gl_lv}=======================================${gl_bai}"
-        read -erp "请输入你的选择: " api_choice
-
-        case "$api_choice" in
-            1)
-                clear
-                echo -e "${gl_huang}--- 切换默认激活模型 ---${gl_bai}"
-                if [ ! -f "$config_file" ]; then
-                    echo -e "${gl_hong}❌ 配置文件不存在！${gl_bai}"; sleep 1; continue
-                fi
-
-                local models_str
-                models_str=$(jq -r '.models.providers | to_entries[] | .key as $p | .value.models[] | "\($p)/\(.id)"' "$config_file" 2>/dev/null)
-                if [ -z "$models_str" ]; then
-                    echo -e "${gl_hong}❌ 未发现可用模型，请先添加供应商！${gl_bai}"
-                    break_end; continue
-                fi
-
-                mapfile -t models_array <<< "$models_str"
-                
-                echo -e "当前可用模型列表："
-                echo -e "---------------------------------------"
-                local i=1
-                for m in "${models_array[@]}"; do
-                    echo -e " [${i}] $m"
-                    ((i++))
-                done
-                echo -e "---------------------------------------"
-                
-                read -erp "请选择目标模型序号 (输入 0 取消): " model_idx
-                if [[ "$model_idx" == "0" ]] || [ -z "$model_idx" ]; then
-                    continue
-                fi
-
-                if [[ "$model_idx" =~ ^[0-9]+$ ]] && [ "$model_idx" -ge 1 ] && [ "$model_idx" -le "${#models_array[@]}" ]; then
-                    local target_model="${models_array[$((model_idx-1))]}"
-                    
-                    echo -e "🔄 正在切换并写入配置..."
-                    local tmp_json
-                    tmp_json=$(jq --arg p "$target_model" '.agents.defaults.model.primary = $p | .agents.defaults.models = {($p): {}}' "$config_file")
-                    echo "$tmp_json" > "$config_file"
-
-                    # 一致性序列重载
-                    openclaw models set "$target_model"
-                    openclaw_sync_sessions_model "$target_model"
-                    
-                    start_gateway
-                    echo -e "${gl_lv}✅ 成功激活并重载主模型: $target_model${gl_bai}"
-                else
-                    echo -e "${gl_hong}❌ 输入序号无效！${gl_bai}"
-                fi
-                break_end
-                ;;
-
-            2) clear; add-openclaw-provider-interactive ;;
-            3) sync-openclaw-provider-interactive ;;
-            4) delete-openclaw-provider-interactive ;;
-            5)
-                clear
-                echo -e "${gl_lv}=======================================${gl_bai}"
-                echo -e "${gl_lv}         已加载 API 供应商详细快照       ${gl_bai}"
-                echo -e "${gl_lv}=======================================${gl_bai}"
-                if [ ! -f "$config_file" ]; then 
-                    echo "${gl_huang}暂无配置数据)${gl_bai}"
-                else
-                    local p_detail
-                    p_detail=$(jq -c '.models.providers | to_entries[]' "$config_file" 2>/dev/null)
-                    if [ -z "$p_detail" ]; then
-                        echo -e "  ${gl_huang}(暂无任何有效配置)${gl_bai}"
-                    else
-                        while read -r row; do
-                            [ -z "$row" ] && continue
-                            local det_name=$(echo "$row" | jq -r .key)
-                            local det_url=$(echo "$row" | jq -r .value.baseUrl)
-                            local det_key=$(echo "$row" | jq -r .value.apiKey)
-                            local det_api=$(echo "$row" | jq -r '.value.api // "未指定"')
-                            local det_models=$(echo "$row" | jq -r '.value.models[].id' | tr '\n' ',' | sed 's/,$//')
-                            
-                            # ============ 替换开始：直接显示完整 Key ============
-                            local short_key=""
-                            if [[ -z "$det_key" ]] || [[ "$det_key" == "null" ]] || [[ "$det_key" == "None" ]]; then
-                                short_key="无"
-                            else
-                                short_key="$det_key"
-                            fi
-                            # ============ 替换结束 ============================
-
-                            echo -e "${gl_lv}◈ 供应商名称:${gl_bai} ${gl_huang}${det_name}${gl_bai}"
-                            echo -e "  ├─ 协议类型: ${gl_lv}${det_api}${gl_bai}"
-                            echo -e "  ├─ Base URL: ${gl_bai}${det_url}"
-                            echo -e "  ├─ API Key : ${gl_bai}${short_key}"
-                            echo -e "  └─ 包含模型: ${gl_lv}${det_models}${gl_bai}"
-                            echo -e "${gl_lv}---------------------------------------${gl_bai}"
-                        done <<< "$p_detail"
-                    fi
-                fi
-                break_end
-                ;;
-            0) return 0 ;;
-            *) echo -e "${gl_hong}❌ 无效的选择，请重试。${gl_bai}"; sleep 1 ;;
-        esac
+    for ip in "${allowed_ips[@]}"; do
+        iptables -A "$FIREWALL_CHAIN" -p tcp --dport "$LISTEN_PORT" -s "$ip" -j ACCEPT
     done
-}
+    iptables -A "$FIREWALL_CHAIN" -p tcp --dport "$LISTEN_PORT" -j DROP
 
-# 7. 机器人连接对接交互式子选单
-bot_connection_menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN}             机器人连接对接              ${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
-        openclaw_show_bot_local_status_block
-         echo -e "${GREEN}========================================${RESET}"
-        echo -e "${GREEN} 1. Telegram 机器人对接${RESET}"
-        echo -e "${GREEN} 2. 飞书 (Lark) 机器人对接${RESET}"
-        echo -e "${GREEN} 3. WhatsApp 机器人对接${RESET}"
-        echo -e "${GREEN} 4. QQ 机器人对接${RESET}"
-        echo -e "${GREEN} 5. 微信机器人对接${RESET}"
-        echo -e "${GREEN} 0. 返回主菜单${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
-        read -erp "请输入你的选择: " bot_choice
-
-        case $bot_choice in
-            1)
-                read -erp "请输入TG机器人收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code
-                if [ "$code" = "0" ] || [ -z "$code" ]; then 
-                    [ -z "$code" ] && echo -e "${RED}错误：连接码不能为空。${RESET}" && sleep 1
-                    continue
-                fi
-                openclaw pairing approve telegram "$code"
-                break_end
-                ;;
-            2)
-                echo -e "${YELLOW}🔄 正在通过 npx 调度部署飞书适配通道...${RESET}"
-                npx -y @larksuite/openclaw-lark install
-                openclaw config set channels.feishu.streaming true
-                openclaw config set channels.feishu.requireMention true --json
-                echo -e "${GREEN}✅ 飞书通道参数设置成功！${RESET}"
-                break_end
-                ;;
-            3)
-                read -erp "请输入WhatsApp收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code
-                if [ "$code" = "0" ] || [ -z "$code" ]; then 
-                    [ -z "$code" ] && echo -e "${RED}错误：连接码不能为空。${RESET}" && sleep 1
-                    continue
-                fi
-                openclaw pairing approve whatsapp "$code"
-                break_end
-                ;;
-            4)
-                echo -e "\n${GREEN}QQ 官方对接指引链接：${RESET}"
-                echo -e "${BLUE}https://q.qq.com/qqbot/openclaw/login.html${RESET}\n"
-                break_end
-                ;;
-            5)
-                echo -e "${YELLOW}🔄 正在下载并注入企业微信/微信开放平台支持组件...${RESET}"
-                npx -y @tencent-weixin/openclaw-weixin-cli@latest install
-                break_end
-                ;;
-            0)
-                return 0
-                ;;
-            *)
-                echo -e "${RED}无效的选择，请重试。${RESET}"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-# 12. 健康检测与自动环境修复
-health_doctor_fix() {
-    echo -e "${GREEN}=== OpenClaw 全自动化故障巡检与修复 ===${RESET}"
-    local config_file
-    config_file=$(openclaw_get_config_file)
-
-    echo -n "[1/3] 核心进程状态扫描: "
-    if pgrep -f "openclaw" &>/dev/null; then
-        echo -e "${GREEN}正常运行${RESET}"
-    else
-        echo -e "${YELLOW}离线。正在为您强制拉起网关进程守护...${RESET}"
-        openclaw gateway start
+    if ! iptables -C INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN" 2>/dev/null; then
+        iptables -I INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN"
     fi
 
-    echo -n "[2/3] 核心配置文件格式校验: "
-    if [ -f "$config_file" ]; then
-        if jq . "$config_file" &>/dev/null; then
-            echo -e "${GREEN}结构合法 (Valid JSON)${RESET}"
-        else
-            echo -e "${RED}结构损坏！正在为您排查加载最近一次的备份恢复...${RESET}"
-            local bak
-            bak=$(ls -t "${config_file}.bak."* 2>/dev/null | head -n 1)
-            if [ -n "$bak" ]; then
-                cp "$bak" "$config_file" && echo -e "${GREEN}已成功还原历史快照配置: $bak${RESET}"
-            else
-                echo -e "${RED}无历史快照备份，建议执行选项 11 重新进行 onboard向导初始化。${RESET}"
-            fi
-        fi
-    else
-        echo -e "${RED}缺失核心配置文件${RESET}"
-    fi
+    mkdir -p "$SNI_BASE_DIR"
+    {
+        echo "# 允许访问 SNIProxy 的客户端 IP/CIDR"
+        printf '%s\n' "${allowed_ips[@]}"
+    } > "$ALLOWLIST_FILE"
 
-    echo -n "[3/3] 全系统底层运行环境依属检测: "
-    if command -v node &>/dev/null && command -v tmux &>/dev/null; then
-        echo -e "${GREEN}环境完备${RESET}"
-    else
-        echo -e "${YELLOW}发现缺失，自动补全修复依赖项...${RESET}"
-        install tmux jq nodejs
+    persist_firewall_rules
+    if systemctl is-active --quiet sniproxy; then
+        systemctl restart sniproxy
     fi
-    break_end
+    print_success "白名单已生效，仅允许指定 IP 访问阻断端口 $LISTEN_PORT。"
 }
 
-# =======================================================================
-# 主菜单及指令控制层
-# =======================================================================
-show_menu() {
-    get_openclaw_status
+manage_client_allowlist() {
+    ensure_root
     clear
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}     ◈    OpenClaw 管理工具    ◈       ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}状态  : $STATUS${RESET}"
-    echo -e "${GREEN}版本  :${RESET} ${YELLOW}$OPENCLAW_VERSION${RESET}"
-    echo -e "${GREEN}模型  :${RESET} ${YELLOW}$CONFIG_COUNT 个 API 供应商${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}  1. 安装 OpenClaw${RESET}"
-    echo -e "${GREEN}  2. 启动 Gateway (消息网关后台)${RESET}"
-    echo -e "${GREEN}  3. 停止 Gateway (消息网关服务)${RESET}"
-    echo -e "${GREEN}  4. 查看状态日志${RESET}"
-    echo -e "${GREEN}  5. API模型切换管理${RESET} "
-    echo -e "${GREEN}  6. 机器人连接对接${RESET}"
-    echo -e "${GREEN}  7. 初始化配置向导${RESET}"
-    echo -e "${GREEN}  8. 健康检测与自动故障修复${RESET}"
-    echo -e "${GREEN}  9. 终端交互式对话UI${RESET}"
-    echo -e "${GREEN} 10. 更新 OpenClaw${RESET}"
-    echo -e "${GREEN} 11. 卸载 OpenClaw${RESET}"
-    echo -e "${GREEN}  0. 退出${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    printf "${GREEN} 请输入选项: ${RESET}"
+    
+    local current_allowed=""
+    [ -f "$ALLOWLIST_FILE" ] && current_allowed=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d')
+    
+    echo -e "${GREEN}=================================${NC}"
+    echo -e "${GREEN}◈ SNIProxy 白名单安全管理 ◈${NC}"
+    echo -e "${GREEN}=================================${NC}"
+    echo -e "${GREEN} 受控拦截端口 :${NC} ${YELLOW}${LISTEN_PORT}${NC}"
+    if [ -n "$current_allowed" ]; then
+        echo -e "${GREEN} 当前已放行的客户端 IP 列表:${NC}"
+        echo "$current_allowed" | sed 's/^/  • /'
+    else
+        echo -e "${GREEN} 当前安全策略 :${NC} ${CYAN}未设限 (任意IP可经由 ${LISTEN_PORT} 端口中转)${NC}"
+    fi
+    echo -e "${GREEN}=================================${NC}"
+    echo -e " ${GREEN}1. 设置/覆盖允许 IP 白名单${NC}"
+    echo -e " ${GREEN}2. 追加允许 IP 到白名单${NC}"
+    echo -e " ${GREEN}3. 清空白名单 (开放所有IP)${NC}"
+    echo -e " ${GREEN}0. 返回主菜单${NC}"
+    echo -e "${GREEN}=================================${NC}"
+    
+    local num=""
+    read -p $'\e[32m请输入选项: \e[0m' num
+    num=$(echo "$num" | xargs 2>/dev/null || echo "")
+
+    case "$num" in
+        1|2)
+            echo -e "\n${YELLOW}[提示] 多个 IP 或 CIDR 请使用空格或逗号分隔${NC}"
+            echo -n -e "${GREEN}请输入客户端 IP/CIDR: ${NC}"
+            local input_ips
+            read_required_input input_ips
+            input_ips=$(echo "$input_ips" | tr ',' ' ')
+
+            local allowed_ips=()
+            if [ "$num" = "2" ] && [ -n "$current_allowed" ]; then
+                while IFS= read -r ip; do [ -n "$ip" ] && allowed_ips+=("$ip"); done <<< "$current_allowed"
+            fi
+
+            for ip in $input_ips; do
+                ip=$(echo "$ip" | tr -d '\r\n' | sed 's/[[:space:]]//g')
+                [ -z "$ip" ] && continue
+                if validate_ip_or_cidr "$ip"; then
+                    allowed_ips+=("$ip")
+                else
+                    print_error "无效的 IP/CIDR 格式: $ip"
+                    return 1
+                fi
+            done
+            
+            [ "${#allowed_ips[@]}" -eq 0 ] && { print_warning "未输入有效IP。"; return 0; }
+            mapfile -t allowed_ips < <(printf '%s\n' "${allowed_ips[@]}" | awk '!seen[$0]++')
+            apply_client_allowlist "${allowed_ips[@]}"
+            ;;
+        3) clear_client_allowlist ;;
+        0) return 0 ;;
+        *) print_error "无效选项" ;;
+    esac
 }
 
+install_sniproxy() {
+    ensure_root
+    if systemctl list-unit-files | grep -q "^sniproxy\.service"; then
+        print_warning "检测到 SNIProxy 已安装。如果需要获取新版本，请选择菜单中的更新选项。"
+        return 0
+    fi
+    
+    print_info "开始全新安装 SNIProxy..."
+    install_dependency "curl"
+    install_dependency "jq"
+    
+    local arch=$(detect_arch)
+    if [ "$arch" = "unknown" ]; then
+        print_error "不支持的系统架构。仅支持 x86_64 与 arm64。"
+        exit 1
+    fi
+
+    print_info "正在获取 SNIProxy 最新版本..."
+    local version=$(curl -sSL "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name')
+    if [ -z "$version" ] || [ "$version" = "null" ]; then
+        print_error "获取最新版本号失败，请检查 network。"
+        exit 1
+    fi
+    print_success "最新版本: $version"
+
+    local tar_name="sniproxy_linux_${arch}.tar.gz"
+    local download_url="https://github.com/XIU2/SNIProxy/releases/download/${version}/${tar_name}"
+    
+    print_info "正在下载: $download_url"
+    if ! curl -fL "$download_url" -o "/tmp/$tar_name"; then
+        print_error "下载 SNIProxy 失败。"
+        exit 1
+    fi
+
+    local tmp_extract="/tmp/sniproxy_$$"
+    mkdir -p "$tmp_extract" "$SNI_BASE_DIR"
+    tar -xzf "/tmp/$tar_name" -C "$tmp_extract"
+    local binary_path=$(find "$tmp_extract" -type f -name "$BINARY_NAME" | head -n 1)
+    
+    mv "$binary_path" "$SNI_BASE_DIR/$BINARY_NAME"
+    chmod +x "$SNI_BASE_DIR/$BINARY_NAME"
+    rm -f "/tmp/$tar_name" && rm -rf "$tmp_extract"
+
+    # 生成初始配置
+    cat <<EOF > "$SNI_BASE_DIR/config.yaml"
+listen_addr: ":$LISTEN_PORT"
+allow_all_hosts: true
+EOF
+
+    # 注册 systemd
+    cat <<EOF > "$SNI_SERVICE_FILE"
+[Unit]
+Description=SNI Proxy
+After=network.target
+
+[Service]
+ExecStart=$SNI_BASE_DIR/$BINARY_NAME -c $SNI_BASE_DIR/config.yaml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable sniproxy
+    systemctl start sniproxy
+    
+    sleep 1
+    if systemctl is-active --quiet sniproxy; then
+        print_success "SNIProxy 安装并成功运行在端口 $LISTEN_PORT 上！"
+    else
+        print_error "服务启动失败，请检查 journalctl -u sniproxy"
+    fi
+}
+
+update_sniproxy() {
+    ensure_root
+    if ! systemctl list-unit-files | grep -q "^sniproxy\.service"; then
+        print_error "系统未检测到已安装的 SNIProxy 服务，无法更新。"
+        return 1
+    fi
+
+    print_info "正在检查并更新 SNIProxy..."
+    install_dependency "curl"
+    install_dependency "jq"
+    
+    local arch=$(detect_arch)
+    local version=$(curl -sSL "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name')
+    if [ -z "$version" ] || [ "$version" = "null" ]; then
+        print_error "获取最新版本号失败。"
+        return 1
+    fi
+
+    print_info "停止旧版 SNIProxy 服务并拉取核心..."
+    systemctl stop sniproxy.service
+
+    local tar_name="sniproxy_linux_${arch}.tar.gz"
+    local download_url="https://github.com/XIU2/SNIProxy/releases/download/${version}/${tar_name}"
+    
+    if curl -fL "$download_url" -o "/tmp/$tar_name"; then
+        local tmp_extract="/tmp/sniproxy_$$"
+        mkdir -p "$tmp_extract"
+        tar -xzf "/tmp/$tar_name" -C "$tmp_extract"
+        local binary_path=$(find "$tmp_extract" -type f -name "$BINARY_NAME" | head -n 1)
+        mv "$binary_path" "$SNI_BASE_DIR/$BINARY_NAME"
+        chmod +x "$SNI_BASE_DIR/$BINARY_NAME"
+        rm -f "/tmp/$tar_name" && rm -rf "$tmp_extract"
+        print_success "更新包替换成功。"
+    else
+        print_error "下载更新资产失败，尝试拉起原有旧核心。"
+    fi
+
+    systemctl start sniproxy
+    print_success "SNIProxy 服务更新流程完成。"
+}
+
+manage_sniproxy_service() {
+    ensure_root
+    if ! systemctl list-unit-files | grep -q "^sniproxy\.service"; then
+        print_error "服务未安装，无法进行状态管理。"
+        return 1
+    fi
+    clear
+    echo -e "${GREEN}=================================${NC}"
+    echo -e "${GREEN}◈ SNIProxy 状态管理 ◈${NC}"
+    echo -e "${GREEN}=================================${NC}"
+    echo -e " ${GREEN}1. 启动服务${NC}"
+    echo -e " ${GREEN}2. 停止服务${NC}"
+    echo -e " ${GREEN}3. 重启服务${NC}"
+    echo -e " ${GREEN}0. 返回${NC}"
+    echo -e "${GREEN}=================================${NC}"
+    
+    local num=""
+    read -p $'\e[32m请输入选项: \e[0m' num
+    num=$(echo "$num" | xargs 2>/dev/null || echo "")
+
+    case "$num" in
+        1) systemctl start sniproxy && print_success "服务已完成启动指令。" ;;
+        2) systemctl stop sniproxy && print_success "服务已完成停止指令。" ;;
+        3) systemctl restart sniproxy && print_success "服务已完成重启指令。" ;;
+        *) return 0 ;;
+    esac
+}
+
+uninstall_sniproxy() {
+    ensure_root
+    print_info "正在完全卸载中转端 SNIProxy 服务..."
+    systemctl stop sniproxy 2>/dev/null || true
+    systemctl disable sniproxy 2>/dev/null || true
+    clear_client_allowlist
+    rm -f "$SNI_SERVICE_FILE"
+    rm -rf "$SNI_BASE_DIR"
+    systemctl daemon-reload
+    print_success "SNIProxy 卸载干净。"
+}
+
+# ==================== 核心模块 2：SmartDNS 管理 ====================
+check_and_fix_port_conflict() {
+    print_info "检查 53 端口占用情况..."
+    local port_usage=""
+    if command -v lsof &> /dev/null; then port_usage=$(lsof -i :53 2>/dev/null); fi
+    if [ -z "$port_usage" ] && command -v ss &> /dev/null; then port_usage=$(ss -tulnp | grep :53 2>/dev/null); fi
+    
+    [ -z "$port_usage" ] && { print_success "端口 53 未被占用。"; return 0; }
+    
+    if echo "$port_usage" | grep -q "systemd-resolve"; then
+        print_warning "发现 systemd-resolved 正在占用端口 53，将尝试自动接管..."
+        ensure_root
+        systemctl stop systemd-resolved
+        systemctl disable systemd-resolved
+        
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        [ -L /etc/resolv.conf ] && rm /etc/resolv.conf
+        [ -f /etc/resolv.conf ] && mv /etc/resolv.conf /etc/resolv.conf.bak.$(date +%u)
+
+        cat > /etc/resolv.conf << 'EOF'
+nameserver 127.0.0.1
+nameserver 1.1.1.1
+EOF
+        if ! chattr +i /etc/resolv.conf 2>/dev/null; then
+            print_warning "环境不支持 chattr 锁定，重置后 resolv.conf 可能会被覆盖。"
+        fi
+        print_success "已成功接管 53 端口系统解析组件。"
+        return 0
+    else
+        print_error "端口 53 被其他未知进程占用，请手动排查:\n$port_usage"
+        return 1
+    fi
+}
+
+install_smartdns_binary() {
+    if command -v smartdns &> /dev/null; then
+        print_warning "检测到 SmartDNS 二进制程序已存在，跳过编译安装。"
+        return 0
+    fi
+    local os_type=$(detect_os)
+    local arch=$(detect_arch)
+    
+    print_info "正在获取 SmartDNS 最新版本资产..."
+    local latest_release=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    [ -z "$latest_release" ] && latest_release="Release47"
+
+    local asset_arch=""
+    if [ "$arch" = "amd64" ]; then asset_arch="x86_64"; else asset_arch="aarch64"; fi
+
+    local download_url=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep "browser_download_url" | grep "$asset_arch-linux-all.tar.gz" | head -n 1 | cut -d '"' -f 4)
+    if [ -z "$download_url" ]; then
+        download_url="https://github.com/pymumu/smartdns/releases/download/${latest_release}/smartdns.${asset_arch}-linux-all.tar.gz"
+    fi
+
+    print_info "下载 SmartDNS 资产包..."
+    cd /tmp
+    if ! wget -q --show-progress "${download_url}" -O smartdns.tar.gz; then
+        print_error "下载 SmartDNS 资产失败。"
+        return 1
+    fi
+
+    tar -xzf smartdns.tar.gz
+    cd smartdns
+    chmod +x ./install
+    ./install -i
+    cd /tmp && rm -rf smartdns smartdns.tar.gz
+    print_success "SmartDNS 核心编译安装完成。"
+    return 0
+}
+
+update_smartdns_binary() {
+    ensure_root
+    if ! command -v smartdns &> /dev/null; then
+        print_error "系统未曾装载 SmartDNS 核心组件，无法执行更新。"
+        return 1
+    fi
+    print_info "准备对本地 SmartDNS 进行核心升级..."
+    systemctl stop smartdns 2>/dev/null || true
+    rm -f $(command -v smartdns)
+    install_smartdns_binary
+    systemctl start smartdns
+    print_success "SmartDNS 升级覆盖工作执行完毕。"
+}
+
+configure_smartdns_rules() {
+    echo -e "\n========================================"
+    print_info "配置流媒体劫持（SmartDNS 侧）"
+    echo -e "========================================\n"
+    echo -n "请输入远端 SNI 解锁机的公网 IP: "
+    local input_ip
+    read_required_input input_ip
+    input_ip=$(echo "$input_ip" | tr -d '\r\n' | sed 's/[[:space:]]//g')
+    
+    if ! validate_ip "$input_ip"; then
+        print_error "输入的 IP 格式错误。"
+        return 1
+    fi
+    UNLOCK_IP="$input_ip"
+
+    check_required_tools() { check_command wget; check_command curl; }
+    check_required_tools
+
+    if ! command -v smartdns &> /dev/null; then
+        print_warning "未检测到 SmartDNS 二进制程序，开始自动安装..."
+        install_smartdns_binary || exit 1
+    fi
+
+    if ! check_and_fix_port_conflict; then exit 1; fi
+
+    print_info "获取官方 SmartDNS 基础模板配置..."
+    wget -q -O "${OUTPUT_FILE}" "${SMARTDNS_CONF_URL}"
+
+    sed -i '/^server /d' "${OUTPUT_FILE}"
+    sed -i '/^bind /d' "${OUTPUT_FILE}"
+
+    cat > "${OUTPUT_FILE}.tmp" << 'EOF'
+# ===== 自动化劫持上游配置 =====
+server 1.1.1.1
+server 8.8.8.8
+bind :53
+cache-size 32768
+prefetch-domain yes
+serve-expired yes
+EOF
+    cat "${OUTPUT_FILE}" >> "${OUTPUT_FILE}.tmp"
+    mv "${OUTPUT_FILE}.tmp" "${OUTPUT_FILE}"
+
+    print_info "获取流媒体解锁域名数据源（450+ 域名）..."
+    curl -s "${DOMAIN_LIST_URL}" -o "${TEMP_DOMAIN_FILE}"
+    
+    cat >> "${OUTPUT_FILE}" << EOF
+
+# ===== 流媒体一键解锁路由规则 =====
+# 目标解锁机: ${UNLOCK_IP}
+EOF
+
+    awk -v ip="${UNLOCK_IP}" '/^[^#[:space:]]/ {print "address /" $1 "/" ip}' "${TEMP_DOMAIN_FILE}" >> "${OUTPUT_FILE}"
+    rm -f "${TEMP_DOMAIN_FILE}"
+
+    mkdir -p /etc/smartdns
+    [ -f /etc/smartdns/smartdns.conf ] && cp /etc/smartdns/smartdns.conf /etc/smartdns/smartdns.conf.bak
+    cp "${OUTPUT_FILE}" /etc/smartdns/smartdns.conf
+    rm -f "${OUTPUT_FILE}"
+
+    print_info "正在启动/重启 SmartDNS 解析引擎..."
+    systemctl enable smartdns &>/dev/null || true
+    systemctl restart smartdns
+
+    sleep 1
+    if systemctl is-active --quiet smartdns; then
+        print_success "解锁端配置大功告成！SmartDNS 现已在 53 端口本地运行。"
+        print_info "规则总条数: $(grep -c "^address " /etc/smartdns/smartdns.conf) 条"
+    else
+        print_error "SmartDNS 运行异常，请通过 'journalctl -u smartdns' 查看系统日志。"
+    fi
+}
+
+manage_smartdns_service() {
+    ensure_root
+    if ! systemctl list-unit-files | grep -q "^smartdns\.service"; then
+        print_error "服务未安装，无法进行状态管理。"
+        return 1
+    fi
+    clear
+    echo -e "${GREEN}=================================${NC}"
+    echo -e "${GREEN}◈ SmartDNS 状态管理 ◈${NC}"
+    echo -e "${GREEN}=================================${NC}"
+    echo -e " ${GREEN}1. 启动服务${NC}"
+    echo -e " ${GREEN}2. 停止服务${NC}"
+    echo -e " ${GREEN}3. 重启服务${NC}"
+    echo -e " ${GREEN}0. 返回${NC}"
+    echo -e "${GREEN}=================================${NC}"
+    
+    local num=""
+    read -p $'\e[32m请输入选项: \e[0m' num
+    num=$(echo "$num" | xargs 2>/dev/null || echo "")
+
+    case "$num" in
+        1) systemctl start smartdns && print_success "服务已完成启动指令。" ;;
+        2) systemctl stop smartdns && print_success "服务已完成停止指令。" ;;
+        3) systemctl restart smartdns && print_success "服务已完成重启指令。" ;;
+        *) return 0 ;;
+    esac
+}
+
+restore_system_defaults() {
+    ensure_root
+    echo -e "\n========================================"
+    print_warning "正在回滚环境并恢复默认 Systemd-resolved 解析"
+    echo -e "========================================\n"
+
+    print_info "停止并清空 SmartDNS 路由..."
+    if systemctl is-active --quiet smartdns 2>/dev/null; then
+        systemctl stop smartdns && systemctl disable smartdns 2>/dev/null || true
+        print_success "SmartDNS 服务已彻底关闭。"
+    fi
+
+    print_info "尝试还原初始化 systemd-resolved 守护进程..."
+    if systemctl list-unit-files | grep -q systemd-resolved; then
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        rm -f /etc/resolv.conf
+        
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+        systemctl enable systemd-resolved 2>/dev/null || true
+        systemctl start systemd-resolved 2>/dev/null || true
+        print_success "系统原生 Systemd-resolved 托管已恢复。"
+    else
+        print_warning "本地不存在 systemd-resolved 单元，将使用静态网络配置代答。"
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        rm -f /etc/resolv.conf
+        cat > /etc/resolv.conf << 'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+    fi
+    
+    if command -v smartdns &> /dev/null; then
+        local smartdns_bin=$(command -v smartdns)
+        rm -f "$smartdns_bin"
+    fi
+    rm -rf /etc/smartdns
+    print_success "网络环境净化还原成功！"
+}
+
+# ==================== 系统主控入口面板 ====================
+# ==================== 系统主控入口 ====================
 main() {
     while true; do
-        show_menu
+        clear
+        
+        # 1. 动态获取 SNIProxy 状态与监听端口
+        local sni_status_view="${RED}未安装${NC}"
+        if systemctl list-unit-files | grep -q "^sniproxy\.service"; then
+            if systemctl is-active --quiet sniproxy; then
+                sni_status_view="${GREEN}运行中${NC} (端口: ${YELLOW}${LISTEN_PORT}${NC})"
+            else
+                sni_status_view="${YELLOW}已停止${NC} (配置端口: ${LISTEN_PORT})"
+            fi
+        fi
+
+        # 2. 动态获取 SmartDNS 状态
+        local smartdns_status_view="${RED}未安装${NC}"
+        if systemctl list-unit-files | grep -q "^smartdns\.service"; then
+            if systemctl is-active --quiet smartdns; then
+                smartdns_status_view="${GREEN}运行中${NC} (端口: 53)"
+            else
+                smartdns_status_view="${YELLOW}已停止${NC}"
+            fi
+        fi
+
+        # 3. 动态获取安全策略与规则路由数
+        local whitelist_view="${CYAN}全部放行${NC}"
+        if [ -f "$ALLOWLIST_FILE" ] && [ -s "$ALLOWLIST_FILE" ]; then
+            local count=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d' | wc -l)
+            whitelist_view="${PURPLE}白名单模式 (阻断除 ${count} 个IP外的所有流量)${NC}"
+        fi
+
+        local rules_count="0"
+        if [ -f /etc/smartdns/smartdns.conf ]; then
+            rules_count=$(grep -c "^address " /etc/smartdns/smartdns.conf)
+        fi
+
+        # 打印主界面
+        echo -e "${GREEN}=================================${NC}"
+        echo -e "${GREEN}◈流媒体 SNI-SmartDNS 管理面板◈${NC}"
+        echo -e "${GREEN}=================================${NC}"
+        echo -e "${GREEN} SNIProxy 状态 :${NC} $sni_status_view"
+        echo -e "${GREEN} SmartDNS 状态 :${NC} $smartdns_status_view"
+        echo -e "${GREEN} 安全策略模式 :${NC} $whitelist_view"
+        echo -e "${GREEN} 劫持域名总数 :${NC} ${YELLOW}${rules_count} 条${NC}"
+        echo -e "${GREEN}=================================${NC}"
+        echo -e " ${GREEN}1. 安装 SNIProxy 服务${NC}"
+        echo -e " ${GREEN}2. 更新 SNIProxy 服务${NC}"
+        echo -e " ${GREEN}3. 卸载 SNIProxy 服务${NC}"
+        echo -e " ${GREEN}4. SNIProxy 状态管理${NC}"
+        echo -e " ${GREEN}5. 配置 SNIProxy 客户端白名单${NC}"
+        echo -e " ${GREEN}6. 安装/配置 SmartDNS 解锁规则${NC}"
+        echo -e " ${GREEN}7. 更新 SmartDNS 核心${NC}"
+        echo -e " ${GREEN}8. SmartDNS 状态管理${NC}"
+        echo -e " ${GREEN}9. 卸载 SmartDNS (恢复系统默认DNS)${NC}"
+        echo -e " ${GREEN}0. 退出${NC}"
+        echo -e "${GREEN}=================================${NC}"
+        
+        # 采用你提出的 echo + read 完美写法
+        echo -ne "${GREEN} 请输入选项: ${NC}"
         read -r choice
+        # 过滤可能误输入的空格或换行
+        choice=$(echo "$choice" | xargs 2>/dev/null || echo "")
+
         case "$choice" in
-            1)  install_moltbot ;;
-            2)  start_gateway && echo -e "${GREEN}✅ 启动指令发送执行完成${RESET}" && break_end ;;
-            3)  
-                echo "停止 OpenClaw..."
-                send_stats "停止 OpenClaw..."
-                tmux kill-session -t gateway > /dev/null 2>&1
-                openclaw gateway stop >/dev/null 2>&1
-                echo -e "${GREEN}✅ 网关核心及守护会话已完全离线停止${RESET}"
-                break_end 
-                ;;
-            4)  view_logs ;;
-            5)  openclaw_api_manage_menu ;;
-            6)  bot_connection_menu ;;
-            7) openclaw onboard; break_end ;;
-            8) health_doctor_fix ;;
-            9) openclaw chat ;;
-            10) 
-                echo "🔄 正在为您执行 NPM 全量拉取覆写更新 OpenClaw..."
-                sudo npm install -g openclaw@latest && start_gateway
-                echo -e "${GREEN}✅ 覆写更新完成！${RESET}"
-                break_end
-                ;;
-            11) 
-                echo -e "${RED}警告：您正准备全盘卸载 OpenClaw 控制程序及清空所有配置。${RESET}"
-                read -erp "确定要继续执行强力清除吗？(y/N): " confirm
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    openclaw gateway stop >/dev/null 2>&1
-                    sudo npm uninstall -g openclaw
-                    rm -rf "${HOME}/.openclaw"
-                    echo -e "${GREEN}✅ OpenClaw 卸载完成。${RESET}"
-                else
-                    echo "❌ 操作已取消。"
-                fi
-                break_end
-                ;;
-            0)  exit 0 ;;
-            *)  echo -e "${RED}输入有误，请输入菜单中有效的数字代号！${RESET}"; sleep 1 ;;
+            1) install_sniproxy; echo -n "按回车键返回主菜单..."; read -r _ ;;
+            2) update_sniproxy; echo -n "按回车键返回主菜单..."; read -r _ ;;
+            3) uninstall_sniproxy; echo -n "按回车键返回主菜单..."; read -r _ ;;
+            4) manage_sniproxy_service; echo -n "按回车键返回主菜单..."; read -r _ ;;
+            5) manage_client_allowlist; echo -n "按回车键返回主菜单..."; read -r _ ;;
+            6) configure_smartdns_rules; echo -n "按回车键返回主菜单..."; read -r _ ;;
+            7) update_smartdns_binary; echo -n "按回车键返回主菜单..."; read -r _ ;;
+            8) manage_smartdns_service; echo -n "按回车键返回主菜单..."; read -r _ ;;
+            9) restore_system_defaults; echo -n "按回车键返回主菜单..."; read -r _ ;;
+            0) print_info "已安全退出面板。"; exit 0 ;;
+            *) print_error "无效选项: '$choice'，请重新输入。"; sleep 1.5 ;;
         esac
     done
 }
 
-# 启动执行
-main
+main "$@"

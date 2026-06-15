@@ -5,12 +5,12 @@ set -e
 # ==================== 配置区 ====================
 CONFIG_FILE="/etc/vnstat_tg.conf"
 PERM_SCRIPT_PATH="/usr/local/bin/vnstat_mgr.sh"
-REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
+REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/zz.sh"
 
 TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 CRON_TIME="0 0 * * *" # 默认每天 0点 发送
-MONITOR_PORTS="22 80 443 8080" # 默认监控端口
+MONITOR_PORTS="22 80 443" # 默认监控端口
 # ================================================
 
 # 颜色定义
@@ -28,7 +28,6 @@ INIT_SYSTEM=""
 ensure_script_landed() {
     # 检查当前运行的路径是不是预期的本地落地路径
     if [ "$0" != "$PERM_SCRIPT_PATH" ]; then
-        echo -e "${GREEN}检测到首次使用远程或临时命令拉起，正在安全下载并固化到本地...${RESET}"
         
         # 优先通过稳定的 URL 重新拉取完整代码，避免管道直接流失
         if command -v curl >/dev/null 2>&1; then
@@ -44,12 +43,11 @@ ensure_script_landed() {
 
         # 如果还是为空，说明是通过纯管道无文件运行且网络访问GitHub受限
         if [ ! -s "$PERM_SCRIPT_PATH" ]; then
-            echo -e "${YELLOW}警告: 无法获取完整代码实体，请检查网络是否能访问 GitHub。${RESET}"
+            echo -e "${YELLOW}警告: 无法获取，请检查网络是否能访问 GitHub。${RESET}"
             exit 1
         fi
 
         chmod +x "$PERM_SCRIPT_PATH"
-        echo -e "${GREEN}实体代码已成功落地: $PERM_SCRIPT_PATH${RESET}"
         sleep 0.5
         
         # 传递所有接收到的参数，切换到本地实体无缝继续运行
@@ -210,7 +208,7 @@ menu_cron_config() {
         if crontab -l 2>/dev/null | grep -q "\-\-cron-report"; then cron_status="已激活"; fi
 
         echo -e "${GREEN}==============================${RESET}"
-        echo -e "${GREEN}       TG 定时通知管理         ${RESET}"
+        echo -e "${GREEN}    ◈  TG 定时通知管理  ◈     ${RESET}"
         echo -e "${GREEN}==============================${RESET}"
         echo -e "${GREEN}任务状态 :${RESET} ${YELLOW}${cron_status}${RESET}"
         echo -e "${GREEN}当前时间 :${RESET} ${YELLOW}${CRON_TIME}${RESET}"
@@ -222,7 +220,7 @@ menu_cron_config() {
         echo -e "${GREEN} 2. 修改 Telegram Chat ID${RESET}"
         echo -e "${GREEN} 3. 修改定时发送时间${RESET}"
         echo -e "${GREEN} 4. 修改需要监控的端口${RESET}"
-        echo -e "${GREEN} 5. 开启 / 更新定时通知任务${RESET}"
+        echo -e "${GREEN} 5. 开启/更新定时通知任务${RESET}"
         echo -e "${GREEN} 6. 关闭定时通知任务${RESET}"
         echo -e "${GREEN} 7. 手动测试发送当前流量报告${RESET}"
         echo -e "${GREEN} 0. 返回主菜单${RESET}"
@@ -236,12 +234,12 @@ menu_cron_config() {
             3)
                 clear
                 echo -e "${GREEN}==============================${RESET}"
-                echo -e "${GREEN}       选择定时发送时间        ${RESET}"
+                echo -e "${GREEN}    ◈  选择定时发送时间  ◈    ${RESET}"
                 echo -e "${GREEN}==============================${RESET}"
-                echo -e "  1) 每天0点"
-                echo -e "  2) 每周一0点"
-                echo -e "  3) 每月1号0点"
-                echo -e "  4) 自定义cron表达式"
+                echo -e "${GREEN}  1) 每天0点${RESET}"
+                echo -e "${GREEN}  2) 每周一0点${RESET}"
+                echo -e "${GREEN}  3) 每月1号0点${RESET}"
+                echo -e "${GREEN}  4) 自定义cron表达式${RESET}"
                 echo -e "${GREEN}==============================${RESET}"
                 echo -ne "${GREEN}请选择时间模板: ${RESET}"
                 read -r time_choice
@@ -254,7 +252,7 @@ menu_cron_config() {
                 save_config; pause ;;
             4)
                 echo -e "当前监控的端口为: ${YELLOW}${MONITOR_PORTS}${RESET}"
-                read -rp "请输入新的端口列表（多个端口请用空格隔开，例如 22 80 443 8888）: " input_ports
+                read -rp "请输入新的端口列表（多个端口请用空格隔开，例如 22 80 443 ）: " input_ports
                 if [ -n "$input_ports" ]; then
                     MONITOR_PORTS="$input_ports"
                     save_config
@@ -394,7 +392,6 @@ remove_vnstat() {
     # 6. 删除本地配置文件及自身脚本文件，实现无痕自毁
     rm -f "$CONFIG_FILE"
     echo -e "${GREEN}系统组件、定时任务、配置文件已全部清除！${RESET}"
-    echo -e "${GREEN}最后一步：自毁灭本地实体脚本...${RESET}"
     rm -f "$PERM_SCRIPT_PATH"
     
     exit 0
@@ -419,24 +416,24 @@ show_menu() {
     clear
     get_panel_info
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}         vnStat 面板          ${RESET}"
+    echo -e "${GREEN}     ◈   vnStat 面板   ◈     ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} ${YELLOW}$panel_status${RESET}"
     echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
     echo -e "${GREEN}网卡 :${RESET} ${YELLOW}${panel_port}${RESET}"
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN} 1. 安装 vnstat (含自动开机自启)${RESET}"
-    echo -e "${GREEN} 2. 重启服务${RESET}"
-    echo -e "${GREEN} 3. 查看服务状态${RESET}"
-    echo -e "${GREEN} 4. 查看网络接口${RESET}"
-    echo -e "${GREEN} 5. 添加监控接口${RESET}"
-    echo -e "${GREEN} 6. 查看默认流量统计${RESET}"
-    echo -e "${GREEN} 7. 查看指定网卡流量${RESET}"
-    echo -e "${GREEN} 8. 查看日流量统计${RESET}"
-    echo -e "${GREEN} 9. 查看月流量统计${RESET}"
-    echo -e "${GREEN}10. 实时流量监控${RESET}"
+    echo -e "${GREEN} 1. 安装 vnstat${RESET}"
+    echo -e "${GREEN} 2. 重启 服务${RESET}"
+    echo -e "${GREEN} 3. 查看 服务状态${RESET}"
+    echo -e "${GREEN} 4. 查看 网络接口${RESET}"
+    echo -e "${GREEN} 5. 添加 监控接口${RESET}"
+    echo -e "${GREEN} 6. 查看 默认流量统计${RESET}"
+    echo -e "${GREEN} 7. 查看 指定网卡流量${RESET}"
+    echo -e "${GREEN} 8. 查看  日流量统计${RESET}"
+    echo -e "${GREEN} 9. 查看 月流量统计${RESET}"
+    echo -e "${GREEN}10. 实时 流量监控${RESET}"
     echo -e "${GREEN}11. 配置 TG 定时通知任务 >>${RESET}"
-    echo -e "${GREEN}12. 卸载 vnstat (含全面数据清理)${RESET}"
+    echo -e "${GREEN}12. 卸载 vnstat${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"

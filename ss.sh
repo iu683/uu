@@ -1,670 +1,356 @@
 #!/bin/bash
-# ========================================================
-#  SNIProxy & SmartDNS 公共解锁 DNS管理脚本 (修复版)
-# ========================================================
+# =========================================
+# 一键部署/管理脚本（Debian/Ubuntu 兼容，IPv4+IPv6 双栈）
+# 适用场景：VPS 已自带 Nginx，直接配置自定义证书
+# 支持防浏览器访问 + 访问日志 + Toolbox 炫酷主页（跳过解析拦截版）
+# =========================================
 
-# 参数配置
-LISTEN_PORT="443"
-FIREWALL_CHAIN_TCP="ALLOW_TCP_443"
-FIREWALL_CHAIN_UDP="ALLOW_UDP_53"
-BINARY_NAME="sniproxy"
-SNI_BASE_DIR="$(pwd)/sniproxy"
-ALLOWLIST_FILE="$SNI_BASE_DIR/allowed_client_ips.txt"
-VERSION_FILE="$SNI_BASE_DIR/version.txt"
-SNI_SERVICE_FILE="/etc/systemd/system/sniproxy.service"
-
-SMARTDNS_CONF_URL="https://raw.githubusercontent.com/pymumu/smartdns/master/etc/smartdns/smartdns.conf"
-DOMAIN_LIST_URL="https://raw.githubusercontent.com/1-stream/1stream-public-utils/refs/heads/main/stream.text.list"
-OUTPUT_FILE="smartdns.conf"
-TEMP_DOMAIN_FILE="/tmp/domain_list.txt"
-
-# 颜色定义
-RED='\033[0;31m'
+WEB_ROOT="/var/www/html"
+LOG_FILE="/var/log/nginx/tim_access.log"
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' 
+RED='\033[0;31m'
+RESET='\033[0m'
 
-# ==================== 基础打印与通用工具函数 ====================
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-print_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
-
-ensure_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        print_error "此操作需要 root 权限。请使用 sudo 或以 root 用户身份运行。"
-        exit 1
-    fi
+show_menu() {
+    clear
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN}         vps短链脚本管理菜单                ${RESET}"
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN}1) 部署脚本 (使用已有 Nginx + 自定义证书)${RESET}"
+    echo -e "${GREEN}2) 卸载脚本${RESET}"
+    echo -e "${GREEN}3) 更新脚本${RESET}"
+    echo -e "${GREEN}4) 查看访问日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
 }
 
-check_command() {
-    if ! command -v "$1" &> /dev/null; then
-        print_error "命令 '$1' 未找到。请先安装它 (例如: apt install -y $1 || yum install -y $1)"
-        exit 1
-    fi
-}
+install_tim() {
+    read -p "请输入你的域名： " DOMAIN
+    read -p "请输入脚本 URL（可选，留空默认不下载）： " TIM_URL
+    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
+    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
 
-read_user_input() {
-    local var_name=$1
-    if [ -r /dev/tty ]; then
-        { read -r "$var_name" < /dev/tty; } 2>/dev/null && return 0
-    fi
-    read -r "$var_name"
-}
-
-read_required_input() {
-    local var_name=$1
-    if ! read_user_input "$var_name"; then
-        print_error "未读取到输入。请在交互式终端运行脚本。"
-        exit 1
-    fi
-}
-
-
-get_public_ip() {
-    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
-    echo "127.0.0.1" && return 0
-}
-
-
-validate_ip() {
-    local ip=$1
-    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        local IFS='.'
-        local -a octets=($ip)
-        for octet in "${octets[@]}"; do
-            if ((octet > 255)); then return 1; fi
-        done
-        return 0
-    fi
-    return 1
-}
-
-validate_ip_or_cidr() {
-    local value=$1
-    local ip="${value%/*}"
-    if [[ "$value" == */* ]]; then
-        local cidr="${value#*/}"
-        if ! [[ "$cidr" =~ ^[0-9]+$ ]] || ((cidr < 0 || cidr > 32)); then return 1; fi
-    fi
-    validate_ip "$ip"
-}
-
-detect_arch() {
-    local machine=$(uname -m)
-    if [ "$machine" = "x86_64" ]; then echo "amd64"
-    elif [ "$machine" = "aarch64" ] || [ "$machine" = "arm64" ]; then echo "arm64"
-    else echo "unknown"; fi
-}
-
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo "$ID"
-    elif [ -f /etc/redhat-release ]; then echo "centos"
-    else echo "unknown"; fi
-}
-
-get_public_ip() {
-    local pub_ip
-    pub_ip=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || echo "你的中转机公网IP")
-    echo "$pub_ip"
-}
-
-get_remote_sni_version() {
-    curl -sS --max-time 1.5 "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "未知"
-}
-
-get_remote_smartdns_version() {
-    curl -sS --max-time 1.5 "https://api.github.com/repos/pymumu/smartdns/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "未知"
-}
-
-install_dependency() {
-    local pkg=$1
-    if command -v "$pkg" &> /dev/null; then return 0; fi
-    print_info "正在安装依赖 $pkg..."
-    local os_type=$(detect_os)
-    if [[ "$os_type" == "ubuntu" || "$os_type" == "debian" ]]; then
-        apt-get update -qq && apt-get install -y "$pkg"
-    elif [[ "$os_type" == "centos" || "$os_type" == "rhel" || "$os_type" == "fedora" ]]; then
-        yum install -y "$pkg"
-    else
-        print_error "未知系统，请手动安装 $pkg 后重试。"
-        exit 1
-    fi
-}
-
-# ==================== 安全策略模块 ====================
-persist_firewall_rules() {
-    if command -v netfilter-persistent &> /dev/null; then
-        netfilter-persistent save >/dev/null 2>&1 && print_success "防火墙规则已持久化。"
-    elif command -v iptables-save &> /dev/null && [ -d /etc/iptables ]; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null && print_success "iptables 规则已保存。"
-    else
-        print_warning "未检测到 iptables 持久化工具，重启后白名单可能会失效。"
-    fi
-}
-
-clear_client_allowlist() {
-    ensure_root
-    print_info "正在清空客户端 IP 白名单，开放公网访问 (53/443)..."
-    if command -v iptables &> /dev/null; then
-        while iptables -C INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP" 2>/dev/null; do
-            iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP"
-        done
-        iptables -F "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
-        iptables -X "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
-
-        while iptables -C INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP" 2>/dev/null; do
-            iptables -D INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP"
-        done
-        iptables -F "$FIREWALL_CHAIN_UDP" 2>/dev/null || true
-        iptables -X "$FIREWALL_CHAIN_UDP" 2>/dev/null || true
-    fi
-    rm -f "$ALLOWLIST_FILE"
-    persist_firewall_rules
-    print_success "安全策略已变更为：允许任意公网落地机连接本 DNS。"
-}
-
-apply_client_allowlist() {
-    local allowed_ips=("$@")
-    check_command "iptables"
-    
-    print_info "正在应用客户端 IP 安全白名单..."
-    iptables -N "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
-    iptables -F "$FIREWALL_CHAIN_TCP"
-    iptables -N "$FIREWALL_CHAIN_UDP" 2>/dev/null || true
-    iptables -F "$FIREWALL_CHAIN_UDP"
-
-    for ip in "${allowed_ips[@]}"; do
-        iptables -A "$FIREWALL_CHAIN_TCP" -p tcp --dport "$LISTEN_PORT" -s "$ip" -j ACCEPT
-        iptables -A "$FIREWALL_CHAIN_UDP" -p udp --dport 53 -s "$ip" -j ACCEPT
+    # 提示输入自定义证书路径并检查是否存在
+    echo -e "${GREEN}--- 自定义证书设置 ---${RESET}"
+    while true; do
+        read -p "请输入您的 SSL 证书(.crt/.pem) 绝对路径: " CERT_PATH
+        if [ -f "$CERT_PATH" ]; then
+            break
+        else
+            echo -e "${RED}❌ 文件不存在，请重新输入！${RESET}"
+        fi
     done
-    
-    iptables -A "$FIREWALL_CHAIN_TCP" -p tcp --dport "$LISTEN_PORT" -j DROP
-    iptables -A "$FIREWALL_CHAIN_UDP" -p udp --dport 53 -j DROP
 
-    if ! iptables -C INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP" 2>/dev/null; then
-        iptables -I INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP"
-    fi
-    if ! iptables -C INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP" 2>/dev/null; then
-        iptables -I INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP"
-    fi
-
-    mkdir -p "$SNI_BASE_DIR"
-    {
-        echo "# 授权访问此公共 DNS 与 解锁中转的落地机 IP"
-        printf '%s\n' "${allowed_ips[@]}"
-    } > "$ALLOWLIST_FILE"
-
-    persist_firewall_rules
-    print_success "安全策略已变更为：仅允许授权白名单 IP 接入解析与解锁服务。"
-}
-
-manage_client_allowlist() {
-    ensure_root
-    clear
-    local current_allowed=""
-    [ -f "$ALLOWLIST_FILE" ] && current_allowed=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d')
-    
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN}      ◈  落地机(客户端) 访问授权管理  ◈       ${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    if [ -n "$current_allowed" ]; then
-        echo -e "${GREEN} 当前已授权放行的落地机 IP 列表:${NC}"
-        echo "$current_allowed" | sed 's/^/  • /'
-    else
-        echo -e "${GREEN} 当前安全策略 :${NC} ${YELLOW}公开解锁模式${NC}"
-    fi
-    echo -e "${GREEN}=============================================${NC}"
-    
-    echo -e "${GREEN}  1. 设置授权落地机 IP${NC}"
-    echo -e "${GREEN}  2. 追加授权落地机 IP${NC}"
-    echo -e "${GREEN}  3. 清空限制(公开解锁)${NC}"
-    echo -e "${GREEN}  0. 返回主菜单${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    
-    echo -ne "${GREEN} 请输入选项: ${NC}"
-    local choice
-    read -r choice
-    choice=$(echo "$choice" | xargs 2>/dev/null || echo "")
-
-    case "$choice" in
-        1|2)
-            echo -e "\n${YELLOW}[提示] 多个落地机 IP 请使用空格或逗号分隔${NC}"
-            echo -n -e "${GREEN}请输入落地机 IP: ${NC}"
-            local input_ips
-            read_required_input input_ips
-            input_ips=$(echo "$input_ips" | tr ',' ' ')
-
-            local allowed_ips=()
-            if [ "$choice" = "2" ] && [ -n "$current_allowed" ]; then
-                while IFS= read -r ip; do [ -n "$ip" ] && allowed_ips+=("$ip"); done <<< "$current_allowed"
-            fi
-
-            for ip in $input_ips; do
-                ip=$(echo "$ip" | tr -d '\r\n' | sed 's/[[:space:]]//g')
-                [ -z "$ip" ] && continue
-                if validate_ip_or_cidr "$ip"; then allowed_ips+=("$ip")
-                else print_error "无效的 IP 格式: $ip"; return 1; fi
-            done
-            
-            [ "${#allowed_ips[@]}" -eq 0 ] && { print_warning "未输入有效IP。"; return 0; }
-            mapfile -t allowed_ips < <(printf '%s\n' "${allowed_ips[@]}" | awk '!seen[$0]++')
-            apply_client_allowlist "${allowed_ips[@]}"
-            ;;
-        3) clear_client_allowlist ;;
-        *) return 0 ;;
-    esac
-}
-
-# ==================== SNIProxy 模块 ====================
-install_sniproxy() {
-    ensure_root
-    local is_update=$1
-    
-    if [ "$is_update" != "true" ] && systemctl list-unit-files | grep -q "^sniproxy\.service"; then
-        print_warning "检测到 SNIProxy 已安装。"
-        return 0
-    fi
-    
-    if [ "$is_update" = "true" ]; then
-        print_info "正在升级 SNIProxy 核心版本..."
-        systemctl stop sniproxy 2>/dev/null || true
-    else
-        print_info "开始全新安装 SNIProxy..."
-    fi
-    
-    install_dependency "curl"; install_dependency "jq"
-    local arch=$(detect_arch)
-    if [ "$arch" = "unknown" ]; then print_error "不支持的架构。"; exit 1; fi
-
-    local version=$(curl -sSL "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name')
-    if [ -z "$version" ] || [ "$version" = "null" ]; then version="v1.0.7"; fi
-    
-    local tar_name="sniproxy_linux_${arch}.tar.gz"
-    local download_url="https://github.com/XIU2/SNIProxy/releases/download/${version}/${tar_name}"
-    
-    curl -fL "$download_url" -o "/tmp/$tar_name"
-    local tmp_extract="/tmp/sniproxy_$$"; mkdir -p "$tmp_extract" "$SNI_BASE_DIR"
-    tar -xzf "/tmp/$tar_name" -C "$tmp_extract"
-    mv "$(find "$tmp_extract" -type f -name "$BINARY_NAME" | head -n 1)" "$SNI_BASE_DIR/$BINARY_NAME"
-    chmod +x "$SNI_BASE_DIR/$BINARY_NAME"
-    rm -f "/tmp/$tar_name" && rm -rf "$tmp_extract"
-
-    echo "$version" > "$VERSION_FILE"
-
-    if [ "$is_update" != "true" ]; then
-        cat <<EOF > "$SNI_BASE_DIR/config.yaml"
-listen_addr: ":$LISTEN_PORT"
-allow_all_hosts: true
-EOF
-
-        cat <<EOF > "$SNI_SERVICE_FILE"
-[Unit]
-Description=SNI Proxy
-After=network.target
-
-[Service]
-ExecStart=$SNI_BASE_DIR/$BINARY_NAME -c $SNI_BASE_DIR/config.yaml
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload && systemctl enable sniproxy
-    fi
-
-    systemctl start sniproxy
-    print_success "SNIProxy 核心包 ($version) 部署成功。"
-}
-
-# ==================== SmartDNS 模块 ====================
-check_and_fix_port_conflict() {
-    print_info "检查 53 端口占用情况..."
-    local port_usage=""
-    if command -v lsof &> /dev/null; then port_usage=$(lsof -i :53 2>/dev/null); fi
-    if [ -z "$port_usage" ] && command -v ss &> /dev/null; then port_usage=$(ss -tulnp | grep :53 2>/dev/null); fi
-    [ -z "$port_usage" ] && return 0
-    
-    if echo "$port_usage" | grep -q "systemd-resolve"; then
-        print_warning "发现 systemd-resolved 正在占用端口 53，执行清理释放..."
-        systemctl stop systemd-resolved && systemctl disable systemd-resolved
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        [ -L /etc/resolv.conf ] && rm /etc/resolv.conf
-        cat > /etc/resolv.conf << 'EOF'
-nameserver 1.1.1.1
-EOF
-        return 0
-    else
-        echo "$port_usage" | grep -q "smartdns" && return 0
-        print_error "端口 53 被其他未知程序占用，请先手动清理:\n$port_usage"
-        return 1
-    fi
-}
-
-install_smartdns_binary() {
-    local is_update=$1
-    if [ "$is_update" != "true" ] && command -v smartdns &> /dev/null; then return 0; fi
-    
-    if [ "$is_update" = "true" ]; then
-        print_info "正在升级并重新编译 SmartDNS 二进制程序..."
-        systemctl stop smartdns 2>/dev/null || true
-    else
-        print_info "正在获取并编译安装 SmartDNS 核心..."
-    fi
-
-    install_dependency "wget"
-    local arch=$(detect_arch)
-    local asset_arch=$([ "$arch" = "amd64" ] && echo "x86_64" || echo "aarch64")
-    local download_url=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep "browser_download_url" | grep "$asset_arch-linux-all.tar.gz" | head -n 1 | cut -d '"' -f 4)
-    
-    cd /tmp && wget -q --show-progress "${download_url}" -O smartdns.tar.gz
-    tar -xzf smartdns.tar.gz && cd smartdns && chmod +x ./install && ./install -i
-    cd /tmp && rm -rf smartdns smartdns.tar.gz
-    print_success "SmartDNS 核心包编译装载就绪。"
-}
-
-configure_smartdns_rules() {
-    local is_update=$1
-    ensure_root
-    if [ "$is_update" != "true" ]; then
-        if ! check_and_fix_port_conflict; then exit 1; fi
-    fi
-    install_smartdns_binary "$is_update"
-
-    print_info "正在构建公网分流规则库..."
-    wget -q -O "${OUTPUT_FILE}" "${SMARTDNS_CONF_URL}"
-    sed -i '/^server /d' "${OUTPUT_FILE}"
-    sed -i '/^bind /d' "${OUTPUT_FILE}"
-
-    cat > "${OUTPUT_FILE}.tmp" << 'EOF'
-# ===== 公网公共 DNS 基础属性 =====
-server 1.1.1.1
-server 8.8.8.8
-bind :53
-cache-size 32768
-prefetch-domain yes
-serve-expired yes
-EOF
-    cat "${OUTPUT_FILE}" >> "${OUTPUT_FILE}.tmp"
-    mv "${OUTPUT_FILE}.tmp" "${OUTPUT_FILE}"
-
-    print_info "正在同步全球流媒体解锁域名数据源..."
-    curl -s "${DOMAIN_LIST_URL}" -o "${TEMP_DOMAIN_FILE}"
-    
-    cat >> "${OUTPUT_FILE}" << EOF
-
-# ===== 自动化就地劫持分流核心规则 =====
-EOF
-
-    # ==================== 💥 修复核心开始 💥 ====================
-    # 使用 gsub(/[[:space:]\r]/, "") 彻底清除所有行内空格及 Windows 换行符，防止首字母被吞
-    awk '/^[^#[:space:]]/ {gsub(/[[:space:]\r]/, ""); if($0!="") print "address /" $0 "/$(get_public_ip)"}' "${TEMP_DOMAIN_FILE}" >> "${OUTPUT_FILE}"
-    # ==================== 💥 修复核心结束 💥 ====================
-
-    rm -f "${TEMP_DOMAIN_FILE}"
-
-    mkdir -p /etc/smartdns
-    [ -f /etc/smartdns/smartdns.conf ] && cp /etc/smartdns/smartdns.conf /etc/smartdns/smartdns.conf.bak
-    cp "${OUTPUT_FILE}" /etc/smartdns/smartdns.conf
-    rm -f "${OUTPUT_FILE}"
-
-    systemctl restart smartdns
-    sleep 1
-    if systemctl is-active --quiet smartdns; then
-        print_success "中转端解锁 DNS 构建完成！"
-        print_info "当前已接管流媒体分流拦截规则共: $(grep -c "^address " /etc/smartdns/smartdns.conf) 条"
-    else
-        print_error "SmartDNS 启动异常。"
-    fi
-}
-
-show_logs() {
-    ensure_root
-    clear
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN}◈  流媒体解锁服务 实时运行日志  ◈${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    print_info "正在读取最近 30 行日志（按 Ctrl+C 即可退出查看）:"
-    echo -e "${YELLOW}--- SmartDNS 分流日志 ---${NC}"
-    journalctl -u smartdns -n 15 --no-pager 2>/dev/null || echo "无日志"
-    echo -e "\n${YELLOW}--- SNIProxy 中转日志 ---${NC}"
-    journalctl -u sniproxy -n 15 --no-pager 2>/dev/null || echo "无日志"
-    echo -e "${GREEN}=============================================${NC}"
-}
-
-# ==================== 彻底净化卸载模块 (修复核心) ====================
-uninstall_all_services() {
-    ensure_root
-    print_warning "正在全面卸载并净化本机的中转与分流服务..."
-    
-    # 1. 停止并禁用 Systemd 服务
-    systemctl stop sniproxy smartdns 2>/dev/null || true
-    systemctl disable sniproxy smartdns 2>/dev/null || true
-    
-    # 2. 调用 SmartDNS 官方自带的卸载逻辑（根治卸载不干净、状态残留的罪魁祸首）
-    if [ -f /usr/sbin/smartdns ] || [ -f /usr/bin/smartdns ]; then
-        print_info "正在调用 SmartDNS 核心卸载脚本..."
-        # 尝试重新拉取最新包或寻找本地残留的安装引导来执行卸载
-        local arch=$(detect_arch)
-        local asset_arch=$([ "$arch" = "amd64" ] && echo "x86_64" || echo "aarch64")
-        local download_url=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep "browser_download_url" | grep "$asset_arch-linux-all.tar.gz" | head -n 1 | cut -d '"' -f 4)
-        
-        if [ -n "$download_url" ]; then
-            cd /tmp && wget -q "${download_url}" -O smartdns_un.tar.gz
-            tar -xzf smartdns_un.tar.gz && cd smartdns && chmod +x ./install
-            ./install -u >/dev/null 2>&1 # 官方卸载命令
-            cd /tmp && rm -rf smartdns smartdns_un.tar.gz
-        fi
-    fi
-
-    # 3. 强力清除所有可能的遗留残余文件
-    clear_client_allowlist
-    rm -f "$SNI_SERVICE_FILE"
-    rm -rf "$SNI_BASE_DIR"
-    rm -rf /etc/smartdns
-    rm -f /usr/lib/systemd/system/smartdns.service /lib/systemd/system/smartdns.service
-    rm -f /usr/sbin/smartdns /usr/bin/smartdns
-    
-    # 4. 刷新 Systemd 守护进程守护缓存
-    systemctl daemon-reload
-    systemctl reset-failed 2>/dev/null || true
-    
-    print_success "系统环境已彻底净化，恢复至初始状态。"
-}
-
-# ==================== 主控控制面板 ====================
-
-main() {
-    local my_ip
-    my_ip=$(get_public_ip)
-    
-    # -------------------------------------------------------------
-    # 【优化项 1】远程版本属于静态数据，移到菜单外，启动脚本时仅获取一次
-    # -------------------------------------------------------------
-    local remote_sni_ver=$(get_remote_sni_version)
-    local remote_sdns_ver=$(get_remote_smartdns_version)
-
-    # 定义需要跨循环持久化的状态变量
-    local sni_installed="false"
-    local smartdns_installed="false"
-    local current_sni_ver="${RED}未装载${NC}"
-    local current_sdns_ver="${RED}未装载${NC}"
-
-    # -------------------------------------------------------------
-    # 【优化项 2】将耗时的“本地安装检测”和“本地版本解析”封装为独立函数
-    # -------------------------------------------------------------
-    refresh_local_status() {
-        # SNIProxy 安装与版本判定
-        sni_installed="false"
-        if systemctl list-unit-files | grep -q "^sniproxy\.service"; then
-            sni_installed="true"
-            if [ -f "$VERSION_FILE" ]; then 
-                current_sni_ver=$(cat "$VERSION_FILE")
-            else
-                current_sni_ver="v1.0.7"
-            fi
+    while true; do
+        read -p "请输入您的 SSL 私钥(.key) 绝对路径: " KEY_PATH
+        if [ -f "$KEY_PATH" ]; then
+            break
         else
-            current_sni_ver="${RED}未装载${NC}"
+            echo -e "${RED}❌ 文件不存在，请重新输入！${RESET}"
         fi
+    done
 
-        # SmartDNS 安装与版本判定
-        smartdns_installed="false"
-        if systemctl list-unit-files | grep -q "^smartdns\.service" || command -v smartdns &> /dev/null; then
-            smartdns_installed="true"
-            local raw_ver=$(smartdns -v 2>&1 | head -n 1)
-            local main_ver=$(echo "$raw_ver" | awk '{print $2}' | cut -d'-' -f1)
-            local sub_ver=$(echo "$raw_ver" | grep -o 'Release[^)]*')
+    # 仅安装基础检测工具
+    echo -e "${GREEN}检查基础依赖: curl, dnsutils...${RESET}"
+    apt update && apt install -y curl dnsutils
 
-            if [ -n "$main_ver" ] && [ -n "$sub_ver" ]; then
-                current_sdns_ver="${main_ver} (${sub_ver})"
-            elif [ -n "$main_ver" ]; then
-                current_sdns_ver="${main_ver}"
-            else
-                current_sdns_ver="未知版本"
-            fi
-        else
-            current_sdns_ver="${RED}未装载${NC}"
-        fi
+    # 检查域名解析 (IPv4 + IPv6) 并仅做友好提示
+    VPS_IPv4=$(curl -s4 https://ifconfig.co || true)
+    VPS_IPv6=$(curl -s6 https://ifconfig.co || true)
+    DOMAIN_A=$(dig +short A "$DOMAIN" | tail -n1)
+    DOMAIN_AAAA=$(dig +short AAAA "$DOMAIN" | tail -n1)
+
+    echo -e "${GREEN}VPS IPv4: $VPS_IPv4${RESET}"
+    echo -e "${GREEN}VPS IPv6: $VPS_IPv6${RESET}"
+    echo -e "${GREEN}域名 A 记录: $DOMAIN_A${RESET}"
+    echo -e "${GREEN}域名 AAAA 记录: $DOMAIN_AAAA${RESET}"
+
+    if [[ "$VPS_IPv4" == "$DOMAIN_A" || "$VPS_IPv6" == "$DOMAIN_AAAA" ]]; then
+        echo -e "${GREEN}✅ 域名解析正确，继续安装...${RESET}"
+    else
+        echo -e "${RED}⚠️  提示：本地检测到域名解析与当前公网 IP 不一致（可能由于 DNS 延迟或启用了 Cloudflare 代理节点）。${RESET}"
+        echo -e "${GREEN}ℹ️  已跳过拦截，正在强制继续安装...${RESET}"
+    fi
+
+    # 创建目录
+    mkdir -p "$WEB_ROOT"
+    mkdir -p "$LOCAL_DIR"
+    chmod 700 "$LOCAL_DIR"
+
+    # 下载脚本（可选）
+    if [[ -n "$TIM_URL" ]]; then
+        curl -fsSL "$TIM_URL" -o "$WEB_ROOT/$DOMAIN"
+        chmod +x "$WEB_ROOT/$DOMAIN"
+        cp "$WEB_ROOT/$DOMAIN" "$LOCAL_DIR/$DOMAIN"
+    fi
+
+    # 配置 Nginx 规则（直接写入自定义证书，并嵌入新版 Toolbox 网页）
+    NGINX_CONF="/etc/nginx/sites-available/$DOMAIN"
+    cat > "$NGINX_CONF" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+    
+    # HTTP 自动跳转 HTTPS
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name $DOMAIN;
+
+    root $WEB_ROOT;
+
+    # 配置自定义证书
+    ssl_certificate $CERT_PATH;
+    ssl_certificate_key $KEY_PATH;
+
+    # SSL 基础安全调优
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    location = / {
+        try_files /$DOMAIN =200;
+
+        if (\$http_user_agent !~* "(curl|wget|fetch|httpie|Go-http-client|python-requests|bash)") {
+            add_header Content-Type text/html;
+            return 200 '<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Toolbox</title>
+<link rel="icon" href="https://cdn.nodeimage.com/i/YLJpfjcyQYlgczKJdxpi7EHzIksXPeW8.webp" type="image/png">
+<style>
+html, body {margin:0; padding:0; height:100%;}
+body {
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  font-family:Arial,sans-serif;
+  transition: background 0.3s, color 0.3s;
+}
+body[data-theme="dark"] {
+  background: #1e1e1e url("https://t.alcy.cc/ycy") no-repeat center/cover;
+  color: #eee;
+}
+body[data-theme="light"] {
+  background: #ffffff url("https://t.alcy.cc/ycy") no-repeat center/cover;
+  color: #000;
+}
+.card {
+  backdrop-filter:blur(15px);
+  -webkit-backdrop-filter:blur(15px);
+  border-radius:20px;
+  padding:40px 60px;
+  text-align:center;
+  box-shadow:0 8px 32px rgba(0,0,0,0.1);
+  max-width:90%;
+  position:relative;
+  transition: background 0.3s, color 0.3s;
+}
+body[data-theme="dark"] .card { background:rgba(40,40,40,0.6); }
+body[data-theme="light"] .card { background:rgba(255,255,255,0.4); }
+h1{font-size:2.5rem; margin-bottom:20px;}
+#cmd{
+  font-size:1.5rem; font-weight:bold;
+  background:rgba(255,255,255,0.25);
+  padding:15px 25px; border-radius:12px;
+  cursor:pointer; user-select:all;
+  border:1px solid rgba(255,255,255,0.3);
+  word-break:break-all;
+}
+#hint{margin-top:15px; font-size:1rem; color:#555;}
+body[data-theme="dark"] #hint{color:#ccc;}
+.footer-extra{margin-top:25px; font-size:14px;}
+@media (max-width:600px){
+  .card{padding:30px 20px;}
+  h1{font-size:1.8rem;}
+  #cmd{font-size:1.1rem; padding:12px 15px;}
+}
+
+/* 圆形切换按钮 + 动画 */
+#theme-toggle {
+  position:absolute;
+  top:15px;
+  right:15px;
+  width:36px;
+  height:36px;
+  line-height:36px;
+  background:rgba(255,255,255,0.3);
+  border-radius:50%;
+  cursor:pointer;
+  border:1px solid rgba(255,255,255,0.5);
+  user-select:none;
+  font-size:1.2rem;
+  text-align:center;
+  transition: transform 0.3s ease, background 0.3s ease;
+}
+#theme-toggle.active {
+  transform: rotate(360deg);
+  background: rgba(255,255,255,0.6);
+}
+@media (max-width:600px){
+  #theme-toggle{
+    width:30px;
+    height:30px;
+    line-height:30px;
+    font-size:1rem;
+    top:10px;
+    right:10px;
+  }
+}
+</style>
+</head>
+<body>
+<div class="card">
+  <div id="theme-toggle">🌓</div>
+  <h1>⚡ Toolbox工具箱</h1>
+  <div id="cmd">bash <(curl -fsSL $DOMAIN)</div>
+  <div id="hint">点击命令即可复制到剪贴板</div>
+  <div class="footer-extra">
+    <p>😊Toolbox🎉累计访问人次💻：</p>
+    <img src="https://count.getloli.com/@:$DOMAIN?name=$DOMAIN&theme=rule34&padding=7&offset=0&align=center&scale=1&pixelated=1&darkmode=auto" 
+         alt="访问计数器" style="margin:10px 0;max-width:100%;"/>
+    <p><span id="runtime_span">⏲️ 加载中... ⏲️</span></p>
+  </div>
+</div>
+
+<script>
+// 命令复制
+const cmdDiv=document.getElementById("cmd");
+cmdDiv.onclick=async()=>{
+  try{
+    await navigator.clipboard.writeText("bash <(curl -fsSL $DOMAIN)");
+    cmdDiv.innerText="✅ 已复制！";
+    setTimeout(()=>{cmdDiv.innerText="bash <(curl -fsSL $DOMAIN)";},1500);
+  }catch(err){ alert("复制失败，请手动复制命令"); }
+}
+
+// 运行时间显示
+const runtime_span=document.getElementById("runtime_span");
+function show_runtime(){
+  const now=new Date();
+  const start=new Date("2026-03-15T00:00:00");
+  const diff=now-start;
+  const days=Math.floor(diff/(24*60*60*1000));
+  const hours=Math.floor((diff/(60*60*1000))%24);
+  const minutes=Math.floor((diff/(60*1000))%60);
+  const seconds=Math.floor((diff/1000)%60);
+  runtime_span.textContent=\`⏲️ Toolbox已运行 \${days}天 | \${hours}小时 | \${minutes}分 | \${seconds}秒 ⏲️\`;
+}
+setInterval(show_runtime,1000);
+show_runtime();
+
+// 夜间/白天切换 + 点击动画
+const themeToggle = document.getElementById("theme-toggle");
+themeToggle.onclick = () => {
+  themeToggle.classList.add(\x27active\x27);
+  setTimeout(()=>themeToggle.classList.remove(\x27active\x27), 300);
+
+  if(document.body.dataset.theme === \x27dark\x27){
+    document.body.dataset.theme = \x27light\x27;
+    localStorage.setItem(\x27theme\x27,\x27light\x27);
+  } else {
+    document.body.dataset.theme = \x27dark\x27;
+    localStorage.setItem(\x27theme\x27,\x27dark\x27);
+  }
+};
+
+// 页面加载时应用保存的主题
+const savedTheme = localStorage.getItem(\x27theme\x27) || (window.matchMedia("(prefers-color-scheme: dark)").matches ? \x27dark\x27 : \x27light\x27);
+document.body.dataset.theme = savedTheme;
+</script>
+</body>
+</html>';
+        }
     }
 
-    # 脚本启动时，先初始化调用一次状态探测
-    refresh_local_status
+    access_log $LOG_FILE combined;
+}
+EOF
 
-    # -------------------------------------------------------------
-    # 【主循环】现在这里面没有任何耗时命令，按下回车瞬时刷新！
-    # -------------------------------------------------------------
-    while true; do
-        clear
-        
-        # 1. 动态服务运行状态（systemctl is-active 响应速度极快，可保留在内部提供实时状态）
-        local sni_status_view="${RED}未安装${NC}"
-        if [ "$sni_installed" = "true" ]; then
-            if systemctl is-active --quiet sniproxy; then
-                sni_status_view="${GREEN}运行中${NC} ${YELLOW}(端口: ${LISTEN_PORT})${NC}"
-            else
-                sni_status_view="${YELLOW}已停止${NC}"
-            fi
-        fi
+    # 启用配置
+    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
+    
+    # 测试并重载已有的 Nginx 服务
+    echo -e "${GREEN}测试 Nginx 配置并重载服务...${RESET}"
+    nginx -t && systemctl reload nginx || {
+        echo -e "${RED}❌ Nginx 配置重载失败，请检查证书有效性。${RESET}"
+        return
+    }
 
-        local smartdns_status_view="${RED}未安装${NC}"
-        if [ "$smartdns_installed" = "true" ]; then
-            if systemctl is-active --quiet smartdns; then
-                smartdns_status_view="${GREEN}运行中${NC} ${YELLOW}(端口: 53)${NC}"
-            else
-                smartdns_status_view="${YELLOW}已停止${NC}"
-            fi
-        fi
-
-        # 2. 动态白名单文件体积检查（本地纯文件判断，不卡顿）
-        local whitelist_view="${YELLOW}公开解锁(任意设备改DNS即可解锁)${NC}"
-        if [ -f "$ALLOWLIST_FILE" ] && [ -s "$ALLOWLIST_FILE" ]; then
-            local count=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d' | wc -l)
-            whitelist_view="${YELLOW}安全模式(允许已授权的 ${count} 个IP)${NC}"
-        fi
-
-        # 3. 渲染主面板
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN}     ◈  流媒体公共 DNS 解锁中转面板  ◈       ${NC}"
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN} SNIProxy 状态:${NC} $sni_status_view"
-        echo -e "${GREEN} SmartDNS 状态:${NC} $smartdns_status_view"
-        echo -e "${GREEN} SNIProxy 版本:${NC} ${YELLOW}${current_sni_ver}${NC}"
-        echo -e "${GREEN} SmartDNS 版本:${NC} ${YELLOW}${current_sdns_ver}${NC}"
-        echo -e "${GREEN} 安全策略访问 :${NC} $whitelist_view"
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN}  1. 安装 解锁服务${NC}"
-        echo -e "${GREEN}  2. 更新 解锁服务${NC}"
-        echo -e "${GREEN}  3. 卸载 解锁服务${NC}"
-        echo -e "${GREEN}  4. 白名单规则${NC}"
-        echo -e "${GREEN}  5. 启动 解锁服务${NC}"
-        echo -e "${GREEN}  6. 停止 解锁服务${NC}"
-        echo -e "${GREEN}  7. 重启 解锁服务${NC}"
-        echo -e "${GREEN}  8. 查看日志${NC}"
-        echo -e "${GREEN}  9. 查看配置${NC}"
-        echo -e "${GREEN}  0. 退出 ${NC}"
-        echo -e "${GREEN}=============================================${NC}"
-        
-        echo -ne "${GREEN} 请输入选项: ${NC}"
-        local choice
-        read -r choice
-        choice=$(echo "$choice" | xargs 2>/dev/null || echo "")
-
-        case "$choice" in
-            1)
-                install_sniproxy "false"
-                configure_smartdns_rules "false"
-                refresh_local_status # 安装后主动刷新本地状态缓存
-                echo -e "\n${GREEN}==================================================${NC}"
-                print_success "中转端部署完全就绪！"
-                echo -e "现在，你其他的【落地机】不需要装任何东西，直接执行这三行命令即可解锁："
-                echo -e "${YELLOW}chattr -i /etc/resolv.conf 2>/dev/null || true${NC}"
-                echo -e "${YELLOW}echo \"nameserver ${my_ip}\" > /etc/resolv.conf${NC}"
-                echo -e "${YELLOW}chattr +i /etc/resolv.conf 2>/dev/null${NC}"
-                echo -e "${GREEN}==================================================${NC}"
-                echo -n "按回车键返回面板..."; read -r _ ;;
-            2) 
-                install_sniproxy "true"
-                configure_smartdns_rules "true"
-                refresh_local_status # 更新后主动刷新本地状态缓存
-                print_success "SNIProxy 和 SmartDNS 核心程序以及分流规则已全部升级成功！"
-                echo -n "按回车键返回面板..."; read -r _ ;;
-            3) 
-                uninstall_all_services
-                refresh_local_status # 卸载后主动刷新本地状态缓存
-                echo -n "按回车键返回面板..."; read -r _ ;;
-            4) 
-                manage_client_allowlist
-                echo -n "按回车键返回面板..."; read -r _ ;;
-            5) systemctl start sniproxy smartdns 2>/dev/null && print_success "服务已完成启动指令。"; sleep 1.5 ;;
-            6) systemctl stop sniproxy smartdns 2>/dev/null && print_success "服务已完成停止指令。"; sleep 1.5 ;;
-            7) systemctl restart sniproxy smartdns 2>/dev/null && print_success "核心组件已全部重启。"; sleep 1.5 ;;
-            8) show_logs; echo -n "按回车键返回面板..."; read -r _ ;;
-            9) 
-                clear
-                echo -e "${GREEN}--- 当前运行配置摘要 ---${NC}"
-                echo -e "DNS 监听地址: 0.0.0.0:53  |  SNI 中转端口: 0.0.0.0:${LISTEN_PORT}"
-                echo -e "已加载劫持分流域名数量: ${YELLOW}$(grep -c "^address " /etc/smartdns/smartdns.conf 2>/dev/null || echo "0")${NC} 条"
-                echo -e "\n${GREEN}--- 本机流媒体原生出口测试 ---${NC}"
-                if command -v curl &> /dev/null; then
-                    echo -n "Netflix 出口状态: "
-                    curl -sI --max-time 3 https://www.netflix.com | head -n 1 || echo "连接超时"
-                else
-                    print_warning "本地缺少 curl，无法执行出口活性探测。"
-                fi
-                echo -n "按回车键返回面板..."; read -r _ ;;
-            0) exit 0 ;;
-            *) print_error "无效选项: '$choice'，请重新输入。"; sleep 1.5 ;;
-        esac
-    done
+    echo -e "${GREEN}==========================================${RESET}"
+    echo -e "${GREEN}部署完成！${RESET}"
+    echo -e "${GREEN}本地脚本已保存到：$LOCAL_DIR/$DOMAIN${RESET}"
+    echo -e "${GREEN}HTTPS 已启用 https://$DOMAIN${RESET}"
+    echo -e "${GREEN}访问日志：$LOG_FILE${RESET}"
+    echo -e "${GREEN}==========================================${RESET}"
 }
 
-main "$@"
+uninstall_tim() {
+    read -p "请输入你的域名 ： " DOMAIN
+    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
+    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
+
+    echo -e "${GREEN}清理 Nginx 站点配置...${RESET}"
+    rm -f /etc/nginx/sites-available/"$DOMAIN"
+    rm -f /etc/nginx/sites-enabled/"$DOMAIN"
+
+    echo -e "${GREEN}删除本地及网页目录下的短链脚本...${RESET}"
+    rm -rf "$LOCAL_DIR"
+    rm -f "$WEB_ROOT/$DOMAIN"
+
+    echo -e "${GREEN}重载 Nginx 使配置生效...${RESET}"
+    systemctl reload nginx
+
+    echo -e "${GREEN}==========================================${RESET}"
+    echo -e "${GREEN}卸载完成！${RESET}"
+    echo -e "${GREEN}==========================================${RESET}"
+}
+
+update_tim() {
+    read -p "请输入最新脚本 URL： " TIM_URL
+    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
+    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
+
+    if [[ -z "$DOMAIN" ]]; then
+        read -p "请输入域名（用于生成文件名）： " DOMAIN
+    fi
+
+    mkdir -p "$LOCAL_DIR"
+    curl -fsSL "$TIM_URL" -o "$LOCAL_DIR/$DOMAIN" || { 
+        echo -e "${RED}❌ 下载脚本失败，请检查 URL${RESET}"
+        return
+    }
+    chmod +x "$LOCAL_DIR/$DOMAIN"
+
+    cp -f "$LOCAL_DIR/$DOMAIN" "$WEB_ROOT/$DOMAIN"
+    echo -e "${GREEN}✅ 更新完成！短链脚本已同步最新版本${RESET}"
+}
+
+view_logs() {
+    if [ -f "$LOG_FILE" ]; then
+        echo -e "${GREEN}显示最近 20 条访问记录：${RESET}"
+        tail -n 20 "$LOG_FILE"
+        echo -e "${GREEN}统计不同 IP (IPv4/IPv6) 访问次数：${RESET}"
+        awk '{print $1}' "$LOG_FILE" | sort | uniq -c | sort -nr
+    else
+        echo -e "${RED}日志文件不存在${RESET}"
+    fi
+}
+
+while true; do
+    show_menu
+    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
+    case $choice in
+        1) install_tim ;;
+        2) uninstall_tim ;;
+        3) update_tim ;;
+        4) view_logs ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}请输入有效选项${RESET}" ;;
+    esac
+    read -p "按回车返回菜单..."
+done

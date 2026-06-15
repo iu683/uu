@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================
-# VPS 管理脚本 – 多目录备份 + TG通知 + 定时任务 + 自更新 
+# VPS 管理脚本 – 多目录备份 + TG通知 + 定时任务 + 自更新
 # =============================================
 
-BASE_DIR="/opt/vpstgmanager"
-SCRIPT_PATH="$BASE_DIR/vpstgmanager.sh"
+BASE_DIR="/opt/vps_manager"
+SCRIPT_PATH="$BASE_DIR/vps_manager.sh"
 SCRIPT_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
 CONFIG_FILE="$BASE_DIR/config"
 CRON_DIRS_FILE="$BASE_DIR/cron_dirs"
@@ -32,17 +32,16 @@ check_dependencies(){
     if [ ${#missing_cmds[@]} -ne 0 ]; then
         echo -e "${YELLOW}检测到缺少依赖: ${missing_cmds[*]}，正在尝试自动安装...${RESET}"
         if [[ -f /etc/alpine-release ]]; then
-            # Alpine 环境适配
-            apk update
+            apk update && apk add ca-certificates # 补充SSL证书，防止curl GitHub失败
             for cmd in "${missing_cmds[@]}"; do
-                if [[ "$cmd" == "tar" ]]; then apk add tar; fi # 安装原生 tar 替换 busybox 版
+                if [[ "$cmd" == "tar" ]]; then apk add tar; fi 
                 if [[ "$cmd" == "zip" ]]; then apk add zip; fi
                 if [[ "$cmd" == "curl" ]]; then apk add curl; fi
             done
         elif [[ -f /etc/debian_version ]]; then
-            apt update && apt install -y curl tar zip
+            apt update && apt install -y curl tar zip ca-certificates
         elif [[ -f /etc/redhat-release ]]; then
-            yum install -y curl tar zip
+            yum install -y curl tar zip ca-certificates
         else
             echo -e "${RED}无法自动识别系统包管理器，请手动安装: ${missing_cmds[*]}${RESET}"
             exit 1
@@ -89,6 +88,7 @@ init(){
     read -rp "请输入 VPS 名称（可为空）: " VPS_NAME
     save_config
     echo -e "${GREEN}配置完成!${RESET}"
+    read -rp "按回车键返回主菜单..." dummy
 }
 
 # ================== 设置保留天数 ==================
@@ -101,6 +101,7 @@ set_keep_days(){
     else
         echo -e "${RED}输入无效，请输入正整数${RESET}"
     fi
+    read -rp "按回车键返回主菜单..." dummy
 }
 
 # ================== 设置压缩格式 ==================
@@ -115,6 +116,7 @@ set_archive_format(){
     esac
     save_config
     echo -e "${GREEN}已设置压缩格式为: $ARCHIVE_FORMAT${RESET}"
+    read -rp "按回车键返回主菜单..." dummy
 }
 
 # ================== 打包与上传核心 ==================
@@ -176,8 +178,6 @@ auto_upload(){
     [[ -z "$targets" ]] && echo -e "${YELLOW}未指定目录，定时任务退出${RESET}" && return
 
     execute_backup "$targets" "自动"
-
-    # 修复优先级漏洞后的过期清理逻辑
     find "$TMP_DIR" -type f -mtime +$KEEP_DAYS \( -name "*.tar.gz" -o -name "*.zip" \) -exec rm -f {} \;
 }
 
@@ -209,11 +209,12 @@ setup_cron_job(){
             crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
             rm -f "$CRON_DIRS_FILE"
             echo -e "${GREEN}已删除所有相关定时任务${RESET}"
+            read -rp "按回车键返回主菜单..." dummy
             return ;;
         8)
             echo -e "${YELLOW}当前配置的 Cron 任务:${RESET}"
             crontab -l 2>/dev/null | grep "$SCRIPT_PATH" || echo "无相关定时任务"
-            read -rp "回车返回菜单..." dummy
+            read -rp "按回车键返回主菜单..." dummy
             return ;;
         0) return ;;
         *) echo -e "${RED}无效选项${RESET}"; return ;;
@@ -223,31 +224,31 @@ setup_cron_job(){
     [[ -z "$BACKUP_DIRS" ]] && echo -e "${YELLOW}未输入目录，取消设置${RESET}" && return
     echo "$BACKUP_DIRS" > "$CRON_DIRS_FILE"
 
-    # 优化点：Cron 里面不传参数，执行时读取本地文件，防止空格引发的解析歧义
-    CRON_CMD="bash $SCRIPT_PATH auto_upload"
+    local bash_path && bash_path=$(command -v bash || echo "/bin/bash")
+    CRON_CMD="$bash_path $SCRIPT_PATH auto_upload"
+    
     crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
     (crontab -l 2>/dev/null; echo "$CRON_TIME $CRON_CMD") | crontab -
     echo -e "${GREEN}定时任务设置成功! 表达式: $CRON_TIME${RESET}"
 
-    # Alpine 环境提示守护进程状态
     if [[ -f /etc/alpine-release ]]; then
-        echo -e "${YELLOW}[Alpine 提示] 请确保系统的 crond 服务已启动 (rc-service crond status / start)${RESET}"
+        echo -e "${YELLOW}[Alpine 提示] 请确保系统的 crond 服务已启动 (rc-service crond status)${RESET}"
     fi
+    read -rp "按回车键返回主菜单..." dummy
 }
 
 # ================== 主菜单 ==================
 menu(){
     while true; do
+        clear 
         load_config
 
-        # 1. 动态检测定时任务状态
         if crontab -l 2>/dev/null | grep -q "$SCRIPT_PATH"; then
             CRON_STATUS="${GREEN}已开启${RESET}"
         else
             CRON_STATUS="${RED}未开启${RESET}"
         fi
 
-        # 2. 格式化显示压缩格式
         if [[ "$ARCHIVE_FORMAT" == "tar" ]]; then
             FORMAT_DISPLAY="tar.gz"
         else
@@ -261,7 +262,7 @@ menu(){
         echo -e "${GREEN} 📦 默认压缩格式:${RESET} ${YELLOW}${FORMAT_DISPLAY}${RESET}"
         echo -e "${GREEN} ⏱️ 定时任务状态:${RESET} ${CRON_STATUS}"
         echo -e "${GREEN}----------------------------------${RESET}"
-        echo -e "${GREEN}1) 立即打包并上传文件/目录${RESET}"
+        echo -e "${GREEN}1) 立打包并上传文件/目录${RESET}"
         echo -e "${GREEN}2) 修改 Telegram 配置${RESET}"
         echo -e "${GREEN}3) 清空本地临时缓存文件${RESET}"
         echo -e "${GREEN}4) 定时任务管理${RESET}"
@@ -275,25 +276,43 @@ menu(){
         read -p "$(echo -e ${GREEN}请选择: ${RESET})" choice
 
         case $choice in
-            1) do_upload ;;
+            1) 
+                do_upload 
+                read -rp "操作已结束，按回车键返回主菜单..." dummy
+                ;;
             2) init ;;
-            3) rm -rf "$TMP_DIR"/* && echo -e "${YELLOW}已清空临时文件夹${RESET}" ;;
+            3) 
+                rm -rf "$TMP_DIR"/* && echo -e "${YELLOW}已清空临时文件夹${RESET}" 
+                read -rp "按回车键返回主菜单..." dummy
+                ;;
             4) setup_cron_job ;;
             5) set_keep_days ;;
-            6) [[ -f "$CRON_DIRS_FILE" ]] && echo -e "${YELLOW}当前定时备份目录: $(cat "$CRON_DIRS_FILE")${RESET}" || echo -e "${YELLOW}暂无定时目录${RESET}" ;;
+            6) 
+                if [[ -f "$CRON_DIRS_FILE" ]]; then
+                    echo -e "${YELLOW}当前定时备份目录: $(cat "$CRON_DIRS_FILE")${RESET}"
+                else
+                    echo -e "${YELLOW}暂无定时目录${RESET}"
+                fi
+                read -rp "按回车键返回主菜单..." dummy
+                ;;
             7) set_archive_format ;;
             8)
                 curl -sSL "$SCRIPT_URL" -o "${SCRIPT_PATH}.next" && \
                 mv "${SCRIPT_PATH}.next" "$SCRIPT_PATH" && \
                 chmod +x "$SCRIPT_PATH"
-                echo -e "${GREEN}更新完成！${RESET}" ;;
+                echo -e "${GREEN}更新完成！${RESET}" 
+                read -rp "按回车键返回主菜单..." dummy
+                ;;
             9)
                 crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
                 rm -rf "$BASE_DIR"
                 echo -e "${RED}已完全卸载并清理配置${RESET}"
                 exit 0 ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选项，请重新输入${RESET}" ;;
+            *) 
+                echo -e "${RED}无效选项，请重新输入${RESET}" 
+                sleep 1
+                ;;
         esac
         echo ""
     done
@@ -305,9 +324,19 @@ check_dependencies
 if [[ "$1" == "auto_upload" ]]; then
     auto_upload "$2"
 else
-    # 如果是第一次在本地运行，自动生成规范路径下的脚本
-    if [[ ! -f "$SCRIPT_PATH" ]]; then
-        cp "$0" "$SCRIPT_PATH" 2>/dev/null || curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+    # 🌟 核心修复点：判断本地文件不存在，或者本地文件大小为 0（空文件）
+    if [[ ! -f "$SCRIPT_PATH" || ! -s "$SCRIPT_PATH" ]]; then
+        
+        # 放弃不安全的 cp "$0"，无论用户是怎么运行的，一律强制从远程下载保底
+        curl -sSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
+        
+        # 如果下载下来还是空的（多发生于 Alpine 缺少证书），给出强提示
+        if [[ ! -s "$SCRIPT_PATH" ]]; then
+            echo -e "${RED}[错误] 安装失败！本地文件仍为空。${RESET}"
+            echo -e "${YELLOW}这通常是因为你的 Alpine 缺少 SSL 证书导致无法连接 GitHub。${RESET}"
+            echo -e "${GREEN}请先在终端运行: apk update && apk add ca-certificates curl${RESET}"
+            exit 1
+        fi
         chmod +x "$SCRIPT_PATH"
     fi
     menu

@@ -1,686 +1,478 @@
-#!/bin/bash
-# ========================================================
-#  SNIProxy & SmartDNS 公共解锁 DNS管理脚本 (修复版)
-# ========================================================
+#!/usr/bin/env bash
 
-# 参数配置
-LISTEN_PORT="443"
-FIREWALL_CHAIN_TCP="ALLOW_TCP_443"
-FIREWALL_CHAIN_UDP="ALLOW_UDP_53"
-BINARY_NAME="sniproxy"
-SNI_BASE_DIR="$(pwd)/sniproxy"
-ALLOWLIST_FILE="$SNI_BASE_DIR/allowed_client_ips.txt"
-VERSION_FILE="$SNI_BASE_DIR/version.txt"
-SNI_SERVICE_FILE="/etc/systemd/system/sniproxy.service"
+set -e
 
-SMARTDNS_CONF_URL="https://raw.githubusercontent.com/pymumu/smartdns/master/etc/smartdns/smartdns.conf"
-DOMAIN_LIST_URL="https://raw.githubusercontent.com/1-stream/1stream-public-utils/refs/heads/main/stream.text.list"
-OUTPUT_FILE="smartdns.conf"
-TEMP_DOMAIN_FILE="/tmp/domain_list.txt"
+# ==================== 配置区 ====================
+CONFIG_FILE="/etc/vnstat_tg.conf"
+PERM_SCRIPT_PATH="/usr/local/bin/vnstat_mgr.sh"
+REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
+
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
+CRON_TIME="0 0 * * *" # 默认每天 0点 发送
+MONITOR_PORTS="22 80 443 8080" # 默认监控端口
+# ================================================
 
 # 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' 
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-# ==================== 基础打印与通用工具函数 ====================
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-print_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+SERVICE_NAME=""
+PKG_MANAGER=""
+PKG_REMOVE_CMD=""
+PKG_INSTALL_CMD=""
+INIT_SYSTEM=""
 
-ensure_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        print_error "此操作需要 root 权限。请使用 sudo 或以 root 用户身份运行。"
-        exit 1
-    fi
-}
-
-check_command() {
-    if ! command -v "$1" &> /dev/null; then
-        print_error "命令 '$1' 未找到。请先安装它 (例如: apt install -y $1 || yum install -y $1)"
-        exit 1
-    fi
-}
-
-read_user_input() {
-    local var_name=$1
-    if [ -r /dev/tty ]; then
-        { read -r "$var_name" < /dev/tty; } 2>/dev/null && return 0
-    fi
-    read -r "$var_name"
-}
-
-read_required_input() {
-    local var_name=$1
-    if ! read_user_input "$var_name"; then
-        print_error "未读取到输入。请在交互式终端运行脚本。"
-        exit 1
-    fi
-}
-
-
-get_public_ip() {
-    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
-    echo "127.0.0.1" && return 0
-}
-
-
-validate_ip() {
-    local ip=$1
-    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        local IFS='.'
-        local -a octets=($ip)
-        for octet in "${octets[@]}"; do
-            if ((octet > 255)); then return 1; fi
-        done
-        return 0
-    fi
-    return 1
-}
-
-validate_ip_or_cidr() {
-    local value=$1
-    local ip="${value%/*}"
-    if [[ "$value" == */* ]]; then
-        local cidr="${value#*/}"
-        if ! [[ "$cidr" =~ ^[0-9]+$ ]] || ((cidr < 0 || cidr > 32)); then return 1; fi
-    fi
-    validate_ip "$ip"
-}
-
-detect_arch() {
-    local machine=$(uname -m)
-    if [ "$machine" = "x86_64" ]; then echo "amd64"
-    elif [ "$machine" = "aarch64" ] || [ "$machine" = "arm64" ]; then echo "arm64"
-    else echo "unknown"; fi
-}
-
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo "$ID"
-    elif [ -f /etc/redhat-release ]; then echo "centos"
-    else echo "unknown"; fi
-}
-
-get_public_ip() {
-    local pub_ip
-    pub_ip=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || echo "你的中转机公网IP")
-    echo "$pub_ip"
-}
-
-get_remote_sni_version() {
-    curl -sS --max-time 1.5 "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "未知"
-}
-
-get_remote_smartdns_version() {
-    curl -sS --max-time 1.5 "https://api.github.com/repos/pymumu/smartdns/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "未知"
-}
-
-install_dependency() {
-    local pkg=$1
-    if command -v "$pkg" &> /dev/null; then return 0; fi
-    print_info "正在安装依赖 $pkg..."
-    local os_type=$(detect_os)
-    if [[ "$os_type" == "ubuntu" || "$os_type" == "debian" ]]; then
-        apt-get update -qq && apt-get install -y "$pkg"
-    elif [[ "$os_type" == "centos" || "$os_type" == "rhel" || "$os_type" == "fedora" ]]; then
-        yum install -y "$pkg"
-    else
-        print_error "未知系统，请手动安装 $pkg 后重试。"
-        exit 1
-    fi
-}
-
-# ==================== 安全策略模块 ====================
-persist_firewall_rules() {
-    if command -v netfilter-persistent &> /dev/null; then
-        netfilter-persistent save >/dev/null 2>&1 && print_success "防火墙规则已持久化。"
-    elif command -v iptables-save &> /dev/null && [ -d /etc/iptables ]; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null && print_success "iptables 规则已保存。"
-    else
-        print_warning "未检测到 iptables 持久化工具，重启后白名单可能会失效。"
-    fi
-}
-
-clear_client_allowlist() {
-    ensure_root
-    print_info "正在清空客户端 IP 白名单，开放公网访问 (53/443)..."
-    if command -v iptables &> /dev/null; then
-        while iptables -C INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP" 2>/dev/null; do
-            iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP"
-        done
-        iptables -F "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
-        iptables -X "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
-
-        while iptables -C INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP" 2>/dev/null; do
-            iptables -D INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP"
-        done
-        iptables -F "$FIREWALL_CHAIN_UDP" 2>/dev/null || true
-        iptables -X "$FIREWALL_CHAIN_UDP" 2>/dev/null || true
-    fi
-    rm -f "$ALLOWLIST_FILE"
-    persist_firewall_rules
-    print_success "安全策略已变更为：允许任意公网落地机连接本 DNS。"
-}
-
-apply_client_allowlist() {
-    local allowed_ips=("$@")
-    check_command "iptables"
-    
-    print_info "正在应用客户端 IP 安全白名单..."
-    iptables -N "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
-    iptables -F "$FIREWALL_CHAIN_TCP"
-    iptables -N "$FIREWALL_CHAIN_UDP" 2>/dev/null || true
-    iptables -F "$FIREWALL_CHAIN_UDP"
-
-    for ip in "${allowed_ips[@]}"; do
-        iptables -A "$FIREWALL_CHAIN_TCP" -p tcp --dport "$LISTEN_PORT" -s "$ip" -j ACCEPT
-        iptables -A "$FIREWALL_CHAIN_UDP" -p udp --dport 53 -s "$ip" -j ACCEPT
-    done
-    
-    iptables -A "$FIREWALL_CHAIN_TCP" -p tcp --dport "$LISTEN_PORT" -j DROP
-    iptables -A "$FIREWALL_CHAIN_UDP" -p udp --dport 53 -j DROP
-
-    if ! iptables -C INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP" 2>/dev/null; then
-        iptables -I INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP"
-    fi
-    if ! iptables -C INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP" 2>/dev/null; then
-        iptables -I INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP"
-    fi
-
-    mkdir -p "$SNI_BASE_DIR"
-    {
-        echo "# 授权访问此公共 DNS 与 解锁中转的落地机 IP"
-        printf '%s\n' "${allowed_ips[@]}"
-    } > "$ALLOWLIST_FILE"
-
-    persist_firewall_rules
-    print_success "安全策略已变更为：仅允许授权白名单 IP 接入解析与解锁服务。"
-}
-
-manage_client_allowlist() {
-    ensure_root
-    clear
-    local current_allowed=""
-    [ -f "$ALLOWLIST_FILE" ] && current_allowed=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d')
-    
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN}      ◈  落地机(客户端) 访问授权管理  ◈       ${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    if [ -n "$current_allowed" ]; then
-        echo -e "${GREEN} 当前已授权放行的落地机 IP 列表:${NC}"
-        echo "$current_allowed" | sed 's/^/  • /'
-    else
-        echo -e "${GREEN} 当前安全策略 :${NC} ${YELLOW}公开解锁模式${NC}"
-    fi
-    echo -e "${GREEN}=============================================${NC}"
-    
-    echo -e "${GREEN}  1. 设置授权落地机 IP${NC}"
-    echo -e "${GREEN}  2. 追加授权落地机 IP${NC}"
-    echo -e "${GREEN}  3. 清空限制(公开解锁)${NC}"
-    echo -e "${GREEN}  0. 返回主菜单${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    
-    echo -ne "${GREEN} 请输入选项: ${NC}"
-    local choice
-    read -r choice
-    choice=$(echo "$choice" | xargs 2>/dev/null || echo "")
-
-    case "$choice" in
-        1|2)
-            echo -e "\n${YELLOW}[提示] 多个落地机 IP 请使用空格或逗号分隔${NC}"
-            echo -n -e "${GREEN}请输入落地机 IP: ${NC}"
-            local input_ips
-            read_required_input input_ips
-            input_ips=$(echo "$input_ips" | tr ',' ' ')
-
-            local allowed_ips=()
-            if [ "$choice" = "2" ] && [ -n "$current_allowed" ]; then
-                while IFS= read -r ip; do [ -n "$ip" ] && allowed_ips+=("$ip"); done <<< "$current_allowed"
-            fi
-
-            for ip in $input_ips; do
-                ip=$(echo "$ip" | tr -d '\r\n' | sed 's/[[:space:]]//g')
-                [ -z "$ip" ] && continue
-                if validate_ip_or_cidr "$ip"; then allowed_ips+=("$ip")
-                else print_error "无效的 IP 格式: $ip"; return 1; fi
-            done
-            
-            [ "${#allowed_ips[@]}" -eq 0 ] && { print_warning "未输入有效IP。"; return 0; }
-            mapfile -t allowed_ips < <(printf '%s\n' "${allowed_ips[@]}" | awk '!seen[$0]++')
-            apply_client_allowlist "${allowed_ips[@]}"
-            ;;
-        3) clear_client_allowlist ;;
-        *) return 0 ;;
-    esac
-}
-
-# ==================== SNIProxy 模块 ====================
-install_sniproxy() {
-    ensure_root
-    local is_update=$1
-    
-    if [ "$is_update" != "true" ] && systemctl list-unit-files | grep -q "^sniproxy\.service"; then
-        print_warning "检测到 SNIProxy 已安装。"
-        return 0
-    fi
-    
-    if [ "$is_update" = "true" ]; then
-        print_info "正在升级 SNIProxy 核心版本..."
-        systemctl stop sniproxy 2>/dev/null || true
-    else
-        print_info "开始全新安装 SNIProxy..."
-    fi
-    
-    install_dependency "curl"; install_dependency "jq"
-    local arch=$(detect_arch)
-    if [ "$arch" = "unknown" ]; then print_error "不支持的架构。"; exit 1; fi
-
-    local version=$(curl -sSL "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name')
-    if [ -z "$version" ] || [ "$version" = "null" ]; then version="v1.0.7"; fi
-    
-    local tar_name="sniproxy_linux_${arch}.tar.gz"
-    local download_url="https://github.com/XIU2/SNIProxy/releases/download/${version}/${tar_name}"
-    
-    curl -fL "$download_url" -o "/tmp/$tar_name"
-    local tmp_extract="/tmp/sniproxy_$$"; mkdir -p "$tmp_extract" "$SNI_BASE_DIR"
-    tar -xzf "/tmp/$tar_name" -C "$tmp_extract"
-    mv "$(find "$tmp_extract" -type f -name "$BINARY_NAME" | head -n 1)" "$SNI_BASE_DIR/$BINARY_NAME"
-    chmod +x "$SNI_BASE_DIR/$BINARY_NAME"
-    rm -f "/tmp/$tar_name" && rm -rf "$tmp_extract"
-
-    echo "$version" > "$VERSION_FILE"
-
-    if [ "$is_update" != "true" ]; then
-        cat <<EOF > "$SNI_BASE_DIR/config.yaml"
-listen_addr: ":$LISTEN_PORT"
-allow_all_hosts: true
-EOF
-
-        cat <<EOF > "$SNI_SERVICE_FILE"
-[Unit]
-Description=SNI Proxy
-After=network.target
-
-[Service]
-ExecStart=$SNI_BASE_DIR/$BINARY_NAME -c $SNI_BASE_DIR/config.yaml
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload && systemctl enable sniproxy
-    fi
-
-    systemctl start sniproxy
-    print_success "SNIProxy 核心包 ($version) 部署成功。"
-}
-
-# ==================== SmartDNS 模块 ====================
-check_and_fix_port_conflict() {
-    print_info "检查 53 端口占用情况..."
-    local port_usage=""
-    if command -v lsof &> /dev/null; then port_usage=$(lsof -i :53 2>/dev/null); fi
-    if [ -z "$port_usage" ] && command -v ss &> /dev/null; then port_usage=$(ss -tulnp | grep :53 2>/dev/null); fi
-    [ -z "$port_usage" ] && return 0
-    
-    if echo "$port_usage" | grep -q "systemd-resolve"; then
-        print_warning "发现 systemd-resolved 正在占用端口 53，执行清理释放..."
-        systemctl stop systemd-resolved && systemctl disable systemd-resolved
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        [ -L /etc/resolv.conf ] && rm /etc/resolv.conf
-        cat > /etc/resolv.conf << 'EOF'
-nameserver 1.1.1.1
-EOF
-        return 0
-    else
-        echo "$port_usage" | grep -q "smartdns" && return 0
-        print_error "端口 53 被其他未知程序占用，请先手动清理:\n$port_usage"
-        return 1
-    fi
-}
-
-install_smartdns_binary() {
-    local is_update=$1
-    if [ "$is_update" != "true" ] && command -v smartdns &> /dev/null; then return 0; fi
-    
-    if [ "$is_update" = "true" ]; then
-        print_info "正在升级并重新编译 SmartDNS 二进制程序..."
-        systemctl stop smartdns 2>/dev/null || true
-    else
-        print_info "正在获取并编译安装 SmartDNS 核心..."
-    fi
-
-    install_dependency "wget"
-    local arch=$(detect_arch)
-    local asset_arch=$([ "$arch" = "amd64" ] && echo "x86_64" || echo "aarch64")
-    local download_url=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep "browser_download_url" | grep "$asset_arch-linux-all.tar.gz" | head -n 1 | cut -d '"' -f 4)
-    
-    cd /tmp && wget -q --show-progress "${download_url}" -O smartdns.tar.gz
-    tar -xzf smartdns.tar.gz && cd smartdns && chmod +x ./install && ./install -i
-    cd /tmp && rm -rf smartdns smartdns.tar.gz
-    print_success "SmartDNS 核心包编译装载就绪。"
-}
-
-configure_smartdns_rules() {
-    local is_update=$1
-    ensure_root
-    if [ "$is_update" != "true" ]; then
-        if ! check_and_fix_port_conflict; then exit 1; fi
-    fi
-    install_smartdns_binary "$is_update"
-
-    # ==================== 🌐 动态自动获取公网 IPv4 (多重保底) ====================
-    print_info "正在自动获取中转端公网 IPv4 地址..."
-    local public_ip=""
-    public_ip=$(curl -s4 --max-time 3 api.ipify.org || curl -s4 --max-time 3 ifconfig.me || curl -s4 --max-time 3 ip4.icanhazip.com)
-    
-    # 去除可能存在的首尾空格或换行符
-    public_ip=$(echo "${public_ip}" | tr -d '[:space:]')
-
-    # 极端情况防呆判断：如果真的死活获取不到公网 IP，回退到 127.0.0.1 保障服务不崩
-    if [ -z "${public_ip}" ]; then
-        print_warning "未能自动获取到公网 IP，将 fallback 降级使用 127.0.0.1"
-        public_ip="127.0.0.1"
-    else
-        print_success "成功获取中转端公网 IP: ${public_ip}"
-    fi
-    # ===========================================================================
-
-    print_info "正在构建公网分流规则库..."
-    wget -q -O "${OUTPUT_FILE}" "${SMARTDNS_CONF_URL}"
-    sed -i '/^server /d' "${OUTPUT_FILE}"
-    sed -i '/^bind /d' "${OUTPUT_FILE}"
-
-    cat > "${OUTPUT_FILE}.tmp" << 'EOF'
-# ===== 公网公共 DNS 基础属性 =====
-server 1.1.1.1
-server 8.8.8.8
-bind :53
-cache-size 32768
-prefetch-domain yes
-serve-expired yes
-EOF
-    cat "${OUTPUT_FILE}" >> "${OUTPUT_FILE}.tmp"
-    mv "${OUTPUT_FILE}.tmp" "${OUTPUT_FILE}"
-
-    print_info "正在同步全球流媒体解锁域名数据源..."
-    curl -s "${DOMAIN_LIST_URL}" -o "${TEMP_DOMAIN_FILE}"
-    
-    cat >> "${OUTPUT_FILE}" << EOF
-
-# ===== 自动化就地劫持分流核心规则 =====
-EOF
-
-    # ==================== 💥 修复核心：引入变量并修正路径 💥 ====================
-    # 1. 传入 -v ip="${public_ip}" 将 Shell 变量安全传递给 awk
-    # 2. 修正源文件为 "${TEMP_DOMAIN_FILE}"，目标文件为 "${OUTPUT_FILE}"
-    awk -v ip="${public_ip}" '/^[^#[:space:]]/ {gsub(/[[:space:]\r]/, ""); if($0!="") print "address /" $0 "/" ip}' "${TEMP_DOMAIN_FILE}" >> "${OUTPUT_FILE}"
-    # ===========================================================================
-
-    rm -f "${TEMP_DOMAIN_FILE}"
-
-    mkdir -p /etc/smartdns
-    [ -f /etc/smartdns/smartdns.conf ] && cp /etc/smartdns/smartdns.conf /etc/smartdns/smartdns.conf.bak
-    cp "${OUTPUT_FILE}" /etc/smartdns/smartdns.conf
-    rm -f "${OUTPUT_FILE}"
-
-    systemctl restart smartdns
-    sleep 1
-    if systemctl is-active --quiet smartdns; then
-        print_success "中转端解锁 DNS 构建完成！"
-        print_info "当前已接管流媒体分流拦截规则共: $(grep -c "^address " /etc/smartdns/smartdns.conf) 条"
-    else
-        print_error "SmartDNS 启动异常。"
-    fi
-}
-
-show_logs() {
-    ensure_root
-    clear
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN}◈  流媒体解锁服务 实时运行日志  ◈${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    print_info "正在读取最近 30 行日志（按 Ctrl+C 即可退出查看）:"
-    echo -e "${YELLOW}--- SmartDNS 分流日志 ---${NC}"
-    journalctl -u smartdns -n 15 --no-pager 2>/dev/null || echo "无日志"
-    echo -e "\n${YELLOW}--- SNIProxy 中转日志 ---${NC}"
-    journalctl -u sniproxy -n 15 --no-pager 2>/dev/null || echo "无日志"
-    echo -e "${GREEN}=============================================${NC}"
-}
-
-# ==================== 彻底净化卸载模块 (修复核心) ====================
-uninstall_all_services() {
-    ensure_root
-    print_warning "正在全面卸载并净化本机的中转与分流服务..."
-    
-    # 1. 停止并禁用 Systemd 服务
-    systemctl stop sniproxy smartdns 2>/dev/null || true
-    systemctl disable sniproxy smartdns 2>/dev/null || true
-    
-    # 2. 调用 SmartDNS 官方自带的卸载逻辑（根治卸载不干净、状态残留的罪魁祸首）
-    if [ -f /usr/sbin/smartdns ] || [ -f /usr/bin/smartdns ]; then
-        print_info "正在调用 SmartDNS 核心卸载脚本..."
-        # 尝试重新拉取最新包或寻找本地残留的安装引导来执行卸载
-        local arch=$(detect_arch)
-        local asset_arch=$([ "$arch" = "amd64" ] && echo "x86_64" || echo "aarch64")
-        local download_url=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep "browser_download_url" | grep "$asset_arch-linux-all.tar.gz" | head -n 1 | cut -d '"' -f 4)
+# ==================== 智能防空降/落地克隆逻辑 ====================
+ensure_script_landed() {
+    # 检查当前运行的路径是不是预期的本地落地路径
+    if [ "$0" != "$PERM_SCRIPT_PATH" ]; then
+        echo -e "${GREEN}检测到首次使用远程或临时命令拉起，正在安全下载并固化到本地...${RESET}"
         
-        if [ -n "$download_url" ]; then
-            cd /tmp && wget -q "${download_url}" -O smartdns_un.tar.gz
-            tar -xzf smartdns_un.tar.gz && cd smartdns && chmod +x ./install
-            ./install -u >/dev/null 2>&1 # 官方卸载命令
-            cd /tmp && rm -rf smartdns smartdns_un.tar.gz
+        # 优先通过稳定的 URL 重新拉取完整代码，避免管道直接流失
+        if command -v curl >/dev/null 2>&1; then
+            curl -sL "$REMOTE_URL" -o "$PERM_SCRIPT_PATH" || true
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$PERM_SCRIPT_PATH" "$REMOTE_URL" || true
         fi
-    fi
 
-    # 3. 强力清除所有可能的遗留残余文件
-    clear_client_allowlist
-    rm -f "$SNI_SERVICE_FILE"
-    rm -rf "$SNI_BASE_DIR"
-    rm -rf /etc/smartdns
-    rm -f /usr/lib/systemd/system/smartdns.service /lib/systemd/system/smartdns.service
-    rm -f /usr/sbin/smartdns /usr/bin/smartdns
-    
-    # 4. 刷新 Systemd 守护进程守护缓存
-    systemctl daemon-reload
-    systemctl reset-failed 2>/dev/null || true
-    
-    print_success "系统环境已彻底净化，恢复至初始状态。"
+        # 极端容错：如果网络阻断导致远程拉取失败，利用当前会话内存直接克隆自身（健壮性双保险）
+        if [ ! -s "$PERM_SCRIPT_PATH" ] && [ -f "$0" ]; then
+            cat "$0" > "$PERM_SCRIPT_PATH" 2>/dev/null || true
+        fi
+
+        # 如果还是为空，说明是通过纯管道无文件运行且网络访问GitHub受限
+        if [ ! -s "$PERM_SCRIPT_PATH" ]; then
+            echo -e "${YELLOW}警告: 无法获取完整代码实体，请检查网络是否能访问 GitHub。${RESET}"
+            exit 1
+        fi
+
+        chmod +x "$PERM_SCRIPT_PATH"
+        echo -e "${GREEN}实体代码已成功落地: $PERM_SCRIPT_PATH${RESET}"
+        sleep 0.5
+        
+        # 传递所有接收到的参数，切换到本地实体无缝继续运行
+        exec "$PERM_SCRIPT_PATH" "$@"
+    fi
 }
 
-# ==================== 主控控制面板 ====================
+# 加载持久化配置
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+}
+
+# 保存持久化配置
+save_config() {
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat << EOF > "$CONFIG_FILE"
+TG_BOT_TOKEN="${TG_BOT_TOKEN}"
+TG_CHAT_ID="${TG_CHAT_ID}"
+CRON_TIME="${CRON_TIME}"
+MONITOR_PORTS="${MONITOR_PORTS}"
+EOF
+}
+
+# 获取公网 IP
+get_public_ip() {
+    curl -s --connect-timeout 5 https://api.ipify.org || curl -s --connect-timeout 5 https://ifconfig.me || echo "未知IP"
+}
+
+# 自动获取系统的默认公网网卡
+get_default_interface() {
+    local iface=$(ip route show | grep default | awk '{print $5}' | head -n 1)
+    echo "${iface:-eth0}"
+}
+
+# 尝试自动修复并安装 iptables 依赖
+ensure_iptables_installed() {
+    if ! command -v iptables >/dev/null 2>&1; then
+        detect_package_manager
+        echo -e "${YELLOW}检测到系统缺少 iptables 组件，正在尝试自动安装...${RESET}"
+        bash -c "$PKG_INSTALL_CMD" >/dev/null 2>&1 || true
+    fi
+}
+
+# 初始化 iptables 端口流量计数规则
+init_port_iptables() {
+    ensure_iptables_installed
+    if ! command -v iptables >/dev/null 2>&1; then
+        return 0 
+    fi
+    
+    load_config
+    local iface=$(get_default_interface)
+    for port in $MONITOR_PORTS; do
+        [ -z "$port" ] && continue
+        if ! iptables -C INPUT -i "$iface" -p tcp --dport "$port" >/dev/null 2>&1; then iptables -A INPUT -i "$iface" -p tcp --dport "$port" >/dev/null 2>&1 || true; fi
+        if ! iptables -C INPUT -i "$iface" -p udp --dport "$port" >/dev/null 2>&1; then iptables -A INPUT -i "$iface" -p udp --dport "$port" >/dev/null 2>&1 || true; fi
+        if ! iptables -C OUTPUT -o "$iface" -p tcp --sport "$port" >/dev/null 2>&1; then iptables -A OUTPUT -o "$iface" -p tcp --sport "$port" >/dev/null 2>&1 || true; fi
+        if ! iptables -C OUTPUT -o "$iface" -p udp --sport "$port" >/dev/null 2>&1; then iptables -A OUTPUT -o "$iface" -p udp --sport "$port" >/dev/null 2>&1 || true; fi
+    done
+}
+
+# 格式化字节
+format_bytes() {
+    local bytes=$1
+    if [ -z "$bytes" ] || [ "$bytes" -le 0 ] 2>/dev/null; then echo "0 B"; return; fi
+    local units=('B' 'KB' 'MB' 'GB' 'TB')
+    local i=0
+    while [ $(echo "$bytes > 1024" | bc -l) -eq 1 ] && [ $i -lt 4 ]; do
+        bytes=$(echo "scale=2; $bytes / 1024" | bc -l)
+        i=$((i+1))
+    done
+    echo "${bytes} ${units[$i]}"
+}
+
+# 获取某个端口的字节数
+get_port_traffic() {
+    local port=$1
+    local direction=$2
+    if ! command -v iptables >/dev/null 2>&1; then echo "0"; return; fi
+    local tcp_bytes=$(iptables -L $direction -nvx 2>/dev/null | grep -E "tcp dport $port|tcp spt $port" | awk '{print $2}' | awk '{s+=$1} END {print s}')
+    local udp_bytes=$(iptables -L $direction -nvx 2>/dev/null | grep -E "udp dport $port|udp spt $port" | awk '{print $2}' | awk '{s+=$1} END {print s}')
+    echo $(( ${tcp_bytes:-0} + ${udp_bytes:-0} ))
+}
+
+# Telegram 发送基础函数
+send_tg_notification() {
+    local message="$1"
+    load_config
+    if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+        local ip=$(get_public_ip)
+        local hostname=$(hostname)
+        local full_message="【vnStat 流量看板】%0A====================%0A"
+        full_message+="主机名称: ${hostname}%0A"
+        full_message+="公网IP: ${ip}%0A"
+        full_message+="====================%0A"
+        full_message+="${message}"
+        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" -d "chat_id=${TG_CHAT_ID}" -d "text=${full_message}" >/dev/null 2>&1 || true
+    fi
+}
+
+# 收集默认网卡与自定义端口的数据
+send_traffic_report() {
+    init_port_iptables
+    load_config
+    local report=""
+    local iface=$(get_default_interface)
+    
+    if command -v vnstat >/dev/null 2>&1; then
+        local today_line=$(vnstat -i "$iface" -d --oneline 2>/dev/null | cut -d';' -f4,5,6 || echo "")
+        local month_line=$(vnstat -i "$iface" -m --oneline 2>/dev/null | cut -d';' -f9,10,11 || echo "")
+        report+="📡 默认网卡: ${iface}%0A"
+        if [ -n "$today_line" ]; then report+=" 今日总流量: 下行 $(echo "$today_line" | cut -d';' -f1) | 上行 $(echo "$today_line" | cut -d';' -f2) | 总计 $(echo "$today_line" | cut -d';' -f3)%0A"; fi
+        if [ -n "$month_line" ]; then report+=" 本月总累计: 下行 $(echo "$month_line" | cut -d';' -f1) | 上行 $(echo "$month_line" | cut -d';' -f2) | 总计 $(echo "$month_line" | cut -d';' -f3)%0A"; fi
+        report+="====================%0A"
+    else
+        report+="📡 默认网卡: ${iface} (vnStat未安装)%0A====================%0A"
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        report+="🔌 独立端口流量统计:%0A"
+        for port in $MONITOR_PORTS; do
+            [ -z "$port" ] && continue
+            local rx_bytes=$(get_port_traffic "$port" "INPUT")
+            local tx_bytes=$(get_port_traffic "$port" "OUTPUT")
+            report+=" 端口 [ ${port} ] -> 下载: $(format_bytes "$rx_bytes") | 上传: $(format_bytes "$tx_bytes") | 总计: $(format_bytes "$((rx_bytes + tx_bytes))")%0A"
+        done
+    fi
+    send_tg_notification "$report"
+}
+
+# 设置或取消每日定时任务
+manage_cron() {
+    local action="$1"
+    crontab -l 2>/dev/null | grep -v "\-\-cron-report" | crontab - || true
+
+    if [ "$action" = "set" ]; then
+        load_config
+        if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            (crontab -l 2>/dev/null; echo "${CRON_TIME} bash $PERM_SCRIPT_PATH --cron-report >/dev/null 2>&1") | crontab -
+            echo -e "${GREEN}定时任务激活成功！当前频次表达式: ${CRON_TIME}${RESET}"
+        else
+            echo -e "${YELLOW}警告: 未配置 TG 参数，无法启动定时任务。${RESET}"
+        fi
+    elif [ "$action" = "unset" ]; then
+        echo -e "${GREEN}已关闭并清理定时流量通知任务。${RESET}"
+    fi
+}
+
+# 定时任务独立管理菜单
+menu_cron_config() {
+    while true; do
+        load_config
+        init_port_iptables
+        clear
+        local cron_status="未激活"
+        if crontab -l 2>/dev/null | grep -q "\-\-cron-report"; then cron_status="已激活"; fi
+
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN}       TG 定时通知管理         ${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN}任务状态 :${RESET} ${YELLOW}${cron_status}${RESET}"
+        echo -e "${GREEN}当前时间 :${RESET} ${YELLOW}${CRON_TIME}${RESET}"
+        echo -e "${GREEN}TG Token :${RESET} ${YELLOW}${TG_BOT_TOKEN:-未配置}${RESET}"
+        echo -e "${GREEN}Chat ID  :${RESET} ${YELLOW}${TG_CHAT_ID:-未配置}${RESET}"
+        echo -e "${GREEN}监控端口 :${RESET} ${YELLOW}${MONITOR_PORTS}${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN} 1. 修改 Telegram Bot Token${RESET}"
+        echo -e "${GREEN} 2. 修改 Telegram Chat ID${RESET}"
+        echo -e "${GREEN} 3. 修改定时发送时间${RESET}"
+        echo -e "${GREEN} 4. 修改需要监控的端口${RESET}"
+        echo -e "${GREEN} 5. 开启 / 更新定时通知任务${RESET}"
+        echo -e "${GREEN} 6. 关闭定时通知任务${RESET}"
+        echo -e "${GREEN} 7. 手动测试发送当前流量报告${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read -r cron_choice
+
+        case "$cron_choice" in
+            1) read -rp "请输入新的 TG Bot Token: " TG_BOT_TOKEN; save_config; pause ;;
+            2) read -rp "请输入新的 TG Chat ID: " TG_CHAT_ID; save_config; pause ;;
+            3)
+                clear
+                echo -e "${GREEN}==============================${RESET}"
+                echo -e "${GREEN}       选择定时发送时间        ${RESET}"
+                echo -e "${GREEN}==============================${RESET}"
+                echo -e "  1) 每天0点"
+                echo -e "  2) 每周一0点"
+                echo -e "  3) 每月1号0点"
+                echo -e "  4) 自定义cron表达式"
+                echo -e "${GREEN}==============================${RESET}"
+                echo -ne "${GREEN}请选择时间模板: ${RESET}"
+                read -r time_choice
+                case "$time_choice" in
+                    1) CRON_TIME="0 0 * * *"; echo -e "${GREEN}已选择: 每天0点${RESET}" ;;
+                    2) CRON_TIME="0 0 * * 1"; echo -e "${GREEN}已选择: 每周一0点${RESET}" ;;
+                    3) CRON_TIME="0 0 1 * *"; echo -e "${GREEN}已选择: 每月1号0点${RESET}" ;;
+                    4) read -rp "请输入标准的 5 位 Cron 表达式 (如 0 12 * * *): " temp_cron; if [ -n "$temp_cron" ]; then CRON_TIME="$temp_cron"; fi ;;
+                esac
+                save_config; pause ;;
+            4)
+                echo -e "当前监控的端口为: ${YELLOW}${MONITOR_PORTS}${RESET}"
+                read -rp "请输入新的端口列表（多个端口请用空格隔开，例如 22 80 443 8888）: " input_ports
+                if [ -n "$input_ports" ]; then
+                    MONITOR_PORTS="$input_ports"
+                    save_config
+                    echo -e "${GREEN}端口更新成功！正在刷新防火墙规则...${RESET}"
+                fi
+                pause ;;
+            5) manage_cron "set"; pause ;;
+            6) manage_cron "unset"; pause ;;
+            7) echo "正在发送测试报告..."; send_traffic_report; echo "已提交发送请求。"; pause ;;
+            0) break ;;
+            *) echo "无效选项"; pause ;;
+        esac
+    done
+}
+
+detect_init_system() {
+    if command -v systemctl >/dev/null 2>&1; then INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1; then INIT_SYSTEM="openrc"
+    else echo "未检测到支持的初始化系统 (systemd 或 openrc)"; exit 1; fi
+}
+
+detect_service() {
+    detect_init_system
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        if systemctl list-unit-files | grep -q '^vnstat\.service'; then SERVICE_NAME="vnstat"
+        elif systemctl list-unit-files | grep -q '^vnstatd\.service'; then SERVICE_NAME="vnstatd"
+        else SERVICE_NAME="vnstat"; fi
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        if [ -f /etc/init.d/vnstatd ]; then SERVICE_NAME="vnstatd"; else SERVICE_NAME="vnstat"; fi
+    fi
+}
+
+detect_package_manager() {
+    if command -v apk >/dev/null 2>&1; then
+        PKG_MANAGER="apk"; PKG_INSTALL_CMD="apk update && apk add vnstat bc iptables cronie || apk add vnstat bc iptables dcron"; PKG_REMOVE_CMD="apk del vnstat"
+    elif command -v apt >/dev/null 2>&1; then
+        PKG_MANAGER="apt"; PKG_INSTALL_CMD="apt update && apt install -y vnstat bc iptables cron"; PKG_REMOVE_CMD="apt remove -y vnstat && apt autoremove -y"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"; PKG_INSTALL_CMD="dnf install -y epel-release || true; dnf install -y vnstat bc iptables crontabs"; PKG_REMOVE_CMD="dnf remove -y vnstat"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MANAGER="yum"; PKG_INSTALL_CMD="yum install -y epel-release || true; yum install -y vnstat bc iptables crontabs"; PKG_REMOVE_CMD="yum remove -y vnstat"
+    else
+        echo "未检测到支持的包管理器（apk/apt/dnf/yum）"; exit 1
+    fi
+}
+
+require_root() { if [ "$(id -u)" -ne 0 ]; then echo "请使用 root 身份运行此脚本"; exit 1; fi; }
+pause() { echo -ne "${GREEN}按回车继续...${RESET}"; read -r _ ; }
+
+manage_service_start() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl enable "$SERVICE_NAME" --now
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-update add "$SERVICE_NAME" default; rc-service "$SERVICE_NAME" start; fi
+}
+
+manage_service_restart() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl restart "$SERVICE_NAME"
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-service "$SERVICE_NAME" restart; fi
+}
+
+manage_service_status() { detect_service; if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl status "$SERVICE_NAME" --no-pager; elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-service "$SERVICE_NAME" status; fi; }
+
+manage_service_stop() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    elif [ "$INIT_SYSTEM" = "openrc" ] ; then
+        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+        rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
+    fi
+}
+
+install_vnstat() {
+    detect_package_manager
+    echo "正在安装 vnstat 及核心组件..."
+    bash -c "$PKG_INSTALL_CMD"
+    echo "正在启动服务并设置开机自启..."
+    manage_service_start
+    init_port_iptables
+    echo "安装与开机自启配置完成！"
+}
+
+restart_service() { manage_service_restart; echo "服务已重启：$SERVICE_NAME"; }
+show_service_status() { manage_service_status; }
+
+list_interfaces() {
+    echo "当前网络接口："
+    if command -v ip >/dev/null 2>&1; then ip -o link show | awk -F': ' '{print $2}' | grep -v lo
+    else ifconfig -a | grep -E '^[a-zA-Z0-9]' | awk '{print $1}' | grep -v lo; fi
+}
+
+add_interface() {
+    list_interfaces
+    read -rp "请输入要监控的网卡名: " iface
+    if [ -z "$iface" ]; then echo "网卡名不能为空"; return; fi
+    vnstat -i "$iface" --add || true
+    manage_service_restart
+    echo "已添加监控接口: $iface"
+}
+
+show_default_stats() { vnstat; }
+show_interface_stats() { list_interfaces; read -rp "请输入要查看的网卡名: " iface; if [ -n "$iface" ]; then vnstat -i "$iface"; fi; }
+show_daily_stats() { read -rp "请输入网卡名（留空则使用默认）: " iface; if [ -n "$iface" ]; then vnstat -i "$iface" -d; else vnstat -d; fi; }
+show_monthly_stats() { read -rp "请输入网卡名（留空则使用默认）: " iface; if [ -n "$iface" ]; then vnstat -i "$iface" -m; else vnstat -m; fi; }
+live_monitor() { read -rp "请输入网卡名（留空则使用默认）: " iface; if [ -n "$iface" ]; then vnstat -i "$iface" -l; else vnstat -l; fi; }
+
+remove_vnstat() {
+    detect_package_manager
+    echo -e "${YELLOW}即将开始卸载 vnstat 面板及清理所有配置...${RESET}"
+    read -rp "是否同时删除流量统计数据库文件? [y/N]: " remove_db
+
+    # 1. 停止服务
+    manage_service_stop
+    
+    # 2. 清理系统级 Crontab 定时器
+    manage_cron "unset"
+
+    # 3. 彻底清除防火墙内各端口的流量监控计数器
+    if command -v iptables >/dev/null 2>&1; then
+        local iface=$(get_default_interface)
+        for port in $MONITOR_PORTS; do
+            iptables -D INPUT -i "$iface" -p tcp --dport "$port" >/dev/null 2>&1 || true
+            iptables -D INPUT -i "$iface" -p udp --dport "$port" >/dev/null 2>&1 || true
+            iptables -D OUTPUT -o "$iface" -p tcp --sport "$port" >/dev/null 2>&1 || true
+            iptables -D OUTPUT -o "$iface" -p udp --sport "$port" >/dev/null 2>&1 || true
+        done
+    fi
+
+    # 4. 卸载包
+    bash -c "$PKG_REMOVE_CMD"
+    
+    # 5. 可选清理数据库
+    if [[ "$remove_db" =~ ^[Yy]$ ]]; then rm -rf /var/lib/vnstat; fi
+    
+    # 6. 删除本地配置文件及自身脚本文件，实现无痕自毁
+    rm -f "$CONFIG_FILE"
+    echo -e "${GREEN}系统组件、定时任务、配置文件已全部清除！${RESET}"
+    echo -e "${GREEN}最后一步：自毁灭本地实体脚本...${RESET}"
+    rm -f "$PERM_SCRIPT_PATH"
+    
+    exit 0
+}
+
+get_panel_info() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then panel_status="运行中"; else panel_status="未运行"; fi
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        if rc-service "$SERVICE_NAME" status 2>/dev/null | grep -q "started"; then panel_status="运行中"; else panel_status="未运行"; fi
+    fi
+    if command -v vnstat >/dev/null 2>&1; then
+        panel_version=$(vnstat -v | awk '{print $2}')
+        panel_port=$(get_default_interface)
+    else
+        panel_version="未安装"; panel_status="未安装"; panel_port="无"
+    fi
+}
+
+show_menu() {
+    clear
+    get_panel_info
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}         vnStat 面板          ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} ${YELLOW}$panel_status${RESET}"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}网卡 :${RESET} ${YELLOW}${panel_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1. 安装 vnstat (含自动开机自启)${RESET}"
+    echo -e "${GREEN} 2. 重启服务${RESET}"
+    echo -e "${GREEN} 3. 查看服务状态${RESET}"
+    echo -e "${GREEN} 4. 查看网络接口${RESET}"
+    echo -e "${GREEN} 5. 添加监控接口${RESET}"
+    echo -e "${GREEN} 6. 查看默认流量统计${RESET}"
+    echo -e "${GREEN} 7. 查看指定网卡流量${RESET}"
+    echo -e "${GREEN} 8. 查看日流量统计${RESET}"
+    echo -e "${GREEN} 9. 查看月流量统计${RESET}"
+    echo -e "${GREEN}10. 实时流量监控${RESET}"
+    echo -e "${GREEN}11. 配置 TG 定时通知任务 >>${RESET}"
+    echo -e "${GREEN}12. 卸载 vnstat (含全面数据清理)${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+}
 
 main() {
-    local my_ip
-    my_ip=$(get_public_ip)
+    # 如果是定时任务拉起，直接执行通知汇报逻辑后静默退出
+    if [ "$1" = "--cron-report" ]; then
+        send_traffic_report
+        exit 0
+    fi
     
-    # -------------------------------------------------------------
-    # 【优化项 1】远程版本属于静态数据，移到菜单外，启动脚本时仅获取一次
-    # -------------------------------------------------------------
-    local remote_sni_ver=$(get_remote_sni_version)
-    local remote_sdns_ver=$(get_remote_smartdns_version)
-
-    # 定义需要跨循环持久化的状态变量
-    local sni_installed="false"
-    local smartdns_installed="false"
-    local current_sni_ver="${RED}未装载${NC}"
-    local current_sdns_ver="${RED}未装载${NC}"
-
-    # -------------------------------------------------------------
-    # 【优化项 2】将耗时的“本地安装检测”和“本地版本解析”封装为独立函数
-    # -------------------------------------------------------------
-    refresh_local_status() {
-        # SNIProxy 安装与版本判定
-        sni_installed="false"
-        if systemctl list-unit-files | grep -q "^sniproxy\.service"; then
-            sni_installed="true"
-            if [ -f "$VERSION_FILE" ]; then 
-                current_sni_ver=$(cat "$VERSION_FILE")
-            else
-                current_sni_ver="v1.0.7"
-            fi
-        else
-            current_sni_ver="${RED}未装载${NC}"
-        fi
-
-        # SmartDNS 安装与版本判定
-        smartdns_installed="false"
-        if systemctl list-unit-files | grep -q "^smartdns\.service" || command -v smartdns &> /dev/null; then
-            smartdns_installed="true"
-            local raw_ver=$(smartdns -v 2>&1 | head -n 1)
-            local main_ver=$(echo "$raw_ver" | awk '{print $2}' | cut -d'-' -f1)
-            local sub_ver=$(echo "$raw_ver" | grep -o 'Release[^)]*')
-
-            if [ -n "$main_ver" ] && [ -n "$sub_ver" ]; then
-                current_sdns_ver="${main_ver} (${sub_ver})"
-            elif [ -n "$main_ver" ]; then
-                current_sdns_ver="${main_ver}"
-            else
-                current_sdns_ver="未知版本"
-            fi
-        else
-            current_sdns_ver="${RED}未装载${NC}"
-        fi
-    }
-
-    # 脚本启动时，先初始化调用一次状态探测
-    refresh_local_status
-
-    # -------------------------------------------------------------
-    # 【主循环】现在这里面没有任何耗时命令，按下回车瞬时刷新！
-    # -------------------------------------------------------------
+    require_root
+    
+    # 核心拦截检测：若不是在预设路径下运行，则克隆自身到本地固化
+    ensure_script_landed "$@"
+    
+    load_config
     while true; do
-        clear
-        
-        # 1. 动态服务运行状态（systemctl is-active 响应速度极快，可保留在内部提供实时状态）
-        local sni_status_view="${RED}未安装${NC}"
-        if [ "$sni_installed" = "true" ]; then
-            if systemctl is-active --quiet sniproxy; then
-                sni_status_view="${GREEN}运行中${NC} ${YELLOW}(端口: ${LISTEN_PORT})${NC}"
-            else
-                sni_status_view="${YELLOW}已停止${NC}"
-            fi
-        fi
-
-        local smartdns_status_view="${RED}未安装${NC}"
-        if [ "$smartdns_installed" = "true" ]; then
-            if systemctl is-active --quiet smartdns; then
-                smartdns_status_view="${GREEN}运行中${NC} ${YELLOW}(端口: 53)${NC}"
-            else
-                smartdns_status_view="${YELLOW}已停止${NC}"
-            fi
-        fi
-
-        # 2. 动态白名单文件体积检查（本地纯文件判断，不卡顿）
-        local whitelist_view="${YELLOW}公开解锁(任意设备改DNS即可解锁)${NC}"
-        if [ -f "$ALLOWLIST_FILE" ] && [ -s "$ALLOWLIST_FILE" ]; then
-            local count=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d' | wc -l)
-            whitelist_view="${YELLOW}安全模式(允许已授权的 ${count} 个IP)${NC}"
-        fi
-
-        # 3. 渲染主面板
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN}     ◈  流媒体公共 DNS 解锁中转面板  ◈       ${NC}"
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN} SNIProxy 状态:${NC} $sni_status_view"
-        echo -e "${GREEN} SmartDNS 状态:${NC} $smartdns_status_view"
-        echo -e "${GREEN} SNIProxy 版本:${NC} ${YELLOW}${current_sni_ver}${NC}"
-        echo -e "${GREEN} SmartDNS 版本:${NC} ${YELLOW}${current_sdns_ver}${NC}"
-        echo -e "${GREEN} 安全策略访问 :${NC} $whitelist_view"
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN}  1. 安装 解锁服务${NC}"
-        echo -e "${GREEN}  2. 更新 解锁服务${NC}"
-        echo -e "${GREEN}  3. 卸载 解锁服务${NC}"
-        echo -e "${GREEN}  4. 白名单规则${NC}"
-        echo -e "${GREEN}  5. 启动 解锁服务${NC}"
-        echo -e "${GREEN}  6. 停止 解锁服务${NC}"
-        echo -e "${GREEN}  7. 重启 解锁服务${NC}"
-        echo -e "${GREEN}  8. 查看日志${NC}"
-        echo -e "${GREEN}  9. 查看配置${NC}"
-        echo -e "${GREEN}  0. 退出 ${NC}"
-        echo -e "${GREEN}=============================================${NC}"
-        
-        echo -ne "${GREEN} 请输入选项: ${NC}"
-        local choice
+        show_menu
         read -r choice
-        choice=$(echo "$choice" | xargs 2>/dev/null || echo "")
-
         case "$choice" in
-            1)
-                install_sniproxy "false"
-                configure_smartdns_rules "false"
-                refresh_local_status # 安装后主动刷新本地状态缓存
-                echo -e "\n${GREEN}==================================================${NC}"
-                print_success "中转端部署完全就绪！"
-                echo -e "现在，你其他的【落地机】不需要装任何东西，直接执行这三行命令即可解锁："
-                echo -e "${YELLOW}chattr -i /etc/resolv.conf 2>/dev/null || true${NC}"
-                echo -e "${YELLOW}echo \"nameserver ${my_ip}\" > /etc/resolv.conf${NC}"
-                echo -e "${YELLOW}chattr +i /etc/resolv.conf 2>/dev/null${NC}"
-                echo -e "${GREEN}==================================================${NC}"
-                echo -n "按回车键返回面板..."; read -r _ ;;
-            2) 
-                install_sniproxy "true"
-                configure_smartdns_rules "true"
-                refresh_local_status # 更新后主动刷新本地状态缓存
-                print_success "SNIProxy 和 SmartDNS 核心程序以及分流规则已全部升级成功！"
-                echo -n "按回车键返回面板..."; read -r _ ;;
-            3) 
-                uninstall_all_services
-                refresh_local_status # 卸载后主动刷新本地状态缓存
-                echo -n "按回车键返回面板..."; read -r _ ;;
-            4) 
-                manage_client_allowlist
-                echo -n "按回车键返回面板..."; read -r _ ;;
-            5) systemctl start sniproxy smartdns 2>/dev/null && print_success "服务已完成启动指令。"; sleep 1.5 ;;
-            6) systemctl stop sniproxy smartdns 2>/dev/null && print_success "服务已完成停止指令。"; sleep 1.5 ;;
-            7) systemctl restart sniproxy smartdns 2>/dev/null && print_success "核心组件已全部重启。"; sleep 1.5 ;;
-            8) show_logs; echo -n "按回车键返回面板..."; read -r _ ;;
-            9) 
-                clear
-                echo -e "${GREEN}--- 当前运行配置摘要 ---${NC}"
-                echo -e "DNS 监听地址: 0.0.0.0:53  |  SNI 中转端口: 0.0.0.0:${LISTEN_PORT}"
-                echo -e "已加载劫持分流域名数量: ${YELLOW}$(grep -c "^address " /etc/smartdns/smartdns.conf 2>/dev/null || echo "0")${NC} 条"
-                echo -e "\n${GREEN}--- 本机流媒体原生出口测试 ---${NC}"
-                if command -v curl &> /dev/null; then
-                    echo -n "Netflix 出口状态: "
-                    curl -sI --max-time 3 https://www.netflix.com | head -n 1 || echo "连接超时"
-                else
-                    print_warning "本地缺少 curl，无法执行出口活性探测。"
-                fi
-                echo -n "按回车键返回面板..."; read -r _ ;;
+            1) install_vnstat; pause ;;
+            2) restart_service; pause ;;
+            3) show_service_status; pause ;;
+            4) list_interfaces; pause ;;
+            5) add_interface; pause ;;
+            6) show_default_stats; pause ;;
+            7) show_interface_stats; pause ;;
+            8) show_daily_stats; pause ;;
+            9) show_monthly_stats; pause ;;
+            10) live_monitor ;;
+            11) menu_cron_config ;;
+            12) remove_vnstat ;;
             0) exit 0 ;;
-            *) print_error "无效选项: '$choice'，请重新输入。"; sleep 1.5 ;;
+            *) echo "无效选项"; pause ;;
         esac
     done
 }

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================================
-#  SNIProxy & SmartDNS 公共解锁 DNS管理脚本 (修复版)
+#   SNIProxy & SmartDNS 公共解锁 DNS管理脚本 (直连+轮询版)
 # ========================================================
 
 # 参数配置
@@ -12,6 +12,15 @@ SNI_BASE_DIR="$(pwd)/sniproxy"
 ALLOWLIST_FILE="$SNI_BASE_DIR/allowed_client_ips.txt"
 VERSION_FILE="$SNI_BASE_DIR/version.txt"
 SNI_SERVICE_FILE="/etc/systemd/system/sniproxy.service"
+
+# GitHub 备用加速代理池（当直连失败时，按顺序轮询尝试）
+GITHUB_PROXY_POOL=(
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://v6.gh-proxy.org/'
+    'https://ghproxy.lvedong.eu.org/'
+)
 
 SMARTDNS_CONF_URL="https://raw.githubusercontent.com/pymumu/smartdns/master/etc/smartdns/smartdns.conf"
 DOMAIN_LIST_URL="https://raw.githubusercontent.com/1-stream/1stream-public-utils/refs/heads/main/stream.text.list"
@@ -103,16 +112,78 @@ detect_os() {
 
 get_public_ip() {
     local pub_ip
-    pub_ip=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || echo "你的中转机公网IP")
+    pub_ip=$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 https://ifconfig.me || echo "你的中转机公网IP")
     echo "$pub_ip"
 }
 
-get_remote_sni_version() {
-    curl -sS --max-time 1.5 "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "未知"
+# -------------------------------------------------------------
+# 【核心下载引擎】默认直连，失败则轮询代理池
+# -------------------------------------------------------------
+smart_download() {
+    local relative_url="$1"
+    local output_path="$2"
+    local tool="${3:-curl}" # 默认用 curl，可选 wget
+    
+    local full_url="https://github.com/${relative_url}"
+    if [[ "$relative_url" == http* ]]; then
+        full_url="$relative_url"
+    fi
+
+    print_info "正在尝试直连下载: $full_url"
+    if [ "$tool" = "wget" ]; then
+        if wget -q --show-progress --timeout=8 --tries=1 "$full_url" -O "$output_path"; then return 0; fi
+    else
+        if curl -fL --connect-timeout 8 "$full_url" -o "$output_path"; then return 0; fi
+    fi
+
+    print_warning "直连下载失败或超时，启动备用代理池轮询策略..."
+    
+    # 提取纯相对路径用于代理拼接
+    local pure_path="$relative_url"
+    if [[ "$relative_url" == http* ]]; then
+        pure_path=$(echo "$relative_url" | sed -e 's|https://github.com/||' -e 's|https://raw.githubusercontent.com/||')
+        # 如果是 raw 链接，部分代理需要特殊拼接，这里统一还原成普通代理支持的格式
+        if [[ "$relative_url" == *raw.githubusercontent.com* ]]; then
+            full_url="https://raw.githubusercontent.com/${pure_path}"
+        else
+            full_url="https://github.com/${pure_path}"
+        fi
+    fi
+
+    for proxy in "${GITHUB_PROXY_POOL[@]}"; do
+        local proxy_url="${proxy}${full_url}"
+        print_info "正在尝试代理节点 [ $proxy ] -> $proxy_url"
+        
+        if [ "$tool" = "wget" ]; then
+            if wget -q --show-progress --timeout=8 --tries=1 "$proxy_url" -O "$output_path"; then
+                print_success "通过代理节点下载成功！"
+                return 0
+            fi
+        else
+            if curl -fL --connect-timeout 8 "$proxy_url" -o "$output_path"; then
+                print_success "通过代理节点下载成功！"
+                return 0
+            fi
+        fi
+        print_warning "该节点响应异常，正在切往下一个节点..."
+    done
+
+    print_error "所有直连及代理通道全部宣告失败，请检查本机基础网络！"
+    return 1
 }
 
-get_remote_smartdns_version() {
-    curl -sS --max-time 1.5 "https://api.github.com/repos/pymumu/smartdns/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "未知"
+get_remote_version_fallback() {
+    local api_path="$1"
+    local default_ver="$2"
+    local tmp_json="/tmp/git_api_$$.json"
+    
+    if smart_download "https://api.github.com/${api_path}" "$tmp_json" "curl"; then
+        local tag=$(jq -r '.tag_name' "$tmp_json" 2>/dev/null)
+        rm -f "$tmp_json"
+        if [ -z "$tag" ] || [ "$tag" = "null" ]; then echo "$default_ver"; else echo "$tag"; fi
+    else
+        echo "$default_ver"
+    fi
 }
 
 install_dependency() {
@@ -275,13 +346,16 @@ install_sniproxy() {
     local arch=$(detect_arch)
     if [ "$arch" = "unknown" ]; then print_error "不支持的架构。"; exit 1; fi
 
-    local version=$(curl -sSL "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name')
-    if [ -z "$version" ] || [ "$version" = "null" ]; then version="v1.0.7"; fi
-    
+    local version=$(get_remote_version_fallback "repos/XIU2/SNIProxy/releases/latest" "v1.0.7")
     local tar_name="sniproxy_linux_${arch}.tar.gz"
-    local download_url="https://github.com/XIU2/SNIProxy/releases/download/${version}/${tar_name}"
+    local rel_url="XIU2/SNIProxy/releases/download/${version}/${tar_name}"
     
-    curl -fL "$download_url" -o "/tmp/$tar_name"
+    print_info "正在拉取 SNIProxy 核心程序包..."
+    if ! smart_download "$rel_url" "/tmp/$tar_name" "curl"; then
+        print_error "SNIProxy 核心包拉取完全失败！"
+        exit 1
+    fi
+    
     local tmp_extract="/tmp/sniproxy_$$"; mkdir -p "$tmp_extract" "$SNI_BASE_DIR"
     tar -xzf "/tmp/$tar_name" -C "$tmp_extract"
     mv "$(find "$tmp_extract" -type f -name "$BINARY_NAME" | head -n 1)" "$SNI_BASE_DIR/$BINARY_NAME"
@@ -353,9 +427,16 @@ install_smartdns_binary() {
     install_dependency "wget"
     local arch=$(detect_arch)
     local asset_arch=$([ "$arch" = "amd64" ] && echo "x86_64" || echo "aarch64")
-    local download_url=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep "browser_download_url" | grep "$asset_arch-linux-all.tar.gz" | head -n 1 | cut -d '"' -f 4)
     
-    cd /tmp && wget -q --show-progress "${download_url}" -O smartdns.tar.gz
+    local rel_url="pymumu/smartdns/releases/download/v1.2024.06.12/smartdns-${asset_arch}-linux-all.tar.gz"
+    
+    cd /tmp && rm -f smartdns.tar.gz
+    print_info "正在下载 SmartDNS 程序组件..."
+    if ! smart_download "$rel_url" "smartdns.tar.gz" "wget"; then
+        print_error "SmartDNS 组件包下载完全失败！"
+        return 1
+    fi
+    
     tar -xzf smartdns.tar.gz && cd smartdns && chmod +x ./install && ./install -i
     cd /tmp && rm -rf smartdns smartdns.tar.gz
     print_success "SmartDNS 核心包编译装载就绪。"
@@ -370,7 +451,7 @@ configure_smartdns_rules() {
     install_smartdns_binary "$is_update"
 
     print_info "正在构建公网分流规则库..."
-    rm -f "${OUTPUT_FILE}" "${OUTPUT_FILE}.tmp"
+    rm -f "${OUTPUT_FILE}"
     
     cat > "${OUTPUT_FILE}" << 'EOF'
 # ===== 公网公共 DNS 基础属性 =====
@@ -381,31 +462,34 @@ cache-size 32768
 prefetch-domain yes
 serve-expired yes
 
+# ===== 阻止浏览器强制使用 QUIC (UDP 443) 绕过中转 =====
+force-qtype-SOA 65
 
 # ===== 自动化就地劫持分流核心规则 =====
 EOF
 
     print_info "正在同步全球流媒体解锁域名数据源..."
-    if ! curl -s "${DOMAIN_LIST_URL}" -o "${TEMP_DOMAIN_FILE}"; then
-        print_error "下载流媒体域名数据源失败，请检查 network！"
+    if ! smart_download "${DOMAIN_LIST_URL}" "${TEMP_DOMAIN_FILE}" "curl"; then
+        print_error "流媒体域名列表获取完全失败！"
         return 1
     fi
     
-    # -------------------------------------------------------------
-    # 【全量注入】不做任何过滤，仅安全剥离 server_name、分号和前缀点
-    # -------------------------------------------------------------
-    grep -v '^[[:space:]]*#' "${TEMP_DOMAIN_FILE}" | \
-    grep "server_name" | \
-    sed 's/server_name//g' | \
-    tr -d ';' | \
-    tr ' ' '\n' | \
-    sed 's/^\.//g' | \
-    sed '/^[[:space:]]*$/d' | \
+    if [ ! -f "${TEMP_DOMAIN_FILE}" ] || [ ! -s "${TEMP_DOMAIN_FILE}" ]; then
+        print_error "流媒体域名列表文件为空！"
+        return 1
+    fi
+
+    cat "${TEMP_DOMAIN_FILE}" | \
+    tr -d '\r' | \
+    tr '[:space:]' '\n' | \
+    sed -e 's/^\.//g' -e 's/;$//g' | \
+    grep -E '^([a-zA-Z0-9_-]+\.)+[a-zA-Z]{2,6}$' | \
     sort -u | \
     while read -r domain; do
-        echo "address /$domain/127.0.0.1" >> "${OUTPUT_FILE}"
+        if [ "$domain" != "domain-set" ] && [ "$domain" != "server_name" ]; then
+            echo "address /$domain/127.0.0.1" >> "${OUTPUT_FILE}"
+        fi
     done
-
     rm -f "${TEMP_DOMAIN_FILE}"
 
     mkdir -p /etc/smartdns
@@ -415,14 +499,16 @@ EOF
 
     systemctl restart smartdns
     sleep 1.5
-    
     if systemctl is-active --quiet smartdns; then
-        print_success "中转端解锁 DNS 构建并清洗完成（已全量导入所有域名）！"
         local valid_count=$(grep -c "^address " /etc/smartdns/smartdns.conf)
-        print_info "当前已接管[合规合法]的流媒体分流拦截规则共: ${YELLOW}${valid_count}${NC} 条"
+        print_success "中转端解锁 DNS 构建并清洗完成！"
+        print_info "当前已接管流媒体分流拦截规则共: ${YELLOW}${valid_count}${NC} 条"
     else
-        print_error "SmartDNS 规则清洗后启动异常，正在还原备份..."
-        [ -f /etc/smartdns/smartdns.conf.bak ] && cp /etc/smartdns/smartdns.conf.bak /etc/smartdns/smartdns.conf && systemctl restart smartdns
+        print_error "SmartDNS 规则清洗后启动异常，正在还原先前备份..."
+        if [ -f /etc/smartdns/smartdns.conf.bak ]; then
+            cp /etc/smartdns/smartdns.conf.bak /etc/smartdns/smartdns.conf
+            systemctl restart smartdns
+        fi
     fi
 }
 
@@ -440,32 +526,27 @@ show_logs() {
     echo -e "${GREEN}=============================================${NC}"
 }
 
-# ==================== 彻底净化卸载模块 (修复核心) ====================
 uninstall_all_services() {
     ensure_root
     print_warning "正在全面卸载并净化本机的中转与分流服务..."
     
-    # 1. 停止并禁用 Systemd 服务
     systemctl stop sniproxy smartdns 2>/dev/null || true
     systemctl disable sniproxy smartdns 2>/dev/null || true
     
-    # 2. 调用 SmartDNS 官方自带的卸载逻辑（根治卸载不干净、状态残留的罪魁祸首）
     if [ -f /usr/sbin/smartdns ] || [ -f /usr/bin/smartdns ]; then
         print_info "正在调用 SmartDNS 核心卸载脚本..."
-        # 尝试重新拉取最新包或寻找本地残留的安装引导来执行卸载
         local arch=$(detect_arch)
         local asset_arch=$([ "$arch" = "amd64" ] && echo "x86_64" || echo "aarch64")
-        local download_url=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep "browser_download_url" | grep "$asset_arch-linux-all.tar.gz" | head -n 1 | cut -d '"' -f 4)
+        local rel_url="pymumu/smartdns/releases/download/v1.2024.06.12/smartdns-${asset_arch}-linux-all.tar.gz"
         
-        if [ -n "$download_url" ]; then
-            cd /tmp && wget -q "${download_url}" -O smartdns_un.tar.gz
+        cd /tmp && rm -f smartdns_un.tar.gz
+        if smart_download "$rel_url" "smartdns_un.tar.gz" "wget"; then
             tar -xzf smartdns_un.tar.gz && cd smartdns && chmod +x ./install
-            ./install -u >/dev/null 2>&1 # 官方卸载命令
+            ./install -u >/dev/null 2>&1
             cd /tmp && rm -rf smartdns smartdns_un.tar.gz
         fi
     fi
 
-    # 3. 强力清除所有可能的遗留残余文件
     clear_client_allowlist
     rm -f "$SNI_SERVICE_FILE"
     rm -rf "$SNI_BASE_DIR"
@@ -473,7 +554,6 @@ uninstall_all_services() {
     rm -f /usr/lib/systemd/system/smartdns.service /lib/systemd/system/smartdns.service
     rm -f /usr/sbin/smartdns /usr/bin/smartdns
     
-    # 4. 刷新 Systemd 守护进程守护缓存
     systemctl daemon-reload
     systemctl reset-failed 2>/dev/null || true
     
@@ -481,28 +561,17 @@ uninstall_all_services() {
 }
 
 # ==================== 主控控制面板 ====================
-
 main() {
     local my_ip
     my_ip=$(get_public_ip)
     
-    # -------------------------------------------------------------
-    # 【优化项 1】远程版本属于静态数据，移到菜单外，启动脚本时仅获取一次
-    # -------------------------------------------------------------
-    local remote_sni_ver=$(get_remote_sni_version)
-    local remote_sdns_ver=$(get_remote_smartdns_version)
-
-    # 定义需要跨循环持久化的状态变量
     local sni_installed="false"
     local smartdns_installed="false"
     local current_sni_ver="${RED}未装载${NC}"
     local current_sdns_ver="${RED}未装载${NC}"
 
-    # -------------------------------------------------------------
-    # 【优化项 2】将耗时的“本地安装检测”和“本地版本解析”封装为独立函数
-    # -------------------------------------------------------------
+    # 精细化本地状态探测
     refresh_local_status() {
-        # SNIProxy 安装与版本判定
         sni_installed="false"
         if systemctl list-unit-files | grep -q "^sniproxy\.service"; then
             sni_installed="true"
@@ -515,36 +584,22 @@ main() {
             current_sni_ver="${RED}未装载${NC}"
         fi
 
-        # SmartDNS 安装与版本判定
         smartdns_installed="false"
         if systemctl list-unit-files | grep -q "^smartdns\.service" || command -v smartdns &> /dev/null; then
             smartdns_installed="true"
-            local raw_ver=$(smartdns -v 2>&1 | head -n 1)
-            local main_ver=$(echo "$raw_ver" | awk '{print $2}' | cut -d'-' -f1)
-            local sub_ver=$(echo "$raw_ver" | grep -o 'Release[^)]*')
-
-            if [ -n "$main_ver" ] && [ -n "$sub_ver" ]; then
-                current_sdns_ver="${main_ver} (${sub_ver})"
-            elif [ -n "$main_ver" ]; then
-                current_sdns_ver="${main_ver}"
-            else
-                current_sdns_ver="未知版本"
-            fi
+            local raw_ver=$(smartdns -v 2>&1 | grep -i "version" | head -n 1)
+            local main_ver=$(echo "$raw_ver" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?')
+            current_sdns_ver="${main_ver:-已装载(版本未知)}"
         else
             current_sdns_ver="${RED}未装载${NC}"
         fi
     }
 
-    # 脚本启动时，先初始化调用一次状态探测
     refresh_local_status
 
-    # -------------------------------------------------------------
-    # 【主循环】现在这里面没有任何耗时命令，按下回车瞬时刷新！
-    # -------------------------------------------------------------
     while true; do
         clear
         
-        # 1. 动态服务运行状态（systemctl is-active 响应速度极快，可保留在内部提供实时状态）
         local sni_status_view="${RED}未安装${NC}"
         if [ "$sni_installed" = "true" ]; then
             if systemctl is-active --quiet sniproxy; then
@@ -559,21 +614,20 @@ main() {
             if systemctl is-active --quiet smartdns; then
                 smartdns_status_view="${GREEN}运行中${NC} ${YELLOW}(端口: 53)${NC}"
             else
-                smartdns_status_view="${YELLOW}已停止${NC}"
+                smartdns_status_view="${YELLOW}开机自启/已停止${NC}"
             fi
         fi
 
-        # 2. 动态白名单文件体积检查（本地纯文件判断，不卡顿）
         local whitelist_view="${YELLOW}公开解锁(任意设备改DNS即可解锁)${NC}"
         if [ -f "$ALLOWLIST_FILE" ] && [ -s "$ALLOWLIST_FILE" ]; then
             local count=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d' | wc -l)
             whitelist_view="${YELLOW}安全模式(允许已授权的 ${count} 个IP)${NC}"
         fi
 
-        # 3. 渲染主面板
         echo -e "${GREEN}=============================================${NC}"
         echo -e "${GREEN}     ◈  流媒体公共 DNS 解锁中转面板  ◈       ${NC}"
         echo -e "${GREEN}=============================================${NC}"
+        echo -e "${GREEN} 核心下载策略:${NC} ${CYAN}默认直连 (失败自动全盲轮询代理池)${NC}"
         echo -e "${GREEN} SNIProxy 状态:${NC} $sni_status_view"
         echo -e "${GREEN} SmartDNS 状态:${NC} $smartdns_status_view"
         echo -e "${GREEN} SNIProxy 版本:${NC} ${YELLOW}${current_sni_ver}${NC}"
@@ -601,7 +655,7 @@ main() {
             1)
                 install_sniproxy "false"
                 configure_smartdns_rules "false"
-                refresh_local_status # 安装后主动刷新本地状态缓存
+                refresh_local_status
                 echo -e "\n${GREEN}==================================================${NC}"
                 print_success "中转端部署完全就绪！"
                 echo -e "现在，你其他的【落地机】不需要装任何东西，直接执行这三行命令即可解锁："
@@ -613,12 +667,12 @@ main() {
             2) 
                 install_sniproxy "true"
                 configure_smartdns_rules "true"
-                refresh_local_status # 更新后主动刷新本地状态缓存
-                print_success "SNIProxy 和 SmartDNS 核心程序以及分流规则已全部升级成功！"
+                refresh_local_status
+                print_success "核心程序与流媒体解析规则库同步完成。"
                 echo -n "按回车键返回面板..."; read -r _ ;;
             3) 
                 uninstall_all_services
-                refresh_local_status # 卸载后主动刷新本地状态缓存
+                refresh_local_status
                 echo -n "按回车键返回面板..."; read -r _ ;;
             4) 
                 manage_client_allowlist

@@ -1,655 +1,477 @@
-#!/bin/bash
-# VPS Toolbox
-# 功能：
-# - 一级菜单加 ▶ 标识，字体绿色
-# - 二级菜单简洁显示，输入 1~99 都可执行
-# - 快捷指令 m / M 自动创建
-# - 系统信息面板
-# - 彩色菜单和动态彩虹标题
-# - 完整安装/卸载
+#!/usr/bin/env bash
 
-INSTALL_PATH="$HOME/vps-toolbox.sh"
-SHORTCUT_PATH="/usr/local/bin/m"
-SHORTCUT_PATH_UPPER="/usr/local/bin/M"
+set -e
 
-# 颜色
-green="\033[32m"
-reset="\033[0m"
-yellow="\033[33m"
-red="\033[31m"
-cyan="\033[36m"
-BLUE="\033[34m"
-ORANGE='\033[38;5;208m'
+# ==================== 配置区 ====================
+CONFIG_FILE="/etc/vnstat_tg.conf"
+PERM_SCRIPT_PATH="/usr/local/bin/vnstat_mgr.sh"
+REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/zz.sh"
 
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
+CRON_TIME="0 0 * * *" # 默认每天 0点 发送
+MONITOR_PORTS="22 80 443" # 默认监控端口
+# ================================================
 
+# 颜色定义
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-# ==========================================
-# GITHUB 代理
-# ==========================================
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
+SERVICE_NAME=""
+PKG_MANAGER=""
+PKG_REMOVE_CMD=""
+PKG_INSTALL_CMD=""
+INIT_SYSTEM=""
 
-# 新增全局缓存变量，记录上一次成功的最快索引（默认从 0 开始，即直连）
-# 只要这个索引成功过，后面所有下载直接秒开，不再卡顿死等
-if [ -z "$SUCCESS_PROXY_IDX" ]; then
-    SUCCESS_PROXY_IDX=0
-fi
-
-# 核心内部优化轮询器：带有记忆和快速跳过功能
-_smart_download_core() {
-    local clean_url="$1"
-    local mode="$2"       # text (用于curl输出), file (用于wget存盘), pipe (用于管道)
-    local file_name="$3"  # 仅file模式需要
-
-    # 1. 优先尝试上一次成功的那个通道 (秒开逻辑)
-    local best_proxy="${GITHUB_PROXY[$SUCCESS_PROXY_IDX]}"
-    local target_url="${best_proxy}${clean_url}"
-    
-    # 降低首次尝试的超时时间到 4 秒，防止用户等太久
-    if [[ "$mode" == "text" || "$mode" == "pipe" ]]; then
-        if response=$(curl -fsSL --max-time 4 "$target_url" 2>/dev/null) && [[ -n "$response" ]]; then
-            echo "$response"
-            return 0
-        fi
-    elif [[ "$mode" == "file" ]]; then
-        if wget -T 4 -t 1 -q -O "$file_name" "$target_url" 2>/dev/null; then
-            return 0
-        fi
-    fi
-
-    # 2. 如果上一次成功的通道失效了，或者第一次运行失败了，才触发全量轮询
-    for idx in "${!GITHUB_PROXY[@]}"; do
-        # 跳过刚才已经试过失败的那个索引
-        [[ $idx -eq $SUCCESS_PROXY_IDX ]] && continue
+# ==================== 智能防空降/落地克隆逻辑 ====================
+ensure_script_landed() {
+    # 检查当前运行的路径是不是预期的本地落地路径
+    if [ "$0" != "$PERM_SCRIPT_PATH" ]; then
         
-        local proxy="${GITHUB_PROXY[$idx]}"
-        local target_url="${proxy}${clean_url}"
+        # 优先通过稳定的 URL 重新拉取完整代码，避免管道直接流失
+        if command -v curl >/dev/null 2>&1; then
+            curl -sL "$REMOTE_URL" -o "$PERM_SCRIPT_PATH" || true
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$PERM_SCRIPT_PATH" "$REMOTE_URL" || true
+        fi
+
+        # 极端容错：如果网络阻断导致远程拉取失败，利用当前会话内存直接克隆自身（健壮性双保险）
+        if [ ! -s "$PERM_SCRIPT_PATH" ] && [ -f "$0" ]; then
+            cat "$0" > "$PERM_SCRIPT_PATH" 2>/dev/null || true
+        fi
+
+        # 如果还是为空，说明是通过纯管道无文件运行且网络访问GitHub受限
+        if [ ! -s "$PERM_SCRIPT_PATH" ]; then
+            echo -e "${YELLOW}警告: 无法获取，请检查网络是否能访问 GitHub。${RESET}"
+            exit 1
+        fi
+
+        chmod +x "$PERM_SCRIPT_PATH"
+        sleep 0.5
         
-        if [[ "$mode" == "file" ]]; then
-            echo -e "${yellow}⚡ 正在切换通道，尝试通过 [${proxy:-直连}]打开...${reset}"
-            if wget -T 5 -t 1 -q -O "$file_name" "$target_url" 2>/dev/null; then
-                SUCCESS_PROXY_IDX=$idx # 记住这个成功的位置
-                return 0
-            fi
-        else
-            if response=$(curl -fsSL --max-time 5 "$target_url" 2>/dev/null) && [[ -n "$response" ]]; then
-                SUCCESS_PROXY_IDX=$idx # 记住这个成功的位置
-                echo "$response"
-                return 0
-            fi
-        fi
-    done
-
-    return 1
+        # 传递所有接收到的参数，切换到本地实体无缝继续运行
+        exec "$PERM_SCRIPT_PATH" "$@"
+    fi
 }
 
-# 1：普通下载器
-smart_curl() {
-    local raw_url="$1"
-    if [[ ! "$raw_url" =~ "github" ]] && [[ ! "$raw_url" =~ "raw.githubusercontent.com" ]]; then
-        curl -fsSL --max-time 10 "$raw_url"
-        return $?
+# 加载持久化配置
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
     fi
-    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://github.com/|https://github.com/|g' | sed -E 's|https://[^/]*/https://raw.githubusercontent.com/|https://raw.githubusercontent.com/|g')
+}
+
+# 保存持久化配置
+save_config() {
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat << EOF > "$CONFIG_FILE"
+TG_BOT_TOKEN="${TG_BOT_TOKEN}"
+TG_CHAT_ID="${TG_CHAT_ID}"
+CRON_TIME="${CRON_TIME}"
+MONITOR_PORTS="${MONITOR_PORTS}"
+EOF
+}
+
+# 获取公网 IP
+get_public_ip() {
+    curl -s --connect-timeout 5 https://api.ipify.org || curl -s --connect-timeout 5 https://ifconfig.me || echo "未知IP"
+}
+
+# 自动获取系统的默认公网网卡
+get_default_interface() {
+    local iface=$(ip route show | grep default | awk '{print $5}' | head -n 1)
+    echo "${iface:-eth0}"
+}
+
+# 尝试自动修复并安装 iptables 依赖
+ensure_iptables_installed() {
+    if ! command -v iptables >/dev/null 2>&1; then
+        detect_package_manager
+        echo -e "${YELLOW}检测到系统缺少 iptables 组件，正在尝试自动安装...${RESET}"
+        bash -c "$PKG_INSTALL_CMD" >/dev/null 2>&1 || true
+    fi
+}
+
+# 初始化 iptables 端口流量计数规则
+init_port_iptables() {
+    ensure_iptables_installed
+    if ! command -v iptables >/dev/null 2>&1; then
+        return 0 
+    fi
     
-    _smart_download_core "$clean_url" "text"
-    if [[ $? -ne 0 ]]; then
-        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}" >&2
-        return 1
+    load_config
+    local iface=$(get_default_interface)
+    for port in $MONITOR_PORTS; do
+        [ -z "$port" ] && continue
+        if ! iptables -C INPUT -i "$iface" -p tcp --dport "$port" >/dev/null 2>&1; then iptables -A INPUT -i "$iface" -p tcp --dport "$port" >/dev/null 2>&1 || true; fi
+        if ! iptables -C INPUT -i "$iface" -p udp --dport "$port" >/dev/null 2>&1; then iptables -A INPUT -i "$iface" -p udp --dport "$port" >/dev/null 2>&1 || true; fi
+        if ! iptables -C OUTPUT -o "$iface" -p tcp --sport "$port" >/dev/null 2>&1; then iptables -A OUTPUT -o "$iface" -p tcp --sport "$port" >/dev/null 2>&1 || true; fi
+        if ! iptables -C OUTPUT -o "$iface" -p udp --sport "$port" >/dev/null 2>&1; then iptables -A OUTPUT -o "$iface" -p udp --sport "$port" >/dev/null 2>&1 || true; fi
+    done
+}
+
+# 格式化字节
+format_bytes() {
+    local bytes=$1
+    if [ -z "$bytes" ] || [ "$bytes" -le 0 ] 2>/dev/null; then echo "0 B"; return; fi
+    local units=('B' 'KB' 'MB' 'GB' 'TB')
+    local i=0
+    while [ $(echo "$bytes > 1024" | bc -l) -eq 1 ] && [ $i -lt 4 ]; do
+        bytes=$(echo "scale=2; $bytes / 1024" | bc -l)
+        i=$((i+1))
+    done
+    echo "${bytes} ${units[$i]}"
+}
+
+# 获取某个端口的字节数
+get_port_traffic() {
+    local port=$1
+    local direction=$2
+    if ! command -v iptables >/dev/null 2>&1; then echo "0"; return; fi
+    local tcp_bytes=$(iptables -L $direction -nvx 2>/dev/null | grep -E "tcp dport $port|tcp spt $port" | awk '{print $2}' | awk '{s+=$1} END {print s}')
+    local udp_bytes=$(iptables -L $direction -nvx 2>/dev/null | grep -E "udp dport $port|udp spt $port" | awk '{print $2}' | awk '{s+=$1} END {print s}')
+    echo $(( ${tcp_bytes:-0} + ${udp_bytes:-0} ))
+}
+
+# Telegram 发送基础函数
+send_tg_notification() {
+    local message="$1"
+    load_config
+    if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+        local ip=$(get_public_ip)
+        local hostname=$(hostname)
+        local full_message="【vnStat 流量看板】%0A====================%0A"
+        full_message+="主机名称: ${hostname}%0A"
+        full_message+="公网IP: ${ip}%0A"
+        full_message+="====================%0A"
+        full_message+="${message}"
+        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" -d "chat_id=${TG_CHAT_ID}" -d "text=${full_message}" >/dev/null 2>&1 || true
     fi
 }
 
-# 2：存盘执行器
-smart_wget_run() {
-    local file_name="$1"
-    local raw_url="$2"
-    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://|https://|g')
-
-    if _smart_download_core "$clean_url" "file" "$file_name"; then
-        echo
-        chmod +x "$file_name"
-        ./"$file_name"
-        return 0
-    else
-        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}"
-        return 1
-    fi
-}
-
-# 3：管道带参执行器
-smart_pipe_run() {
-    local raw_url="$1"
-    local bash_args="$2"
-    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://|https://|g')
-
-    local response
-    response=$(_smart_download_core "$clean_url" "pipe")
+# 收集默认网卡与自定义端口的数据
+send_traffic_report() {
+    init_port_iptables
+    load_config
+    local report=""
+    local iface=$(get_default_interface)
     
-    if [[ -n "$response" ]]; then
-        echo
-        if [[ -n "$bash_args" ]]; then
-            sudo bash -s $bash_args <<< "$response"
-        else
-            sudo bash <<< "$response"
-        fi
-        return 0
+    if command -v vnstat >/dev/null 2>&1; then
+        local today_line=$(vnstat -i "$iface" -d --oneline 2>/dev/null | cut -d';' -f4,5,6 || echo "")
+        local month_line=$(vnstat -i "$iface" -m --oneline 2>/dev/null | cut -d';' -f9,10,11 || echo "")
+        report+="📡 默认网卡: ${iface}%0A"
+        if [ -n "$today_line" ]; then report+=" 今日总流量: 下行 $(echo "$today_line" | cut -d';' -f1) | 上行 $(echo "$today_line" | cut -d';' -f2) | 总计 $(echo "$today_line" | cut -d';' -f3)%0A"; fi
+        if [ -n "$month_line" ]; then report+=" 本月总累计: 下行 $(echo "$month_line" | cut -d';' -f1) | 上行 $(echo "$month_line" | cut -d';' -f2) | 总计 $(echo "$month_line" | cut -d';' -f3)%0A"; fi
+        report+="====================%0A"
     else
-        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}"
-        return 1
-    fi
-}
-# 彩虹标题
-rainbow_animate() {
-    local text="$1"
-    local colors=(31 33 32 36 34 35)
-    local len=${#text}
-    for ((i=0; i<len; i++)); do
-        printf "\033[%sm%s" "${colors[$((i % ${#colors[@]}))]}" "${text:$i:1}"
-        sleep 0.002
-    done
-    printf "${reset}\n"
-}
-
-# 系统资源显示
-show_system_usage() {
-    local width=36
-    local content_indent="    "
-
-    # ================== 格式化函数 ==================
-    format_size() {
-        local size_mb=${1:-0}  # 防止为空
-        if [ "$size_mb" -lt 1024 ]; then
-            echo "${size_mb}M"
-        else
-            awk "BEGIN{printf \"%.1fG\", $size_mb/1024}"
-        fi
-    }
-
-    # ================== 获取数据 ==================
-    # 内存
-    read mem_total mem_used <<< $(LANG=C free -m | awk 'NR==2{print $2, $3}')
-    mem_total=${mem_total:-0}
-    mem_used=${mem_used:-0}
-    mem_total_fmt=$(format_size "$mem_total")
-    mem_used_fmt=$(format_size "$mem_used")
-    mem_percent=$(awk "BEGIN{if($mem_total>0){printf \"%.0f\", $mem_used*100/$mem_total}else{print 0}}")
-    mem_percent="${mem_percent}%"  # 加回百分号显示
-
-    # 磁盘
-    read disk_total_h disk_used_h disk_used_percent <<< $(df -m / | awk 'NR==2{print $2, $3, $5}')
-    disk_total_h=${disk_total_h:-0}
-    disk_used_h=${disk_used_h:-0}
-    disk_used_percent=${disk_used_percent:-0%}
-    disk_total_fmt=$(format_size "$disk_total_h")
-    disk_used_fmt=$(format_size "$disk_used_h")
-
-    # CPU
-    # 读取 /proc/stat 第一行，计算 CPU 使用率（防止空值）
-    cpu_usage=$(awk 'NR==1{usage=($2+$4)*100/($2+$4+$5); if(usage!=""){printf "%.1f", usage}else{print 0}}' /proc/stat)
-    cpu_usage="${cpu_usage}%"  # 加回百分号显示
-
-    # ================== 系统状态 ==================
-    mem_num=${mem_percent%\%}        # 去掉百分号
-    disk_num=${disk_used_percent%\%} # 去掉百分号
-    cpu_num=${cpu_usage%\%}          # 去掉百分号
-
-    max_level=0
-    for n in $mem_num $disk_num $cpu_num; do
-        if (( $(awk "BEGIN{print ($n>80)?1:0}") )); then max_level=2; fi
-        if (( $(awk "BEGIN{print ($n>60 && $n<=80)?1:0}") )) && [ "$max_level" -lt 2 ]; then max_level=1; fi
-    done
-
-    if [ "$max_level" -eq 0 ]; then
-        system_status="${green}系统状态：正常 ✔${reset}"
-    elif [ "$max_level" -eq 1 ]; then
-        system_status="${yellow}系统状态：警告 ⚡${reset}"
-    else
-        system_status="${red}系统状态：危险 🔥${reset}"
+        report+="📡 默认网卡: ${iface} (vnStat未安装)%0A====================%0A"
     fi
 
-    # ================== 输出 ==================
-    pad_string() {
-        local str="$1"
-        printf "%-${width}s" "${content_indent}${str}"
-    }
-
-    echo -e "${green}┌$(printf '─%.0s' $(seq 1 $width))┐${reset}"
-    echo -e "$(pad_string "${system_status}")"
-    echo -e "$(pad_string "${yellow}📊 内存：${mem_used_fmt}/${mem_total_fmt} (${mem_percent})${reset}")"
-    echo -e "$(pad_string "${yellow}💽 磁盘：${disk_used_fmt}/${disk_total_fmt} (${disk_used_percent})${reset}")"
-    echo -e "$(pad_string "${yellow} ⚙ CPU ：${cpu_usage}${reset}")"
-    echo -e "${green}└$(printf '─%.0s' $(seq 1 $width))┘${reset}"
-}
-
-# ================== 系统信息 ==================
-
-# 判断是否容器
-if [ -f /proc/1/cgroup ] && grep -qE '(docker|lxc|kubepods)' /proc/1/cgroup; then
-    container_flag=" (Container)"
-else
-    container_flag=""
-fi
-
-# 系统名称
-if [ -f /etc/os-release ]; then
-    system_name=$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"')
-else
-    system_name=$(uname -s)
-fi
-system_name="${system_name}${container_flag}"
-
-
-
-# ===============================
-# 获取当前时区（跨系统兼容）
-# ===============================
-get_timezone() {
-    # 1️⃣ systemd 环境，屏蔽错误
-    if command -v timedatectl &>/dev/null; then
-        tz=$(timedatectl show -p Timezone --value 2>/dev/null)
-        [[ -n "$tz" ]] && echo "$tz" && return
-    fi
-
-    # 2️⃣ /etc/timezone 文件（Debian）
-    if [[ -f /etc/timezone ]]; then
-        tz=$(cat /etc/timezone)
-        [[ -n "$tz" ]] && echo "$tz" && return
-    fi
-
-    # 3️⃣ /etc/localtime 符号链接（RedHat / CentOS）
-    if [[ -L /etc/localtime ]]; then
-        tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
-        [[ -n "$tz" ]] && echo "$tz" && return
-    fi
-
-    # 4️⃣ /etc/localtime 文件内容匹配（minimal / docker / chroot）
-    if [[ -f /etc/localtime ]]; then
-        tz=$(strings /etc/localtime 2>/dev/null | grep -E '^[A-Z][a-z]+/[A-Z][a-zA-Z_]+$' | head -n1)
-        [[ -n "$tz" ]] && echo "$tz" && return
-    fi
-
-    # 5️⃣ 兜底
-    echo "未知"
-}
-
-timezone=$(get_timezone)
-
-# 架构
-
-cpu_arch=$(uname -m)
-
-# 获取 CPU 型号
-cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
-[ -z "$cpu_model" ] && cpu_model=$(grep -m1 "Hardware" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
-[ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | grep "Model name" | cut -d: -f2)
-
-# 清理不需要的部分
-cpu_model=$(echo "$cpu_model" | sed -E \
-    -e 's/@.*GHz//g' \
-    -e 's/CPU//g' \
-    -e 's/Processor//g' \
-    -e 's/[0-9]+-Core//g' \
-	-e 's/\bv[1-9]\b//g' \
-    -e 's/\s+/ /g' \
-    | xargs)
-
-cpu="${cpu_model:-Unknown CPU} (${cpu_arch})"
-
-
-# 当前时间
-datetime=$(date "+%Y-%m-%d %H:%M:%S")
-
-# VPS 运行时间
-if [ -f /proc/uptime ]; then
-    uptime_seconds=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
-    days=$((uptime_seconds/86400))
-    hours=$(( (uptime_seconds%86400)/3600 ))
-    minutes=$(( (uptime_seconds%3600)/60 ))
-    if [ "$days" -gt 0 ]; then
-        vps_uptime="${days}天${hours}小时${minutes}分钟"
-    elif [ "$hours" -gt 0 ]; then
-        vps_uptime="${hours}小时${minutes}分钟"
-    else
-        vps_uptime="${minutes}分钟"
-    fi
-else
-    vps_uptime=$(uptime -p 2>/dev/null | tr -d ' ' || echo "未知")
-fi
-
-
-
-# 一级菜单
-MAIN_MENU=(
-    "系统设置"
-    "网络代理"
-    "网络检测"
-    "Docker管理"
-    "应用商店"
-    "证书管理"
-    "系统管理"
-    "备份恢复"
-    "玩具熊ʕ•ᴥ•ʔ"
-    "更新卸载"
-)
-
-# 二级菜单（编号去掉前导零，显示时格式化为两位数）
-SUB_MENU[1]="1 更新系统|2 系统信息|3 修改root密码|4 root登录管理|5 修改SSH端口|6 修改时区|7 时间同步|8 切换v4V6|9 开放所有端口|10 更换系统源|11 DDdebian13|12 DDwindows|13 NAT鸡重装系统|14 DD飞牛|15 修改语言|16 修改主机名|17 DNS优化|18 一键优化✨|19 VPS重启"
-SUB_MENU[2]="20 代理工具箱|21 FRP管理|22 EasyTier组网|23 ShellCrash|24 CFWARP|25 BBRv3|26 BBR+TCP智能调参|27 Socks5/HTTP|28 Reality|29 Snell|30 Shadowsocks|31 Hysteria2|32 Xray-Argo|33 3X-UI|34 vless-all-in-one|35 Realm|36 哆啦A梦转发面板|37 DDNS动态域名|38 自建DNS解锁|39 流量狗|40 流量日报"
-SUB_MENU[3]="41 NodeQuality|42 融合怪测试|43 YABS测试|44 网络质量体检|45 IP质量体检|46 硬盘质量体检|47 三网延迟检测|48 简单回程测试|49 完整路由检测|50 流媒体解锁|51 三网测速|52 网络PING/DNS检测|53 检查25端口开放|54 网络工具箱"
-SUB_MENU[4]="55 Docker管理|56 DockerCompose管理|57 DockerCompose备份恢复|58 DockerCompose自动更新"
-SUB_MENU[5]="59 应用管理|60 宝塔面板|61 1Panel面板|62 CLICD开小鸡|63 OpenClaw|64 HermesAgent"
-SUB_MENU[6]="65 NGINXV4反代✨|66 NGINXV6反代|67 Caddy反代|68 Acme申请证书|69 Lucky反代"
-SUB_MENU[7]="71 系统清理|72 重装系统|73 系统组件|74 开发环境|75 工作区管理|76 防火墙管理|78 Fail2ban|79 系统监控|80 添加SWAP|81 DNS管理|82 定时任务"
-SUB_MENU[8]="83 系统快照|84 系统恢复|85 本地备份|86 Rsync同步|87 Rclone备份|89 Croc文件传输|90 压缩文件|91 解压文件"
-SUB_MENU[9]="100 GProxy加速|101 1panelapps管理|102 Akile优选DNS|103 自动机场签到|104 关闭哪吒监控SSH|105 AI检测|106 代理工具检测|107 卸载探针"
-SUB_MENU[10]="77 自动更新|88 更新脚本|99 卸载脚本"
-
-# 显示一级菜单
-show_main_menu() {
-    clear
-    # 上边框保留彩虹效果
-    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-    # 标题文字改为纯黄色
-    echo -e "${yellow}📦 VPS Toolbox工具箱${reset}${ORANGE}(快捷指令:M/m)${reset} ${yellow}📦${reset}"
-
-    # 下边框保留彩虹效果
-    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-    # 系统信息
-    show_system_usage
-
-
-    # 当前日期时间显示在框下、菜单上
-
-    # 终端宽度（可用不用）
-    term_width=$(tput cols 2>/dev/null || echo 80)
-
-    label_w=8  # 左侧标签宽度
-
-    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "💻" $label_w "系统" "$system_name"
-    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🌍" $label_w "时区" "$timezone"
-    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🧩" $label_w "架构" "$cpu"
-    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🕒" $label_w "时间" "$datetime"
-    printf "${ORANGE}%s %-*s:${ORANGE} %s${re}\n" "🚀" $label_w "在线" "$vps_uptime"
-
-    # 绿色下划线
-    echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${re}"
-
-    # 显示菜单
-    for i in "${!MAIN_MENU[@]}"; do
-        if [[ $i -eq 8 ]]; then  # 第9项（索引从0开始）
-            # 符号红色，数字和点绿色，文字黄色
-            printf "${red}▶${reset} ${green}%02d.${reset} ${yellow}%s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
-        else
-            # 其他项保持原来的颜色（符号红色，数字绿色，文字绿色）
-            printf "${red}▶${reset} ${green}%02d. %s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
-        fi
-    done
-}
-
-
-# 显示二级菜单并选择
-show_sub_menu() {
-    local idx="$1"
-    while true; do
-        IFS='|' read -ra options <<< "${SUB_MENU[idx]}"
-        local map=()
-        echo
-        for opt in "${options[@]}"; do
-            local num="${opt%% *}"
-            local name="${opt#* }"
-            printf "${red}▶${reset} ${yellow}%02d %s${reset}\n" "$num" "$name"
-            map+=("$num")
+    if command -v iptables >/dev/null 2>&1; then
+        report+="🔌 独立端口流量统计:%0A"
+        for port in $MONITOR_PORTS; do
+            [ -z "$port" ] && continue
+            local rx_bytes=$(get_port_traffic "$port" "INPUT")
+            local tx_bytes=$(get_port_traffic "$port" "OUTPUT")
+            report+=" 端口 [ ${port} ] -> 下载: $(format_bytes "$rx_bytes") | 上传: $(format_bytes "$tx_bytes") | 总计: $(format_bytes "$((rx_bytes + tx_bytes))")%0A"
         done
-        echo -ne "${red}请输入要执行的编号${ORANGE}(0返回/X退出)${ORANGE}:${reset}"
-        read -r choice
+    fi
+    send_tg_notification "$report"
+}
 
-        # X/x 直接退出脚本
-        if [[ "$choice" =~ ^[xX]$ ]]; then
-            exit 0
-        fi
+# 设置或取消每日定时任务
+manage_cron() {
+    local action="$1"
+    crontab -l 2>/dev/null | grep -v "\-\-cron-report" | crontab - || true
 
-        # 按回车直接刷新菜单
-        if [[ -z "$choice" ]]; then
-            clear
-            continue
-        fi
-
-        # 输入 0 或 00 返回一级菜单
-        if [[ "$choice" == "0" || "$choice" == "00" ]]; then
-            return
-        fi
-
-        # 只允许数字输入
-        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-            echo -e "${red}无效选项，请输入数字！${reset}"
-            sleep 1
-            clear
-            continue
-        fi
-
-        # 判断是否为有效选项
-        if [[ ! " ${map[*]} " =~ (^|[[:space:]])$choice($|[[:space:]]) ]]; then
-            echo -e "${red}无效选项${reset}"
-            sleep 1
-            clear
-            continue
-        fi
-
-        # 执行选项
-        execute_choice "$choice"
-
-        # 只有 0/99 才退出二级菜单，否则按回车刷新二级菜单
-        if [[ "$choice" != "0" && "$choice" != "99" ]]; then
-            read -rp $'\e[31m按回车刷新二级菜单...\e[0m' tmp
-            clear
+    if [ "$action" = "set" ]; then
+        load_config
+        if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            (crontab -l 2>/dev/null; echo "${CRON_TIME} bash $PERM_SCRIPT_PATH --cron-report >/dev/null 2>&1") | crontab -
+            echo -e "${GREEN}定时任务激活成功！当前频次表达式: ${CRON_TIME}${RESET}"
         else
-            break
+            echo -e "${YELLOW}警告: 未配置 TG 参数，无法启动定时任务。${RESET}"
         fi
+    elif [ "$action" = "unset" ]; then
+        echo -e "${GREEN}已关闭并清理定时流量通知任务。${RESET}"
+    fi
+}
+
+# 定时任务独立管理菜单
+menu_cron_config() {
+    while true; do
+        load_config
+        init_port_iptables
+        clear
+        local cron_status="未激活"
+        if crontab -l 2>/dev/null | grep -q "\-\-cron-report"; then cron_status="已激活"; fi
+
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN}    ◈  TG 定时通知管理  ◈     ${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN}任务状态 :${RESET} ${YELLOW}${cron_status}${RESET}"
+        echo -e "${GREEN}当前时间 :${RESET} ${YELLOW}${CRON_TIME}${RESET}"
+        echo -e "${GREEN}TG Token :${RESET} ${YELLOW}${TG_BOT_TOKEN:-未配置}${RESET}"
+        echo -e "${GREEN}Chat ID  :${RESET} ${YELLOW}${TG_CHAT_ID:-未配置}${RESET}"
+        echo -e "${GREEN}监控端口 :${RESET} ${YELLOW}${MONITOR_PORTS}${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN} 1. 修改 Telegram Bot Token${RESET}"
+        echo -e "${GREEN} 2. 修改 Telegram Chat ID${RESET}"
+        echo -e "${GREEN} 3. 修改定时发送时间${RESET}"
+        echo -e "${GREEN} 4. 修改需要监控的端口${RESET}"
+        echo -e "${GREEN} 5. 开启/更新定时通知任务${RESET}"
+        echo -e "${GREEN} 6. 关闭定时通知任务${RESET}"
+        echo -e "${GREEN} 7. 手动测试发送当前流量报告${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read -r cron_choice
+
+        case "$cron_choice" in
+            1) read -rp "请输入新的 TG Bot Token: " TG_BOT_TOKEN; save_config; pause ;;
+            2) read -rp "请输入新的 TG Chat ID: " TG_CHAT_ID; save_config; pause ;;
+            3)
+                clear
+                echo -e "${GREEN}==============================${RESET}"
+                echo -e "${GREEN}    ◈  选择定时发送时间  ◈    ${RESET}"
+                echo -e "${GREEN}==============================${RESET}"
+                echo -e "${GREEN}  1) 每天0点${RESET}"
+                echo -e "${GREEN}  2) 每周一0点${RESET}"
+                echo -e "${GREEN}  3) 每月1号0点${RESET}"
+                echo -e "${GREEN}  4) 自定义cron表达式${RESET}"
+                echo -e "${GREEN}==============================${RESET}"
+                echo -ne "${GREEN}请选择时间模板: ${RESET}"
+                read -r time_choice
+                case "$time_choice" in
+                    1) CRON_TIME="0 0 * * *"; echo -e "${GREEN}已选择: 每天0点${RESET}" ;;
+                    2) CRON_TIME="0 0 * * 1"; echo -e "${GREEN}已选择: 每周一0点${RESET}" ;;
+                    3) CRON_TIME="0 0 1 * *"; echo -e "${GREEN}已选择: 每月1号0点${RESET}" ;;
+                    4) read -rp "请输入标准的 5 位 Cron 表达式 (如 0 12 * * *): " temp_cron; if [ -n "$temp_cron" ]; then CRON_TIME="$temp_cron"; fi ;;
+                esac
+                save_config; pause ;;
+            4)
+                echo -e "当前监控的端口为: ${YELLOW}${MONITOR_PORTS}${RESET}"
+                read -rp "请输入新的端口列表（多个端口请用空格隔开，例如 22 80 443 ）: " input_ports
+                if [ -n "$input_ports" ]; then
+                    MONITOR_PORTS="$input_ports"
+                    save_config
+                    echo -e "${GREEN}端口更新成功！正在刷新防火墙规则...${RESET}"
+                fi
+                pause ;;
+            5) manage_cron "set"; pause ;;
+            6) manage_cron "unset"; pause ;;
+            7) echo "正在发送测试报告..."; send_traffic_report; echo "已提交发送请求。"; pause ;;
+            0) break ;;
+            *) echo "无效选项"; pause ;;
+        esac
     done
 }
 
+detect_init_system() {
+    if command -v systemctl >/dev/null 2>&1; then INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1; then INIT_SYSTEM="openrc"
+    else echo "未检测到支持的初始化系统 (systemd 或 openrc)"; exit 1; fi
+}
 
-
-
-# 删除快捷指令
-remove_shortcut() {
-    if [[ $EUID -eq 0 ]]; then
-        rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
-    else
-        sudo rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
+detect_service() {
+    detect_init_system
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        if systemctl list-unit-files | grep -q '^vnstat\.service'; then SERVICE_NAME="vnstat"
+        elif systemctl list-unit-files | grep -q '^vnstatd\.service'; then SERVICE_NAME="vnstatd"
+        else SERVICE_NAME="vnstat"; fi
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        if [ -f /etc/init.d/vnstatd ]; then SERVICE_NAME="vnstatd"; else SERVICE_NAME="vnstat"; fi
     fi
 }
 
-# 执行菜单选项
-execute_choice() {
-    case "$1" in
-        1) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/update.sh) ;;
-        2) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vpsinfo.sh) ;;
-        3) sudo passwd root ;;
-        4) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SSHDLGL.sh) ;;
-        5) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/sshdk.sh) ;;
-        6) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/time.sh) ;;
-        7) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/systemdtimesyncd.sh) ;;
-        8) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/qhwl.sh) ;;
-        9) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/UFWFX.sh) ;;
-        10) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/huanyuan.sh) ;;
-        11) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Debian13.sh) ;;
-        12) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/windowos.sh) ;;
-        13) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/DDnat.sh) ;;
-        14) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ddfnos.sh) ;;
-        15) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/xgyu.sh) ;;
-        16) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/home.sh) ;;
-        17) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Mosdnsxos.sh) ;;
-        18) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/vpsupos.sh) ;;
-        19) sudo reboot ;;
-        20) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/proxy.sh) ;;
-        21) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/FRPos.sh) ;;
-        22) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/EasyTierx.sh) ;;
-        23) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/ShellCrash.sh);;
-        24) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/CFWARPtoolos.sh) ;;
-        25) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/BBRv3os.sh) ;;
-        26) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/BBR.sh) ;;
-        27) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/MicaProxyos.sh) ;;
-        28) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/VlessRealityos.sh) ;;
-        29) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Snellos.sh) ;;
-        30) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SSRustos.sh) ;;
-        31) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Hy2os.sh) ;;
-        32) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/2go.sh) ;;
-        33) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/3xuios.sh) ;;
-        34) smart_wget_run "vless-server.sh" "https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh" ;;
-        35) smart_pipe_run "https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh" "install" ;;
-        36) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/flux-panel.sh);;
-        37) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DDNS.sh) ;;
-        38) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SNIProxyDNSos.sh) ;;
-        39) smart_wget_run "port-traffic-dog.sh" "https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh" ;;
-        40) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/vnstattgos.sh) ;;
-        41) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NodeQuality.sh) ;;
-        42) curl -L https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh -o ecs.sh && chmod +x ecs.sh && bash ecs.sh ;;
-        43) curl -sL https://yabs.sh | bash ;;
-        44) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NetQuality.sh) ;;
-        45) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/IPQuality.sh) ;;
-        46) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/HardwareQuality.sh) ;;
-        47) bash <(curl -Ls https://Net.Check.Place) -P ;;
-        48) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
-        49) bash <(curl -Ls https://Net.Check.Place) -R ;;
-        50) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
-        51) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ecsspeed.sh) ;;
-        52) bash <(wget -qO- https://raw.githubusercontent.com/Cd1s/network-latency-tester/main/latency.sh) ;;
-        53) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Telnet.sh) ;;
-        54) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Networktoolx.sh) ;; 
-        55) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Dockersos.sh) ;;
-        56) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockercompose.sh) ;;
-        57) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Dockcompbauck.sh) ;;
-        58) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockerupdate.sh) ;;
-        59) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Store.sh) ;;
-        60) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/Baotax.sh) ;;
-        61) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/1Panelx.sh) ;;
-        62) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/NAT/CLICD.sh) ;;
-        63) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/OpenClaw.sh) ;;
-        64) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/Hermes.sh) ;;
-        65) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginxos.sh) ;;
-        66) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginx6os.sh) ;;
-        67) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Caddyos.sh) ;;
-        68) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Acmeos.sh) ;;
-        69) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/CN/CNLucky.sh) ;;
-        71) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clear.sh) ;;
-        72) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/reinstall.sh) ;;
-        73) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/package.sh) ;;
-        74) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/exploitation.sh) ;;
-        75) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tmux.sh) ;;
-        76) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/firewallos.sh) ;;
-        78) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Fail2banos.sh) ;;
-        79) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/System.sh) ;;
-        80) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SWAP.sh) ;;
-        81) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/DNSos.sh) ;;
-        82) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/crontab.sh) ;;
-        83) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/snapshotBos.sh) ;;
-        84) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/snapshotRos.sh) ;;
-        85) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/beifen.sh) ;;
-        86) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Rrsync.sh) ;;
-        87) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Rcloneos.sh) ;;
-        89) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Croc.sh) ;;
-        90) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/yasuo.sh) ;;
-        91) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tarzip.sh) ;;
-        100) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/CN/CNGProxy.sh) ;;
-        101) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/1Pappsx.sh) ;;
-        102) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/AkileDNS.sh) ;;
-        103) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/JCQD.sh) ;;
-        104) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
-		105) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/AIcheck.sh) ;;
-        106) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/test.sh) ;;
-        107) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/unagent.sh) ;;
-
-        #  自动更新脚本
-        77) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/tool/toolboxupdates.sh) ;; 
-        88)
-            echo -e "${yellow}正在更新工具箱...${reset}"
-            
-            # 使用 smart_curl 获取内容并覆盖写入到本地脚本路径
-            # smart_curl 会自动处理：直连 -> 失败则依次轮询各代理节点
-            if ! smart_curl "https://raw.githubusercontent.com/sistarry/toolbox/main/tool/vps-toolbox.sh" > "$INSTALL_PATH"; then
-                echo -e "${red}更新失败，所有代理及直连均无法访问，请检查网络！${reset}"
-                return 1
-            fi
-            
-            # 检查下载的文件是否为空（防止意外下载到空内容把本地脚本整坏）
-            if [[ ! -s "$INSTALL_PATH" ]]; then
-                echo -e "${red}更新失败：下载的文件为空，已终止覆盖！${reset}"
-                return 1
-            fi
-
-            chmod +x "$INSTALL_PATH"
-            echo -e "${green}更新完成！${reset}"
-            # 重新执行最新脚本
-            exec bash "$INSTALL_PATH"
-            ;;
-
-        99) 
-            echo -e "${yellow}正在卸载工具箱...${reset}"
-
-            # 删除快捷指令
-            remove_shortcut
- 
-            # 删除工具箱脚本
-            if [[ -f "$INSTALL_PATH" ]]; then
-            rm -f "$INSTALL_PATH"
-            echo -e "${green}工具箱已删除${reset}"
-            fi
-            # 删除首次运行标记文件
-            MARK_FILE="$HOME/.vpstoolbox"
-            if [[ -f "$MARK_FILE" ]]; then
-            rm -f "$MARK_FILE"
-            fi
-           echo -e "${red}卸载完成！${reset}"
-           exit 0
-           ;;
-        0) exit 0 ;;
-        *) echo -e "${red}无效选项${reset}"; return 1 ;;
-    esac
+detect_package_manager() {
+    if command -v apk >/dev/null 2>&1; then
+        PKG_MANAGER="apk"; PKG_INSTALL_CMD="apk update && apk add vnstat bc iptables cronie || apk add vnstat bc iptables dcron"; PKG_REMOVE_CMD="apk del vnstat"
+    elif command -v apt >/dev/null 2>&1; then
+        PKG_MANAGER="apt"; PKG_INSTALL_CMD="apt update && apt install -y vnstat bc iptables cron"; PKG_REMOVE_CMD="apt remove -y vnstat && apt autoremove -y"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"; PKG_INSTALL_CMD="dnf install -y epel-release || true; dnf install -y vnstat bc iptables crontabs"; PKG_REMOVE_CMD="dnf remove -y vnstat"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MANAGER="yum"; PKG_INSTALL_CMD="yum install -y epel-release || true; yum install -y vnstat bc iptables crontabs"; PKG_REMOVE_CMD="yum remove -y vnstat"
+    else
+        echo "未检测到支持的包管理器（apk/apt/dnf/yum）"; exit 1
+    fi
 }
 
+require_root() { if [ "$(id -u)" -ne 0 ]; then echo "请使用 root 身份运行此脚本"; exit 1; fi; }
+pause() { echo -ne "${GREEN}按回车继续...${RESET}"; read -r _ ; }
 
-# 主循环
-while true; do
-    show_main_menu
-    echo -ne "${red}请输入要执行的编号${ORANGE}(0退出)${ORANGE}:${reset} "
-    read -r main_choice
+manage_service_start() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl enable "$SERVICE_NAME" --now
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-update add "$SERVICE_NAME" default; rc-service "$SERVICE_NAME" start; fi
+}
 
-    # X/x 直接退出脚本
-    if [[ "$main_choice" =~ ^[xX]$ ]]; then
-        exit 0
+manage_service_restart() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl restart "$SERVICE_NAME"
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-service "$SERVICE_NAME" restart; fi
+}
+
+manage_service_status() { detect_service; if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl status "$SERVICE_NAME" --no-pager; elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-service "$SERVICE_NAME" status; fi; }
+
+manage_service_stop() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    elif [ "$INIT_SYSTEM" = "openrc" ] ; then
+        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+        rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
+    fi
+}
+
+install_vnstat() {
+    detect_package_manager
+    echo "正在安装 vnstat 及核心组件..."
+    bash -c "$PKG_INSTALL_CMD"
+    echo "正在启动服务并设置开机自启..."
+    manage_service_start
+    init_port_iptables
+    echo "安装与开机自启配置完成！"
+}
+
+restart_service() { manage_service_restart; echo "服务已重启：$SERVICE_NAME"; }
+show_service_status() { manage_service_status; }
+
+list_interfaces() {
+    echo "当前网络接口："
+    if command -v ip >/dev/null 2>&1; then ip -o link show | awk -F': ' '{print $2}' | grep -v lo
+    else ifconfig -a | grep -E '^[a-zA-Z0-9]' | awk '{print $1}' | grep -v lo; fi
+}
+
+add_interface() {
+    list_interfaces
+    read -rp "请输入要监控的网卡名: " iface
+    if [ -z "$iface" ]; then echo "网卡名不能为空"; return; fi
+    vnstat -i "$iface" --add || true
+    manage_service_restart
+    echo "已添加监控接口: $iface"
+}
+
+show_default_stats() { vnstat; }
+show_interface_stats() { list_interfaces; read -rp "请输入要查看的网卡名: " iface; if [ -n "$iface" ]; then vnstat -i "$iface"; fi; }
+show_daily_stats() { read -rp "请输入网卡名（留空则使用默认）: " iface; if [ -n "$iface" ]; then vnstat -i "$iface" -d; else vnstat -d; fi; }
+show_monthly_stats() { read -rp "请输入网卡名（留空则使用默认）: " iface; if [ -n "$iface" ]; then vnstat -i "$iface" -m; else vnstat -m; fi; }
+live_monitor() { read -rp "请输入网卡名（留空则使用默认）: " iface; if [ -n "$iface" ]; then vnstat -i "$iface" -l; else vnstat -l; fi; }
+
+remove_vnstat() {
+    detect_package_manager
+    echo -e "${YELLOW}即将开始卸载 vnstat 面板及清理所有配置...${RESET}"
+    read -rp "是否同时删除流量统计数据库文件? [y/N]: " remove_db
+
+    # 1. 停止服务
+    manage_service_stop
+    
+    # 2. 清理系统级 Crontab 定时器
+    manage_cron "unset"
+
+    # 3. 彻底清除防火墙内各端口的流量监控计数器
+    if command -v iptables >/dev/null 2>&1; then
+        local iface=$(get_default_interface)
+        for port in $MONITOR_PORTS; do
+            iptables -D INPUT -i "$iface" -p tcp --dport "$port" >/dev/null 2>&1 || true
+            iptables -D INPUT -i "$iface" -p udp --dport "$port" >/dev/null 2>&1 || true
+            iptables -D OUTPUT -o "$iface" -p tcp --sport "$port" >/dev/null 2>&1 || true
+            iptables -D OUTPUT -o "$iface" -p udp --sport "$port" >/dev/null 2>&1 || true
+        done
     fi
 
-    # 按回车刷新菜单
-    if [[ -z "$main_choice" ]]; then
-        continue
-    fi
+    # 4. 卸载包
+    bash -c "$PKG_REMOVE_CMD"
+    
+    # 5. 可选清理数据库
+    if [[ "$remove_db" =~ ^[Yy]$ ]]; then rm -rf /var/lib/vnstat; fi
+    
+    # 6. 删除本地配置文件及自身脚本文件，实现无痕自毁
+    rm -f "$CONFIG_FILE"
+    echo -e "${GREEN}系统组件、定时任务、配置文件已全部清除！${RESET}"
+    rm -f "$PERM_SCRIPT_PATH"
+    
+    exit 0
+}
 
-    # 输入 0 退出
-    if [[ "$main_choice" == "0" ]]; then
-        exit 0
+get_panel_info() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then panel_status="运行中"; else panel_status="未运行"; fi
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        if rc-service "$SERVICE_NAME" status 2>/dev/null | grep -q "started"; then panel_status="运行中"; else panel_status="未运行"; fi
     fi
-
-    # 只允许数字输入
-    if ! [[ "$main_choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${red}无效选项，请输入数字！${reset}"
-        sleep 1
-        continue
-    fi
-
-    # 判断范围
-    if (( main_choice >= 1 && main_choice <= ${#MAIN_MENU[@]} )); then
-        show_sub_menu "$main_choice"
+    if command -v vnstat >/dev/null 2>&1; then
+        panel_version=$(vnstat -v | awk '{print $2}')
+        panel_port=$(get_default_interface)
     else
-        echo -e "${red}无效选项${reset}"
-        sleep 1
+        panel_version="未安装"; panel_status="未安装"; panel_port="无"
     fi
-done
+}
+
+show_menu() {
+    clear
+    get_panel_info
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}     ◈   vnStat 面板   ◈     ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} ${YELLOW}$panel_status${RESET}"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}网卡 :${RESET} ${YELLOW}${panel_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1. 安装 vnstat${RESET}"
+    echo -e "${GREEN} 2. 重启 服务${RESET}"
+    echo -e "${GREEN} 3. 查看 服务状态${RESET}"
+    echo -e "${GREEN} 4. 查看 网络接口${RESET}"
+    echo -e "${GREEN} 5. 添加 监控接口${RESET}"
+    echo -e "${GREEN} 6. 查看 默认流量统计${RESET}"
+    echo -e "${GREEN} 7. 查看 指定网卡流量${RESET}"
+    echo -e "${GREEN} 8. 查看  日流量统计${RESET}"
+    echo -e "${GREEN} 9. 查看 月流量统计${RESET}"
+    echo -e "${GREEN}10. 实时 流量监控${RESET}"
+    echo -e "${GREEN}11. 配置 TG 定时通知任务 >>${RESET}"
+    echo -e "${GREEN}12. 卸载 vnstat${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+}
+
+main() {
+    # 如果是定时任务拉起，直接执行通知汇报逻辑后静默退出
+    if [ "$1" = "--cron-report" ]; then
+        send_traffic_report
+        exit 0
+    fi
+    
+    require_root
+    
+    # 核心拦截检测：若不是在预设路径下运行，则克隆自身到本地固化
+    ensure_script_landed "$@"
+    
+    load_config
+    while true; do
+        show_menu
+        read -r choice
+        case "$choice" in
+            1) install_vnstat; pause ;;
+            2) restart_service; pause ;;
+            3) show_service_status; pause ;;
+            4) list_interfaces; pause ;;
+            5) add_interface; pause ;;
+            6) show_default_stats; pause ;;
+            7) show_interface_stats; pause ;;
+            8) show_daily_stats; pause ;;
+            9) show_monthly_stats; pause ;;
+            10) live_monitor ;;
+            11) menu_cron_config ;;
+            12) remove_vnstat ;;
+            0) exit 0 ;;
+            *) echo "无效选项"; pause ;;
+        esac
+    done
+}
+
+main "$@"

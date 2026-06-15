@@ -1,15 +1,16 @@
 #!/bin/bash
 # ========================================================
-#  SNIProxy & SmartDNS 一体化公共解锁 DNS 架构管理脚本
+#  SNIProxy & SmartDNS 公共解锁 DNS管理脚本
 # ========================================================
 
 # 参数配置
 LISTEN_PORT="443"
-FIREWALL_CHAIN_TCP="SNIPROXY_CLIENT_ALLOWLIST_TCP"
-FIREWALL_CHAIN_UDP="SMARTDNS_CLIENT_ALLOWLIST_UDP"
+FIREWALL_CHAIN_TCP="ALLOW_TCP_443"
+FIREWALL_CHAIN_UDP="ALLOW_UDP_53"
 BINARY_NAME="sniproxy"
 SNI_BASE_DIR="$(pwd)/sniproxy"
 ALLOWLIST_FILE="$SNI_BASE_DIR/allowed_client_ips.txt"
+VERSION_FILE="$SNI_BASE_DIR/version.txt"
 SNI_SERVICE_FILE="/etc/systemd/system/sniproxy.service"
 
 SMARTDNS_CONF_URL="https://raw.githubusercontent.com/pymumu/smartdns/master/etc/smartdns/smartdns.conf"
@@ -24,7 +25,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
-NC='\033[0m' # 无颜色
+NC='\033[0m' # 无颜色 (等同于 RESET)
 
 # ==================== 基础打印与通用工具函数 ====================
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -41,7 +42,7 @@ ensure_root() {
 
 check_command() {
     if ! command -v "$1" &> /dev/null; then
-        print_error "命令 '$1' 未找到。请先安装它 (例如: apt install -y $1 或 yum install -y $1)"
+        print_error "命令 '$1' 未找到。请先安装它 (例如: apt install -y $1 || yum install -y $1)"
         exit 1
     fi
 }
@@ -106,6 +107,15 @@ get_public_ip() {
     echo "$pub_ip"
 }
 
+# 动态获取官方最新版本号 (带超短时限防卡死)
+get_remote_sni_version() {
+    curl -sS --max-time 1.5 "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "未知"
+}
+
+get_remote_smartdns_version() {
+    curl -sS --max-time 1.5 "https://api.github.com/repos/pymumu/smartdns/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "未知"
+}
+
 install_dependency() {
     local pkg=$1
     if command -v "$pkg" &> /dev/null; then return 0; fi
@@ -116,12 +126,12 @@ install_dependency() {
     elif [[ "$os_type" == "centos" || "$os_type" == "rhel" || "$os_type" == "fedora" ]]; then
         yum install -y "$pkg"
     else
-        print_error "未知的系统组件，请手动安装 $pkg 后重试。"
+        print_error "未系统的组件，请手动安装 $pkg 后重试。"
         exit 1
     fi
 }
 
-# ==================== 安全策略模块（支持公网双向拦截） ====================
+# ==================== 安全策略模块 ====================
 persist_firewall_rules() {
     if command -v netfilter-persistent &> /dev/null; then
         netfilter-persistent save >/dev/null 2>&1 && print_success "防火墙规则已持久化。"
@@ -136,14 +146,12 @@ clear_client_allowlist() {
     ensure_root
     print_info "正在清空客户端 IP 白名单，开放公网访问 (53/443)..."
     if command -v iptables &> /dev/null; then
-        # 清理 443 TCP 拦截
         while iptables -C INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP" 2>/dev/null; do
             iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP"
         done
         iptables -F "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
         iptables -X "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
 
-        # 清理 53 UDP 拦截
         while iptables -C INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP" 2>/dev/null; do
             iptables -D INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP"
         done
@@ -160,23 +168,19 @@ apply_client_allowlist() {
     check_command "iptables"
     
     print_info "正在应用客户端 IP 安全白名单..."
-    # 建立并清空链
     iptables -N "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
     iptables -F "$FIREWALL_CHAIN_TCP"
     iptables -N "$FIREWALL_CHAIN_UDP" 2>/dev/null || true
     iptables -F "$FIREWALL_CHAIN_UDP"
 
-    # 放行白名单内的 IP 访问 443(TCP) 和 53(UDP)
     for ip in "${allowed_ips[@]}"; do
         iptables -A "$FIREWALL_CHAIN_TCP" -p tcp --dport "$LISTEN_PORT" -s "$ip" -j ACCEPT
         iptables -A "$FIREWALL_CHAIN_UDP" -p udp --dport 53 -s "$ip" -j ACCEPT
     done
     
-    # 阻断其余所有人的访问
     iptables -A "$FIREWALL_CHAIN_TCP" -p tcp --dport "$LISTEN_PORT" -j DROP
     iptables -A "$FIREWALL_CHAIN_UDP" -p udp --dport 53 -j DROP
 
-    # 将链插入 INPUT
     if ! iptables -C INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP" 2>/dev/null; then
         iptables -I INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP"
     fi
@@ -200,21 +204,22 @@ manage_client_allowlist() {
     local current_allowed=""
     [ -f "$ALLOWLIST_FILE" ] && current_allowed=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d')
     
-    echo -e "${GREEN}=================================${NC}"
-    echo -e "${GREEN}◈ 落地机(客户端) 访问授权管理 ◈${NC}"
-    echo -e "${GREEN}=================================${NC}"
+    echo -e "${GREEN}=============================================${NC}"
+    echo -e "${GREEN}◈  落地机(客户端) 访问授权管理  ◈${NC}"
+    echo -e "${GREEN}=============================================${NC}"
     if [ -n "$current_allowed" ]; then
         echo -e "${GREEN} 当前已授权放行的落地机 IP 列表:${NC}"
         echo "$current_allowed" | sed 's/^/  • /'
     else
         echo -e "${GREEN} 当前安全策略 :${NC} ${CYAN}公开解锁模式 (任意公网落地机改 DNS 均可直接使用)${NC}"
     fi
-    echo -e "${GREEN}=================================${NC}"
-    echo -e " ${GREEN}1. 设置/覆盖 授权落地机 IP${NC}"
-    echo -e " ${GREEN}2. 追加 授权落地机 IP${NC}"
-    echo -e " ${GREEN}3. 清空限制 (变为完全公开解锁)${NC}"
-    echo -e " ${GREEN}0. 返回主菜单${NC}"
-    echo -e "${GREEN}=================================${NC}"
+    echo -e "${GREEN}=============================================${NC}"
+    
+    echo -e "${GREEN}  1. 设置授权落地机 IP${NC}"
+    echo -e "${GREEN}  2. 追加授权落地机 IP${NC}"
+    echo -e "${GREEN}  3. 清空限制(公开解锁)${NC}"
+    echo -e "${GREEN}  0. 返回主菜单${NC}"
+    echo -e "${GREEN}=============================================${NC}"
     
     echo -ne "${GREEN} 请输入选项: ${NC}"
     local choice
@@ -253,17 +258,27 @@ manage_client_allowlist() {
 # ==================== SNIProxy 模块 ====================
 install_sniproxy() {
     ensure_root
-    if systemctl list-unit-files | grep -q "^sniproxy\.service"; then
+    local is_update=$1
+    
+    if [ "$is_update" != "true" ] && systemctl list-unit-files | grep -q "^sniproxy\.service"; then
         print_warning "检测到 SNIProxy 已安装。"
         return 0
     fi
-    print_info "开始全新安装 SNIProxy..."
-    install_dependency "curl"; install_dependency "jq"
     
+    if [ "$is_update" = "true" ]; then
+        print_info "正在升级 SNIProxy 核心版本..."
+        systemctl stop sniproxy 2>/dev/null || true
+    else
+        print_info "开始全新安装 SNIProxy..."
+    fi
+    
+    install_dependency "curl"; install_dependency "jq"
     local arch=$(detect_arch)
     if [ "$arch" = "unknown" ]; then print_error "不支持的架构。"; exit 1; fi
 
     local version=$(curl -sSL "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name')
+    if [ -z "$version" ] || [ "$version" = "null" ]; then version="v1.0.7"; fi
+    
     local tar_name="sniproxy_linux_${arch}.tar.gz"
     local download_url="https://github.com/XIU2/SNIProxy/releases/download/${version}/${tar_name}"
     
@@ -274,12 +289,15 @@ install_sniproxy() {
     chmod +x "$SNI_BASE_DIR/$BINARY_NAME"
     rm -f "/tmp/$tar_name" && rm -rf "$tmp_extract"
 
-    cat <<EOF > "$SNI_BASE_DIR/config.yaml"
+    echo "$version" > "$VERSION_FILE"
+
+    if [ "$is_update" != "true" ]; then
+        cat <<EOF > "$SNI_BASE_DIR/config.yaml"
 listen_addr: ":$LISTEN_PORT"
 allow_all_hosts: true
 EOF
 
-    cat <<EOF > "$SNI_SERVICE_FILE"
+        cat <<EOF > "$SNI_SERVICE_FILE"
 [Unit]
 Description=SNI Proxy
 After=network.target
@@ -291,12 +309,14 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
+        systemctl daemon-reload && systemctl enable sniproxy
+    fi
 
-    systemctl daemon-reload && systemctl enable sniproxy && systemctl start sniproxy
-    print_success "SNIProxy 部署完成并成功启动。"
+    systemctl start sniproxy
+    print_success "SNIProxy 核心包 ($version) 部署成功。"
 }
 
-# ==================== SmartDNS 模块 (优化为公网分流解析) ====================
+# ==================== SmartDNS 模块 (包含动态编译更新) ====================
 check_and_fix_port_conflict() {
     print_info "检查 53 端口占用情况..."
     local port_usage=""
@@ -314,15 +334,23 @@ nameserver 1.1.1.1
 EOF
         return 0
     else
-        echo "$port_usage" | grep -q "smartdns" && return 0 # 如果是自己占用的，直接允许
+        echo "$port_usage" | grep -q "smartdns" && return 0
         print_error "端口 53 被其他未知程序占用，请先手动清理:\n$port_usage"
         return 1
     fi
 }
 
 install_smartdns_binary() {
-    if command -v smartdns &> /dev/null; then return 0; fi
-    print_info "正在获取并编译安装 SmartDNS 核心..."
+    local is_update=$1
+    if [ "$is_update" != "true" ] && command -v smartdns &> /dev/null; then return 0; fi
+    
+    if [ "$is_update" = "true" ]; then
+        print_info "正在升级并重新编译 SmartDNS 二进制程序..."
+        systemctl stop smartdns 2>/dev/null || true
+    else
+        print_info "正在获取并编译安装 SmartDNS 核心..."
+    fi
+
     install_dependency "wget"
     local arch=$(detect_arch)
     local asset_arch=$([ "$arch" = "amd64" ] && echo "x86_64" || echo "aarch64")
@@ -331,20 +359,22 @@ install_smartdns_binary() {
     cd /tmp && wget -q --show-progress "${download_url}" -O smartdns.tar.gz
     tar -xzf smartdns.tar.gz && cd smartdns && chmod +x ./install && ./install -i
     cd /tmp && rm -rf smartdns smartdns.tar.gz
-    print_success "SmartDNS 二进制核心装载完毕。"
+    print_success "SmartDNS 核心包编译装载就绪。"
 }
 
 configure_smartdns_rules() {
+    local is_update=$1
     ensure_root
-    if ! check_and_fix_port_conflict; then exit 1; fi
-    install_smartdns_binary
+    if [ "$is_update" != "true" ]; then
+        if ! check_and_fix_port_conflict; then exit 1; fi
+    fi
+    install_smartdns_binary "$is_update"
 
-    print_info "正在构建公网公共分流解锁 DNS 配置..."
+    print_info "正在构建公网分流规则库..."
     wget -q -O "${OUTPUT_FILE}" "${SMARTDNS_CONF_URL}"
     sed -i '/^server /d' "${OUTPUT_FILE}"
     sed -i '/^bind /d' "${OUTPUT_FILE}"
 
-    # 核心优化：让 SmartDNS 绑定公网端口 53，并设置流媒体全部就地劫持（解析到本地 127.0.0.1）
     cat > "${OUTPUT_FILE}.tmp" << 'EOF'
 # ===== 公网公共 DNS 基础属性 =====
 server 1.1.1.1
@@ -364,7 +394,6 @@ EOF
 
 # ===== 自动化就地劫持分流核心规则 =====
 EOF
-    # 将流媒体全部解析到中转机本地的 SNIProxy 监听环回口上
     awk '/^[^#[:space:]]/ {print "address /" $1 "/127.0.0.1"}' "${TEMP_DOMAIN_FILE}" >> "${OUTPUT_FILE}"
     rm -f "${TEMP_DOMAIN_FILE}"
 
@@ -373,18 +402,30 @@ EOF
     cp "${OUTPUT_FILE}" /etc/smartdns/smartdns.conf
     rm -f "${OUTPUT_FILE}"
 
-    # 解决官方安装脚本默认拉起没有规则的问题
     systemctl restart smartdns
     sleep 1
     if systemctl is-active --quiet smartdns; then
-        print_success "中转端一体化公共解锁 DNS 构建大功告成！"
+        print_success "中转端解锁 DNS 构建完成！"
         print_info "当前已接管流媒体分流拦截规则共: $(grep -c "^address " /etc/smartdns/smartdns.conf) 条"
     else
         print_error "SmartDNS 启动异常。"
     fi
 }
 
-# ==================== 卸载清退模块 ====================
+show_logs() {
+    ensure_root
+    clear
+    echo -e "${GREEN}=============================================${NC}"
+    echo -e "${GREEN}◈  流媒体解锁服务 实时运行日志  ◈${NC}"
+    echo -e "${GREEN}=============================================${NC}"
+    print_info "正在读取最近 30 行日志（按 Ctrl+C 即可退出查看）:"
+    echo -e "${YELLOW}--- SmartDNS 分流日志 ---${NC}"
+    journalctl -u smartdns -n 15 --no-pager
+    echo -e "\n${YELLOW}--- SNIProxy 中转日志 ---${NC}"
+    journalctl -u sniproxy -n 15 --no-pager
+    echo -e "${GREEN}=============================================${NC}"
+}
+
 uninstall_all_services() {
     ensure_root
     print_warning "正在全面卸载并净化本机的中转与分流服务..."
@@ -415,11 +456,25 @@ main() {
             smartdns_status_view="${GREEN}运行中${NC} (公网端口: 53)"
         elif systemctl list-unit-files | grep -q "^smartdns\.service"; then smartdns_status_view="${YELLOW}已停止${NC}"; fi
 
-        local whitelist_view="${CYAN}公开解锁 (任意公网设备均可改DNS解锁)${NC}"
+        local whitelist_view="${CYAN}公开解锁 (任意设备改DNS即可解锁)${NC}"
         if [ -f "$ALLOWLIST_FILE" ] && [ -s "$ALLOWLIST_FILE" ]; then
             local count=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d' | wc -l)
-            whitelist_view="${PURPLE}安全鉴权模式 (仅允许已授权的 ${count} 个落地鸡IP访问)${NC}"
+            whitelist_view="${PURPLE}安全鉴权模式 (允许已授权的 ${count} 个落地鸡IP)${NC}"
         fi
+
+        # --- 💥 双系统版本读取与对齐核心逻辑 💥 ---
+        # 1. SNIProxy 版本
+        local current_sni_ver="${RED}未装载${NC}"
+        if [ -f "$VERSION_FILE" ]; then current_sni_ver=$(cat "$VERSION_FILE"); fi
+        local remote_sni_ver=$(get_remote_sni_version)
+
+        # 2. SmartDNS 版本
+        local current_sdns_ver="${RED}未装载${NC}"
+        if command -v smartdns &> /dev/null; then
+            # 运行 smartdns -v 动态抓取如 1.2024.xx 的版本前缀
+            current_sdns_ver="v$(smartdns -v 2>&1 | grep "version" | awk '{print $3}' | cut -d'-' -f1)"
+        fi
+        local remote_sdns_ver=$(get_remote_smartdns_version)
 
         echo -e "${GREEN}=============================================${NC}"
         echo -e "${GREEN}◈  流媒体公共 DNS 一体化智能解锁中转面板  ◈${NC}"
@@ -428,12 +483,19 @@ main() {
         echo -e "${GREEN} SNIProxy 解锁中转状态:${NC} $sni_status_view"
         echo -e "${GREEN} SmartDNS 公网分流状态:${NC} $smartdns_status_view"
         echo -e "${GREEN} 授权安全策略访问模式 :${NC} $whitelist_view"
+        echo -e "${GREEN} SNIProxy 版本       :${NC}${CYAN}${current_sni_ver}${NC}→${YELLOW}${remote_sni_ver}${NC}"
+        echo -e "${GREEN} SmartDNS 版本       :${NC}${CYAN}${current_sdns_ver}${NC}→${YELLOW}${remote_sdns_ver}${NC}"
         echo -e "${GREEN}=============================================${NC}"
-        echo -e " ${GREEN}1. 一键部署 “多功能公共解锁 DNS 服务”${NC} (安装/配置 53+443)"
-        echo -e " ${GREEN}2. 配置/管理 授权使用本 DNS 的落地机 IP${NC} (安全策略管理)"
-        echo -e " ${GREEN}3. 重启一键解锁全部服务${NC}"
-        echo -e " ${GREEN}4. 完全卸载本站所有组件 (恢复干净系统)${NC}"
-        echo -e " ${GREEN}0. 退出面板${NC}"
+        echo -e "${GREEN}  1. 安装 解锁服务${NC}"
+        echo -e "${GREEN}  2. 更新 服务版本${NC}"
+        echo -e "${GREEN}  3. 卸载 解锁服务${NC}"
+        echo -e "${GREEN}  4. 安全白名单放行${NC}"
+        echo -e "${GREEN}  5. 启动 解锁服务${NC}"
+        echo -e "${GREEN}  6. 停止 解锁服务${NC}"
+        echo -e "${GREEN}  7. 重启 解锁服务${NC}"
+        echo -e "${GREEN}  8. 查看 日志${NC}"
+        echo -e "${GREEN}  9. 查看 配置与出口状态${NC}"
+        echo -e "${GREEN}  0. 退出 ${NC}"
         echo -e "${GREEN}=============================================${NC}"
         
         echo -ne "${GREEN} 请输入选项: ${NC}"
@@ -443,20 +505,42 @@ main() {
 
         case "$choice" in
             1)
-                install_sniproxy
-                configure_smartdns_rules
+                install_sniproxy "false"
+                configure_smartdns_rules "false"
                 echo -e "\n${GREEN}==================================================${NC}"
-                print_success "中转机端部署完全就绪！"
+                print_success "中转端部署完全就绪！"
                 echo -e "现在，你其他的【落地机】不需要装任何东西，直接执行这三行命令即可解锁："
                 echo -e "${YELLOW}chattr -i /etc/resolv.conf 2>/dev/null || true${NC}"
                 echo -e "${YELLOW}echo \"nameserver ${my_ip}\" > /etc/resolv.conf${NC}"
                 echo -e "${YELLOW}chattr +i /etc/resolv.conf 2>/dev/null${NC}"
                 echo -e "${GREEN}==================================================${NC}"
                 echo -n "按回车键返回面板..."; read -r _ ;;
-            2) manage_client_allowlist; echo -n "按回车键返回面板..."; read -r _ ;;
-            3) systemctl restart sniproxy smartdns && print_success "核心组件已全部重启。"; sleep 1.5 ;;
-            4) uninstall_all_services; echo -n "按回车键返回面板..."; read -r _ ;;
-            0) print_info "已安全退出面板。"; exit 0 ;;
+            2) 
+                # 点击 2 同时进行两个主程序热升级 + 全新 707+ 域名规则拉取
+                install_sniproxy "true"
+                configure_smartdns_rules "true"
+                print_success "SNIProxy 和 SmartDNS 核心程序以及分流规则已全部升级成功！"
+                echo -n "按回车键返回面板..."; read -r _ ;;
+            3) uninstall_all_services; echo -n "按回车键返回面板..."; read -r _ ;;
+            4) manage_client_allowlist; echo -n "按回车键返回面板..."; read -r _ ;;
+            5) systemctl start sniproxy smartdns 2>/dev/null && print_success "服务已完成启动指令。"; sleep 1.5 ;;
+            6) systemctl stop sniproxy smartdns 2>/dev/null && print_success "服务已完成停止指令。"; sleep 1.5 ;;
+            7) systemctl restart sniproxy smartdns 2>/dev/null && print_success "核心组件已全部重启。"; sleep 1.5 ;;
+            8) show_logs; echo -n "按回车键返回面板..."; read -r _ ;;
+            9) 
+                clear
+                echo -e "${GREEN}--- 当前运行配置摘要 ---${NC}"
+                echo -e "DNS 监听地址: 0.0.0.0:53  |  SNI 中转端口: 0.0.0.0:${LISTEN_PORT}"
+                echo -e "已加载劫持分流域名数量: ${YELLOW}$(grep -c "^address " /etc/smartdns/smartdns.conf 2>/dev/null || echo "0")${NC} 条"
+                echo -e "\n${GREEN}--- 本机流媒体原生出口测试 ---${NC}"
+                if command -v curl &> /dev/null; then
+                    echo -n "Netflix 出口状态: "
+                    curl -sI --max-time 3 https://www.netflix.com | head -n 1 || echo "连接超时"
+                else
+                    print_warning "本地缺少 curl，无法执行出口活性探测。"
+                fi
+                echo -n "按回车键返回面板..."; read -r _ ;;
+            0) exit 0 ;;
             *) print_error "无效选项: '$choice'，请重新输入。"; sleep 1.5 ;;
         esac
     done

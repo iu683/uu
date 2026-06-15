@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================================
-#  SNIProxy & SmartDNS 公共解锁 DNS管理脚本 (修复版)
+#  SNIProxy & SmartDNS 公共解锁 DNS管理脚本
 # ========================================================
 
 # 参数配置
@@ -372,6 +372,7 @@ configure_smartdns_rules() {
     print_info "正在构建公网分流规则库..."
     rm -f "${OUTPUT_FILE}" "${OUTPUT_FILE}.tmp"
     
+    # 构建基础配置
     cat > "${OUTPUT_FILE}" << 'EOF'
 # ===== 公网公共 DNS 基础属性 =====
 server 1.1.1.1
@@ -380,6 +381,7 @@ bind :53
 cache-size 32768
 prefetch-domain yes
 serve-expired yes
+
 
 
 # ===== 自动化就地劫持分流核心规则 =====
@@ -392,16 +394,18 @@ EOF
     fi
     
     # -------------------------------------------------------------
-    # 【高精剥离器】精准粉碎 domain-set 语法，完美提取后面所有流媒体域名
+    # 【高精洗稿】干掉 \r，揉碎空格，精准提取域名，不给 SNIProxy 添乱
     # -------------------------------------------------------------
-    grep "domain-set" "${TEMP_DOMAIN_FILE}" | while read -r line; do
-        # 剥离掉 domain-set -name XXX 这一段，只留下后面的域名部分
-        local pure_domains=$(echo "$line" | sed -E 's/^domain-set[[:space:]]+-name[[:space:]]+[^[:space:]]+//')
-        
-        # 将留下的域名一行一个打散，去掉前缀点，注入 SmartDNS
-        echo "$pure_domains" | tr ' ' '\n' | sed 's/^\.//g' | sed '/^[[:space:]]*$/d' | while read -r domain; do
+    cat "${TEMP_DOMAIN_FILE}" | \
+    tr -d '\r' | \
+    tr '[:space:]' '\n' | \
+    sed -e 's/^\.//g' -e 's/;$//g' | \
+    grep -E '^([a-zA-Z0-9_-]+\.)+[a-zA-Z]{2,6}$' | \
+    sort -u | \
+    while read -r domain; do
+        if [ "$domain" != "domain-set" ] && [ "$domain" != "server_name" ]; then
             echo "address /$domain/127.0.0.1" >> "${OUTPUT_FILE}"
-        done
+        fi
     done
 
     rm -f "${TEMP_DOMAIN_FILE}"
@@ -411,16 +415,20 @@ EOF
     cp "${OUTPUT_FILE}" /etc/smartdns/smartdns.conf
     rm -f "${OUTPUT_FILE}"
 
+    # 重启并验证
     systemctl restart smartdns
     sleep 1.5
     
     if systemctl is-active --quiet smartdns; then
-        print_success "中转端解锁 DNS 构建并清洗完成！"
         local valid_count=$(grep -c "^address " /etc/smartdns/smartdns.conf)
+        print_success "中转端解锁 DNS 构建并清洗完成！"
         print_info "当前已接管[合规合法]的流媒体分流拦截规则共: ${YELLOW}${valid_count}${NC} 条"
     else
-        print_error "SmartDNS 规则清洗后启动异常，正在还原备份..."
-        [ -f /etc/smartdns/smartdns.conf.bak ] && cp /etc/smartdns/smartdns.conf.bak /etc/smartdns/smartdns.conf && systemctl restart smartdns
+        print_error "SmartDNS 规则清洗后启动异常，正在还原先前备份..."
+        if [ -f /etc/smartdns/smartdns.conf.bak ]; then
+            cp /etc/smartdns/smartdns.conf.bak /etc/smartdns/smartdns.conf
+            systemctl restart smartdns
+        fi
     fi
 }
 

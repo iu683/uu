@@ -63,6 +63,37 @@ read_required_input() {
     fi
 }
 
+
+get_public_ip() {
+    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    echo "127.0.0.1" && return 0
+}
+
+
 validate_ip() {
     local ip=$1
     if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -369,10 +400,29 @@ configure_smartdns_rules() {
     fi
     install_smartdns_binary "$is_update"
 
-    print_info "正在构建公网分流规则库..."
-    rm -f "${OUTPUT_FILE}" "${OUTPUT_FILE}.tmp"
+    # ==================== 🌐 动态自动获取公网 IPv4 (多重保底) ====================
+    print_info "正在自动获取中转端公网 IPv4 地址..."
+    local public_ip=""
+    public_ip=$(curl -s4 --max-time 3 api.ipify.org || curl -s4 --max-time 3 ifconfig.me || curl -s4 --max-time 3 ip4.icanhazip.com)
     
-    cat > "${OUTPUT_FILE}" << 'EOF'
+    # 去除可能存在的首尾空格或换行符
+    public_ip=$(echo "${public_ip}" | tr -d '[:space:]')
+
+    # 极端情况防呆判断：如果真的死活获取不到公网 IP，回退到 127.0.0.1 保障服务不崩
+    if [ -z "${public_ip}" ]; then
+        print_warning "未能自动获取到公网 IP，将 fallback 降级使用 127.0.0.1"
+        public_ip="127.0.0.1"
+    else
+        print_success "成功获取中转端公网 IP: ${public_ip}"
+    fi
+    # ===========================================================================
+
+    print_info "正在构建公网分流规则库..."
+    wget -q -O "${OUTPUT_FILE}" "${SMARTDNS_CONF_URL}"
+    sed -i '/^server /d' "${OUTPUT_FILE}"
+    sed -i '/^bind /d' "${OUTPUT_FILE}"
+
+    cat > "${OUTPUT_FILE}.tmp" << 'EOF'
 # ===== 公网公共 DNS 基础属性 =====
 server 1.1.1.1
 server 8.8.8.8
@@ -380,34 +430,23 @@ bind :53
 cache-size 32768
 prefetch-domain yes
 serve-expired yes
+EOF
+    cat "${OUTPUT_FILE}" >> "${OUTPUT_FILE}.tmp"
+    mv "${OUTPUT_FILE}.tmp" "${OUTPUT_FILE}"
 
-# ===== 阻止浏览器强制使用 QUIC (UDP 443) 绕过中转 =====
-force-qtype-SOA 65
+    print_info "正在同步全球流媒体解锁域名数据源..."
+    curl -s "${DOMAIN_LIST_URL}" -o "${TEMP_DOMAIN_FILE}"
+    
+    cat >> "${OUTPUT_FILE}" << EOF
 
 # ===== 自动化就地劫持分流核心规则 =====
 EOF
 
-    print_info "正在同步全球流媒体解锁域名数据源..."
-    if ! curl -s "${DOMAIN_LIST_URL}" -o "${TEMP_DOMAIN_FILE}"; then
-        print_error "下载流媒体域名数据源失败，请检查网络！"
-        return 1
-    fi
-    
-    # -------------------------------------------------------------
-    # 【降维打击洗稿法】斩杀 \r，把所有空格打断为换行，只抓取合法域名
-    # -------------------------------------------------------------
-    cat "${TEMP_DOMAIN_FILE}" | \
-    tr -d '\r' | \
-    tr '[:space:]' '\n' | \
-    sed -e 's/^\.//g' -e 's/;$//g' | \
-    grep -E '^([a-zA-Z0-9_-]+\.)+[a-zA-Z]{2,6}$' | \
-    sort -u | \
-    while read -r domain; do
-        # 排除由于宏标签或纯文本混进来的非域名单词
-        if [ "$domain" != "domain-set" ] && [ "$domain" != "server_name" ]; then
-            echo "address /$domain/127.0.0.1" >> "${OUTPUT_FILE}"
-        fi
-    done
+    # ==================== 💥 修复核心：引入变量并修正路径 💥 ====================
+    # 1. 传入 -v ip="${public_ip}" 将 Shell 变量安全传递给 awk
+    # 2. 修正源文件为 "${TEMP_DOMAIN_FILE}"，目标文件为 "${OUTPUT_FILE}"
+    awk -v ip="${public_ip}" '/^[^#[:space:]]/ {gsub(/[[:space:]\r]/, ""); if($0!="") print "address /" $0 "/" ip}' "${TEMP_DOMAIN_FILE}" >> "${OUTPUT_FILE}"
+    # ===========================================================================
 
     rm -f "${TEMP_DOMAIN_FILE}"
 
@@ -416,22 +455,13 @@ EOF
     cp "${OUTPUT_FILE}" /etc/smartdns/smartdns.conf
     rm -f "${OUTPUT_FILE}"
 
-    # 尝试启动并验证
     systemctl restart smartdns
-    sleep 1.5
-    
+    sleep 1
     if systemctl is-active --quiet smartdns; then
-        local valid_count=$(grep -c "^address " /etc/smartdns/smartdns.conf)
-        print_success "中转端解锁 DNS 构建并清洗完成！"
-        print_info "当前已接管[合规合法]的流媒体分流拦截规则共: ${YELLOW}${valid_count}${NC} 条"
+        print_success "中转端解锁 DNS 构建完成！"
+        print_info "当前已接管流媒体分流拦截规则共: $(grep -c "^address " /etc/smartdns/smartdns.conf) 条"
     else
-        print_error "SmartDNS 规则清洗后由于潜在语法冲突启动异常，正在为您还原稳妥备份..."
-        if [ -f /etc/smartdns/smartdns.conf.bak ]; then
-            cp /etc/smartdns/smartdns.conf.bak /etc/smartdns/smartdns.conf
-            systemctl restart smartdns
-            local restore_count=$(grep -c "^address " /etc/smartdns/smartdns.conf)
-            print_warning "已成功回滚至上一版安全规则，当前接管规则: ${YELLOW}${restore_count}${NC} 条"
-        fi
+        print_error "SmartDNS 启动异常。"
     fi
 }
 

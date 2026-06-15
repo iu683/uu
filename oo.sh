@@ -1,487 +1,993 @@
-#!/bin/sh
-# ========================================================
-#  SNIProxy & SmartDNS 公共解锁 DNS管理脚本 (Alpine 终极无缝修复版)
-# ========================================================
+#!/bin/bash
 
-# ==================== 🛠️ 1. Alpine 基础依赖与防火墙完美初始化 ====================
-if [ ! -f /tmp/alpine_dep_ok.flag ]; then
-    echo "[INFO] 正在检测 Alpine 系统核心依赖组件..."
-    apk update --no-cache >/dev/null 2>&1
+# =========================================================
+# Xray VLESS-Reality 管理脚本
+# =========================================================
+
+set -Eeuo pipefail
+
+# ================== 颜色 ==================
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
+RESET="\033[0m"
+
+# ================== 基础变量 ==================
+readonly SERVICE_NAME="vlessreality"
+readonly XRAY_CONFIG="/usr/local/etc/${SERVICE_NAME}/config.json"
+readonly XRAY_BINARY="/usr/local/bin/${SERVICE_NAME}"
+readonly XRAY_PUBLIC_KEY_FILE="/usr/local/etc/${SERVICE_NAME}/public.key"
+
+# 降级备用版本（当自动获取最新版本失败时使用）
+readonly BACKUP_VERSION="26.3.27"
+
+TMP_DIR=$(mktemp -d -t xray.XXXXXX)
+
+# ================== GITHUB 代理 ==================
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+)
+
+# ================== cleanup ==================
+cleanup() {
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+
+trap cleanup EXIT INT TERM
+
+# ================== 日志 ==================
+info() {
+    echo -e "${GREEN}[信息] $*${RESET}" >&2
+}
+
+warn() {
+    echo -e "${YELLOW}[警告] $*${RESET}" >&2
+}
+
+error() {
+    echo -e "${RED}[错误] $*${RESET}" >&2
+}
+
+pause() {
+    read -n 1 -s -r -p "按任意键返回菜单..." || true
+    echo
+}
+
+# ================== 获取公网IP ==================
+get_public_ip() {
+    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
     
-    if ! command -v bash >/dev/null 2>&1; then
-        echo "[INFO] 发现系统缺少 bash，正在自动安装..."
-        apk add --no-cache bash >/dev/null 2>&1
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
-    
-    for pkg in curl jq iptables ip6tables wget make gcc g++ musl-dev linux-headers openssl-dev xargs; do
-        if ! command -v $pkg >/dev/null 2>&1 && [ "$pkg" != "musl-dev" ] && [ "$pkg" != "linux-headers" ] && [ "$pkg" != "openssl-dev" ]; then
-            echo "[INFO] 正在自动补齐核心组件: $pkg..."
-            apk add --no-cache $pkg >/dev/null 2>&1
+
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    echo "127.0.0.1" && return 0
+}
+
+# ================== 检查端口占用 ==================
+check_port() {
+    local port="$1"
+
+    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then
+        return 1  # 被占用
+    fi
+
+    return 0  # 没用占用
+}
+
+# ================== 验证端口格式 ==================
+is_valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] \
+        && [[ "$1" -ge 1 ]] \
+        && [[ "$1" -le 65535 ]]
+}
+
+# ================== 获取可用随机端口 ==================
+get_random_port() {
+    local rand_port
+    while true; do
+        rand_port=$((RANDOM % 55536 + 10000))
+        if check_port "$rand_port"; then
+            echo "$rand_port"
+            return 0
         fi
     done
-    
-    apk add --no-cache musl-dev linux-headers openssl-dev >/dev/null 2>&1
-    
-    # 💥【核心修复】彻底攻克 iptables 拒绝空载启动的系统暗坑 💥
-    if [ -f /etc/init.d/iptables ]; then
-        rc-update add iptables default >/dev/null 2>&1
-        if ! rc-service iptables status | grep -q "started"; then
-            echo "[INFO] 检测到防火墙服务未激活，正在注入安全基准规则以破除 Alpine 空载限制..."
-            iptables -F INPUT 2>/dev/null || true
-            iptables -A INPUT -i lo -j ACCEPT 2>/dev/null
-            iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-            iptables -A INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null
-            if [ -f /etc/init.d/iptables ]; then
-                /etc/init.d/iptables save >/dev/null 2>&1
-            fi
-            rc-service iptables start >/dev/null 2>&1
-        fi
-    fi
-
-    touch /tmp/alpine_dep_ok.flag
-    echo "[SUCCESS] Alpine 基础运行环境与防火墙状态已完美激活就绪！"
-fi
-
-if [ -z "$BASH_VERSION" ]; then
-    exec bash "$0" "$@"
-fi
-
-# ==================== 💎 2. 高级 Bash 核心业务逻辑实现 ====================
-LISTEN_PORT="443"
-BINARY_NAME="sniproxy"
-SNI_BASE_DIR="/etc/sniproxy"
-ALLOWLIST_FILE="$SNI_BASE_DIR/allowed_client_ips.txt"
-VERSION_FILE="$SNI_BASE_DIR/version.txt"
-
-DOMAIN_LIST_URL="https://raw.githubusercontent.com/1-stream/1stream-public-utils/refs/heads/main/stream.text.list"
-OUTPUT_FILE="/etc/smartdns/smartdns.conf"
-TEMP_DOMAIN_FILE="/tmp/domain_list.txt"
-
-# 颜色定义
-RED='\033;31m'
-GREEN='\033;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' 
-
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-print_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
-
-ensure_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        print_error "此操作需要 root 权限。请使用 root 用户身份运行。"
-        exit 1
-    fi
 }
 
-check_command() {
-    if ! command -v "$1" &> /dev/null; then
-        apk add --no-cache "$1" >/dev/null 2>&1
-    fi
+# ================== UUID验证 ==================
+is_valid_uuid() {
+    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
 }
 
-read_user_input() {
-    local var_name=$1
-    if [ -r /dev/tty ]; then
-        { read -r "$var_name" < /dev/tty; } 2>/dev/null && return 0
-    fi
-    read -r "$var_name"
-}
-
-read_required_input() {
-    local var_name=$1
-    if ! read_user_input "$var_name"; then
-        print_error "未读取到输入。请在交互式终端运行脚本。"
-        exit 1
-    fi
-}
-
-validate_ip() {
-    local ip=$1
-    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        local IFS='.'
-        local -a octets=($ip)
-        for octet in "${octets[@]}"; do
-            if ((octet > 255)); then return 1; fi
-        done
+# ================== ShortID 验证 ==================
+is_valid_shortid() {
+    local len=${#1}
+    if [[ "$1" =~ ^[0-9a-fA-F]+$ ]] && (( len % 2 == 0 )) && (( len <= 16 )); then
         return 0
     fi
     return 1
 }
 
-validate_ip_or_cidr() {
-    local value=$1
-    local ip="${value%/*}"
-    if [[ "$value" == */* ]]; then
-        local cidr="${value#*/}"
-        if ! [[ "$cidr" =~ ^[0-9]+$ ]] || ((cidr < 0 || cidr > 32)); then return 1; fi
-    fi
-    validate_ip "$ip"
+# ================== 域名验证 ==================
+is_valid_domain() {
+    [[ "$1" =~ ^([a-zA-Z0-9](-?[a-zA-Z0-9])*\.)+[A-Za-z]{2,}$ ]]
 }
 
-detect_arch() {
-    local machine=$(uname -m)
-    if [ "$machine" = "x86_64" ]; then echo "amd64"
-    elif [ "$machine" = "aarch64" ] || [ "$machine" = "arm64" ]; then echo "arm64"
-    else echo "unknown"; fi
-}
-
-get_public_ip() {
-    local pub_ip
-    pub_ip=$(curl -s4 --max-time 3 api.ipify.org || curl -s4 --max-time 3 ifconfig.me || echo "你的中转机公网IP")
-    echo "$pub_ip"
-}
-
-get_remote_sni_version() {
-    curl -sS --max-time 1.5 "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "未知"
-}
-
-get_remote_smartdns_version() {
-    curl -sS --max-time 1.5 "https://api.github.com/repos/pymumu/smartdns/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "未知"
-}
-
-persist_firewall_rules() {
-    if [ -f /etc/init.d/iptables ]; then
-        rc-service iptables save >/dev/null 2>&1 && print_success "防火墙规则已持久化。"
-    fi
-}
-
-clear_client_allowlist() {
-    ensure_root
-    print_info "正在清空客户端 IP 白名单..."
-    if command -v iptables &> /dev/null; then
-        iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-        
-        if [ -f "$ALLOWLIST_FILE" ]; then
-            while read -r ip; do
-                [[ "$ip" =~ ^# ]] || [ -z "$ip" ] && continue
-                iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -s "$ip" -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p udp --dport 53 -s "$ip" -j ACCEPT 2>/dev/null || true
-            done < "$ALLOWLIST_FILE"
-        fi
-        iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -j DROP 2>/dev/null || true
-        iptables -D INPUT -p udp --dport 53 -j DROP 2>/dev/null || true
-    fi
-    rm -f "$ALLOWLIST_FILE"
-    persist_firewall_rules
-}
-
-apply_client_allowlist() {
-    local allowed_ips=("$@")
-    check_command "iptables"
-    
-    print_info "正在构建客户端 IP 安全白名单规则..."
-    clear_client_allowlist >/dev/null 2>&1
-
-    for ip in "${allowed_ips[@]}"; do
-        iptables -A INPUT -p tcp --dport "$LISTEN_PORT" -s "$ip" -j ACCEPT
-        iptables -A INPUT -p udp --dport 53 -s "$ip" -j ACCEPT
-    done
-    
-    iptables -A INPUT -p tcp --dport "$LISTEN_PORT" -j DROP
-    iptables -A INPUT -p udp --dport 53 -j DROP
-
-    mkdir -p "$SNI_BASE_DIR"
-    {
-        echo "# 授权访问此公共 DNS 与 解锁中转的落地机 IP"
-        printf '%s\n' "${allowed_ips[@]}"
-    } > "$ALLOWLIST_FILE"
-
-    persist_firewall_rules
-    print_success "安全策略已变更：安全白名单已应用。"
-}
-
-manage_client_allowlist() {
-    ensure_root
-    clear
-    local current_allowed=""
-    [ -f "$ALLOWLIST_FILE" ] && current_allowed=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d')
-    
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN}      ◈  落地机(客户端) 访问授权管理  ◈       ${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    if [ -n "$current_allowed" ]; then
-        echo -e "${GREEN} 当前已授权放行的落地机 IP 列表:${NC}"
-        echo "$current_allowed" | sed 's/^/  • /'
-    else
-        echo -e "${GREEN} 当前安全策略 :${NC} ${YELLOW}公开解锁模式${NC}"
-    fi
-    echo -e "${GREEN}=============================================${NC}"
-    
-    echo -e "${GREEN}  1. 设置授权落地机 IP${NC}"
-    echo -e "${GREEN}  2. 追加授权落地机 IP${NC}"
-    echo -e "${GREEN}  3. 清空限制(公开解锁)${NC}"
-    echo -e "${GREEN}  0. 返回主菜单${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    
-    echo -ne "${GREEN} 请输入选项: ${NC}"
-    local choice
-    read -r choice
-    choice=$(echo "$choice" | tr -d '[:space:]')
-
-    case "$choice" in
-        1|2)
-            echo -e "\n${YELLOW}[提示] 多个落地机 IP 请使用空格或逗号分隔${NC}"
-            echo -n -e "${GREEN}请输入落地机 IP: ${NC}"
-            local input_ips
-            read_required_input input_ips
-            input_ips=$(echo "$input_ips" | tr ',' ' ')
-
-            local allowed_ips=()
-            if [ "$choice" = "2" ] && [ -n "$current_allowed" ]; then
-                while IFS= read -r ip; do [ -n "$ip" ] && allowed_ips+=("$ip"); done <<< "$current_allowed"
-            fi
-
-            for ip in $input_ips; do
-                ip=$(echo "$ip" | tr -d '\n\r[[:space:]]')
-                [ -z "$ip" ] && continue
-                if validate_ip_or_cidr "$ip"; then allowed_ips+=("$ip")
-                else print_error "无效的 IP 格式: $ip"; return 1; fi
-            done
-            
-            [ "${#allowed_ips[@]}" -eq 0 ] && { print_warning "未输入有效IP。"; return 0; }
-            
-            local unique_ips=()
-            while IFS= read -r line; do
-                [ -n "$line" ] && unique_ips+=("$line")
-            done <<EOF
-$(printf '%s\n' "${allowed_ips[@]}" | awk '!seen[$0]++')
-EOF
-            apply_client_allowlist "${unique_ips[@]}"
-            ;;
-        3) clear_client_allowlist && print_success "已转为公开解锁。";;
-        *) return 0 ;;
+# ================== 架构检测 ==================
+get_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64) echo "64" ;;
+        aarch64|arm64) echo "arm64-v8a" ;;
+        armv7l) echo "arm32-v7a" ;;
+        *) error "暂不支持的系统架构: $arch"; return 1 ;;
     esac
 }
 
-install_sniproxy() {
-    ensure_root
-    local is_update=$1
-    if [ "$is_update" != "true" ] && [ -f "/etc/init.d/sniproxy" ]; then return 0; fi
+# ================== 自动获取最新版本号 ==================
+get_latest_version() {
+    local latest_version=""
+    info "正在获取 GitHub 最新 Xray 版本号..."
     
-    local arch=$(detect_arch)
-    local version=$(curl -sSL "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name')
-    [ -z "$version" ] || [ "$version" = "null" ] && version="v1.0.7"
-    
-    local tar_name="sniproxy_linux_${arch}.tar.gz"
-    curl -fL "https://github.com/XIU2/SNIProxy/releases/download/${version}/${tar_name}" -o "/tmp/$tar_name"
-    mkdir -p "$SNI_BASE_DIR"
-    tar -xzf "/tmp/$tar_name" -C "/tmp"
-    mv /tmp/sniproxy "$SNI_BASE_DIR/$BINARY_NAME"
-    chmod +x "$SNI_BASE_DIR/$BINARY_NAME"
-    rm -f "/tmp/$tar_name"
-
-    echo "$version" > "$VERSION_FILE"
-
-    cat <<EOF > "$SNI_BASE_DIR/config.yaml"
-listen_addr: ":$LISTEN_PORT"
-allow_all_hosts: true
-EOF
-
-    cat <<'EOF' > /etc/init.d/sniproxy
-#!/sbin/openrc-run
-description="SNI Proxy Service"
-pidfile="/run/sniproxy.pid"
-command="/etc/sniproxy/sniproxy"
-command_args="-c /etc/sniproxy/config.yaml"
-command_background="yes"
-depend() { need net; after firewall; }
-EOF
-    chmod +x /etc/init.d/sniproxy
-    rc-update add sniproxy default >/dev/null 2>&1
-    rc-service sniproxy restart
-}
-
-install_smartdns_binary() {
-    local is_update=$1
-    if [ "$is_update" != "true" ] && command -v smartdns &> /dev/null; then return 0; fi
-    
-    local arch=$(detect_arch)
-    local asset_arch=$([ "$arch" = "amd64" ] && echo "x86_64" || echo "aarch64")
-    local download_url=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep "browser_download_url" | grep "$asset_arch-linux-all.tar.gz" | head -n 1 | cut -d '"' -f 4)
-    
-    cd /tmp && wget -q "${download_url}" -O smartdns.tar.gz
-    tar -xzf smartdns.tar.gz && cd smartdns && chmod +x ./install
-    ./install -i
-    cd /tmp && rm -rf smartdns smartdns.tar.gz
-}
-
-configure_smartdns_rules() {
-    local is_update=$1
-    ensure_root
-    if [ "$is_update" != "true" ]; then
-        if ! check_and_fix_port_conflict; then exit 1; fi
+    # 优先尝试直连拉取 API
+    latest_version=$(curl -fsSL --max-time 5 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+        | jq -r '.tag_name' 2>/dev/null || echo "")
+        
+    # 如果直连获取失败，轮询代理进行 API 拉取
+    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
+        for proxy in "${GITHUB_PROXY[@]}"; do
+            [[ -z "$proxy" ]] && continue
+            latest_version=$(curl -fsSL --max-time 5 "${proxy}https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+                | jq -r '.tag_name' 2>/dev/null || echo "")
+            [[ -n "$latest_version" && "$latest_version" != "null" ]] && break
+        done
     fi
-    install_smartdns_binary "$is_update"
 
-    print_info "正在自动获取中转端公网 IPv4 地址..."
-    local public_ip=""
-    public_ip=$(curl -s4 --max-time 3 api.ipify.org || curl -s4 --max-time 3 ifconfig.me || echo "127.0.0.1")
-    public_ip=$(echo "${public_ip}" | tr -d '[:space:]')
-    print_success "成功获取中转端公网 IP: ${public_ip}"
+    latest_version="${latest_version#v}"
 
-    print_info "正在从零构建轻量化安全分流规则库..."
-    mkdir -p /etc/smartdns
-
-    # ==================== 💥 【核心修复】强效过滤与定界符强转 💥 ====================
-    # 使用强转义后的 'EOF' 防止变量被提早展开，且保证配置纯净不带杂质
-    cat > "${OUTPUT_FILE}" << 'EOF'
-# ===== Alpine 专属安全精简配置 =====
-bind :53
-cache-size 32768
-prefetch-domain yes
-serve-expired yes
-
-# ===== 上游纯净公共不污染 DNS =====
-server 1.1.1.1
-server 8.8.8.8
-
-# ===== 自动化流媒体就地劫持拦截区 =====
-EOF
-
-    print_info "正在同步全球流媒体解锁域名数据源..."
-    curl -s "${DOMAIN_LIST_URL}" -o "${TEMP_DOMAIN_FILE}"
-    
-    # 用 awk 精准提纯过滤，干失掉所有的 Windows \r 回车换行残留，将劫持牢牢绑向公网 IP
-    awk -v ip="${public_ip}" '/^[^#[:space:]]/ {gsub(/[[:space:]\r\n]/, ""); if($0!="") print "address /" $0 "/" ip}' "${TEMP_DOMAIN_FILE}" >> "${OUTPUT_FILE}"
-    rm -f "${TEMP_DOMAIN_FILE}"
-
-    # 优雅重启 SmartDNS
-    rc-service smartdns restart
-    sleep 2
-    if rc-service smartdns status | grep -q "started"; then
-        print_success "中转端 SmartDNS 完美接管并全线运转成功！"
-        print_info "当前已稳定装载流媒体分流拦截规则共: $(grep -c "^address " /etc/smartdns/smartdns.conf) 条"
+    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
+        warn "通过 GitHub 接口获取最新版本失败，将使用内置备用版本: v${BACKUP_VERSION}"
+        echo "$BACKUP_VERSION"
     else
-        print_error "SmartDNS 依旧未能成功拉起。请退出脚本后输入命令查看原始报错原因: smartdns -f -c /etc/smartdns/smartdns.conf"
+        info "成功获取最新版本: v${latest_version}"
+        echo "$latest_version"
     fi
 }
 
-check_and_fix_port_conflict() {
-    local port_usage=""
-    if command -v ss &> /dev/null; then port_usage=$(ss -tulnp | grep :53 2>/dev/null); fi
-    [ -z "$port_usage" ] && return 0
-    if echo "$port_usage" | grep -q "smartdns"; then return 0; fi
+# ================== 代理下载核心逻辑 ==================
+download_file() {
+    local url_path="$1"
+    local output_file="$2"
+    local success=1
+
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        info "尝试使用代理下载: ${proxy:-直连}"
+        if wget -T 15 -t 2 -O "$output_file" "${proxy}${url_path}"; then
+            success=0
+            break
+        fi
+    done
+    return $success
+}
+
+# ================== 从GitHub下载并解压Xray ==================
+download_and_extract_xray() {
+    local arch version
+    arch=$(get_arch) || return 1
+    version=$(get_latest_version)
+    
+    local download_url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"
+    local zip_file="$TMP_DIR/xray.zip"
+    
+    info "正在准备从 GitHub 下载 Xray v${version} (${arch})..."
+    if ! download_file "$download_url" "$zip_file"; then
+        error "从 GitHub 下载 Xray 失败，所有代理均已尝试，请检查网络连接。"
+        return 1
+    fi
+    
+    info "正在解压..."
+    mkdir -p "$TMP_DIR/extracted"
+    if ! unzip -qo "$zip_file" -d "$TMP_DIR/extracted"; then
+        error "解压 Xray 压缩包失败，请确保系统已安装 unzip。"
+        return 1
+    fi
+    
+    # 安装二进制文件
+    mkdir -p "$(dirname "$XRAY_BINARY")"
+    rm -f "$XRAY_BINARY"
+    cp -f "$TMP_DIR/extracted/xray" "$XRAY_BINARY"
+    chmod +x "$XRAY_BINARY"
+    
+    # 安装 GeoData 资源文件
+    mkdir -p "/usr/local/share/${SERVICE_NAME}"
+    cp -f "$TMP_DIR/extracted/geoip.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+    cp -f "$TMP_DIR/extracted/geosite.dat" "/usr/local/share/${SERVICE_NAME}/" 2>/dev/null || true
+}
+
+# ================== 配置 Systemd 服务 ==================
+setup_systemd_service() {
+    info "配置 Systemd 服务 [${SERVICE_NAME}]..."
+    
+    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Xray Vless Reality Service
+Documentation=https://github.com/XTLS/Xray-core
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=${XRAY_BINARY} run -config ${XRAY_CONFIG}
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
+}
+
+# ================== 获取Xray状态 ==================
+get_xray_status() {
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        echo -e "${GREEN}● 运行中${RESET}"
+    else
+        echo -e "${RED}● 未运行${RESET}"
+    fi
+}
+
+# ================== 获取版本 ==================
+get_xray_version() {
+    if [[ -x "$XRAY_BINARY" ]]; then
+        "$XRAY_BINARY" version 2>/dev/null \
+            | grep -i "Xray" \
+            | head -n 1 \
+            | awk '{print $2}' || echo "未知"
+    else
+        echo "未安装"
+    fi
+}
+
+# ================== 获取监听地址 ==================
+get_listen_ip() {
+    if sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null \
+        | grep -q '= 1'; then
+        echo "0.0.0.0"
+    else
+        echo "::"
+    fi
+}
+
+# ================== 测试配置 ==================
+test_config() {
+    if "$XRAY_BINARY" run -test -config "$XRAY_CONFIG"; then
+        info "Configuration OK"
+        return 0
+    fi
+
+    error "配置测试失败"
     return 1
 }
 
-show_logs() {
-    ensure_root
-    clear
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN}◈  流媒体解锁服务 实时运行状态 (Alpine)  ◈${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    rc-service smartdns status
-    rc-service sniproxy status
-    echo -e "${GREEN}=============================================${NC}"
+# ================== 重启服务 ==================
+restart_xray() {
+    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
+    sleep 1
+
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        info "${SERVICE_NAME} 启动成功"
+        return 0
+    fi
+
+    error "${SERVICE_NAME} 启动失败"
+    journalctl -u "${SERVICE_NAME}" -n 20 --no-pager || true
+    return 1
 }
 
-uninstall_all_services() {
-    ensure_root
-    print_warning "正在全面卸载并从 Alpine 中净化本服务组件..."
-    rc-service sniproxy stop 2>/dev/null || true
-    rc-update del sniproxy default 2>/dev/null || true
-    rc-service smartdns stop 2>/dev/null || true
-    rc-update del smartdns default 2>/dev/null || true
-    clear_client_allowlist >/dev/null 2>&1
-    rm -f /etc/init.d/sniproxy /etc/init.d/smartdns
-    rm -rf "$SNI_BASE_DIR" /etc/smartdns /usr/sbin/smartdns /usr/bin/smartdns
-    print_success "系统环境已彻底净化。"
+# ================== 生成 Reality 密钥 ==================
+generate_reality_keys() {
+    info "正在生成 Reality 密钥..."
+    local key_pair
+
+    if ! key_pair=$(timeout 10 "$XRAY_BINARY" x25519 2>/dev/null); then
+        error "Reality 密钥生成失败"
+        return 1
+    fi
+
+    local private_key
+    private_key=$(echo "$key_pair" \
+        | grep -i "Private" \
+        | awk -F ': ' '{print $2}' \
+        | tr -d '\r')
+
+    local public_key
+    public_key=$(echo "$key_pair" \
+        | grep -i "Public" \
+        | awk -F ': ' '{print $2}' \
+        | tr -d '\r')
+
+    if [[ -z "${private_key:-}" || -z "${public_key:-}" ]]; then
+        error "生成的密钥对无效或为空"
+        return 1
+    fi
+
+    echo "$public_key" > "$XRAY_PUBLIC_KEY_FILE"
+    echo "${private_key}|${public_key}"
 }
 
-# ==================== 主控控制面板 ====================
-main() {
-    local my_ip=$(get_public_ip)
-    local sni_installed="false"
-    local smartdns_installed="false"
-    local current_sni_ver="${RED}未装载${NC}"
-    local current_sdns_ver="${RED}未装载${NC}"
+# ================== 获取 PublicKey ==================
+get_public_key() {
+    [[ -f "$XRAY_PUBLIC_KEY_FILE" ]] && cat "$XRAY_PUBLIC_KEY_FILE"
+}
 
-    refresh_local_status() {
-        if [ -f "/etc/init.d/sniproxy" ]; then
-            sni_installed="true"
-            [ -f "$VERSION_FILE" ] && current_sni_ver=$(cat "$VERSION_FILE") || current_sni_ver="v1.0.7"
-        else
-            current_sni_ver="${RED}未安装${NC}"
-        fi
+# ================== 写配置 ==================
+write_config() {
+    local port="$1"
+    local uuid="$2"
+    local domain="$3"
+    local private_key="$4"
+    local shortid="$5"
 
-        if [ -f "/etc/init.d/smartdns" ] || command -v smartdns &> /dev/null; then
-            smartdns_installed="true"
-            local main_ver=$(smartdns -v 2>&1 | head -n 1 | awk '{print $2}' | cut -d'-' -f1)
-            current_sdns_ver="${main_ver:-已装载}"
-        else
-            current_sdns_ver="${RED}未安装${NC}"
-        fi
+    local listen_ip
+    listen_ip=$(get_listen_ip)
+
+    mkdir -p "$(dirname "$XRAY_CONFIG")"
+
+    cat > "$XRAY_CONFIG" <<EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "${listen_ip}",
+      "port": ${port},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${domain}:443",
+          "xver": 0,
+          "serverNames": [
+            "${domain}"
+          ],
+          "privateKey": "${private_key}",
+          "shortIds": [
+            "${shortid}"
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      }
     }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4v6"
+      }
+    }
+  ]
+}
+EOF
+}
 
-    refresh_local_status
+# ================== 生成订阅 ==================
+generate_link() {
+    local ip
+    if ! ip=$(get_public_ip); then
+        error "获取公网 IP 失败"
+        return 1
+    fi
+
+    local uuid port domain shortid public_key
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "error")
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "443")
+    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null || echo "www.amazon.com")
+    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || echo "null")
+    public_key=$(get_public_key)
+
+    local display_ip="$ip"
+    [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
+
+    local hostname
+    hostname=$(hostname -s 2>/dev/null | tr ' ' '_')
+    [[ -z "$hostname" ]] && hostname="Xray"
+
+    mkdir -p /root/proxynode/Reality/
+
+    cat > /root/proxynode/Reality/xray_vless_reality.txt <<EOF
+vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}&spx=%2F#${hostname}-VLESS-Reality
+EOF
+}
+
+# ================== 显示配置 ==================
+show_current_config() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+        error "配置文件不存在"
+        return
+    fi
+
+    local ip uuid port domain shortid public_key outbound_mode
+    ip=$(get_public_ip || echo "未知")
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+    port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || echo "未知")
+    public_key=$(get_public_key)
+    
+    local current_protocol
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null || echo "freedom")
+    if [[ "$current_protocol" == "socks" ]]; then
+        outbound_mode="Socks5 链式代理"
+    else
+        outbound_mode="直连 (Freedom)"
+    fi
+
+    echo -e "${GREEN}====== 当前配置 ======${RESET}"
+    echo -e "${YELLOW}IP地址      : ${ip}${RESET}"
+    echo -e "${YELLOW}端口        : ${port}${RESET}"
+    echo -e "${YELLOW}UUID        : ${uuid}${RESET}"
+    echo -e "${YELLOW}SNI         : ${domain}${RESET}"
+    echo -e "${YELLOW}PublicKey   : ${public_key}${RESET}"
+    echo -e "${YELLOW}ShortID     : ${shortid}${RESET}"
+    echo -e "${YELLOW}出口模式    : ${outbound_mode}${RESET}"
+    echo -e "${YELLOW}📄 V6VPS 请自行替换分享链接中的 IP 地址为 V6 ★${RESET}"
+    echo
+
+    if [[ -f /root/proxynode/Reality/xray_vless_reality.txt ]]; then
+        echo -e "${GREEN}====== 👉 分享链接 ======${RESET}"
+        cat /root/proxynode/Reality/xray_vless_reality.txt
+    fi
+}
+
+# ================== 配置 Xray ==================
+configure_xray() {
+    info "开始配置 Reality 节点..."
+    local port uuid domain short_id
 
     while true; do
-        clear
-        local sni_status_view="${RED}未安装${NC}"
-        [ "$sni_installed" = "true" ] && (rc-service sniproxy status | grep -q "started" && sni_status_view="${GREEN}运行中${NC} ${YELLOW}(端口: ${LISTEN_PORT})${NC}" || sni_status_view="${YELLOW}已停止${NC}")
-        
-        local smartdns_status_view="${RED}未安装${NC}"
-        [ "$smartdns_installed" = "true" ] && (rc-service smartdns status | grep -q "started" && smartdns_status_view="${GREEN}运行中${NC} ${YELLOW}(端口: 53)${NC}" || smartdns_status_view="${YELLOW}已停止${NC}")
-
-        local whitelist_view="${YELLOW}公开解锁(任意设备改DNS即可解锁)${NC}"
-        if [ -f "$ALLOWLIST_FILE" ] && [ -s "$ALLOWLIST_FILE" ]; then
-            local count=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d' | wc -l)
-            whitelist_view="${YELLOW}安全模式(允许已授权的 ${count} 个IP)${NC}"
+        read -rp "请输入端口 (直接回车随机分配端口): " input_port
+        if [[ -z "$input_port" ]]; then
+            port=$(get_random_port)
+            info "已为您随机分配未被占用端口: $port"
+            break
+        elif is_valid_port "$input_port"; then
+            if ! check_port "$input_port"; then
+                error "端口 ${input_port} 已被占用，请重新输入。"
+                continue
+            fi
+            port="$input_port"
+            break
+        else
+            error "端口无效"
         fi
+    done
 
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN}        ◈    流媒体 DNS 解锁面板 (Alpine)    ◈         ${NC}"
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN} SNIProxy 状态:${NC} $sni_status_view"
-        echo -e "${GREEN} SmartDNS 状态:${NC} $smartdns_status_view"
-        echo -e "${GREEN} SNIProxy 版本:${NC} ${YELLOW}${current_sni_ver}${NC}"
-        echo -e "${GREEN} SmartDNS 版本:${NC} ${YELLOW}${current_sdns_ver}${NC}"
-        echo -e "${GREEN} 安全策略访问 :${NC} $whitelist_view"
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN}  1. 安装 解锁服务${NC}"
-        echo -e "${GREEN}  2. 更新 解锁服务${NC}"
-        echo -e "${GREEN}  3. 卸载 解锁服务${NC}"
-        echo -e "${GREEN}  4. 白名单规则${NC}"
-        echo -e "${GREEN}  5. 启动 解锁服务${NC}"
-        echo -e "${GREEN}  6. 停止 解锁服务${NC}"
-        echo -e "${GREEN}  7. 重启 解锁服务${NC}"
-        echo -e "${GREEN}  8. 查看状态${NC}"
-        echo -e "${GREEN}  0. 退出 ${NC}"
-        echo -e "${GREEN}=============================================${NC}"
+    while true; do
+        read -rp "请输入UUID (默认:自动生成): " input_uuid
+        if [[ -z "${input_uuid:-}" ]]; then
+            uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
+            break
+        elif is_valid_uuid "$input_uuid"; then
+            uuid="$input_uuid"
+            break
+        else
+            error "UUID 格式无效"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入SNI域名 (默认:www.amazon.com): " input_domain
+        domain=${input_domain:-www.amazon.com}
+        if is_valid_domain "$domain"; then
+            break
+        else
+            error "域名格式无效"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入自定义 ShortID (直接回车自动生成 8 位字符): " input_shortid
+        if [[ -z "$input_shortid" ]]; then
+            short_id=$(openssl rand -hex 4)
+            break
+        elif is_valid_shortid "$input_shortid"; then
+            short_id="$input_shortid"
+            break
+        else
+            error "ShortID 无效！必须为偶数位（最长16位）的十六进制字符（0-9, a-f）。"
+        fi
+    done
+
+    mkdir -p "/usr/local/etc/${SERVICE_NAME}"
+
+    local keys private_key
+    keys=$(generate_reality_keys) || return 1
+    private_key=$(echo "$keys" | cut -d '|' -f1)
+
+    write_config "$port" "$uuid" "$domain" "$private_key" "$short_id"
+    test_config || return 1
+    generate_link
+    restart_xray
+    show_current_config
+}
+
+# ================== 配置自定义Socks5出口 ==================
+configure_custom_socks5_outbound() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then 
+        error "错误: 未安装，无法配置出口模式。"
+        return
+    fi
+
+    local mode current_protocol tmp_file
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$XRAY_CONFIG" 2>/dev/null || echo "freedom")
+
+    echo "---------------------------------------------"
+    echo "请选择出口模式："
+    if [[ "$current_protocol" == "socks" ]]; then
+        echo -e "当前模式: ${YELLOW}Socks5${RESET}"
+    else
+        echo -e "当前模式: ${GREEN}直连${RESET}"
+    fi
+    echo "1) 直连出口"
+    echo "2) Socks5 出口"
+    echo "0) 取消"
+    echo "---------------------------------------------"
+
+    read -rp "请输入选项 [0-2]: " mode || true
+    case "$mode" in
+        1)
+            tmp_file=$(mktemp)
+            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$XRAY_CONFIG" > "$tmp_file"
+            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+                rm -f "$tmp_file"
+                error "生成的直连配置无效。"
+                return 1
+            fi
+            cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+            mv "$tmp_file" "$XRAY_CONFIG"
+            chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
+            if ! restart_xray; then
+                error "切换到直连失败。"
+                return 1
+            fi
+            info "已成功切换为直连出口！"
+            return
+            ;;
+        2)
+            ;;
+        0|"")
+            info "已取消配置。"
+            return
+            ;;
+        *)
+            error "无效选项，请输入 0-2 之间的数字。"
+            return 1
+            ;;
+    esac
+
+    info "配置自定义 Socks5 出口代理..."
+
+    local socks_host socks_port socks_user socks_pass
+
+    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
+    [[ -z "$socks_host" ]] && info "已取消配置。" && return
+
+    while true; do
+        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
+        [[ -z "$socks_port" ]] && socks_port=1080
+        if is_valid_port "$socks_port"; then
+            break
+        else
+            error "端口无效，请输入一个1-65535之间的数字。"
+        fi
+    done
+
+    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
+    if [[ -n "$socks_user" ]]; then
+        read -rs -p "请输入 Socks5 密码: " socks_pass || true
+        echo
+    else
+        socks_pass=""
+    fi
+
+    tmp_file=$(mktemp)
+
+    if [[ -n "$socks_user" ]]; then
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            --arg user "$socks_user" \
+            --arg pass "$socks_pass" \
+            '
+            .outbounds = [
+              {
+                "protocol": "socks",
+                "tag": "custom-socks5-out",
+                "settings": {
+                  "servers": [
+                    {
+                      "address": $host,
+                      "port": $port,
+                      "users": [
+                        {
+                          "user": $user,
+                          "pass": $pass
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+            ' "$XRAY_CONFIG" > "$tmp_file"
+    else
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            '
+            .outbounds = [
+              {
+                "protocol": "socks",
+                "tag": "custom-socks5-out",
+                "settings": {
+                  "servers": [
+                    {
+                      "address": $host,
+                      "port": $port
+                    }
+                  ]
+                }
+              }
+            ]
+            ' "$XRAY_CONFIG" > "$tmp_file"
+    fi
+
+    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        error "生成的 Socks5 配置无效，请检查输入后重试。"
+        return 1
+    fi
+
+    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+    mv "$tmp_file" "$XRAY_CONFIG"
+    chmod 644 "$XRAY_CONFIG" 2>/dev/null || true
+
+    if ! restart_xray; then
+        error "重启服务失败，当前配置可能与 system 境不兼容。"
+        return 1
+    fi
+    info "已成功切换为 Socks5 出口！"
+}
+
+# ================== 安装 ==================
+install_xray() {
+    info "开始解压安装 Xray..."
+    download_and_extract_xray || return 1
+    setup_systemd_service
+    configure_xray
+    info "安装完成并已成功启动服务: ${SERVICE_NAME}"
+}
+
+# ================== 更新 ==================
+update_xray() {
+    info "开始更新 Xray 程序..."
+    
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        info "检测到服务正在运行，正在停止服务以进行更新..."
+        systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    fi
+
+    info "开始拉取最新 Xray 二进制文件..."
+    if ! download_and_extract_xray; then
+        error "下载或安装新版本失败，尝试重新启动原服务..."
+        restart_xray
+        return 1
+    fi
+    
+    if restart_xray; then
+        info "最新版更新并启动成功！当前版本: $(get_xray_version)"
+    else
+        error "更新后服务启动失败，请查看日志。"
+        return 1
+    fi
+}
+
+# ================== 修改配置 ==================
+modify_config() {
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+        error "配置文件不存在"
+        return 1
+    fi
+
+    local old_port old_uuid old_domain private_key old_shortid
+    old_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "443")
+    old_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || echo "")
+    old_domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG" 2>/dev/null || echo "")
+    private_key=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$XRAY_CONFIG" 2>/dev/null || echo "")
+    old_shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || echo "")
+
+    [[ "$old_shortid" == "null" || -z "$old_shortid" ]] && old_shortid=$(openssl rand -hex 4)
+
+    local port uuid domain shortid
+
+    while true; do
+        read -rp "请输入新端口 [当前:${old_port}, 回车不修改]: " input_port
         
-        echo -ne "${GREEN} 请输入选项: ${NC}"
-        local choice
-        read -r choice
-        choice=$(echo "$choice" | tr -d '[:space:]')
+        if [[ -z "$input_port" ]]; then
+            port="$old_port"
+            break
+        elif [[ "${input_port,,}" == "rand" ]]; then
+            port=$(get_random_port)
+            info "已为您重分配随机端口: $port"
+            break
+        elif is_valid_port "$input_port"; then
+            if [[ "$input_port" != "$old_port" ]]; then
+                if ! check_port "$input_port"; then
+                    error "端口 ${input_port} 已被占用，请更换。"
+                    continue
+                fi
+            fi
+            port="$input_port"
+            break
+        else
+            error "端口无效，请输入 1-65535 之间的数字。"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入UUID [当前:${old_uuid}]: " input_uuid
+        uuid=${input_uuid:-$old_uuid}
+        if is_valid_uuid "$uuid"; then
+            break
+        else
+            error "UUID 格式无效"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入SNI域名 [当前:${old_domain}]: " input_domain
+        domain=${input_domain:-$old_domain}
+        if is_valid_domain "$domain"; then
+            break
+        else
+            error "域名格式无效"
+        fi
+    done
+
+    while true; do
+        read -rp "请输入ShortID [当前:${old_shortid}, 回车不修改]: " input_shortid
+        shortid=${input_shortid:-$old_shortid}
+        if is_valid_shortid "$shortid"; then
+            break
+        else
+            error "ShortID 无效！必须为偶数位（最长16位）的十六进制字符（0-9, a-f）。"
+        fi
+    done
+
+    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+
+    write_config "$port" "$uuid" "$domain" "$private_key" "$shortid"
+    test_config || return 1
+    generate_link
+    restart_xray
+    info "配置修改成功"
+}
+
+# ================== 卸载 ==================
+uninstall_xray() {
+    warn "即将卸载 vlessreality 服务..."
+
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+    
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+    systemctl daemon-reload
+    
+    rm -f "$XRAY_BINARY"
+    rm -rf "/usr/local/etc/${SERVICE_NAME}"
+    rm -rf "/usr/local/share/${SERVICE_NAME}"
+    rm -f /root/proxynode/Reality/xray_vless_reality.txt
+    
+    info "服务已完全卸载并清理残留。"
+}
+
+# ================== SNI 优选 ==================
+select_best_sni() {
+    info "开始优选 SNI 延迟测试"
+
+    local SNIS=(
+        amd.com apps.mzstatic.com aws.com azure.microsoft.com beacon.gtv-pub.com
+        bing.com catalog.gamepass.com cdn.bizibly.com cdn-dynmedia-1.microsoft.com
+        devblogs.microsoft.com fpinit.itunes.apple.com go.microsoft.com
+        gray-config-prod.api.arc-cdn.net gray.video-player.arcpublishing.com
+        images.nvidia.com r.bing.com services.digitaleast.mobi snap.licdn.com
+        statici.icloud.com tag.demandbase.com tag-logger.demandbase.com
+        ts1.tc.mm.bing.net ts2.tc.mm.bing.net vs.aws.amazon.com www.apple.com
+        www.icloud.com www.microsoft.com www.oracle.com www.xbox.com
+        www.xilinx.com xp.apple.com
+    )
+
+    local BEST_SNI=""
+    local BEST_TIME=999999
+
+    for sni in "${SNIS[@]}"; do
+        local start
+        start=$(date +%s%N)
+
+        if timeout 3 openssl s_client -connect "${sni}:443" -servername "${sni}" -brief </dev/null >/dev/null 2>&1; then
+            local end cost
+            end=$(date +%s%N)
+            cost=$(( (end - start) / 1000000 ))
+
+            echo "[SNI] $sni -> ${cost}ms"
+
+            if [ $cost -lt $BEST_TIME ]; then
+                BEST_TIME=$cost
+                BEST_SNI=$sni
+            fi
+        fi
+    done
+
+    if [ -n "$BEST_SNI" ]; then
+        info "最优 SNI: $BEST_SNI (${BEST_TIME}ms)"
+        echo "$BEST_SNI"
+        return 0
+    else
+        warn "未找到可用 SNI"
+        return 1
+    fi
+}
+
+# ================== 菜单 ==================
+show_menu() {
+    clear
+    local status version port_show
+    status=$(get_xray_status)
+    version=$(get_xray_version)
+    port_show="-"
+
+    if [[ -f "$XRAY_CONFIG" ]]; then
+        port_show=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG" 2>/dev/null || echo "-")
+    fi
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}      VLESS-Reality 面板       ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1. 安装 VLESS-Reality${RESET}"
+    echo -e "${GREEN} 2. 更新 VLESS-Reality${RESET}"
+    echo -e "${GREEN} 3. 卸载 VLESS-Reality${RESET}"
+    echo -e "${GREEN} 4. 修改配置${RESET}"
+    echo -e "${GREEN} 5. 启动 VLESS-Reality${RESET}"
+    echo -e "${GREEN} 6. 停止 VLESS-Reality${RESET}"
+    echo -e "${GREEN} 7. 重启 VLESS-Reality${RESET}"
+    echo -e "${GREEN} 8. 查看服务日志${RESET}"
+    echo -e "${GREEN} 9. 查看节点配置${RESET}"
+    echo -e "${GREEN}10. 配置Socks5出口${RESET}"
+    echo -e "${GREEN}11. SNI域名优选✨${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+# ================== 安装依赖 ==================
+install_dependencies() {
+    if command -v apt &>/dev/null; then
+        apt update && apt install -y jq curl wget openssl ca-certificates iproute2 coreutils unzip || true
+    elif command -v dnf &>/dev/null; then
+        dnf install -y jq curl wget openssl ca-certificates iproute2 coreutils unzip
+    elif command -v yum &>/dev/null; then
+        yum install -y jq curl wget openssl ca-certificates iproute2 coreutils unzip
+    else
+        error "未知的包管理器，请手动安装所需的依赖: jq, curl, wget, openssl, unzip"
+        exit 1
+    fi
+}
+
+# ================== 依赖检查 ==================
+pre_check() {
+    if [[ $(id -u) -ne 0 ]]; then
+        error "请使用 root 用户运行"
+        exit 1
+    fi
+
+    local deps=(jq curl wget openssl ss timeout unzip)
+    local missing=0
+
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing=1
+            break
+        fi
+    done
+
+    if [[ "$missing" -eq 1 ]]; then
+        info "检测到缺失依赖，正在安装..."
+        install_dependencies
+    fi
+}
+
+# ================== 主循环 ==================
+main() {
+    pre_check
+
+    while true; do
+        show_menu
+        
+        local choice=""
+        read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+        
+        [[ -z "$choice" ]] && continue
 
         case "$choice" in
-            1)
-                install_sniproxy "false"
-                configure_smartdns_rules "false"
-                refresh_local_status
-                echo -e "\n${GREEN}==================================================${NC}"
-                print_success "Alpine 中转端部署完全就绪！"
-                echo -e "你的【落地机】执行这三行命令即可解锁："
-                echo -e "${YELLOW}chattr -i /etc/resolv.conf 2>/dev/null || true${NC}"
-                echo -e "${YELLOW}echo \"nameserver ${my_ip}\" > /etc/resolv.conf${NC}"
-                echo -e "${YELLOW}chattr +i /etc/resolv.conf 2>/dev/null${NC}"
-                echo -e "${GREEN}==================================================${NC}"
-                echo -n "按回车键返回面板..."; read -r _ ;;
-            2) install_sniproxy "true"; configure_smartdns_rules "true"; refresh_local_status; echo -n "按回车键返回面板..."; read -r _ ;;
-            3) uninstall_all_services; refresh_local_status; echo -n "按回车键返回面板..."; read -r _ ;;
-            4) manage_client_allowlist; echo -n "按回车键返回面板..."; read -r _ ;;
-            5) rc-service sniproxy start 2>/dev/null; rc-service smartdns start 2>/dev/null; print_success "指令完成。"; sleep 1.5 ;;
-            6) rc-service sniproxy stop 2>/dev/null; rc-service smartdns stop 2>/dev/null; print_success "指令完成。"; sleep 1.5 ;;
-            7) rc-service sniproxy restart 2>/dev/null; rc-service smartdns restart 2>/dev/null; print_success "已重启。"; sleep 1.5 ;;
-            8) show_logs; echo -n "按回车键返回面板..."; read -r _ ;;
+            1) install_xray; pause ;;
+            2) update_xray; pause ;;
+            3) uninstall_xray; pause ;;
+            4) modify_config; pause ;;
+            5) systemctl start "${SERVICE_NAME}" &>/dev/null || true; restart_xray; pause ;;
+            6) systemctl stop "${SERVICE_NAME}" &>/dev/null || true; info "服务已停止"; pause ;;
+            7) restart_xray; pause ;;
+            8) journalctl -u "${SERVICE_NAME}" -e --no-pager || true; pause ;;
+            9) show_current_config; pause ;;
+            10) configure_custom_socks5_outbound; pause ;;
+            11) select_best_sni; pause ;;
             0) exit 0 ;;
-            *) print_error "无效选项。"; sleep 1.5 ;;
+            *) error "无效输入"; pause ;;
         esac
     done
 }

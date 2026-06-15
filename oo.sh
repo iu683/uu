@@ -1,187 +1,250 @@
 #!/bin/bash
-# =========================================================
-# 一键部署/管理脚本（去除 Nginx 安装与证书自动申请）
-# 支持手动输入自定义 SSL 证书路径，兼容 IPv4+IPv6 双栈
-# =========================================================
 
-WEB_ROOT="/var/www/html"
-LOG_FILE="/var/log/nginx/tim_access.log"
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-RESET='\033[0m'
+# ================== 颜色定义 ==================
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-show_menu() {
-    clear
-    echo -e "${GREEN}=========================================${RESET}"
-    echo -e "${GREEN}        vps短链脚本管理菜单                ${RESET}"
-    echo -e "${GREEN}=========================================${RESET}"
-    echo -e "${GREEN}1) 部署脚本${RESET}"
-    echo -e "${GREEN}2) 卸载脚本${RESET}"
-    echo -e "${GREEN}3) 更新脚本${RESET}"
-    echo -e "${GREEN}4) 查看访问日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-}
+# ================== 自定义基础配置 ==================
+WEB_ROOT="/var/www/vps_gate"                    # 存放时钟网页和安装脚本的自定义目录
+NGINX_CONF_DIR="/etc/nginx/conf.d"              # 你现有的 Nginx 配置目录
+LOG_ACCESS="/var/log/nginx/gate_access.log"     # 独立的访问日志路径
 
-install_tim() {
-    read -p "请输入你的域名： " DOMAIN
-    read -p "请输入脚本 URL（可选，留空默认不下载）： " TIM_URL
+# 原本的工具箱脚本 GitHub 下载后缀
+SCRIPT_URL_SUFFIX="raw.githubusercontent.com/sistarry/toolbox/main/tool/vps-toolbox.sh"
+
+# 检查 root 权限
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}❌ 请以 root 用户运行此脚本！${RESET}"
+    exit 1
+fi
+
+# ================== 功能函数 ==================
+
+# 1. 配置并启动 (自定义域名 + 自定义 SSL)
+install_gate() {
+    echo -e "${GREEN}====== 🛠️ 自定义配置向导 ======${RESET}"
     
-    echo -e "${GREEN}--- 请输入自定义 SSL 证书绝对路径 ---${RESET}"
-    read -p "请输入证书文件路径 (如 /etc/acmessl/xxxx/cert.crt): " SSL_CERT
-    read -p "请输入私钥文件路径 (如 /etc/acmessl/xxxx/private.key): " SSL_KEY
-    
-    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
-    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
-
-    if [[ ! -f "$SSL_CERT" || ! -f "$SSL_KEY" ]]; then
-        echo -e "${RED}❌ 错误: 找不到指定的证书或私钥文件，请检查路径是否正确！${RESET}"
-        echo -e "${RED}当前输入 -> 证书: $SSL_CERT | 私钥: $SSL_KEY${RESET}"
+    # 1.1 输入自定义域名
+    echo -n "🌐 请输入你的自定义域名 (例如 tool.wwwo.eu.cc): "
+    read -r DOMAIN
+    if [ -z "$DOMAIN" ]; then
+        echo -e "${RED}❌ 域名不能为空！${RESET}"
         return
     fi
 
-    mkdir -p "$WEB_ROOT"
-    mkdir -p "$LOCAL_DIR"
-    chmod 700 "$LOCAL_DIR"
+    # 1.2 输入证书路径
+    echo -n "🔑 请输入该域名的 SSL 证书 (.crt / .pem) 绝对路径: "
+    read -r CERT_PATH
+    echo -n "🔑 请输入该域名的 SSL 密钥 (.key) 绝对路径: "
+    read -r KEY_PATH
 
-    if [[ -n "$TIM_URL" ]]; then
-        curl -fsSL "$TIM_URL" -o "$WEB_ROOT/$DOMAIN"
-        chmod +x "$WEB_ROOT/$DOMAIN"
-        cp "$WEB_ROOT/$DOMAIN" "$LOCAL_DIR/$DOMAIN"
+    # 简单校验文件是否存在
+    if [ ! -f "$CERT_PATH" ] || [ ! -f "$KEY_PATH" ]; then
+        echo -e "${RED}❌ 证书或密钥文件不存在！请检查路径是否正确。${RESET}"
+        return
     fi
 
-    NGINX_CONF="/etc/nginx/sites-available/$DOMAIN"
-    cat > "$NGINX_CONF" <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
-}
+    echo -e "${YELLOW}🔄 开始为域名 [${DOMAIN}] 配置分流环境...${RESET}"
 
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    server_name $DOMAIN;
+    # 定义该域名专属的配置文件名
+    CONF_FILE="${NGINX_CONF_DIR}/gate_${DOMAIN}.conf"
 
-    root $WEB_ROOT;
+    # 自动创建自定义网页目录并生成时钟与脚本
+    mkdir -p "$WEB_ROOT"
 
-    ssl_certificate $SSL_CERT;
-    ssl_certificate_key $SSL_KEY;
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    location = / {
-        try_files /$DOMAIN =200;
-
-        if (\$http_user_agent !~* "(curl|wget|fetch|httpie|Go-http-client|python-requests|bash)") {
-            add_header Content-Type text/html;
-            return 200 '<!DOCTYPE html>
+    # 生成 网页时钟 (clock.html)
+    cat << 'EOF' > "$WEB_ROOT/clock.html"
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<title>时钟</title>
-<style>
-html, body { margin:0; padding:0; height:100%; display:flex; justify-content:center; align-items:center; background:#f0f0f0; font-family:Arial,sans-serif; flex-direction:column;}
-h1 { font-size:3rem; margin:0;}
-#time { font-size:5rem; font-weight:bold; margin-top:20px;}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VPS 炫酷数字时钟</title>
+    <style>
+        body { background-color: #050505; color: #00ff66; font-family: 'Courier New', monospace; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; overflow: hidden; }
+        .clock-container { text-align: center; padding: 30px; border: 2px solid #00ff66; border-radius: 15px; box-shadow: 0 0 30px rgba(0, 255, 102, 0.3); background: rgba(0,0,0,0.8); }
+        #clock { font-size: 8vw; font-weight: bold; text-shadow: 0 0 20px #00ff66; margin-bottom: 10px; }
+    </style>
 </head>
 <body>
-<h1>🌎世界时间</h1>
-<div id="time"></div>
-<script>
-function updateTime() {
-    const now = new Date();
-    document.getElementById("time").innerText = now.toLocaleString();
-}
-setInterval(updateTime, 1000);
-updateTime();
-</script>
+    <div class="clock-container">
+        <div id="clock">00:00:00</div>
+    </div>
+    <script>
+        setInterval(() => { document.getElementById('clock').textContent = new Date().toTimeString().split(' ')[0]; }, 1000);
+    </script>
 </body>
-</html>';
+</html>
+EOF
+
+    # 生成 客户端执行的安装脚本 (install.sh)
+    cat << EOF > "$WEB_ROOT/install.sh"
+#!/bin/bash
+GREEN="\\033[32m"
+YELLOW="\\033[33m"
+RED="\\033[31m"
+RESET="\\033[0m"
+
+SCRIPT_PATH="/root/vps-toolbox.sh"
+SCRIPT_URL_SUFFIX="${SCRIPT_URL_SUFFIX}"
+BIN_LINK_DIR="/usr/local/bin"
+
+GITHUB_PROXY=('', 'https://v6.gh-proxy.org/', 'https://gh-proxy.com/', 'https://hub.glowp.xyz/', 'https://proxy.vvvv.ee/', 'https://ghproxy.lvedong.eu.org/')
+
+if [ ! -f "\$SCRIPT_PATH" ]; then
+    SUCCESS=false
+    for proxy in "\${GITHUB_PROXY[@]}"; do
+        FULL_URL="\${proxy}\${SCRIPT_URL_SUFFIX}"
+        if [ -n "\$proxy" ]; then echo -e "\${YELLOW}🔄 正在通过代理安装... \${RESET}"; else echo -e "\${YELLOW}🔄 正在通过直连安装... \${RESET}"; fi
+        curl -fsSL --connect-timeout 5 -o "\$SCRIPT_PATH" "\$FULL_URL"
+        if [ \$? -eq 0 ] && [ -s "\$SCRIPT_PATH" ]; then SUCCESS=true; break; fi
+    done
+    if [ "\$SUCCESS" = false ]; then echo -e "\${RED}❌ 所有代理节点均安装失败\${RESET}"; exit 1; fi
+    chmod +x "\$SCRIPT_PATH"
+    ln -sf "\$SCRIPT_PATH" "$BIN_LINK_DIR/m"
+    ln -sf "\$SCRIPT_PATH" "$BIN_LINK_DIR/M"
+    echo -e "\${GREEN}✅ 安装完成，输入 m 或 M 运行\${RESET}"
+fi
+exec "\$SCRIPT_PATH"
+EOF
+
+    # 生成包含自动 HTTPS 的 Nginx 配置文件
+    cat << EOF > "$CONF_FILE"
+# HTTP 80 端口配置
+server {
+    listen 80;
+    server_name $DOMAIN;
+    
+    # HTTP 状态下的 curl 智能分流
+    location / {
+        if (\$http_user_agent ~* "curl") {
+            root $WEB_ROOT;
+            rewrite ^/\$ /install.sh last;
+        }
+        
+        # 浏览器访问则强制重定向到 HTTPS
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+# HTTPS 443 端口配置
+server {
+    listen 443 ssl;
+    server_name $DOMAIN;
+
+    # 动态导入自定义证书
+    ssl_certificate $CERT_PATH;
+    ssl_certificate_key $KEY_PATH;
+
+    ssl_session_timeout 5m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:HIGH:!aNULL:!MD5:!RC4:!DHE;
+    ssl_prefer_server_ciphers on;
+
+    root $WEB_ROOT;
+    access_log $LOG_ACCESS;
+
+    location / {
+        index clock.html;
+
+        # HTTPS 状态下的 curl 智能分流
+        if (\$http_user_agent ~* "curl") {
+            rewrite ^/\$ /install.sh last;
         }
     }
-
-    access_log $LOG_FILE combined;
 }
 EOF
 
-    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
-    nginx -t && systemctl restart nginx
-
-    echo -e "${GREEN}==========================================${RESET}"
-    echo -e "${GREEN}部署完成！${RESET}"
-    echo -e "${GREEN}本地脚本已保存到：$LOCAL_DIR/$DOMAIN${RESET}"
-    echo -e "${GREEN}Nginx 已成功加载自定义证书并开启 443 监听。${RESET}"
-    echo -e "${GREEN}访问日志：$LOG_FILE${RESET}"
-    echo -e "${GREEN}==========================================${RESET}"
-}
-
-uninstall_tim() {
-    read -p "请输入你的域名 ： " DOMAIN
-    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
-    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
-
-    echo -e "${GREEN}删除 Nginx 配置...${RESET}"
-    rm -f /etc/nginx/sites-available/"$DOMAIN"
-    rm -f /etc/nginx/sites-enabled/"$DOMAIN"
-
-    echo -e "${GREEN}删除本地脚本...${RESET}"
-    rm -rf "$LOCAL_DIR"
-
-    echo -e "${GREEN}删除网页根目录脚本...${RESET}"
-    rm -f "$WEB_ROOT/$DOMAIN"
-
-    echo -e "${GREEN}重启 Nginx...${RESET}"
-    systemctl restart nginx
-
-    echo -e "${GREEN}==========================================${RESET}"
-    echo -e "${GREEN}卸载完成！${RESET}"
-    echo -e "${GREEN}==========================================${RESET}"
-}
-
-update_tim() {
-    read -p "请输入最新脚本 URL： " TIM_URL
-    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
-    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
-
-    if [[ -z "$DOMAIN" ]]; then
-        read -p "请输入域名（用于生成文件名）： " DOMAIN
-    fi
-
-    mkdir -p "$LOCAL_DIR"
-    curl -fsSL "$TIM_URL" -o "$LOCAL_DIR/$DOMAIN" || { 
-        echo -e "${RED}❌ 下载脚本失败，请检查 URL、权限或路径${RESET}"
-        return
-    }
-    chmod +x "$LOCAL_DIR/$DOMAIN"
-
-    cp -f "$LOCAL_DIR/$DOMAIN" "$WEB_ROOT/$DOMAIN"
-    echo -e "${GREEN}✅ 更新完成！本地和网页脚本已同步最新版本${RESET}"
-}
-
-view_logs() {
-    if [ -f "$LOG_FILE" ]; then
-        echo -e "${GREEN}显示最近 20 条访问记录：${RESET}"
-        tail -n 20 "$LOG_FILE"
-        echo -e "${GREEN}统计不同 IP (IPv4/IPv6) 访问次数：${RESET}"
-        awk '{print $1}' "$LOG_FILE" | sort | uniq -c | sort -nr
+    # 检查 Nginx 配置语法
+    nginx -t &>/dev/null
+    if [ $? -eq 0 ]; then
+        # 仅仅平滑重载 Nginx，不影响现有其他网站
+        nginx -s reload
+        # 将当前配置的域名记录到一个本地临时文件，方便卸载和菜单显示
+        echo "$DOMAIN" > "${WEB_ROOT}/current_domain.txt"
+        echo -e "${GREEN}✅ 分流配置成功应用！${RESET}"
+        echo -e "${GREEN}🌐 浏览器打开查看时钟: ${YELLOW}https://${DOMAIN}${RESET}"
+        echo -e "${GREEN}💻 其它 VPS 一键执行命令: ${YELLOW}bash <(curl -fsSL ${DOMAIN})${RESET}"
     else
-        echo -e "${RED}日志文件不存在${RESET}"
+        echo -e "${RED}❌ Nginx 语法检查失败，可能是证书路径不匹配或冲突，请重新检查！${RESET}"
+        rm -f "$CONF_FILE"
     fi
 }
 
+# 2. 查看独立的访问日志
+view_logs() {
+    if [ ! -f "$LOG_ACCESS" ] || [ ! -s "$LOG_ACCESS" ]; then
+        echo -e "${RED}❌ 暂无客户端访问或安装日志。${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}👀 正在实时监听独立日志流 (按 Ctrl+C 退出)...${RESET}"
+    echo -e "${YELLOW}------------------------------------------------------------------${RESET}"
+    tail -f "$LOG_ACCESS"
+}
+
+# 3. 卸载清除
+uninstall_gate() {
+    # 自动读取当前正在生效的自定义域名
+    if [ -f "${WEB_ROOT}/current_domain.txt" ]; then
+        CURRENT_DOMAIN=$(cat "${WEB_ROOT}/current_domain.txt")
+    else
+        echo -n "❓ 未检测到默认配置记录，请输入要卸载的域名: "
+        read -r CURRENT_DOMAIN
+    fi
+
+    if [ -z "$CURRENT_DOMAIN" ]; then
+        echo -e "${RED}❌ 未输入域名，取消卸载。${RESET}"
+        return
+    fi
+
+    CONF_FILE="${NGINX_CONF_DIR}/gate_${CURRENT_DOMAIN}.conf"
+
+    echo -e "${RED}⚠️ 确定要清除域名 [${CURRENT_DOMAIN}] 的所有分流配置和网页文件吗？(y/n)${RESET}"
+    read -r confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        rm -f "$CONF_FILE"
+        rm -rf "$WEB_ROOT"
+        nginx -s reload
+        echo -e "${GREEN}✅ 卸载完成，域名 [${CURRENT_DOMAIN}] 的规则已成功剥离并重载 Nginx！${RESET}"
+    else
+        echo -e "${YELLOW}❌ 已取消卸载。${RESET}"
+    fi
+}
+
+# ================== 菜单主循环 ==================
 while true; do
-    show_menu
-    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
+    clear
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${GREEN}   🌐 Nginx · 全自定义域名与 SSL 分流管理菜单   ${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
+    
+    # 动态获取当前运行的域名状态
+    if [ -f "${WEB_ROOT}/current_domain.txt" ]; then
+        RUNNING_DOMAIN=$(cat "${WEB_ROOT}/current_domain.txt")
+        echo -e " 当前状态: ${GREEN}已启用 ➡️  https://${RUNNING_DOMAIN}${RESET}"
+    else
+        echo -e " 当前状态: ${RED}未启用 / 已停用${RESET}"
+    fi
+    
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${YELLOW} 1. ${RESET} 配置并启动 (手动输入自定义域名 + 自定义SSL证书)"
+    echo -e "${YELLOW} 2. ${RESET} 查看 客户端访问与安装日志 (实时监控)"
+    echo -e "${YELLOW} 3. ${RESET} 卸载 / 清除 现有分流配置"
+    echo -e "${YELLOW} 4. ${RESET} 退出脚本"
+    echo -e "${GREEN}================================================${RESET}"
+    echo -n " 请输入数字 [1-4]: "
+    read -r choice
+
     case $choice in
-        1) install_tim ;;
-        2) uninstall_tim ;;
-        3) update_tim ;;
-        4) view_logs ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}请输入有效选项${RESET}" ;;
+        1) install_gate ;;
+        2) view_logs ;;
+        3) uninstall_gate ;;
+        4) echo -e "${GREEN}👋 再见！${RESET}" && exit 0 ;;
+        *) echo -e "${RED}❌ 输入错误！${RESET}" ;;
     esac
-    read -p "按回车返回菜单..."
+    echo
+    echo -n "按回车键返回菜单..."
+    read -r
 done

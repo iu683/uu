@@ -1,532 +1,655 @@
-#!/bin/sh
-# ========================================================
-#  SNIProxy & SmartDNS 公共解锁 DNS管理脚本 (Alpine 完美检测版)
-# ========================================================
+#!/bin/bash
+# VPS Toolbox
+# 功能：
+# - 一级菜单加 ▶ 标识，字体绿色
+# - 二级菜单简洁显示，输入 1~99 都可执行
+# - 快捷指令 m / M 自动创建
+# - 系统信息面板
+# - 彩色菜单和动态彩虹标题
+# - 完整安装/卸载
 
-# ==================== 🛠️ 1. Alpine 基础依赖与防火墙完美初始化 ====================
-if [ ! -f /tmp/alpine_dep_ok.flag ]; then
-    echo "[INFO] 正在检测 Alpine 系统核心依赖组件..."
-    apk update --no-cache >/dev/null 2>&1
-    
-    if ! command -v bash >/dev/null 2>&1; then
-        echo "[INFO] 发现系统缺少 bash，正在自动安装..."
-        apk add --no-cache bash >/dev/null 2>&1
-    fi
-    
-    for pkg in curl jq iptables ip6tables wget make gcc g++ musl-dev linux-headers openssl-dev xargs; do
-        if ! command -v $pkg >/dev/null 2>&1 && [ "$pkg" != "musl-dev" ] && [ "$pkg" != "linux-headers" ] && [ "$pkg" != "openssl-dev" ]; then
-            echo "[INFO] 正在自动补齐核心组件: $pkg..."
-            apk add --no-cache $pkg >/dev/null 2>&1
-        fi
-    done
-    
-    apk add --no-cache musl-dev linux-headers openssl-dev >/dev/null 2>&1
-    
-    # 彻底攻克 iptables 拒绝空载启动的系统暗坑
-    if [ -f /etc/init.d/iptables ]; then
-        rc-update add iptables default >/dev/null 2>&1
-        if ! rc-service iptables status | grep -q "started"; then
-            echo "[INFO] 检测到防火墙服务未激活，正在注入安全基准规则以破除 Alpine 空载限制..."
-            iptables -F INPUT 2>/dev/null || true
-            iptables -A INPUT -i lo -j ACCEPT 2>/dev/null
-            iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-            iptables -A INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null
-            if [ -f /etc/init.d/iptables ]; then
-                /etc/init.d/iptables save >/dev/null 2>&1
-            fi
-            rc-service iptables start >/dev/null 2>&1
-        fi
-    fi
+INSTALL_PATH="$HOME/vps-toolbox.sh"
+SHORTCUT_PATH="/usr/local/bin/m"
+SHORTCUT_PATH_UPPER="/usr/local/bin/M"
 
-    touch /tmp/alpine_dep_ok.flag
-    echo "[SUCCESS] Alpine 基础运行环境与防火墙状态已完美激活就绪！"
+# 颜色
+green="\033[32m"
+reset="\033[0m"
+yellow="\033[33m"
+red="\033[31m"
+cyan="\033[36m"
+BLUE="\033[34m"
+ORANGE='\033[38;5;208m'
+
+
+
+# ==========================================
+# GITHUB 代理
+# ==========================================
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+)
+
+# 新增全局缓存变量，记录上一次成功的最快索引（默认从 0 开始，即直连）
+# 只要这个索引成功过，后面所有下载直接秒开，不再卡顿死等
+if [ -z "$SUCCESS_PROXY_IDX" ]; then
+    SUCCESS_PROXY_IDX=0
 fi
 
-if [ -z "$BASH_VERSION" ]; then
-    exec bash "$0" "$@"
-fi
+# 核心内部优化轮询器：带有记忆和快速跳过功能
+_smart_download_core() {
+    local clean_url="$1"
+    local mode="$2"       # text (用于curl输出), file (用于wget存盘), pipe (用于管道)
+    local file_name="$3"  # 仅file模式需要
 
-# ==================== 💎 2. 高级 Bash 核心业务逻辑实现 ====================
-LISTEN_PORT="443"
-BINARY_NAME="sniproxy"
-SNI_BASE_DIR="/etc/sniproxy"
-ALLOWLIST_FILE="$SNI_BASE_DIR/allowed_client_ips.txt"
-VERSION_FILE="$SNI_BASE_DIR/version.txt"
-
-DOMAIN_LIST_URL="https://raw.githubusercontent.com/1-stream/1stream-public-utils/refs/heads/main/stream.text.list"
-OUTPUT_FILE="/etc/smartdns/smartdns.conf"
-TEMP_DOMAIN_FILE="/tmp/domain_list.txt"
-
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' 
-
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-print_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
-
-ensure_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        print_error "此操作需要 root 权限。请使用 root 用户身份运行。"
-        exit 1
+    # 1. 优先尝试上一次成功的那个通道 (秒开逻辑)
+    local best_proxy="${GITHUB_PROXY[$SUCCESS_PROXY_IDX]}"
+    local target_url="${best_proxy}${clean_url}"
+    
+    # 降低首次尝试的超时时间到 4 秒，防止用户等太久
+    if [[ "$mode" == "text" || "$mode" == "pipe" ]]; then
+        if response=$(curl -fsSL --max-time 4 "$target_url" 2>/dev/null) && [[ -n "$response" ]]; then
+            echo "$response"
+            return 0
+        fi
+    elif [[ "$mode" == "file" ]]; then
+        if wget -T 4 -t 1 -q -O "$file_name" "$target_url" 2>/dev/null; then
+            return 0
+        fi
     fi
-}
 
-check_command() {
-    if ! command -v "$1" &> /dev/null; then
-        apk add --no-cache "$1" >/dev/null 2>&1
-    fi
-}
-
-read_user_input() {
-    local var_name=$1
-    if [ -r /dev/tty ]; then
-        { read -r "$var_name" < /dev/tty; } 2>/dev/null && return 0
-    fi
-    read -r "$var_name"
-}
-
-read_required_input() {
-    local var_name=$1
-    if ! read_user_input "$var_name"; then
-        print_error "未读取到输入。请在交互式终端运行脚本。"
-        exit 1
-    fi
-}
-
-validate_ip() {
-    local ip=$1
-    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        local IFS='.'
-        local -a octets=($ip)
-        for octet in "${octets[@]}"; do
-            if ((octet > 255)); then return 1; fi
-        done
-        return 0
-    fi
-    return 1
-}
-
-validate_ip_or_cidr() {
-    local value=$1
-    local ip="${value%/*}"
-    if [[ "$value" == */* ]]; then
-        local cidr="${value#*/}"
-        if ! [[ "$cidr" =~ ^[0-9]+$ ]] || ((cidr < 0 || cidr > 32)); then return 1; fi
-    fi
-    validate_ip "$ip"
-}
-
-detect_arch() {
-    local machine=$(uname -m)
-    if [ "$machine" = "x86_64" ]; then echo "amd64"
-    elif [ "$machine" = "aarch64" ] || [ "$machine" = "arm64" ]; then echo "arm64"
-    else echo "unknown"; fi
-}
-
-get_public_ip() {
-    local pub_ip
-    pub_ip=$(curl -s4 --max-time 3 api.ipify.org || curl -s4 --max-time 3 ifconfig.me || echo "你的中转机公网IP")
-    echo "$pub_ip"
-}
-
-persist_firewall_rules() {
-    if [ -f /etc/init.d/iptables ]; then
-        rc-service iptables save >/dev/null 2>&1 && print_success "防火墙规则已持久化。"
-    fi
-}
-
-clear_client_allowlist() {
-    ensure_root
-    print_info "正在清空客户端 IP 白名单..."
-    if command -v iptables &> /dev/null; then
-        iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+    # 2. 如果上一次成功的通道失效了，或者第一次运行失败了，才触发全量轮询
+    for idx in "${!GITHUB_PROXY[@]}"; do
+        # 跳过刚才已经试过失败的那个索引
+        [[ $idx -eq $SUCCESS_PROXY_IDX ]] && continue
         
-        if [ -f "$ALLOWLIST_FILE" ]; then
-            while read -r ip; do
-                [[ "$ip" =~ ^# ]] || [ -z "$ip" ] && continue
-                iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -s "$ip" -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p udp --dport 53 -s "$ip" -j ACCEPT 2>/dev/null || true
-            done < "$ALLOWLIST_FILE"
-        fi
-        iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -j DROP 2>/dev/null || true
-        iptables -D INPUT -p udp --dport 53 -j DROP 2>/dev/null || true
-    fi
-    rm -f "$ALLOWLIST_FILE"
-    persist_firewall_rules
-}
-
-apply_client_allowlist() {
-    local allowed_ips=("$@")
-    check_command "iptables"
-    
-    print_info "正在构建客户端 IP 安全白名单规则..."
-    clear_client_allowlist >/dev/null 2>&1
-
-    for ip in "${allowed_ips[@]}"; do
-        iptables -A INPUT -p tcp --dport "$LISTEN_PORT" -s "$ip" -j ACCEPT
-        iptables -A INPUT -p udp --dport 53 -s "$ip" -j ACCEPT
-    done
-    
-    iptables -A INPUT -p tcp --dport "$LISTEN_PORT" -j DROP
-    iptables -A INPUT -p udp --dport 53 -j DROP
-
-    mkdir -p "$SNI_BASE_DIR"
-    {
-        echo "# 授权访问此公共 DNS 与 解锁中转的落地机 IP"
-        printf '%s\n' "${allowed_ips[@]}"
-    } > "$ALLOWLIST_FILE"
-
-    persist_firewall_rules
-    print_success "安全策略已变更：安全白名单已应用。"
-}
-
-manage_client_allowlist() {
-    ensure_root
-    clear
-    local current_allowed=""
-    [ -f "$ALLOWLIST_FILE" ] && current_allowed=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d')
-    
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN}      ◈  落地机(客户端) 访问授权管理  ◈       ${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    if [ -n "$current_allowed" ]; then
-        echo -e "${GREEN} 当前已授权放行的落地机 IP 列表:${NC}"
-        echo "$current_allowed" | sed 's/^/  • /'
-    else
-        echo -e "${GREEN} 当前安全策略 :${NC} ${YELLOW}公开解锁模式${NC}"
-    fi
-    echo -e "${GREEN}=============================================${NC}"
-    
-    echo -e "${GREEN}  1. 设置授权落地机 IP${NC}"
-    echo -e "${GREEN}  2. 追加授权落地机 IP${NC}"
-    echo -e "${GREEN}  3. 清空限制(公开解锁)${NC}"
-    echo -e "${GREEN}  0. 返回主菜单${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    
-    echo -ne "${GREEN} 请输入选项: ${NC}"
-    local choice
-    read -r choice
-    choice=$(echo "$choice" | tr -d '[:space:]')
-
-    case "$choice" in
-        1|2)
-            echo -e "\n${YELLOW}[提示] 多个落地机 IP 请使用空格或逗号分隔${NC}"
-            echo -n -e "${GREEN}请输入落地机 IP: ${NC}"
-            local input_ips
-            read_required_input input_ips
-            input_ips=$(echo "$input_ips" | tr ',' ' ')
-
-            local allowed_ips=()
-            if [ "$choice" = "2" ] && [ -n "$current_allowed" ]; then
-                while IFS= read -r ip; do [ -n "$ip" ] && allowed_ips+=("$ip"); done <<< "$current_allowed"
+        local proxy="${GITHUB_PROXY[$idx]}"
+        local target_url="${proxy}${clean_url}"
+        
+        if [[ "$mode" == "file" ]]; then
+            echo -e "${yellow}⚡ 正在切换通道，尝试通过 [${proxy:-直连}]打开...${reset}"
+            if wget -T 5 -t 1 -q -O "$file_name" "$target_url" 2>/dev/null; then
+                SUCCESS_PROXY_IDX=$idx # 记住这个成功的位置
+                return 0
             fi
+        else
+            if response=$(curl -fsSL --max-time 5 "$target_url" 2>/dev/null) && [[ -n "$response" ]]; then
+                SUCCESS_PROXY_IDX=$idx # 记住这个成功的位置
+                echo "$response"
+                return 0
+            fi
+        fi
+    done
 
-            for ip in $input_ips; do
-                ip=$(echo "$ip" | tr -d '\n\r[[:space:]]')
-                [ -z "$ip" ] && continue
-                if validate_ip_or_cidr "$ip"; then allowed_ips+=("$ip")
-                else print_error "无效的 IP 格式: $ip"; return 1; fi
-            done
-            
-            [ "${#allowed_ips[@]}" -eq 0 ] && { print_warning "未输入有效IP。"; return 0; }
-            
-            local unique_ips=()
-            while IFS= read -r line; do
-                [ -n "$line" ] && unique_ips+=("$line")
-            done <<EOF
-$(printf '%s\n' "${allowed_ips[@]}" | awk '!seen[$0]++')
-EOF
-            apply_client_allowlist "${unique_ips[@]}"
-            ;;
-        3) clear_client_allowlist && print_success "已转为公开解锁。";;
-        *) return 0 ;;
-    esac
-}
-
-install_sniproxy() {
-    ensure_root
-    local is_update=$1
-    if [ "$is_update" != "true" ] && [ -f "/etc/init.d/sniproxy" ]; then return 0; fi
-    
-    local arch=$(detect_arch)
-    local version=$(curl -sSL "https://api.github.com/repos/XIU2/SNIProxy/releases/latest" | jq -r '.tag_name')
-    [ -z "$version" ] || [ "$version" = "null" ] && version="v1.0.7"
-    
-    local tar_name="sniproxy_linux_${arch}.tar.gz"
-    curl -fL "https://github.com/XIU2/SNIProxy/releases/download/${version}/${tar_name}" -o "/tmp/$tar_name"
-    mkdir -p "$SNI_BASE_DIR"
-    tar -xzf "/tmp/$tar_name" -C "/tmp"
-    mv /tmp/sniproxy "$SNI_BASE_DIR/$BINARY_NAME"
-    chmod +x "$SNI_BASE_DIR/$BINARY_NAME"
-    rm -f "/tmp/$tar_name"
-
-    echo "$version" > "$VERSION_FILE"
-
-    cat <<EOF > "$SNI_BASE_DIR/config.yaml"
-listen_addr: ":$LISTEN_PORT"
-allow_all_hosts: true
-EOF
-
-    cat <<'EOF' > /etc/init.d/sniproxy
-#!/sbin/openrc-run
-description="SNI Proxy Service"
-pidfile="/run/sniproxy.pid"
-command="/etc/sniproxy/sniproxy"
-command_args="-c /etc/sniproxy/config.yaml"
-command_background="yes"
-depend() { need net; after firewall; }
-EOF
-    chmod +x /etc/init.d/sniproxy
-    rc-update add sniproxy default >/dev/null 2>&1
-    rc-service sniproxy restart
-}
-
-install_smartdns_binary() {
-    local is_update=$1
-    if [ "$is_update" != "true" ] && command -v smartdns &> /dev/null; then return 0; fi
-    
-    local arch=$(detect_arch)
-    local asset_arch=$([ "$arch" = "amd64" ] && echo "x86_64" || echo "aarch64")
-    local download_url=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep "browser_download_url" | grep "$asset_arch-linux-all.tar.gz" | head -n 1 | cut -d '"' -f 4)
-    
-    cd /tmp && wget -q "${download_url}" -O smartdns.tar.gz
-    tar -xzf smartdns.tar.gz && cd smartdns && chmod +x ./install
-    ./install -i
-    cd /tmp && rm -rf smartdns smartdns.tar.gz
-}
-
-configure_smartdns_rules() {
-    local is_update=$1
-    ensure_root
-    if [ "$is_update" != "true" ]; then
-        if ! check_and_fix_port_conflict; then exit 1; fi
-    fi
-    install_smartdns_binary "$is_update"
-
-    print_info "正在自动获取中转端公网 IPv4 地址..."
-    local public_ip=""
-    public_ip=$(curl -s4 --max-time 3 api.ipify.org || curl -s4 --max-time 3 ifconfig.me || echo "127.0.0.1")
-    public_ip=$(echo "${public_ip}" | tr -d '[:space:]')
-    print_success "成功获取中转端公网 IP: ${public_ip}"
-
-    print_info "清理残存的独立 SmartDNS 孤儿进程..."
-    rc-service smartdns stop >/dev/null 2>&1 || true
-    killall -9 smartdns >/dev/null 2>&1 || true
-    pkill -9 smartdns >/dev/null 2>&1 || true
-    rm -f /var/run/smartdns.pid /run/smartdns.pid 2>/dev/null
-
-    print_info "正在从零构建轻量化安全分流规则库..."
-    mkdir -p /etc/smartdns
-
-    cat > "${OUTPUT_FILE}" << 'EOF'
-# ===== Alpine 专属安全精简配置 =====
-bind :53
-cache-size 32768
-prefetch-domain yes
-serve-expired yes
-log-file /var/log/smartdns/smartdns.log
-log-level info
-
-# ===== 上游纯净公共不污染 DNS =====
-server 1.1.1.1
-server 8.8.8.8
-
-# ===== 自动化流媒体就地劫持拦截区 =====
-EOF
-
-    print_info "正在同步全球流媒体解锁域名数据源..."
-    curl -s "${DOMAIN_LIST_URL}" -o "${TEMP_DOMAIN_FILE}"
-    
-    awk -v ip="${public_ip}" '/^[^#[:space:]]/ {gsub(/[[:space:]\r\n]/, ""); if($0!="") print "address /" $0 "/" ip}' "${TEMP_DOMAIN_FILE}" >> "${OUTPUT_FILE}"
-    rm -f "${TEMP_DOMAIN_FILE}"
-
-    rc-service smartdns start
-    print_info "正在等待本地大容量规则库载入内存 (稍等 5 秒)..."
-    sleep 5
-    
-    if pgrep smartdns >/dev/null || (command -v ss &>/dev/null && ss -tulnp | grep -q ":53 ") || (command -v netstat &>/dev/null && netstat -tuln | grep -q ":53 "); then
-        print_success "中转端 SmartDNS 完美接管并全线运转成功！"
-        print_info "当前已稳定装载流媒体分流拦截规则共: $(grep -c "^address " /etc/smartdns/smartdns.conf) 条"
-    else
-        print_error "SmartDNS 依旧未能成功拉起。请退出脚本后输入命令查看原始报错原因: smartdns -f -c /etc/smartdns/smartdns.conf"
-    fi
-}
-
-check_and_fix_port_conflict() {
-    local port_usage=""
-    if command -v ss &> /dev/null; then port_usage=$(ss -tulnp | grep :53 2>/dev/null); fi
-    [ -z "$port_usage" ] && return 0
-    if echo "$port_usage" | grep -q "smartdns"; then return 0; fi
     return 1
 }
 
-# ==================== 💥 新增：查看系统综合服务日志 💥 ====================
-view_service_logs() {
-    ensure_root
-    clear
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN}        ◈    流媒体服务 综合运行日志    ◈        ${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${YELLOW}[提示] 输入 Ctrl+C 即可退出日志查看模式${NC}"
-    echo -e "${GREEN}=============================================${NC}\n"
+# 1：普通下载器
+smart_curl() {
+    local raw_url="$1"
+    if [[ ! "$raw_url" =~ "github" ]] && [[ ! "$raw_url" =~ "raw.githubusercontent.com" ]]; then
+        curl -fsSL --max-time 10 "$raw_url"
+        return $?
+    fi
+    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://github.com/|https://github.com/|g' | sed -E 's|https://[^/]*/https://raw.githubusercontent.com/|https://raw.githubusercontent.com/|g')
     
-    # 检测最有可能存在日志的地方
-    if [ -f "/var/log/smartdns/smartdns.log" ]; then
-        echo -e "${GREEN}--- SmartDNS 核心运行日志摘要 (最新 30 行) ---${NC}"
-        tail -n 30 /var/log/smartdns/smartdns.log
-        echo ""
+    _smart_download_core "$clean_url" "text"
+    if [[ $? -ne 0 ]]; then
+        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}" >&2
+        return 1
     fi
+}
+
+# 2：存盘执行器
+smart_wget_run() {
+    local file_name="$1"
+    local raw_url="$2"
+    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://|https://|g')
+
+    if _smart_download_core "$clean_url" "file" "$file_name"; then
+        echo
+        chmod +x "$file_name"
+        ./"$file_name"
+        return 0
+    else
+        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}"
+        return 1
+    fi
+}
+
+# 3：管道带参执行器
+smart_pipe_run() {
+    local raw_url="$1"
+    local bash_args="$2"
+    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://|https://|g')
+
+    local response
+    response=$(_smart_download_core "$clean_url" "pipe")
     
-    echo -e "${GREEN}--- 系统身份验证与安全防御日志 (最新 15 行) ---${NC}"
-    if [ -f "/var/log/messages" ]; then
-        tail -n 15 /var/log/messages | grep -E "sshd|auth|iptables" || tail -n 15 /var/log/messages
-    else
-        echo "暂无 /var/log/messages 日志文件。"
-    fi
-    echo -e "\n${GREEN}=============================================${NC}"
-}
-
-# ==================== 💥 新增：查看并检索分流域名配置 💥 ====================
-view_smartdns_config() {
-    clear
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN}        ◈   SmartDNS 实时拦截域名规则数   ◈        ${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    if [ -f "$OUTPUT_FILE" ]; then
-        local total_rules=$(grep -c "^address " "$OUTPUT_FILE")
-        echo -e " 配置文件路径 : ${YELLOW}$OUTPUT_FILE${NC}"
-        echo -e " 拦截规则总量 : ${GREEN}$total_rules 条${NC}"
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e " 核心控制基础配置前瞻:"
-        grep -v "^address " "$OUTPUT_FILE" | grep -v "^#" | sed '/^[[:space:]]*$/d' | sed 's/^/  • /'
-        echo -e "${GREEN}=============================================${NC}"
-        echo -n -e "是否需要检索特定劫持域名？(输入域名关键字, 直接回车则跳过): "
-        local search_key
-        read -r search_key
-        if [ -n "$search_key" ]; then
-            echo -e "\n${YELLOW}--- 以下是包含 [ $search_key ] 的劫持映射条目 ---${NC}"
-            grep "^address " "$OUTPUT_FILE" | grep "$search_key" | head -n 30 | sed 's/^/  /'
-            [ $(grep "^address " "$OUTPUT_FILE" | grep -c "$search_key") -gt 30 ] && echo "  ... (条目过多，仅为您展示前 30 条) ..."
-        fi
-    else
-        print_error "未找到 SmartDNS 配置文件，请先执行安装！"
-    fi
-    echo -e "\n${GREEN}=============================================${NC}"
-}
-
-uninstall_all_services() {
-    ensure_root
-    print_warning "正在全面卸载并从 Alpine 中净化本服务组件..."
-    rc-service sniproxy stop 2>/dev/null || true
-    rc-update del sniproxy default 2>/dev/null || true
-    rc-service smartdns stop 2>/dev/null || true
-    rc-update del smartdns default 2>/dev/null || true
-    clear_client_allowlist >/dev/null 2>&1
-    rm -f /etc/init.d/sniproxy /etc/init.d/smartdns
-    rm -rf "$SNI_BASE_DIR" /etc/smartdns /usr/sbin/smartdns /usr/bin/smartdns
-    print_success "系统环境已彻底净化。"
-}
-
-# ==================== 主控控制面板 ====================
-main() {
-    local my_ip=$(get_public_ip)
-    local sni_installed="false"
-    local smartdns_installed="false"
-    local current_sni_ver="${RED}未安装${NC}"
-    local current_sdns_ver="${RED}未安装${NC}"
-
-    refresh_local_status() {
-        # 💥 核心改进：改为用硬核的进程与服务端口活体探针，不再被 OpenRC 的状态同步漏洞欺骗
-        if pgrep -f "sniproxy" >/dev/null || (command -v ss &>/dev/null && ss -tulnp | grep -q ":$LISTEN_PORT ") || (command -v netstat &>/dev/null && netstat -tuln | grep -q ":$LISTEN_PORT "); then
-            sni_installed="true"
-            [ -f "$VERSION_FILE" ] && current_sni_ver=$(cat "$VERSION_FILE") || current_sni_ver="v1.0.7"
+    if [[ -n "$response" ]]; then
+        echo
+        if [[ -n "$bash_args" ]]; then
+            sudo bash -s $bash_args <<< "$response"
         else
-            sni_installed="false"
-            if [ -f "$SNI_BASE_DIR/$BINARY_NAME" ]; then current_sni_ver="已装载(未运行)"; else current_sni_ver="${RED}未安装${NC}"; fi
+            sudo bash <<< "$response"
         fi
+        return 0
+    else
+        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}"
+        return 1
+    fi
+}
+# 彩虹标题
+rainbow_animate() {
+    local text="$1"
+    local colors=(31 33 32 36 34 35)
+    local len=${#text}
+    for ((i=0; i<len; i++)); do
+        printf "\033[%sm%s" "${colors[$((i % ${#colors[@]}))]}" "${text:$i:1}"
+        sleep 0.002
+    done
+    printf "${reset}\n"
+}
 
-        if pgrep "smartdns" >/dev/null || (command -v ss &>/dev/null && ss -tulnp | grep -q ":53 ") || (command -v netstat &>/dev/null && netstat -tuln | grep -q ":53 "); then
-            smartdns_installed="true"
-            local main_ver=$(smartdns -v 2>&1 | head -n 1 | awk '{print $2}' | cut -d'-' -f1)
-            current_sdns_ver="${main_ver:-已运行}"
+# 系统资源显示
+show_system_usage() {
+    local width=36
+    local content_indent="    "
+
+    # ================== 格式化函数 ==================
+    format_size() {
+        local size_mb=${1:-0}  # 防止为空
+        if [ "$size_mb" -lt 1024 ]; then
+            echo "${size_mb}M"
         else
-            smartdns_installed="false"
-            if command -v smartdns &> /dev/null; then current_sdns_ver="已装载(未运行)"; else current_sdns_ver="${RED}未安装${NC}"; fi
+            awk "BEGIN{printf \"%.1fG\", $size_mb/1024}"
         fi
     }
 
-    while true; do
-        refresh_local_status
-        clear
-        
-        local sni_status_view="${RED}已停止${NC}"
-        [ "$sni_installed" = "true" ] && sni_status_view="${GREEN}运行中${NC} ${YELLOW}(端口: ${LISTEN_PORT})${NC}"
-        
-        local smartdns_status_view="${RED}已停止${NC}"
-        [ "$smartdns_installed" = "true" ] && smartdns_status_view="${GREEN}运行中${NC} ${YELLOW}(端口: 53)${NC}"
+    # ================== 获取数据 ==================
+    # 内存
+    read mem_total mem_used <<< $(LANG=C free -m | awk 'NR==2{print $2, $3}')
+    mem_total=${mem_total:-0}
+    mem_used=${mem_used:-0}
+    mem_total_fmt=$(format_size "$mem_total")
+    mem_used_fmt=$(format_size "$mem_used")
+    mem_percent=$(awk "BEGIN{if($mem_total>0){printf \"%.0f\", $mem_used*100/$mem_total}else{print 0}}")
+    mem_percent="${mem_percent}%"  # 加回百分号显示
 
-        local whitelist_view="${YELLOW}公开解锁(任意设备改DNS即可解锁)${NC}"
-        if [ -f "$ALLOWLIST_FILE" ] && [ -s "$ALLOWLIST_FILE" ]; then
-            local count=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d' | wc -l)
-            whitelist_view="${YELLOW}安全模式(允许已授权的 ${count} 个IP)${NC}"
+    # 磁盘
+    read disk_total_h disk_used_h disk_used_percent <<< $(df -m / | awk 'NR==2{print $2, $3, $5}')
+    disk_total_h=${disk_total_h:-0}
+    disk_used_h=${disk_used_h:-0}
+    disk_used_percent=${disk_used_percent:-0%}
+    disk_total_fmt=$(format_size "$disk_total_h")
+    disk_used_fmt=$(format_size "$disk_used_h")
+
+    # CPU
+    # 读取 /proc/stat 第一行，计算 CPU 使用率（防止空值）
+    cpu_usage=$(awk 'NR==1{usage=($2+$4)*100/($2+$4+$5); if(usage!=""){printf "%.1f", usage}else{print 0}}' /proc/stat)
+    cpu_usage="${cpu_usage}%"  # 加回百分号显示
+
+    # ================== 系统状态 ==================
+    mem_num=${mem_percent%\%}        # 去掉百分号
+    disk_num=${disk_used_percent%\%} # 去掉百分号
+    cpu_num=${cpu_usage%\%}          # 去掉百分号
+
+    max_level=0
+    for n in $mem_num $disk_num $cpu_num; do
+        if (( $(awk "BEGIN{print ($n>80)?1:0}") )); then max_level=2; fi
+        if (( $(awk "BEGIN{print ($n>60 && $n<=80)?1:0}") )) && [ "$max_level" -lt 2 ]; then max_level=1; fi
+    done
+
+    if [ "$max_level" -eq 0 ]; then
+        system_status="${green}系统状态：正常 ✔${reset}"
+    elif [ "$max_level" -eq 1 ]; then
+        system_status="${yellow}系统状态：警告 ⚡${reset}"
+    else
+        system_status="${red}系统状态：危险 🔥${reset}"
+    fi
+
+    # ================== 输出 ==================
+    pad_string() {
+        local str="$1"
+        printf "%-${width}s" "${content_indent}${str}"
+    }
+
+    echo -e "${green}┌$(printf '─%.0s' $(seq 1 $width))┐${reset}"
+    echo -e "$(pad_string "${system_status}")"
+    echo -e "$(pad_string "${yellow}📊 内存：${mem_used_fmt}/${mem_total_fmt} (${mem_percent})${reset}")"
+    echo -e "$(pad_string "${yellow}💽 磁盘：${disk_used_fmt}/${disk_total_fmt} (${disk_used_percent})${reset}")"
+    echo -e "$(pad_string "${yellow} ⚙ CPU ：${cpu_usage}${reset}")"
+    echo -e "${green}└$(printf '─%.0s' $(seq 1 $width))┘${reset}"
+}
+
+# ================== 系统信息 ==================
+
+# 判断是否容器
+if [ -f /proc/1/cgroup ] && grep -qE '(docker|lxc|kubepods)' /proc/1/cgroup; then
+    container_flag=" (Container)"
+else
+    container_flag=""
+fi
+
+# 系统名称
+if [ -f /etc/os-release ]; then
+    system_name=$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"')
+else
+    system_name=$(uname -s)
+fi
+system_name="${system_name}${container_flag}"
+
+
+
+# ===============================
+# 获取当前时区（跨系统兼容）
+# ===============================
+get_timezone() {
+    # 1️⃣ systemd 环境，屏蔽错误
+    if command -v timedatectl &>/dev/null; then
+        tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 2️⃣ /etc/timezone 文件（Debian）
+    if [[ -f /etc/timezone ]]; then
+        tz=$(cat /etc/timezone)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 3️⃣ /etc/localtime 符号链接（RedHat / CentOS）
+    if [[ -L /etc/localtime ]]; then
+        tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 4️⃣ /etc/localtime 文件内容匹配（minimal / docker / chroot）
+    if [[ -f /etc/localtime ]]; then
+        tz=$(strings /etc/localtime 2>/dev/null | grep -E '^[A-Z][a-z]+/[A-Z][a-zA-Z_]+$' | head -n1)
+        [[ -n "$tz" ]] && echo "$tz" && return
+    fi
+
+    # 5️⃣ 兜底
+    echo "未知"
+}
+
+timezone=$(get_timezone)
+
+# 架构
+
+cpu_arch=$(uname -m)
+
+# 获取 CPU 型号
+cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(grep -m1 "Hardware" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+[ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | grep "Model name" | cut -d: -f2)
+
+# 清理不需要的部分
+cpu_model=$(echo "$cpu_model" | sed -E \
+    -e 's/@.*GHz//g' \
+    -e 's/CPU//g' \
+    -e 's/Processor//g' \
+    -e 's/[0-9]+-Core//g' \
+	-e 's/\bv[1-9]\b//g' \
+    -e 's/\s+/ /g' \
+    | xargs)
+
+cpu="${cpu_model:-Unknown CPU} (${cpu_arch})"
+
+
+# 当前时间
+datetime=$(date "+%Y-%m-%d %H:%M:%S")
+
+# VPS 运行时间
+if [ -f /proc/uptime ]; then
+    uptime_seconds=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
+    days=$((uptime_seconds/86400))
+    hours=$(( (uptime_seconds%86400)/3600 ))
+    minutes=$(( (uptime_seconds%3600)/60 ))
+    if [ "$days" -gt 0 ]; then
+        vps_uptime="${days}天${hours}小时${minutes}分钟"
+    elif [ "$hours" -gt 0 ]; then
+        vps_uptime="${hours}小时${minutes}分钟"
+    else
+        vps_uptime="${minutes}分钟"
+    fi
+else
+    vps_uptime=$(uptime -p 2>/dev/null | tr -d ' ' || echo "未知")
+fi
+
+
+
+# 一级菜单
+MAIN_MENU=(
+    "系统设置"
+    "网络代理"
+    "网络检测"
+    "Docker管理"
+    "应用商店"
+    "证书管理"
+    "系统管理"
+    "备份恢复"
+    "玩具熊ʕ•ᴥ•ʔ"
+    "更新卸载"
+)
+
+# 二级菜单（编号去掉前导零，显示时格式化为两位数）
+SUB_MENU[1]="1 更新系统|2 系统信息|3 修改root密码|4 root登录管理|5 修改SSH端口|6 修改时区|7 时间同步|8 切换v4V6|9 开放所有端口|10 更换系统源|11 DDdebian13|12 DDwindows|13 NAT鸡重装系统|14 DD飞牛|15 修改语言|16 修改主机名|17 DNS优化|18 一键优化✨|19 VPS重启"
+SUB_MENU[2]="20 代理工具箱|21 FRP管理|22 EasyTier组网|23 ShellCrash|24 CFWARP|25 BBRv3|26 BBR+TCP智能调参|27 Socks5/HTTP|28 Reality|29 Snell|30 Shadowsocks|31 Hysteria2|32 Xray-Argo|33 3X-UI|34 vless-all-in-one|35 Realm|36 哆啦A梦转发面板|37 DDNS动态域名|38 自建DNS解锁|39 流量狗|40 流量日报"
+SUB_MENU[3]="41 NodeQuality|42 融合怪测试|43 YABS测试|44 网络质量体检|45 IP质量体检|46 硬盘质量体检|47 三网延迟检测|48 简单回程测试|49 完整路由检测|50 流媒体解锁|51 三网测速|52 网络PING/DNS检测|53 检查25端口开放|54 网络工具箱"
+SUB_MENU[4]="55 Docker管理|56 DockerCompose管理|57 DockerCompose备份恢复|58 DockerCompose自动更新"
+SUB_MENU[5]="59 应用管理|60 宝塔面板|61 1Panel面板|62 CLICD开小鸡|63 OpenClaw|64 HermesAgent"
+SUB_MENU[6]="65 NGINXV4反代✨|66 NGINXV6反代|67 Caddy反代|68 Acme申请证书|69 Lucky反代"
+SUB_MENU[7]="71 系统清理|72 重装系统|73 系统组件|74 开发环境|75 工作区管理|76 防火墙管理|78 Fail2ban|79 系统监控|80 添加SWAP|81 DNS管理|82 定时任务"
+SUB_MENU[8]="83 系统快照|84 系统恢复|85 本地备份|86 Rsync同步|87 Rclone备份|89 Croc文件传输|90 压缩文件|91 解压文件"
+SUB_MENU[9]="100 GProxy加速|101 1panelapps管理|102 Akile优选DNS|103 自动机场签到|104 关闭哪吒监控SSH|105 AI检测|106 代理工具检测|107 卸载探针"
+SUB_MENU[10]="77 自动更新|88 更新脚本|99 卸载脚本"
+
+# 显示一级菜单
+show_main_menu() {
+    clear
+    # 上边框保留彩虹效果
+    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # 标题文字改为纯黄色
+    echo -e "${yellow}📦 VPS Toolbox工具箱${reset}${ORANGE}(快捷指令:M/m)${reset} ${yellow}📦${reset}"
+
+    # 下边框保留彩虹效果
+    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # 系统信息
+    show_system_usage
+
+
+    # 当前日期时间显示在框下、菜单上
+
+    # 终端宽度（可用不用）
+    term_width=$(tput cols 2>/dev/null || echo 80)
+
+    label_w=8  # 左侧标签宽度
+
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "💻" $label_w "系统" "$system_name"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🌍" $label_w "时区" "$timezone"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🧩" $label_w "架构" "$cpu"
+    printf "${ORANGE}%s %-*s:${yellow} %s${re}\n" "🕒" $label_w "时间" "$datetime"
+    printf "${ORANGE}%s %-*s:${ORANGE} %s${re}\n" "🚀" $label_w "在线" "$vps_uptime"
+
+    # 绿色下划线
+    echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${re}"
+
+    # 显示菜单
+    for i in "${!MAIN_MENU[@]}"; do
+        if [[ $i -eq 8 ]]; then  # 第9项（索引从0开始）
+            # 符号红色，数字和点绿色，文字黄色
+            printf "${red}▶${reset} ${green}%02d.${reset} ${yellow}%s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
+        else
+            # 其他项保持原来的颜色（符号红色，数字绿色，文字绿色）
+            printf "${red}▶${reset} ${green}%02d. %s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
         fi
-
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN}        ◈    流媒体 DNS 解锁面板 (Alpine)    ◈         ${NC}"
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN} SNIProxy 状态:${NC} $sni_status_view"
-        echo -e "${GREEN} SmartDNS 状态:${NC} $smartdns_status_view"
-        echo -e "${GREEN} SNIProxy 版本:${NC} ${YELLOW}${current_sni_ver}${NC}"
-        echo -e "${GREEN} SmartDNS 版本:${NC} ${YELLOW}${current_sdns_ver}${NC}"
-        echo -e "${GREEN} 安全策略访问 :${NC} $whitelist_view"
-        echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN}  1. 安装 解锁服务          5. 启动 解锁服务${NC}"
-        echo -e "${GREEN}  2. 更新 解锁服务          6. 停止 解锁服务${NC}"
-        echo -e "${GREEN}  3. 卸载 解锁服务          7. 重启 解锁服务${NC}"
-        echo -e "${GREEN}  4. 落地机白名单管理${NC}"
-        echo -e "${GREEN}---------------------------------------------${NC}"
-        echo -e "${GREEN}  8. 查看综合运行日志 (新增)${NC}"
-        echo -e "${GREEN}  9. 查看分流域名配置 (新增)${NC}"
-        echo -e "${GREEN}  0. 退出面板${NC}"
-        echo -e "${GREEN}=============================================${NC}"
-        
-        echo -ne "${GREEN} 请输入选项: ${NC}"
-        local choice
-        read -r choice
-        choice=$(echo "$choice" | tr -d '[:space:]')
-
-        case "$choice" in
-            1)
-                install_sniproxy "false"
-                configure_smartdns_rules "false"
-                echo -e "\n${GREEN}==================================================${NC}"
-                print_success "Alpine 中转端部署完全就绪！"
-                echo -e "你的【落地机】执行这三行命令即可解锁："
-                echo -e "${YELLOW}chattr -i /etc/resolv.conf 2>/dev/null || true${NC}"
-                echo -e "${YELLOW}echo \"nameserver ${my_ip}\" > /etc/resolv.conf${NC}"
-                echo -e "${YELLOW}chattr +i /etc/resolv.conf 2>/dev/null${NC}"
-                echo -e "${GREEN}==================================================${NC}"
-                echo -n "按回车键返回面板..."; read -r _ ;;
-            2) install_sniproxy "true"; configure_smartdns_rules "true"; echo -n "按回车键返回面板..."; read -r _ ;;
-            3) uninstall_all_services; echo -n "按回车键返回面板..."; read -r _ ;;
-            4) manage_client_allowlist; echo -n "按回车键返回面板..."; read -r _ ;;
-            5) rc-service sniproxy start 2>/dev/null; rc-service smartdns start 2>/dev/null; print_success "启动指令已下发。"; sleep 1.5 ;;
-            6) rc-service sniproxy stop 2>/dev/null; rc-service smartdns stop 2>/dev/null; killall -9 smartdns sniproxy >/dev/null 2>&1 || true; print_success "停止指令已下发。"; sleep 1.5 ;;
-            7) rc-service sniproxy restart 2>/dev/null; rc-service smartdns restart 2>/dev/null; print_success "服务已重启。"; sleep 1.5 ;;
-            8) view_service_logs; echo -n "按回车键返回面板..."; read -r _ ;;
-            9) view_smartdns_config; echo -n "按回车键返回面板..."; read -r _ ;;
-            0) exit 0 ;;
-            *) print_error "无效选项。"; sleep 1.5 ;;
-        esac
     done
 }
 
-main "$@"
+
+# 显示二级菜单并选择
+show_sub_menu() {
+    local idx="$1"
+    while true; do
+        IFS='|' read -ra options <<< "${SUB_MENU[idx]}"
+        local map=()
+        echo
+        for opt in "${options[@]}"; do
+            local num="${opt%% *}"
+            local name="${opt#* }"
+            printf "${red}▶${reset} ${yellow}%02d %s${reset}\n" "$num" "$name"
+            map+=("$num")
+        done
+        echo -ne "${red}请输入要执行的编号${ORANGE}(0返回/X退出)${ORANGE}:${reset}"
+        read -r choice
+
+        # X/x 直接退出脚本
+        if [[ "$choice" =~ ^[xX]$ ]]; then
+            exit 0
+        fi
+
+        # 按回车直接刷新菜单
+        if [[ -z "$choice" ]]; then
+            clear
+            continue
+        fi
+
+        # 输入 0 或 00 返回一级菜单
+        if [[ "$choice" == "0" || "$choice" == "00" ]]; then
+            return
+        fi
+
+        # 只允许数字输入
+        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+            echo -e "${red}无效选项，请输入数字！${reset}"
+            sleep 1
+            clear
+            continue
+        fi
+
+        # 判断是否为有效选项
+        if [[ ! " ${map[*]} " =~ (^|[[:space:]])$choice($|[[:space:]]) ]]; then
+            echo -e "${red}无效选项${reset}"
+            sleep 1
+            clear
+            continue
+        fi
+
+        # 执行选项
+        execute_choice "$choice"
+
+        # 只有 0/99 才退出二级菜单，否则按回车刷新二级菜单
+        if [[ "$choice" != "0" && "$choice" != "99" ]]; then
+            read -rp $'\e[31m按回车刷新二级菜单...\e[0m' tmp
+            clear
+        else
+            break
+        fi
+    done
+}
+
+
+
+
+# 删除快捷指令
+remove_shortcut() {
+    if [[ $EUID -eq 0 ]]; then
+        rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
+    else
+        sudo rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
+    fi
+}
+
+# 执行菜单选项
+execute_choice() {
+    case "$1" in
+        1) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/update.sh) ;;
+        2) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vpsinfo.sh) ;;
+        3) sudo passwd root ;;
+        4) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SSHDLGL.sh) ;;
+        5) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/sshdk.sh) ;;
+        6) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/time.sh) ;;
+        7) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/systemdtimesyncd.sh) ;;
+        8) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/qhwl.sh) ;;
+        9) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/UFWFX.sh) ;;
+        10) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/huanyuan.sh) ;;
+        11) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Debian13.sh) ;;
+        12) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/windowos.sh) ;;
+        13) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/DDnat.sh) ;;
+        14) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ddfnos.sh) ;;
+        15) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/xgyu.sh) ;;
+        16) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/home.sh) ;;
+        17) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Mosdnsxos.sh) ;;
+        18) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/vpsupos.sh) ;;
+        19) sudo reboot ;;
+        20) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/proxy.sh) ;;
+        21) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/FRPos.sh) ;;
+        22) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/EasyTierx.sh) ;;
+        23) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/ShellCrash.sh);;
+        24) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/CFWARPtoolos.sh) ;;
+        25) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/BBRv3os.sh) ;;
+        26) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/BBR.sh) ;;
+        27) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/MicaProxyos.sh) ;;
+        28) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/VlessRealityos.sh) ;;
+        29) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Snellos.sh) ;;
+        30) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SSRustos.sh) ;;
+        31) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Hy2os.sh) ;;
+        32) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/2go.sh) ;;
+        33) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/3xuios.sh) ;;
+        34) smart_wget_run "vless-server.sh" "https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh" ;;
+        35) smart_pipe_run "https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh" "install" ;;
+        36) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/flux-panel.sh);;
+        37) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DDNS.sh) ;;
+        38) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SNIProxyDNSos.sh) ;;
+        39) smart_wget_run "port-traffic-dog.sh" "https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh" ;;
+        40) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/vnstattgos.sh) ;;
+        41) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NodeQuality.sh) ;;
+        42) curl -L https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh -o ecs.sh && chmod +x ecs.sh && bash ecs.sh ;;
+        43) curl -sL https://yabs.sh | bash ;;
+        44) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NetQuality.sh) ;;
+        45) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/IPQuality.sh) ;;
+        46) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/HardwareQuality.sh) ;;
+        47) bash <(curl -Ls https://Net.Check.Place) -P ;;
+        48) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
+        49) bash <(curl -Ls https://Net.Check.Place) -R ;;
+        50) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
+        51) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ecsspeed.sh) ;;
+        52) bash <(wget -qO- https://raw.githubusercontent.com/Cd1s/network-latency-tester/main/latency.sh) ;;
+        53) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Telnet.sh) ;;
+        54) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Networktoolx.sh) ;; 
+        55) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Dockersos.sh) ;;
+        56) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockercompose.sh) ;;
+        57) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Dockcompbauck.sh) ;;
+        58) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockerupdate.sh) ;;
+        59) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Store.sh) ;;
+        60) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/Baotax.sh) ;;
+        61) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/1Panelx.sh) ;;
+        62) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/NAT/CLICD.sh) ;;
+        63) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/OpenClaw.sh) ;;
+        64) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/Hermes.sh) ;;
+        65) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginxos.sh) ;;
+        66) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginx6os.sh) ;;
+        67) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Caddyos.sh) ;;
+        68) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Acmeos.sh) ;;
+        69) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/CN/CNLucky.sh) ;;
+        71) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clear.sh) ;;
+        72) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/reinstall.sh) ;;
+        73) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/package.sh) ;;
+        74) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/exploitation.sh) ;;
+        75) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tmux.sh) ;;
+        76) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/firewallos.sh) ;;
+        78) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Fail2banos.sh) ;;
+        79) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/System.sh) ;;
+        80) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SWAP.sh) ;;
+        81) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/DNSos.sh) ;;
+        82) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/crontab.sh) ;;
+        83) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/snapshotBos.sh) ;;
+        84) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/snapshotRos.sh) ;;
+        85) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/beifen.sh) ;;
+        86) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Rrsync.sh) ;;
+        87) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Rcloneos.sh) ;;
+        89) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Croc.sh) ;;
+        90) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/yasuo.sh) ;;
+        91) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tarzip.sh) ;;
+        100) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/CN/CNGProxy.sh) ;;
+        101) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/1Pappsx.sh) ;;
+        102) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/AkileDNS.sh) ;;
+        103) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/JCQD.sh) ;;
+        104) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
+		105) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/AIcheck.sh) ;;
+        106) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/test.sh) ;;
+        107) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/unagent.sh) ;;
+
+        #  自动更新脚本
+        77) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/tool/toolboxupdates.sh) ;; 
+        88)
+            echo -e "${yellow}正在更新工具箱...${reset}"
+            
+            # 使用 smart_curl 获取内容并覆盖写入到本地脚本路径
+            # smart_curl 会自动处理：直连 -> 失败则依次轮询各代理节点
+            if ! smart_curl "https://raw.githubusercontent.com/sistarry/toolbox/main/tool/vps-toolbox.sh" > "$INSTALL_PATH"; then
+                echo -e "${red}更新失败，所有代理及直连均无法访问，请检查网络！${reset}"
+                return 1
+            fi
+            
+            # 检查下载的文件是否为空（防止意外下载到空内容把本地脚本整坏）
+            if [[ ! -s "$INSTALL_PATH" ]]; then
+                echo -e "${red}更新失败：下载的文件为空，已终止覆盖！${reset}"
+                return 1
+            fi
+
+            chmod +x "$INSTALL_PATH"
+            echo -e "${green}更新完成！${reset}"
+            # 重新执行最新脚本
+            exec bash "$INSTALL_PATH"
+            ;;
+
+        99) 
+            echo -e "${yellow}正在卸载工具箱...${reset}"
+
+            # 删除快捷指令
+            remove_shortcut
+ 
+            # 删除工具箱脚本
+            if [[ -f "$INSTALL_PATH" ]]; then
+            rm -f "$INSTALL_PATH"
+            echo -e "${green}工具箱已删除${reset}"
+            fi
+            # 删除首次运行标记文件
+            MARK_FILE="$HOME/.vpstoolbox"
+            if [[ -f "$MARK_FILE" ]]; then
+            rm -f "$MARK_FILE"
+            fi
+           echo -e "${red}卸载完成！${reset}"
+           exit 0
+           ;;
+        0) exit 0 ;;
+        *) echo -e "${red}无效选项${reset}"; return 1 ;;
+    esac
+}
+
+
+# 主循环
+while true; do
+    show_main_menu
+    echo -ne "${red}请输入要执行的编号${ORANGE}(0退出)${ORANGE}:${reset} "
+    read -r main_choice
+
+    # X/x 直接退出脚本
+    if [[ "$main_choice" =~ ^[xX]$ ]]; then
+        exit 0
+    fi
+
+    # 按回车刷新菜单
+    if [[ -z "$main_choice" ]]; then
+        continue
+    fi
+
+    # 输入 0 退出
+    if [[ "$main_choice" == "0" ]]; then
+        exit 0
+    fi
+
+    # 只允许数字输入
+    if ! [[ "$main_choice" =~ ^[0-9]+$ ]]; then
+        echo -e "${red}无效选项，请输入数字！${reset}"
+        sleep 1
+        continue
+    fi
+
+    # 判断范围
+    if (( main_choice >= 1 && main_choice <= ${#MAIN_MENU[@]} )); then
+        show_sub_menu "$main_choice"
+    else
+        echo -e "${red}无效选项${reset}"
+        sleep 1
+    fi
+done

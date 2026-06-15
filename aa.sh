@@ -1,17 +1,14 @@
 #!/bin/bash
 # ========================================================
-#  SNIProxy & SmartDNS 公共解锁 DNS管理脚本 (修复版)
+#  SNIProxy & SmartDNS 公共解锁 DNS管理脚本 (Alpine 专属版)
 # ========================================================
 
 # 参数配置
 LISTEN_PORT="443"
-FIREWALL_CHAIN_TCP="ALLOW_TCP_443"
-FIREWALL_CHAIN_UDP="ALLOW_UDP_53"
 BINARY_NAME="sniproxy"
-SNI_BASE_DIR="$(pwd)/sniproxy"
+SNI_BASE_DIR="/etc/sniproxy"
 ALLOWLIST_FILE="$SNI_BASE_DIR/allowed_client_ips.txt"
 VERSION_FILE="$SNI_BASE_DIR/version.txt"
-SNI_SERVICE_FILE="/etc/systemd/system/sniproxy.service"
 
 SMARTDNS_CONF_URL="https://raw.githubusercontent.com/pymumu/smartdns/master/etc/smartdns/smartdns.conf"
 DOMAIN_LIST_URL="https://raw.githubusercontent.com/1-stream/1stream-public-utils/refs/heads/main/stream.text.list"
@@ -35,14 +32,14 @@ print_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
 ensure_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        print_error "此操作需要 root 权限。请使用 sudo 或以 root 用户身份运行。"
+        print_error "此操作需要 root 权限。请使用 root 用户身份运行。"
         exit 1
     fi
 }
 
 check_command() {
     if ! command -v "$1" &> /dev/null; then
-        print_error "命令 '$1' 未找到。请先安装它 (例如: apt install -y $1 || yum install -y $1)"
+        print_error "命令 '$1' 未找到。请先安装它 (例如: apk add $1)"
         exit 1
     fi
 }
@@ -93,14 +90,6 @@ detect_arch() {
     else echo "unknown"; fi
 }
 
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo "$ID"
-    elif [ -f /etc/redhat-release ]; then echo "centos"
-    else echo "unknown"; fi
-}
-
 get_public_ip() {
     local pub_ip
     pub_ip=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || echo "你的中转机公网IP")
@@ -115,29 +104,20 @@ get_remote_smartdns_version() {
     curl -sS --max-time 1.5 "https://api.github.com/repos/pymumu/smartdns/releases/latest" | jq -r '.tag_name' 2>/dev/null || echo "未知"
 }
 
+# Alpine 专属包管理器封装
 install_dependency() {
     local pkg=$1
     if command -v "$pkg" &> /dev/null; then return 0; fi
-    print_info "正在安装依赖 $pkg..."
-    local os_type=$(detect_os)
-    if [[ "$os_type" == "ubuntu" || "$os_type" == "debian" ]]; then
-        apt-get update -qq && apt-get install -y "$pkg"
-    elif [[ "$os_type" == "centos" || "$os_type" == "rhel" || "$os_type" == "fedora" ]]; then
-        yum install -y "$pkg"
-    else
-        print_error "未知系统，请手动安装 $pkg 后重试。"
-        exit 1
-    fi
+    print_info "正在通过 apk 安装依赖 $pkg..."
+    apk add --no-cache "$pkg"
 }
 
-# ==================== 安全策略模块 ====================
+# ==================== 安全策略模块 (Alpine iptables 版) ====================
 persist_firewall_rules() {
-    if command -v netfilter-persistent &> /dev/null; then
-        netfilter-persistent save >/dev/null 2>&1 && print_success "防火墙规则已持久化。"
-    elif command -v iptables-save &> /dev/null && [ -d /etc/iptables ]; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null && print_success "iptables 规则已保存。"
+    if [ -f /etc/init.d/iptables ]; then
+        rc-service iptables save >/dev/null 2>&1 && print_success "防火墙规则已持久化。"
     else
-        print_warning "未检测到 iptables 持久化工具，重启后白名单可能会失效。"
+        print_warning "未检测到 Alpine iptables 服务，重启后白名单可能会失效。建议执行: apk add iptables && rc-update add iptables"
     fi
 }
 
@@ -145,17 +125,17 @@ clear_client_allowlist() {
     ensure_root
     print_info "正在清空客户端 IP 白名单，开放公网访问 (53/443)..."
     if command -v iptables &> /dev/null; then
-        while iptables -C INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP" 2>/dev/null; do
-            iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP"
-        done
-        iptables -F "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
-        iptables -X "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
-
-        while iptables -C INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP" 2>/dev/null; do
-            iptables -D INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP"
-        done
-        iptables -F "$FIREWALL_CHAIN_UDP" 2>/dev/null || true
-        iptables -X "$FIREWALL_CHAIN_UDP" 2>/dev/null || true
+        iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+        
+        # 清理可能残留的特定IP规则
+        if [ -f "$ALLOWLIST_FILE" ]; then
+            while read -r ip; do
+                [[ "$ip" =~ ^# ]] || [ -z "$ip" ] && continue
+                iptables -D INPUT -p tcp --dport "$LISTEN_PORT" -s "$ip" -j ACCEPT 2>/dev/null || true
+                iptables -D INPUT -p udp --dport 53 -s "$ip" -j ACCEPT 2>/dev/null || true
+            done < "$ALLOWLIST_FILE"
+        fi
     fi
     rm -f "$ALLOWLIST_FILE"
     persist_firewall_rules
@@ -167,25 +147,19 @@ apply_client_allowlist() {
     check_command "iptables"
     
     print_info "正在应用客户端 IP 安全白名单..."
-    iptables -N "$FIREWALL_CHAIN_TCP" 2>/dev/null || true
-    iptables -F "$FIREWALL_CHAIN_TCP"
-    iptables -N "$FIREWALL_CHAIN_UDP" 2>/dev/null || true
-    iptables -F "$FIREWALL_CHAIN_UDP"
+    
+    # 先清除之前的旧规则，防止重复叠加
+    clear_client_allowlist >/dev/null 2>&1
 
+    # 循环允许白名单中的 IP
     for ip in "${allowed_ips[@]}"; do
-        iptables -A "$FIREWALL_CHAIN_TCP" -p tcp --dport "$LISTEN_PORT" -s "$ip" -j ACCEPT
-        iptables -A "$FIREWALL_CHAIN_UDP" -p udp --dport 53 -s "$ip" -j ACCEPT
+        iptables -A INPUT -p tcp --dport "$LISTEN_PORT" -s "$ip" -j ACCEPT
+        iptables -A INPUT -p udp --dport 53 -s "$ip" -j ACCEPT
     done
     
-    iptables -A "$FIREWALL_CHAIN_TCP" -p tcp --dport "$LISTEN_PORT" -j DROP
-    iptables -A "$FIREWALL_CHAIN_UDP" -p udp --dport 53 -j DROP
-
-    if ! iptables -C INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP" 2>/dev/null; then
-        iptables -I INPUT -p tcp --dport "$LISTEN_PORT" -j "$FIREWALL_CHAIN_TCP"
-    fi
-    if ! iptables -C INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP" 2>/dev/null; then
-        iptables -I INPUT -p udp --dport 53 -j "$FIREWALL_CHAIN_UDP"
-    fi
+    # 末尾兜底阻断其他未授权流量
+    iptables -A INPUT -p tcp --dport "$LISTEN_PORT" -j DROP
+    iptables -A INPUT -p udp --dport 53 -j DROP
 
     mkdir -p "$SNI_BASE_DIR"
     {
@@ -223,7 +197,7 @@ manage_client_allowlist() {
     echo -ne "${GREEN} 请输入选项: ${NC}"
     local choice
     read -r choice
-    choice=$(echo "$choice" | xargs 2>/dev/null || echo "")
+    choice=$(echo "$choice" | tr -d '[:space:]')
 
     case "$choice" in
         1|2)
@@ -246,27 +220,34 @@ manage_client_allowlist() {
             done
             
             [ "${#allowed_ips[@]}" -eq 0 ] && { print_warning "未输入有效IP。"; return 0; }
-            mapfile -t allowed_ips < <(printf '%s\n' "${allowed_ips[@]}" | awk '!seen[$0]++')
-            apply_client_allowlist "${allowed_ips[@]}"
+            
+            # Busybox 兼容的去重方式
+            mapfile_t_replacement() {
+                printf '%s\n' "${allowed_ips[@]}" | awk '!seen[$0]++'
+            }
+            local unique_ips=()
+            while IFS= read -r line; do unique_ips+=("$line"); done < <(mapfile_t_replacement)
+            
+            apply_client_allowlist "${unique_ips[@]}"
             ;;
         3) clear_client_allowlist ;;
         *) return 0 ;;
     esac
 }
 
-# ==================== SNIProxy 模块 ====================
+# ==================== SNIProxy 模块 (Alpine OpenRC 版) ====================
 install_sniproxy() {
     ensure_root
     local is_update=$1
     
-    if [ "$is_update" != "true" ] && systemctl list-unit-files | grep -q "^sniproxy\.service"; then
+    if [ "$is_update" != "true" ] && [ -f "/etc/init.d/sniproxy" ]; then
         print_warning "检测到 SNIProxy 已安装。"
         return 0
     fi
     
     if [ "$is_update" = "true" ]; then
         print_info "正在升级 SNIProxy 核心版本..."
-        systemctl stop sniproxy 2>/dev/null || true
+        rc-service sniproxy stop 2>/dev/null || true
     else
         print_info "开始全新安装 SNIProxy..."
     fi
@@ -296,47 +277,39 @@ listen_addr: ":$LISTEN_PORT"
 allow_all_hosts: true
 EOF
 
-        cat <<EOF > "$SNI_SERVICE_FILE"
-[Unit]
-Description=SNI Proxy
-After=network.target
+        # 写入 Alpine 的 OpenRC 服务脚本
+        cat <<'EOF' > /etc/init.d/sniproxy
+#!/sbin/openrc-run
 
-[Service]
-ExecStart=$SNI_BASE_DIR/$BINARY_NAME -c $SNI_BASE_DIR/config.yaml
-Restart=on-failure
+description="SNI Proxy Service"
+pidfile="/run/sniproxy.pid"
+command="/etc/sniproxy/sniproxy"
+command_args="-c /etc/sniproxy/config.yaml"
+command_background="yes"
 
-[Install]
-WantedBy=multi-user.target
+depend() {
+    need net
+    after firewall
+}
 EOF
-        systemctl daemon-reload && systemctl enable sniproxy
+        chmod +x /etc/init.d/sniproxy
+        rc-update add sniproxy default
     fi
 
-    systemctl start sniproxy
+    rc-service sniproxy start
     print_success "SNIProxy 核心包 ($version) 部署成功。"
 }
 
-# ==================== SmartDNS 模块 ====================
+# ==================== SmartDNS 模块 (Alpine 适配) ====================
 check_and_fix_port_conflict() {
     print_info "检查 53 端口占用情况..."
     local port_usage=""
-    if command -v lsof &> /dev/null; then port_usage=$(lsof -i :53 2>/dev/null); fi
-    if [ -z "$port_usage" ] && command -v ss &> /dev/null; then port_usage=$(ss -tulnp | grep :53 2>/dev/null); fi
+    if command -v ss &> /dev/null; then port_usage=$(ss -tulnp | grep :53 2>/dev/null); fi
     [ -z "$port_usage" ] && return 0
     
-    if echo "$port_usage" | grep -q "systemd-resolve"; then
-        print_warning "发现 systemd-resolved 正在占用端口 53，执行清理释放..."
-        systemctl stop systemd-resolved && systemctl disable systemd-resolved
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        [ -L /etc/resolv.conf ] && rm /etc/resolv.conf
-        cat > /etc/resolv.conf << 'EOF'
-nameserver 1.1.1.1
-EOF
-        return 0
-    else
-        echo "$port_usage" | grep -q "smartdns" && return 0
-        print_error "端口 53 被其他未知程序占用，请先手动清理:\n$port_usage"
-        return 1
-    fi
+    if echo "$port_usage" | grep -q "smartdns" && return 0
+    print_error "端口 53 被其他程序占用，请先手动清理:\n$port_usage"
+    return 1
 }
 
 install_smartdns_binary() {
@@ -345,18 +318,25 @@ install_smartdns_binary() {
     
     if [ "$is_update" = "true" ]; then
         print_info "正在升级并重新编译 SmartDNS 二进制程序..."
-        systemctl stop smartdns 2>/dev/null || true
+        rc-service smartdns stop 2>/dev/null || true
     else
         print_info "正在获取并编译安装 SmartDNS 核心..."
     fi
 
-    install_dependency "wget"
+    # Alpine 编译依赖环境补齐
+    print_info "正在安装 SmartDNS 必须的轻量级编译工具链..."
+    apk add --no-cache wget make gcc g++ musl-dev linux-headers openssl-dev
+
     local arch=$(detect_arch)
     local asset_arch=$([ "$arch" = "amd64" ] && echo "x86_64" || echo "aarch64")
     local download_url=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep "browser_download_url" | grep "$asset_arch-linux-all.tar.gz" | head -n 1 | cut -d '"' -f 4)
     
     cd /tmp && wget -q --show-progress "${download_url}" -O smartdns.tar.gz
-    tar -xzf smartdns.tar.gz && cd smartdns && chmod +x ./install && ./install -i
+    tar -xzf smartdns.tar.gz && cd smartdns && chmod +x ./install
+    
+    # 针对 Alpine 强制生成 OpenRC 服务单元而非 systemd
+    ./install -i
+    
     cd /tmp && rm -rf smartdns smartdns.tar.gz
     print_success "SmartDNS 核心包编译装载就绪。"
 }
@@ -368,6 +348,20 @@ configure_smartdns_rules() {
         if ! check_and_fix_port_conflict; then exit 1; fi
     fi
     install_smartdns_binary "$is_update"
+
+    # ==================== 🌐 动态自动获取公网 IPv4 (多重保底) ====================
+    print_info "正在自动获取中转端公网 IPv4 地址..."
+    local public_ip=""
+    public_ip=$(curl -s4 --max-time 3 api.ipify.org || curl -s4 --max-time 3 ifconfig.me || curl -s4 --max-time 3 ip4.icanhazip.com)
+    public_ip=$(echo "${public_ip}" | tr -d '[:space:]')
+
+    if [ -z "${public_ip}" ]; then
+        print_warning "未能自动获取到公网 IP，将 fallback 降级使用 127.0.0.1"
+        public_ip="127.0.0.1"
+    else
+        print_success "成功获取中转端公网 IP: ${public_ip}"
+    fi
+    # ===========================================================================
 
     print_info "正在构建公网分流规则库..."
     wget -q -O "${OUTPUT_FILE}" "${SMARTDNS_CONF_URL}"
@@ -393,7 +387,10 @@ EOF
 
 # ===== 自动化就地劫持分流核心规则 =====
 EOF
-    awk '/^[^#[:space:]]/ {print "address /" $1 "/127.0.0.1"}' "${TEMP_DOMAIN_FILE}" >> "${OUTPUT_FILE}"
+
+    # 清除隐藏字符并将域名精准写入
+    awk -v ip="${public_ip}" '/^[^#[:space:]]/ {gsub(/[[:space:]\r]/, ""); if($0!="") print "address /" $0 "/" ip}' "${TEMP_DOMAIN_FILE}" >> "${OUTPUT_FILE}"
+
     rm -f "${TEMP_DOMAIN_FILE}"
 
     mkdir -p /etc/smartdns
@@ -401,9 +398,9 @@ EOF
     cp "${OUTPUT_FILE}" /etc/smartdns/smartdns.conf
     rm -f "${OUTPUT_FILE}"
 
-    systemctl restart smartdns
+    rc-service smartdns restart
     sleep 1
-    if systemctl is-active --quiet smartdns; then
+    if rc-service smartdns status | grep -q "started"; then
         print_success "中转端解锁 DNS 构建完成！"
         print_info "当前已接管流媒体分流拦截规则共: $(grep -c "^address " /etc/smartdns/smartdns.conf) 条"
     else
@@ -415,81 +412,59 @@ show_logs() {
     ensure_root
     clear
     echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN}◈  流媒体解锁服务 实时运行日志  ◈${NC}"
+    echo -e "${GREEN}◈  流媒体解锁服务 实时运行日志 (Alpine)  ◈${NC}"
     echo -e "${GREEN}=============================================${NC}"
-    print_info "正在读取最近 30 行日志（按 Ctrl+C 即可退出查看）:"
-    echo -e "${YELLOW}--- SmartDNS 分流日志 ---${NC}"
-    journalctl -u smartdns -n 15 --no-pager 2>/dev/null || echo "无日志"
-    echo -e "\n${YELLOW}--- SNIProxy 中转日志 ---${NC}"
-    journalctl -u sniproxy -n 15 --no-pager 2>/dev/null || echo "无日志"
+    print_info "正在读取本地系统日志记录（按 Ctrl+C 即可退出查看）:"
+    echo -e "${YELLOW}--- 服务活性检测状态 ---${NC}"
+    rc-service smartdns status
+    rc-service sniproxy status
+    echo -e "\n${YELLOW}--- 系统最新消息输出 (提示: Alpine默认无journald) ---${NC}"
+    if [ -f /var/log/messages ]; then
+        tail -n 30 /var/log/messages
+    else
+        echo "未检测到系统 syslog 文件。如果需要高级分流日志，请在中转机上手动执行抓包命令检测。"
+    fi
     echo -e "${GREEN}=============================================${NC}"
 }
 
-# ==================== 彻底净化卸载模块 (修复核心) ====================
+# ==================== 彻底净化卸载模块 ====================
 uninstall_all_services() {
     ensure_root
     print_warning "正在全面卸载并净化本机的中转与分流服务..."
     
-    # 1. 停止并禁用 Systemd 服务
-    systemctl stop sniproxy smartdns 2>/dev/null || true
-    systemctl disable sniproxy smartdns 2>/dev/null || true
+    # 1. 停止并禁用 OpenRC 服务
+    rc-service sniproxy stop 2>/dev/null || true
+    rc-update del sniproxy default 2>/dev/null || true
+    rc-service smartdns stop 2>/dev/null || true
+    rc-update del smartdns default 2>/dev/null || true
     
-    # 2. 调用 SmartDNS 官方自带的卸载逻辑（根治卸载不干净、状态残留的罪魁祸首）
-    if [ -f /usr/sbin/smartdns ] || [ -f /usr/bin/smartdns ]; then
-        print_info "正在调用 SmartDNS 核心卸载脚本..."
-        # 尝试重新拉取最新包或寻找本地残留的安装引导来执行卸载
-        local arch=$(detect_arch)
-        local asset_arch=$([ "$arch" = "amd64" ] && echo "x86_64" || echo "aarch64")
-        local download_url=$(curl -s https://api.github.com/repos/pymumu/smartdns/releases/latest | grep "browser_download_url" | grep "$asset_arch-linux-all.tar.gz" | head -n 1 | cut -d '"' -f 4)
-        
-        if [ -n "$download_url" ]; then
-            cd /tmp && wget -q "${download_url}" -O smartdns_un.tar.gz
-            tar -xzf smartdns_un.tar.gz && cd smartdns && chmod +x ./install
-            ./install -u >/dev/null 2>&1 # 官方卸载命令
-            cd /tmp && rm -rf smartdns smartdns_un.tar.gz
-        fi
-    fi
-
-    # 3. 强力清除所有可能的遗留残余文件
+    # 2. 清除程序和残余文件
     clear_client_allowlist
-    rm -f "$SNI_SERVICE_FILE"
+    rm -f /etc/init.d/sniproxy
     rm -rf "$SNI_BASE_DIR"
     rm -rf /etc/smartdns
-    rm -f /usr/lib/systemd/system/smartdns.service /lib/systemd/system/smartdns.service
+    rm -f /etc/init.d/smartdns
     rm -f /usr/sbin/smartdns /usr/bin/smartdns
-    
-    # 4. 刷新 Systemd 守护进程守护缓存
-    systemctl daemon-reload
-    systemctl reset-failed 2>/dev/null || true
     
     print_success "系统环境已彻底净化，恢复至初始状态。"
 }
 
 # ==================== 主控控制面板 ====================
-
 main() {
     local my_ip
     my_ip=$(get_public_ip)
     
-    # -------------------------------------------------------------
-    # 【优化项 1】远程版本属于静态数据，移到菜单外，启动脚本时仅获取一次
-    # -------------------------------------------------------------
     local remote_sni_ver=$(get_remote_sni_version)
     local remote_sdns_ver=$(get_remote_smartdns_version)
 
-    # 定义需要跨循环持久化的状态变量
     local sni_installed="false"
     local smartdns_installed="false"
     local current_sni_ver="${RED}未装载${NC}"
     local current_sdns_ver="${RED}未装载${NC}"
 
-    # -------------------------------------------------------------
-    # 【优化项 2】将耗时的“本地安装检测”和“本地版本解析”封装为独立函数
-    # -------------------------------------------------------------
     refresh_local_status() {
-        # SNIProxy 安装与版本判定
         sni_installed="false"
-        if systemctl list-unit-files | grep -q "^sniproxy\.service"; then
+        if [ -f "/etc/init.d/sniproxy" ]; then
             sni_installed="true"
             if [ -f "$VERSION_FILE" ]; then 
                 current_sni_ver=$(cat "$VERSION_FILE")
@@ -497,42 +472,32 @@ main() {
                 current_sni_ver="v1.0.7"
             fi
         else
-            current_sni_ver="${RED}未装载${NC}"
+            current_sni_ver="${RED}未安装${NC}"
         fi
 
-        # SmartDNS 安装与版本判定
         smartdns_installed="false"
-        if systemctl list-unit-files | grep -q "^smartdns\.service" || command -v smartdns &> /dev/null; then
+        if [ -f "/etc/init.d/smartdns" ] || command -v smartdns &> /dev/null; then
             smartdns_installed="true"
             local raw_ver=$(smartdns -v 2>&1 | head -n 1)
             local main_ver=$(echo "$raw_ver" | awk '{print $2}' | cut -d'-' -f1)
-            local sub_ver=$(echo "$raw_ver" | grep -o 'Release[^)]*')
-
-            if [ -n "$main_ver" ] && [ -n "$sub_ver" ]; then
-                current_sdns_ver="${main_ver} (${sub_ver})"
-            elif [ -n "$main_ver" ]; then
+            if [ -n "$main_ver" ]; then
                 current_sdns_ver="${main_ver}"
             else
-                current_sdns_ver="未知版本"
+                current_sdns_ver="已装载"
             fi
         else
-            current_sdns_ver="${RED}未装载${NC}"
+            current_sdns_ver="${RED}未安装${NC}"
         fi
     }
 
-    # 脚本启动时，先初始化调用一次状态探测
     refresh_local_status
 
-    # -------------------------------------------------------------
-    # 【主循环】现在这里面没有任何耗时命令，按下回车瞬时刷新！
-    # -------------------------------------------------------------
     while true; do
         clear
         
-        # 1. 动态服务运行状态（systemctl is-active 响应速度极快，可保留在内部提供实时状态）
         local sni_status_view="${RED}未安装${NC}"
         if [ "$sni_installed" = "true" ]; then
-            if systemctl is-active --quiet sniproxy; then
+            if rc-service sniproxy status | grep -q "started"; then
                 sni_status_view="${GREEN}运行中${NC} ${YELLOW}(端口: ${LISTEN_PORT})${NC}"
             else
                 sni_status_view="${YELLOW}已停止${NC}"
@@ -541,23 +506,21 @@ main() {
 
         local smartdns_status_view="${RED}未安装${NC}"
         if [ "$smartdns_installed" = "true" ]; then
-            if systemctl is-active --quiet smartdns; then
+            if rc-service smartdns status | grep -q "started"; then
                 smartdns_status_view="${GREEN}运行中${NC} ${YELLOW}(端口: 53)${NC}"
             else
                 smartdns_status_view="${YELLOW}已停止${NC}"
             fi
         fi
 
-        # 2. 动态白名单文件体积检查（本地纯文件判断，不卡顿）
         local whitelist_view="${YELLOW}公开解锁(任意设备改DNS即可解锁)${NC}"
         if [ -f "$ALLOWLIST_FILE" ] && [ -s "$ALLOWLIST_FILE" ]; then
             local count=$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | sed '/^[[:space:]]*$/d' | wc -l)
             whitelist_view="${YELLOW}安全模式(允许已授权的 ${count} 个IP)${NC}"
         fi
 
-        # 3. 渲染主面板
         echo -e "${GREEN}=============================================${NC}"
-        echo -e "${GREEN}     ◈  流媒体公共 DNS 解锁中转面板  ◈       ${NC}"
+        echo -e "${GREEN}        ◈    流媒体 DNS 解锁面板 (Alpine)    ◈         ${NC}"
         echo -e "${GREEN}=============================================${NC}"
         echo -e "${GREEN} SNIProxy 状态:${NC} $sni_status_view"
         echo -e "${GREEN} SmartDNS 状态:${NC} $smartdns_status_view"
@@ -580,15 +543,15 @@ main() {
         echo -ne "${GREEN} 请输入选项: ${NC}"
         local choice
         read -r choice
-        choice=$(echo "$choice" | xargs 2>/dev/null || echo "")
+        choice=$(echo "$choice" | tr -d '[:space:]')
 
         case "$choice" in
             1)
                 install_sniproxy "false"
                 configure_smartdns_rules "false"
-                refresh_local_status # 安装后主动刷新本地状态缓存
+                refresh_local_status
                 echo -e "\n${GREEN}==================================================${NC}"
-                print_success "中转端部署完全就绪！"
+                print_success "Alpine 中转端部署完全就绪！"
                 echo -e "现在，你其他的【落地机】不需要装任何东西，直接执行这三行命令即可解锁："
                 echo -e "${YELLOW}chattr -i /etc/resolv.conf 2>/dev/null || true${NC}"
                 echo -e "${YELLOW}echo \"nameserver ${my_ip}\" > /etc/resolv.conf${NC}"
@@ -598,19 +561,19 @@ main() {
             2) 
                 install_sniproxy "true"
                 configure_smartdns_rules "true"
-                refresh_local_status # 更新后主动刷新本地状态缓存
+                refresh_local_status
                 print_success "SNIProxy 和 SmartDNS 核心程序以及分流规则已全部升级成功！"
                 echo -n "按回车键返回面板..."; read -r _ ;;
             3) 
                 uninstall_all_services
-                refresh_local_status # 卸载后主动刷新本地状态缓存
+                refresh_local_status
                 echo -n "按回车键返回面板..."; read -r _ ;;
             4) 
                 manage_client_allowlist
                 echo -n "按回车键返回面板..."; read -r _ ;;
-            5) systemctl start sniproxy smartdns 2>/dev/null && print_success "服务已完成启动指令。"; sleep 1.5 ;;
-            6) systemctl stop sniproxy smartdns 2>/dev/null && print_success "服务已完成停止指令。"; sleep 1.5 ;;
-            7) systemctl restart sniproxy smartdns 2>/dev/null && print_success "核心组件已全部重启。"; sleep 1.5 ;;
+            5) rc-service sniproxy start 2>/dev/null; rc-service smartdns start 2>/dev/null; print_success "服务已完成启动指令。"; sleep 1.5 ;;
+            6) rc-service sniproxy stop 2>/dev/null; rc-service smartdns stop 2>/dev/null; print_success "服务已完成停止指令。"; sleep 1.5 ;;
+            7) rc-service sniproxy restart 2>/dev/null; rc-service smartdns restart 2>/dev/null; print_success "核心组件已全部重启。"; sleep 1.5 ;;
             8) show_logs; echo -n "按回车键返回面板..."; read -r _ ;;
             9) 
                 clear

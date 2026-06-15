@@ -1,250 +1,445 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# ================== 颜色定义 ==================
+set -e
+
+# ==================== 配置区 ====================
+CONFIG_FILE="/etc/vnstat_tg.conf"
+PERM_SCRIPT_PATH="/usr/local/bin/vnstat_mgr.sh"
+
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
+CRON_TIME="0 0 * * *" # 默认每天 0点 发送
+MONITOR_PORTS="22 80 443 8080" # 默认监控端口字符串，动态保存在配置文件中
+# ================================================
+
+# 颜色定义
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
 RESET="\033[0m"
 
-# ================== 自定义基础配置 ==================
-WEB_ROOT="/var/www/vps_gate"                    # 存放时钟网页和安装脚本的自定义目录
-NGINX_CONF_DIR="/etc/nginx/conf.d"              # 你现有的 Nginx 配置目录
-LOG_ACCESS="/var/log/nginx/gate_access.log"     # 独立的访问日志路径
+SERVICE_NAME=""
+PKG_MANAGER=""
+PKG_REMOVE_CMD=""
+PKG_INSTALL_CMD=""
+INIT_SYSTEM=""
 
-# 原本的工具箱脚本 GitHub 下载后缀
-SCRIPT_URL_SUFFIX="raw.githubusercontent.com/sistarry/toolbox/main/tool/vps-toolbox.sh"
-
-# 检查 root 权限
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}❌ 请以 root 用户运行此脚本！${RESET}"
-    exit 1
-fi
-
-# ================== 功能函数 ==================
-
-# 1. 配置并启动 (自定义域名 + 自定义 SSL)
-install_gate() {
-    echo -e "${GREEN}====== 🛠️ 自定义配置向导 ======${RESET}"
-    
-    # 1.1 输入自定义域名
-    echo -n "🌐 请输入你的自定义域名 (例如 tool.wwwo.eu.cc): "
-    read -r DOMAIN
-    if [ -z "$DOMAIN" ]; then
-        echo -e "${RED}❌ 域名不能为空！${RESET}"
-        return
+# 加载持久化配置
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
     fi
+}
 
-    # 1.2 输入证书路径
-    echo -n "🔑 请输入该域名的 SSL 证书 (.crt / .pem) 绝对路径: "
-    read -r CERT_PATH
-    echo -n "🔑 请输入该域名的 SSL 密钥 (.key) 绝对路径: "
-    read -r KEY_PATH
-
-    # 简单校验文件是否存在
-    if [ ! -f "$CERT_PATH" ] || [ ! -f "$KEY_PATH" ]; then
-        echo -e "${RED}❌ 证书或密钥文件不存在！请检查路径是否正确。${RESET}"
-        return
-    fi
-
-    echo -e "${YELLOW}🔄 开始为域名 [${DOMAIN}] 配置分流环境...${RESET}"
-
-    # 定义该域名专属的配置文件名
-    CONF_FILE="${NGINX_CONF_DIR}/gate_${DOMAIN}.conf"
-
-    # 自动创建自定义网页目录并生成时钟与脚本
-    mkdir -p "$WEB_ROOT"
-
-    # 生成 网页时钟 (clock.html)
-    cat << 'EOF' > "$WEB_ROOT/clock.html"
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VPS 炫酷数字时钟</title>
-    <style>
-        body { background-color: #050505; color: #00ff66; font-family: 'Courier New', monospace; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; overflow: hidden; }
-        .clock-container { text-align: center; padding: 30px; border: 2px solid #00ff66; border-radius: 15px; box-shadow: 0 0 30px rgba(0, 255, 102, 0.3); background: rgba(0,0,0,0.8); }
-        #clock { font-size: 8vw; font-weight: bold; text-shadow: 0 0 20px #00ff66; margin-bottom: 10px; }
-    </style>
-</head>
-<body>
-    <div class="clock-container">
-        <div id="clock">00:00:00</div>
-    </div>
-    <script>
-        setInterval(() => { document.getElementById('clock').textContent = new Date().toTimeString().split(' ')[0]; }, 1000);
-    </script>
-</body>
-</html>
+# 保存持久化配置
+save_config() {
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat << EOF > "$CONFIG_FILE"
+TG_BOT_TOKEN="${TG_BOT_TOKEN}"
+TG_CHAT_ID="${TG_CHAT_ID}"
+CRON_TIME="${CRON_TIME}"
+MONITOR_PORTS="${MONITOR_PORTS}"
 EOF
+}
 
-    # 生成 客户端执行的安装脚本 (install.sh)
-    cat << EOF > "$WEB_ROOT/install.sh"
-#!/bin/bash
-GREEN="\\033[32m"
-YELLOW="\\033[33m"
-RED="\\033[31m"
-RESET="\\033[0m"
+# 获取公网 IP
+get_public_ip() {
+    curl -s --connect-timeout 5 https://api.ipify.org || curl -s --connect-timeout 5 https://ifconfig.me || echo "未知IP"
+}
 
-SCRIPT_PATH="/root/vps-toolbox.sh"
-SCRIPT_URL_SUFFIX="${SCRIPT_URL_SUFFIX}"
-BIN_LINK_DIR="/usr/local/bin"
+# 自动获取系统的默认公网网卡
+get_default_interface() {
+    local iface=$(ip route show | grep default | awk '{print $5}' | head -n 1)
+    echo "${iface:-eth0}"
+}
 
-GITHUB_PROXY=('', 'https://v6.gh-proxy.org/', 'https://gh-proxy.com/', 'https://hub.glowp.xyz/', 'https://proxy.vvvv.ee/', 'https://ghproxy.lvedong.eu.org/')
+# 尝试自动修复并安装 iptables 依赖
+ensure_iptables_installed() {
+    if ! command -v iptables >/dev/null 2>&1; then
+        detect_package_manager
+        echo -e "${YELLOW}检测到系统缺少 iptables 组件，正在尝试自动安装...${RESET}"
+        bash -c "$PKG_INSTALL_CMD" >/dev/null 2>&1 || true
+    fi
+}
 
-if [ ! -f "\$SCRIPT_PATH" ]; then
-    SUCCESS=false
-    for proxy in "\${GITHUB_PROXY[@]}"; do
-        FULL_URL="\${proxy}\${SCRIPT_URL_SUFFIX}"
-        if [ -n "\$proxy" ]; then echo -e "\${YELLOW}🔄 正在通过代理安装... \${RESET}"; else echo -e "\${YELLOW}🔄 正在通过直连安装... \${RESET}"; fi
-        curl -fsSL --connect-timeout 5 -o "\$SCRIPT_PATH" "\$FULL_URL"
-        if [ \$? -eq 0 ] && [ -s "\$SCRIPT_PATH" ]; then SUCCESS=true; break; fi
+# 初始化 iptables 端口流量计数规则
+init_port_iptables() {
+    ensure_iptables_installed
+    if ! command -v iptables >/dev/null 2>&1; then
+        return 0 # 如果实在安装失败（如容器无权限），直接跳过不报错
+    fi
+    
+    load_config
+    local iface=$(get_default_interface)
+    for port in $MONITOR_PORTS; do
+        [ -z "$port" ] && continue
+        # INPUT 计数器
+        if ! iptables -C INPUT -i "$iface" -p tcp --dport "$port" >/dev/null 2>&1; then iptables -A INPUT -i "$iface" -p tcp --dport "$port" >/dev/null 2>&1 || true; fi
+        if ! iptables -C INPUT -i "$iface" -p udp --dport "$port" >/dev/null 2>&1; then iptables -A INPUT -i "$iface" -p udp --dport "$port" >/dev/null 2>&1 || true; fi
+        # OUTPUT 计数器
+        if ! iptables -C OUTPUT -o "$iface" -p tcp --sport "$port" >/dev/null 2>&1; then iptables -A OUTPUT -o "$iface" -p tcp --sport "$port" >/dev/null 2>&1 || true; fi
+        if ! iptables -C OUTPUT -o "$iface" -p udp --sport "$port" >/dev/null 2>&1; then iptables -A OUTPUT -o "$iface" -p udp --sport "$port" >/dev/null 2>&1 || true; fi
     done
-    if [ "\$SUCCESS" = false ]; then echo -e "\${RED}❌ 所有代理节点均安装失败\${RESET}"; exit 1; fi
-    chmod +x "\$SCRIPT_PATH"
-    ln -sf "\$SCRIPT_PATH" "$BIN_LINK_DIR/m"
-    ln -sf "\$SCRIPT_PATH" "$BIN_LINK_DIR/M"
-    echo -e "\${GREEN}✅ 安装完成，输入 m 或 M 运行\${RESET}"
-fi
-exec "\$SCRIPT_PATH"
-EOF
+}
 
-    # 生成包含自动 HTTPS 的 Nginx 配置文件
-    cat << EOF > "$CONF_FILE"
-# HTTP 80 端口配置
-server {
-    listen 80;
-    server_name $DOMAIN;
+# 格式化字节
+format_bytes() {
+    local bytes=$1
+    if [ -z "$bytes" ] || [ "$bytes" -le 0 ] 2>/dev/null; then echo "0 B"; return; fi
+    local units=('B' 'KB' 'MB' 'GB' 'TB')
+    local i=0
+    while [ $(echo "$bytes > 1024" | bc -l) -eq 1 ] && [ $i -lt 4 ]; do
+        bytes=$(echo "scale=2; $bytes / 1024" | bc -l)
+        i=$((i+1))
+    done
+    echo "${bytes} ${units[$i]}"
+}
+
+# 获取某个端口的字节数
+get_port_traffic() {
+    local port=$1
+    local direction=$2
+    if ! command -v iptables >/dev/null 2>&1; then echo "0"; return; fi
+    local tcp_bytes=$(iptables -L $direction -nvx 2>/dev/null | grep -E "tcp dport $port|tcp spt $port" | awk '{print $2}' | awk '{s+=$1} END {print s}')
+    local udp_bytes=$(iptables -L $direction -nvx 2>/dev/null | grep -E "udp dport $port|udp spt $port" | awk '{print $2}' | awk '{s+=$1} END {print s}')
+    echo $(( ${tcp_bytes:-0} + ${udp_bytes:-0} ))
+}
+
+# Telegram 发送基础函数
+send_tg_notification() {
+    local message="$1"
+    load_config
+    if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+        local ip=$(get_public_ip)
+        local hostname=$(hostname)
+        local full_message="【vnStat 流量看板】%0A====================%0A"
+        full_message+="主机名称: ${hostname}%0A"
+        full_message+="公网IP: ${ip}%0A"
+        full_message+="====================%0A"
+        full_message+="${message}"
+        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" -d "chat_id=${TG_CHAT_ID}" -d "text=${full_message}" >/dev/null 2>&1 || true
+    fi
+}
+
+# 收集默认网卡与自定义端口的数据
+send_traffic_report() {
+    init_port_iptables
+    load_config
+    local report=""
+    local iface=$(get_default_interface)
     
-    # HTTP 状态下的 curl 智能分流
-    location / {
-        if (\$http_user_agent ~* "curl") {
-            root $WEB_ROOT;
-            rewrite ^/\$ /install.sh last;
-        }
-        
-        # 浏览器访问则强制重定向到 HTTPS
-        return 301 https://\$host\$request_uri;
-    }
-}
-
-# HTTPS 443 端口配置
-server {
-    listen 443 ssl;
-    server_name $DOMAIN;
-
-    # 动态导入自定义证书
-    ssl_certificate $CERT_PATH;
-    ssl_certificate_key $KEY_PATH;
-
-    ssl_session_timeout 5m;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:HIGH:!aNULL:!MD5:!RC4:!DHE;
-    ssl_prefer_server_ciphers on;
-
-    root $WEB_ROOT;
-    access_log $LOG_ACCESS;
-
-    location / {
-        index clock.html;
-
-        # HTTPS 状态下的 curl 智能分流
-        if (\$http_user_agent ~* "curl") {
-            rewrite ^/\$ /install.sh last;
-        }
-    }
-}
-EOF
-
-    # 检查 Nginx 配置语法
-    nginx -t &>/dev/null
-    if [ $? -eq 0 ]; then
-        # 仅仅平滑重载 Nginx，不影响现有其他网站
-        nginx -s reload
-        # 将当前配置的域名记录到一个本地临时文件，方便卸载和菜单显示
-        echo "$DOMAIN" > "${WEB_ROOT}/current_domain.txt"
-        echo -e "${GREEN}✅ 分流配置成功应用！${RESET}"
-        echo -e "${GREEN}🌐 浏览器打开查看时钟: ${YELLOW}https://${DOMAIN}${RESET}"
-        echo -e "${GREEN}💻 其它 VPS 一键执行命令: ${YELLOW}bash <(curl -fsSL ${DOMAIN})${RESET}"
+    if command -v vnstat >/dev/null 2>&1; then
+        local today_line=$(vnstat -i "$iface" -d --oneline 2>/dev/null | cut -d';' -f4,5,6 || echo "")
+        local month_line=$(vnstat -i "$iface" -m --oneline 2>/dev/null | cut -d';' -f9,10,11 || echo "")
+        report+="📡 默认网卡: ${iface}%0A"
+        if [ -n "$today_line" ]; then report+=" 今日总流量: 下行 $(echo "$today_line" | cut -d';' -f1) | 上行 $(echo "$today_line" | cut -d';' -f2) | 总计 $(echo "$today_line" | cut -d';' -f3)%0A"; fi
+        if [ -n "$month_line" ]; then report+=" 本月总累计: 下行 $(echo "$month_line" | cut -d';' -f1) | 上行 $(echo "$month_line" | cut -d';' -f2) | 总计 $(echo "$month_line" | cut -d';' -f3)%0A"; fi
+        report+="====================%0A"
     else
-        echo -e "${RED}❌ Nginx 语法检查失败，可能是证书路径不匹配或冲突，请重新检查！${RESET}"
-        rm -f "$CONF_FILE"
+        report+="📡 默认网卡: ${iface} (vnStat未安装)%0A====================%0A"
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        report+="🔌 独立端口流量统计:%0A"
+        for port in $MONITOR_PORTS; do
+            [ -z "$port" ] && continue
+            local rx_bytes=$(get_port_traffic "$port" "INPUT")
+            local tx_bytes=$(get_port_traffic "$port" "OUTPUT")
+            report+=" 端口 [ ${port} ] -> 下载: $(format_bytes "$rx_bytes") | 上传: $(format_bytes "$tx_bytes") | 总计: $(format_bytes "$((rx_bytes + tx_bytes))")%0A"
+        done
+    fi
+    send_tg_notification "$report"
+}
+
+# 设置或取消每日定时任务
+manage_cron() {
+    local action="$1"
+    local current_script=$(readlink -f "$0" 2>/dev/null || echo "")
+    local target_run_path="$current_script"
+
+    if [[ "$current_script" =~ "pipe" ]] || [ -z "$current_script" ] || [[ "$current_script" =~ "/proc/" ]]; then
+        target_run_path="$PERM_SCRIPT_PATH"
+        cat "$0" > "$PERM_SCRIPT_PATH" 2>/dev/null || true
+        chmod +x "$PERM_SCRIPT_PATH" 2>/dev/null || true
+    fi
+    
+    if ! command -v crontab >/dev/null 2>&1; then
+        if command -v apk >/dev/null 2>&1; then apk add dcron bc iptables; rc-update add dcron default && rc-service dcron start; fi
+        if command -v apt >/dev/null 2>&1; then apt install -y cron bc iptables; systemctl enable cron --now; fi
+        if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then yum install -y crontabs bc iptables; systemctl enable crond --now; fi
+    fi
+
+    crontab -l 2>/dev/null | grep -v "\-\-cron-report" | crontab - || true
+
+    if [ "$action" = "set" ]; then
+        load_config
+        if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            (crontab -l 2>/dev/null; echo "${CRON_TIME} bash $target_run_path --cron-report >/dev/null 2>&1") | crontab -
+            echo -e "${GREEN}定时任务激活成功！当前频次表达式: ${CRON_TIME}${RESET}"
+        else
+            echo -e "${YELLOW}警告: 未配置 TG 参数，无法启动定时任务。${RESET}"
+        fi
+    elif [ "$action" = "unset" ]; then
+        echo -e "${GREEN}已关闭并清理定时流量通知任务。${RESET}"
     fi
 }
 
-# 2. 查看独立的访问日志
-view_logs() {
-    if [ ! -f "$LOG_ACCESS" ] || [ ! -s "$LOG_ACCESS" ]; then
-        echo -e "${RED}❌ 暂无客户端访问或安装日志。${RESET}"
-        return
-    fi
-    echo -e "${YELLOW}👀 正在实时监听独立日志流 (按 Ctrl+C 退出)...${RESET}"
-    echo -e "${YELLOW}------------------------------------------------------------------${RESET}"
-    tail -f "$LOG_ACCESS"
+# 定时任务独立管理菜单
+menu_cron_config() {
+    while true; do
+        load_config
+        init_port_iptables
+        clear
+        local cron_status="未激活"
+        if crontab -l 2>/dev/null | grep -q "\-\-cron-report"; then cron_status="已激活"; fi
+
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN}       TG 定时通知管理         ${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN}任务状态 :${RESET} ${YELLOW}${cron_status}${RESET}"
+        echo -e "${GREEN}当前时间 :${RESET} ${YELLOW}${CRON_TIME}${RESET}"
+        echo -e "${GREEN}TG Token :${RESET} ${YELLOW}${TG_BOT_TOKEN:-未配置}${RESET}"
+        echo -e "${GREEN}Chat ID  :${RESET} ${YELLOW}${TG_CHAT_ID:-未配置}${RESET}"
+        echo -e "${GREEN}监控端口 :${RESET} ${YELLOW}${MONITOR_PORTS}${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN} 1. 修改 Telegram Bot Token${RESET}"
+        echo -e "${GREEN} 2. 修改 Telegram Chat ID${RESET}"
+        echo -e "${GREEN} 3. 修改定时发送时间${RESET}"
+        echo -e "${GREEN} 4. 修改需要监控的端口${RESET}"
+        echo -e "${GREEN} 5. 开启 / 更新定时通知任务${RESET}"
+        echo -e "${GREEN} 6. 关闭定时通知任务${RESET}"
+        echo -e "${GREEN} 7. 手动测试发送当前流量报告${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read -r cron_choice
+
+        case "$cron_choice" in
+            1) read -rp "请输入新的 TG Bot Token: " TG_BOT_TOKEN; save_config; pause ;;
+            2) read -rp "请输入新的 TG Chat ID: " TG_CHAT_ID; save_config; pause ;;
+            3)
+                clear
+                echo -e "${GREEN}==============================${RESET}"
+                echo -e "${GREEN}       选择定时发送时间        ${RESET}"
+                echo -e "${GREEN}==============================${RESET}"
+                echo -e "  1) 每天0点"
+                echo -e "  2) 每周一0点"
+                echo -e "  3) 每月1号0点"
+                echo -e "  4) 自定义cron表达式"
+                echo -e "${GREEN}==============================${RESET}"
+                echo -ne "${GREEN}请选择时间模板: ${RESET}"
+                read -r time_choice
+                case "$time_choice" in
+                    1) CRON_TIME="0 0 * * *"; echo -e "${GREEN}已选择: 每天0点${RESET}" ;;
+                    2) CRON_TIME="0 0 * * 1"; echo -e "${GREEN}已选择: 每周一0点${RESET}" ;;
+                    3) CRON_TIME="0 0 1 * *"; echo -e "${GREEN}已选择: 每月1号0点${RESET}" ;;
+                    4) read -rp "请输入标准的 5 位 Cron 表达式 (如 0 12 * * *): " temp_cron; if [ -n "$temp_cron" ]; then CRON_TIME="$temp_cron"; fi ;;
+                esac
+                save_config; pause ;;
+            4)
+                echo -e "当前监控的端口为: ${YELLOW}${MONITOR_PORTS}${RESET}"
+                read -rp "请输入新的端口列表（多个端口请用空格隔开，例如 22 80 443 8888）: " input_ports
+                if [ -n "$input_ports" ]; then
+                    MONITOR_PORTS="$input_ports"
+                    save_config
+                    echo -e "${GREEN}端口更新成功！正在刷新防火墙规则...${RESET}"
+                fi
+                pause ;;
+            5) manage_cron "set"; pause ;;
+            6) manage_cron "unset"; pause ;;
+            7) echo "正在发送测试报告..."; send_traffic_report; echo "已提交发送请求。"; pause ;;
+            0) break ;;
+            *) echo "无效选项"; pause ;;
+        esac
+    done
 }
 
-# 3. 卸载清除
-uninstall_gate() {
-    # 自动读取当前正在生效的自定义域名
-    if [ -f "${WEB_ROOT}/current_domain.txt" ]; then
-        CURRENT_DOMAIN=$(cat "${WEB_ROOT}/current_domain.txt")
+detect_init_system() {
+    if command -v systemctl >/dev/null 2>&1; then INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1; then INIT_SYSTEM="openrc"
+    else echo "未检测到支持的初始化系统 (systemd 或 openrc)"; exit 1; fi
+}
+
+detect_service() {
+    detect_init_system
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        if systemctl list-unit-files | grep -q '^vnstat\.service'; then SERVICE_NAME="vnstat"
+        elif systemctl list-unit-files | grep -q '^vnstatd\.service'; then SERVICE_NAME="vnstatd"
+        else SERVICE_NAME="vnstat"; fi
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        if [ -f /etc/init.d/vnstatd ]; then SERVICE_NAME="vnstatd"; else SERVICE_NAME="vnstat"; fi
+    fi
+}
+
+detect_package_manager() {
+    if command -v apk >/dev/null 2>&1; then
+        PKG_MANAGER="apk"; PKG_INSTALL_CMD="apk update && apk add vnstat bc iptables"; PKG_REMOVE_CMD="apk del vnstat"
+    elif command -v apt >/dev/null 2>&1; then
+        PKG_MANAGER="apt"; PKG_INSTALL_CMD="apt update && apt install -y vnstat bc iptables"; PKG_REMOVE_CMD="apt remove -y vnstat && apt autoremove -y"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"; PKG_INSTALL_CMD="dnf install -y epel-release || true; dnf install -y vnstat bc iptables"; PKG_REMOVE_CMD="dnf remove -y vnstat"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MANAGER="yum"; PKG_INSTALL_CMD="yum install -y epel-release || true; yum install -y vnstat bc iptables"; PKG_REMOVE_CMD="yum remove -y vnstat"
     else
-        echo -n "❓ 未检测到默认配置记录，请输入要卸载的域名: "
-        read -r CURRENT_DOMAIN
-    fi
-
-    if [ -z "$CURRENT_DOMAIN" ]; then
-        echo -e "${RED}❌ 未输入域名，取消卸载。${RESET}"
-        return
-    fi
-
-    CONF_FILE="${NGINX_CONF_DIR}/gate_${CURRENT_DOMAIN}.conf"
-
-    echo -e "${RED}⚠️ 确定要清除域名 [${CURRENT_DOMAIN}] 的所有分流配置和网页文件吗？(y/n)${RESET}"
-    read -r confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        rm -f "$CONF_FILE"
-        rm -rf "$WEB_ROOT"
-        nginx -s reload
-        echo -e "${GREEN}✅ 卸载完成，域名 [${CURRENT_DOMAIN}] 的规则已成功剥离并重载 Nginx！${RESET}"
-    else
-        echo -e "${YELLOW}❌ 已取消卸载。${RESET}"
+        echo "未检测到支持的包管理器（apk/apt/dnf/yum）"; exit 1
     fi
 }
 
-# ================== 菜单主循环 ==================
-while true; do
+require_root() { if [ "$(id -u)" -ne 0 ]; then echo "请使用 root 身份运行此脚本"; exit 1; fi; }
+pause() { echo -ne "${GREEN}按回车继续...${RESET}"; read -r _ ; }
+
+manage_service_start() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl enable "$SERVICE_NAME" --now
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-update add "$SERVICE_NAME" default; rc-service "$SERVICE_NAME" start; fi
+}
+
+manage_service_restart() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl restart "$SERVICE_NAME"
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-service "$SERVICE_NAME" restart; fi
+}
+
+manage_service_status() { detect_service; if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl status "$SERVICE_NAME" --no-pager; elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-service "$SERVICE_NAME" status; fi; }
+
+manage_service_stop() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    elif [ "$INIT_SYSTEM" = "openrc" ] ; then
+        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+        rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
+    fi
+}
+
+install_vnstat() {
+    detect_package_manager
+    echo "正在安装 vnstat 及核心组件..."
+    bash -c "$PKG_INSTALL_CMD"
+    echo "正在启动服务并设置开机自启..."
+    manage_service_start
+    init_port_iptables
+    echo "安装与开机自启配置完成！"
+}
+
+restart_service() { manage_service_restart; echo "服务已重启：$SERVICE_NAME"; }
+show_service_status() { manage_service_status; }
+
+list_interfaces() {
+    echo "当前网络接口："
+    if command -v ip >/dev/null 2>&1; then ip -o link show | awk -F': ' '{print $2}' | grep -v lo
+    else ifconfig -a | grep -E '^[a-zA-Z0-9]' | awk '{print $1}' | grep -v lo; fi
+}
+
+add_interface() {
+    list_interfaces
+    read -rp "请输入要监控的网卡名: " iface
+    if [ -z "$iface" ]; then echo "网卡名不能为空"; return; fi
+    vnstat -i "$iface" --add || true
+    manage_service_restart
+    echo "已添加监控接口: $iface"
+}
+
+show_default_stats() { vnstat; }
+show_interface_stats() { list_interfaces; read -rp "请输入要查看的网卡名: " iface; if [ -n "$iface" ]; then vnstat -i "$iface"; fi; }
+show_daily_stats() { read -rp "请输入网卡名（留空则使用默认）: " iface; if [ -n "$iface" ]; then vnstat -i "$iface" -d; else vnstat -d; fi; }
+show_monthly_stats() { read -rp "请输入网卡名（留空则使用默认）: " iface; if [ -n "$iface" ]; then vnstat -i "$iface" -m; else vnstat -m; fi; }
+live_monitor() { read -rp "请输入网卡名（留空则使用默认）: " iface; if [ -n "$iface" ]; then vnstat -i "$iface" -l; else vnstat -l; fi; }
+
+remove_vnstat() {
+    detect_package_manager
+    echo "即将卸载 vnstat..."
+    read -rp "是否同时删除统计数据库 /var/lib/vnstat ? [y/N]: " remove_db
+
+    manage_service_stop
+    manage_cron "unset"
+    rm -f "$CONFIG_FILE"
+    rm -f "$PERM_SCRIPT_PATH"
+
+    if command -v iptables >/dev/null 2>&1; then
+        local iface=$(get_default_interface)
+        for port in $MONITOR_PORTS; do
+            iptables -D INPUT -i "$iface" -p tcp --dport "$port" >/dev/null 2>&1 || true
+            iptables -D INPUT -i "$iface" -p udp --dport "$port" >/dev/null 2>&1 || true
+            iptables -D OUTPUT -o "$iface" -p tcp --sport "$port" >/dev/null 2>&1 || true
+            iptables -D OUTPUT -o "$iface" -p udp --sport "$port" >/dev/null 2>&1 || true
+        done
+    fi
+
+    bash -c "$PKG_REMOVE_CMD"
+    if [[ "$remove_db" =~ ^[Yy]$ ]]; then rm -rf /var/lib/vnstat; fi
+    echo "vnstat 已卸载完成"
+}
+
+get_panel_info() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then panel_status="运行中"; else panel_status="未运行"; fi
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        if rc-service "$SERVICE_NAME" status 2>/dev/null | grep -q "started"; then panel_status="运行中"; else panel_status="未运行"; fi
+    fi
+    if command -v vnstat >/dev/null 2>&1; then
+        panel_version=$(vnstat -v | awk '{print $2}')
+        panel_port=$(get_default_interface)
+    else
+        panel_version="未安装"; panel_status="未安装"; panel_port="无"
+    fi
+}
+
+show_menu() {
     clear
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN}   🌐 Nginx · 全自定义域名与 SSL 分流管理菜单   ${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-    
-    # 动态获取当前运行的域名状态
-    if [ -f "${WEB_ROOT}/current_domain.txt" ]; then
-        RUNNING_DOMAIN=$(cat "${WEB_ROOT}/current_domain.txt")
-        echo -e " 当前状态: ${GREEN}已启用 ➡️  https://${RUNNING_DOMAIN}${RESET}"
-    else
-        echo -e " 当前状态: ${RED}未启用 / 已停用${RESET}"
-    fi
-    
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${YELLOW} 1. ${RESET} 配置并启动 (手动输入自定义域名 + 自定义SSL证书)"
-    echo -e "${YELLOW} 2. ${RESET} 查看 客户端访问与安装日志 (实时监控)"
-    echo -e "${YELLOW} 3. ${RESET} 卸载 / 清除 现有分流配置"
-    echo -e "${YELLOW} 4. ${RESET} 退出脚本"
-    echo -e "${GREEN}================================================${RESET}"
-    echo -n " 请输入数字 [1-4]: "
-    read -r choice
+    get_panel_info
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}         vnStat 面板          ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} ${YELLOW}$panel_status${RESET}"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}网卡 :${RESET} ${YELLOW}${panel_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1. 安装 vnstat (含自动开机自启)${RESET}"
+    echo -e "${GREEN} 2. 重举服务${RESET}"
+    echo -e "${GREEN} 3. 查看服务状态${RESET}"
+    echo -e "${GREEN} 4. 查看网络接口${RESET}"
+    echo -e "${GREEN} 5. 添加监控接口${RESET}"
+    echo -e "${GREEN} 6. 查看默认流量统计${RESET}"
+    echo -e "${GREEN} 7. 查看指定网卡流量${RESET}"
+    echo -e "${GREEN} 8. 查看日流量统计${RESET}"
+    echo -e "${GREEN} 9. 查看月流量统计${RESET}"
+    echo -e "${GREEN}10. 实时流量监控${RESET}"
+    echo -e "${GREEN}11. 配置 TG 定时通知任务 >>${RESET}"
+    echo -e "${GREEN}12. 卸载 vnstat${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+}
 
-    case $choice in
-        1) install_gate ;;
-        2) view_logs ;;
-        3) uninstall_gate ;;
-        4) echo -e "${GREEN}👋 再见！${RESET}" && exit 0 ;;
-        *) echo -e "${RED}❌ 输入错误！${RESET}" ;;
-    esac
-    echo
-    echo -n "按回车键返回菜单..."
-    read -r
-done
+main() {
+    if [ "$1" = "--cron-report" ]; then
+        send_traffic_report
+        exit 0
+    fi
+    require_root
+    load_config
+    while true; do
+        show_menu
+        read -r choice
+        case "$choice" in
+            1) install_vnstat; pause ;;
+            2) restart_service; pause ;;
+            3) show_service_status; pause ;;
+            4) list_interfaces; pause ;;
+            5) add_interface; pause ;;
+            6) show_default_stats; pause ;;
+            7) show_interface_stats; pause ;;
+            8) show_daily_stats; pause ;;
+            9) show_monthly_stats; pause ;;
+            10) live_monitor ;;
+            11) menu_cron_config ;;
+            12) remove_vnstat; pause ;;
+            0) exit 0 ;;
+            *) echo "无效选项"; pause ;;
+        esac
+    done
+}
+
+main "$@"

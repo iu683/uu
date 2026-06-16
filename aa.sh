@@ -1,362 +1,196 @@
 #!/bin/bash
 # ========================================
-# qBittorrent-Nox 一键管理脚本 (官方标准参数版)
+# yt-dlp 一键管理脚本 PRO+ (极致加速防风控版)
+# 菜单字体绿色版
 # ========================================
 
-# 颜色
-RED="\033[31m"
+VIDEO_DIR="/opt/yt-dlp"
+URL_FILE="$VIDEO_DIR/urls.txt"
+COOKIE_FILE="/media/cookies.txt"
+
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-SERVICE_NAME="qbittorrent"
-APP_DIR="/opt/qbittorrent"
-CONFIG_DIR="$APP_DIR/config"
-DOWNLOAD_DIR="$APP_DIR/downloads"
-BIN_PATH="/usr/local/bin/qbittorrent-nox"
-SERVICE_FILE="/etc/systemd/system/qbittorrent.service"
+mkdir -p "$VIDEO_DIR"
 
-# 获取真实的运行用户
-REAL_USER=${SUDO_USER:-$(whoami)}
+# 统一定义带颜色的 Prompt 提示符，解决 read -p 兼容性问题
+PROMPT_CHOICE=$(echo -e "${GREEN}请输入选项: ${RESET}")
+PROMPT_URL=$(echo -e "${GREEN}请输入视频链接: ${RESET}")
+PROMPT_CUSTOM=$(echo -e "${GREEN}请输入完整 yt-dlp 参数（不含 yt-dlp）: ${RESET}")
+PROMPT_DEL=$(echo -e "${GREEN}请输入要删除的目录名称: ${RESET}")
+PROMPT_CONTINUE=$(echo -e "${GREEN}按回车继续...${RESET}")
 
-# 动态获取状态、版本、端口和绑定IP
-get_status_info() {
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        status="${GREEN}已启动${RESET}"
+# 自动检测并获取 Cookies 参数
+get_cookie_args() {
+    if [ -f "$COOKIE_FILE" ]; then
+        echo "--cookies $COOKIE_FILE"
     else
-        status="${RED}未运行${RESET}"
+        echo ""
     fi
+}
 
-    if [[ -f "$BIN_PATH" ]]; then
-        version=$($BIN_PATH --version 2>/dev/null | awk '{print $2}')
-        [[ -z "$version" ]] && version="已安装"
+install_yt() {
+    echo -e "${GREEN}正在安装 yt-dlp、Node.js 及多线程依赖...${RESET}"
+    apt update -y
+    apt install -y ffmpeg curl nano aria2 nodejs
+
+    # 下载最新版 yt-dlp
+    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+    chmod a+rx /usr/local/bin/yt-dlp
+
+    # 配置永久识别 Node.js 环境（防止 YouTube 算法风控）
+    mkdir -p ~/.config/yt-dlp
+    echo '--js-runtimes node:/usr/bin/node' > ~/.config/yt-dlp/config
+
+    echo -e "${GREEN}安装与永久环境配置完成！${RESET}"
+}
+
+update_yt() {
+    echo -e "${GREEN}正在更新 yt-dlp...${RESET}"
+    yt-dlp -U
+}
+
+uninstall_yt() {
+    rm -f /usr/local/bin/yt-dlp
+    rm -rf /opt/yt-dlp
+    rm -rf ~/.config/yt-dlp
+    echo -e "${GREEN}已卸载 yt-dlp 及相关配置文件${RESET}"
+    exit 0
+}
+
+download_single() {
+    read -e -p "$PROMPT_URL" url
+    [ -z "$url" ] && return
+    
+    # 组合多线程与Cookies参数
+    yt-dlp $(get_cookie_args) \
+        --external-downloader aria2c --external-downloader-args "-x 16 -s 16 -k 1M" \
+        -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
+        --write-subs --sub-langs all \
+        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites "$url"
+}
+
+download_batch() {
+    if [ ! -f "$URL_FILE" ]; then
+        echo "# 一行一个视频链接" > "$URL_FILE"
+    fi
+    nano "$URL_FILE"
+    
+    yt-dlp $(get_cookie_args) \
+        --external-downloader aria2c --external-downloader-args "-x 16 -s 16 -k 1M" \
+        -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
+        --write-subs --sub-langs all \
+        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
+        --write-info-json \
+        -a "$URL_FILE" \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites
+}
+
+download_custom() {
+    read -e -p "$PROMPT_CUSTOM" custom
+    [ -z "$custom" ] && return
+    
+    yt-dlp $(get_cookie_args) -P "$VIDEO_DIR" $custom \
+        --write-subs --sub-langs all \
+        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites
+}
+
+download_mp3() {
+    read -e -p "$PROMPT_URL" url
+    [ -z "$url" ] && return
+    
+    yt-dlp $(get_cookie_args) \
+        --external-downloader aria2c --external-downloader-args "-x 16 -s 16 -k 1M" \
+        -P "$VIDEO_DIR" -x --audio-format mp3 --audio-quality 0 \
+        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites "$url"
+}
+
+delete_video() {
+    echo -e "${GREEN}当前视频目录：${RESET}"
+    ls "$VIDEO_DIR"
+    read -e -p "$PROMPT_DEL" name
+    [ -z "$name" ] && return
+    
+    if [ -d "$VIDEO_DIR/$name" ]; then
+        rm -rf "$VIDEO_DIR/$name"
+        echo -e "${GREEN}已成功删除目录: $name${RESET}"
     else
-        version="${RED}未安装${RESET}"
+        echo -e "${RED}未找到该目录！${RESET}"
     fi
+}
 
-    if [[ -f "$SERVICE_FILE" ]]; then
-        # 从服务文件中精准提取端口
-        port_show=$(grep -oE -- '--webui-port=[0-9]+' "$SERVICE_FILE" | cut -d= -f2)
-        [[ -z "$port_show" ]] && port_show="8080"
-        
-        # 从服务文件中提取绑定IP
-        ip_show=$(grep -oE -- '--bind-to=[^ ]+' "$SERVICE_FILE" | cut -d= -f2)
-        [[ -z "$ip_show" ]] && ip_show="0.0.0.0 (公网)"
+show_list() {
+    echo -e "${GREEN}已下载视频列表：${RESET}"
+    if [ -d "$VIDEO_DIR" ] && [ "$(ls -A $VIDEO_DIR)" ]; then
+        ls -td "$VIDEO_DIR"/*/ 2>/dev/null | sed "s|$VIDEO_DIR/||g"
     else
-        port_show="N/A"
-        ip_show="N/A"
+        echo -e "${YELLOW}暂无视频${RESET}"
     fi
-}
-
-validate_port() {
-    local port=$1
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
-        echo -e "${RED}错误: 端口范围必须在 1-65535 之间！${RESET}"
-        return 1
-    fi
-    return 0
-}
-
-get_qb_password() {
-    local log_line log_pass
-    log_line=$(sudo journalctl -u "$SERVICE_NAME" --no-pager | grep -Ei "temporary password is:|password was randomly generated:|provided for this session:" | tail -n 1)
-    if [[ -n "$log_line" ]]; then
-        log_pass=$(echo "$log_line" | sed -e 's/.*session://I' -e 's/.*is://I' | tr -d '[:space:].:')
-    fi
-    if [[ -n "$log_pass" ]]; then
-        echo -e "${GREEN}${log_pass}${RESET}"
-    else
-        echo -e "${RED}未找到临时密码（可能已修改或日志已清空）${RESET}"
-    fi
-}
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "127.0.0.1"
-}
-
-# 1. 部署 qBittorrent-Nox
-install_qbittorrent() {
-    if [[ -f "$BIN_PATH" ]]; then
-        echo -e "${YELLOW}提示: qBittorrent 已安装在 $BIN_PATH，请勿重复安装。${RESET}"
-        return
-    fi
-
-    echo -ne "${YELLOW}请输入你想要设置的 WebUI 端口号 [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-    if ! validate_port "$custom_port"; then return; fi
-
-    echo -e "${YELLOW}请选择 WebUI 绑定的 IP 地址:${RESET}"
-    echo -e "  1) 0.0.0.0   (默认：允许公网/局域网访问)"
-    echo -e "  2) 127.0.0.1 (安全：仅限本地或反向代理/SSH隧道访问)"
-    echo -ne "${YELLOW}请选择选项或直接输入自定义IP [默认: 1]: ${RESET}"
-    read -r ip_choice
-    
-    local exec_args="--webui-port=${custom_port}"
-    local target_ip="0.0.0.0"
-    if [[ "$ip_choice" == "2" ]]; then
-        exec_args="--webui-port=${custom_port} --bind-to=127.0.0.1"
-        target_ip="127.0.0.1"
-    elif [[ -n "$ip_choice" && "$ip_choice" != "1" ]]; then
-        exec_args="--webui-port=${custom_port} --bind-to=${ip_choice}"
-        target_ip="${ip_choice}"
-    fi
-
-    local arch url_file
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64)      url_file="x86_64-qbittorrent-nox" ;;
-        aarch64)     url_file="aarch64-qbittorrent-nox" ;;
-        armv7l)      url_file="armv7-qbittorrent-nox" ;;
-        armhf)       url_file="armhf-qbittorrent-nox" ;;
-        riscv64)     url_file="riscv64-qbittorrent-nox" ;;
-        i386|i686)   url_file="x86-qbittorrent-nox" ;;
-        *) echo -e "${RED}错误: 暂不支持您的系统架构 ($arch)！${RESET}" && return ;;
-    esac
-
-    sudo apt update && sudo apt install -y curl wget
-
-    echo -e "${YELLOW}正在检索 GitHub 最新版本信息...${RESET}"
-    local release_json latest_tag expected_sha
-    release_json=$(curl -s https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases/latest)
-    latest_tag=$(echo "$release_json" | grep -oP '"tag_name": "\K[^"]+')
-    if [[ -z "$latest_tag" ]]; then echo -e "${RED}错误: 无法获取最新版本号。${RESET}" && return; fi
-
-    expected_sha=$(echo "$release_json" | grep -A 2 "$url_file" | grep -oP '"body": "sha256:\K[a-f0-9]{64}' || echo "$release_json" | grep -oP "sha256:${url_file}\s+\K[a-f0-9]{64}" || echo "$release_json" | sed -n "/${url_file}/,/^$/p" | grep -oP '[a-f0-9]{64}')
-    
-    local download_url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${latest_tag}/${url_file}"
-    echo -e "${YELLOW}正在从 GitHub 下载最新二进制文件...${RESET}"
-    sudo wget -q --show-progress -O "$BIN_PATH" "$download_url"
-    if [[ $? -ne 0 || ! -s "$BIN_PATH" ]]; then echo -e "${RED}错误: 下载失败！${RESET}" && sudo rm -f "$BIN_PATH" && return; fi
-
-    if [[ -n "$expected_sha" && ${#expected_sha} -eq 64 ]]; then
-        local calculated_sha
-        calculated_sha=$(sha256sum "$BIN_PATH" | awk '{print $1}')
-        if [[ "$calculated_sha" != "$expected_sha" ]]; then echo -e "${RED}错误: SHA256 校验失败！${RESET}" && sudo rm -f "$BIN_PATH" && return; fi
-    fi
-
-    sudo chmod +x "$BIN_PATH"
-    sudo mkdir -p "$CONFIG_DIR" "$DOWNLOAD_DIR"
-    sudo chown -R "$REAL_USER":"$REAL_USER" "$APP_DIR"
-    sudo chmod -R 755 "$APP_DIR"
-
-    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
-[Unit]
-Description=qBittorrent Command Line Client (Static Latest)
-After=network.target
-
-[Service]
-ExecStart=$BIN_PATH ${exec_args} --profile=$CONFIG_DIR
-User=$REAL_USER
-Restart=on-failure
-WorkingDirectory=$DOWNLOAD_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    sudo systemctl daemon-reload
-    sudo systemctl start qbittorrent
-    sudo systemctl enable qbittorrent
-
-    echo -e "${YELLOW}等待服务启动并生成密码...${RESET}"
-    sleep 4
-
-    local display_ip="$target_ip"
-    [[ "$target_ip" == "0.0.0.0" ]] && display_ip=$(get_public_ip)
-
-    echo -e "\n${GREEN}qBittorrent-Nox 安装完成!${RESET}"
-    echo -e "${YELLOW}WebUI 地址: http://${display_ip}:${custom_port}${RESET}"
-    echo -e "${YELLOW}用户名: admin${RESET}"
-    echo -ne "${YELLOW}初始密码: ${RESET}"
-    get_qb_password
-}
-
-# 2. 自动检查并更新到最新版 (继承原有端口和 IP 绑定选项)
-update_qbittorrent() {
-    if [[ ! -f "$BIN_PATH" ]]; then echo -e "${RED}错误: 未安装 qBittorrent！${RESET}" && return; fi
-
-    # 完整继承现有的启动参数字符串，直接保持原样更新
-    local current_args="--webui-port=8080"
-    if [[ -f "$SERVICE_FILE" ]]; then
-        current_args=$(grep -oE -- '--webui-port=[0-9]+(--bind-to=[^ ]+)?|--webui-port=[0-9]+ --bind-to=[^ ]+' "$SERVICE_FILE" || grep -oP 'ExecStart='"$BIN_PATH"'\s+\K.*(?=\s+--profile)' "$SERVICE_FILE")
-        [[ -z "$current_args" ]] && current_args="--webui-port=8080"
-    fi
-
-    echo -e "${YELLOW}正在检测系统架构并获取最新版本...${RESET}"
-    local arch url_file
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64)      url_file="x86_64-qbittorrent-nox" ;;
-        aarch64)     url_file="aarch64-qbittorrent-nox" ;;
-        armv7l)      url_file="armv7-qbittorrent-nox" ;;
-        armhf)       url_file="armhf-qbittorrent-nox" ;;
-        riscv64)     url_file="riscv64-qbittorrent-nox" ;;
-        i386|i686)   url_file="x86-qbittorrent-nox" ;;
-        *) echo -e "${RED}错误: 暂不支持您的架构 ($arch)！${RESET}" && return ;;
-    esac
-
-    local release_json latest_tag expected_sha
-    release_json=$(curl -s https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases/latest)
-    latest_tag=$(echo "$release_json" | grep -oP '"tag_name": "\K[^"]+')
-    if [[ -z "$latest_tag" ]]; then echo -e "${RED}错误: 无法获取最新版本号。${RESET}" && return; fi
-
-    expected_sha=$(echo "$release_json" | grep -A 2 "$url_file" | grep -oP '"body": "sha256:\K[a-f0-9]{64}' || echo "$release_json" | grep -oP "sha256:${url_file}\s+\K[a-f0-9]{64}" || echo "$release_json" | sed -n "/${url_file}/,/^$/p" | grep -oP '[a-f0-9]{64}')
-
-    local tmp_bin="/tmp/qbittorrent-nox.tmp"
-    sudo wget -q --show-progress -O "$tmp_bin" "https://github.com/userdocs/qbittorrent-nox-static/releases/download/${latest_tag}/${url_file}"
-    if [[ $? -ne 0 || ! -s "$tmp_bin" ]]; then echo -e "${RED}错误: 下载失败。${RESET}" && sudo rm -f "$tmp_bin" && return; fi
-
-    if [[ -n "$expected_sha" && ${#expected_sha} -eq 64 ]]; then
-        local calculated_sha
-        calculated_sha=$(sha256sum "$tmp_bin" | awk '{print $1}')
-        if [[ "$calculated_sha" != "$expected_sha" ]]; then echo -e "${RED}错误: 校验失败。${RESET}" && sudo rm -f "$tmp_bin" && return; fi
-    fi
-
-    sudo systemctl stop qbittorrent
-    sudo mv -f "$tmp_bin" "$BIN_PATH"
-    sudo chmod +x "$BIN_PATH"
-    
-    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
-[Unit]
-Description=qBittorrent Command Line Client (Static Latest)
-After=network.target
-
-[Service]
-ExecStart=$BIN_PATH ${current_args} --profile=$CONFIG_DIR
-User=$REAL_USER
-Restart=on-failure
-WorkingDirectory=$DOWNLOAD_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    sudo systemctl daemon-reload
-    sudo systemctl start qbittorrent
-    echo -e "${GREEN}qBittorrent 已成功无缝更新至最新版！${RESET}"
-}
-
-# 3. 卸载服务
-uninstall_qbittorrent() {
-    sudo systemctl stop ${SERVICE_NAME} 2>/dev/null
-    sudo systemctl disable ${SERVICE_NAME} 2>/dev/null
-    sudo rm -f "$SERVICE_FILE"
-    sudo systemctl daemon-reload
-    sudo rm -f "$BIN_PATH"
-    sudo rm -rf "$APP_DIR"
-    echo -e "${GREEN}qBittorrent 已彻底卸载。${RESET}"
-}
-
-# 4. 修改端口和 IP 绑定配置
-edit_config() {
-    if [[ ! -f "$SERVICE_FILE" ]]; then echo -e "${RED}错误: 未检测到服务文件！${RESET}" && return; fi
-    get_status_info
-    echo -e "${CYAN}当前 WebUI 端口为 : ${port_show}${RESET}"
-    echo -e "${CYAN}当前 WebUI 绑定 IP: ${ip_show}${RESET}"
-    echo "---"
-    
-    echo -ne "${YELLOW}请输入新的 WebUI 端口号 (直接回车保持不变): ${RESET}"
-    read -r new_port
-    [[ -z "$new_port" ]] && new_port=$port_show
-    if ! validate_port "$new_port"; then return; fi
-
-    echo -e "${YELLOW}请选择新的 WebUI 绑定 IP:${RESET}"
-    echo -e "  1) 0.0.0.0   (公网/局域网访问)"
-    echo -e "  2) 127.0.0.1 (本地回回环/绝对安全)"
-    echo -ne "${YELLOW}请输入选项或输入自定义IP (直接回车保持不变): ${RESET}"
-    read -r ip_choice
-    
-    local target_ip="$ip_show"
-    [[ "$target_ip" == *"公网"* ]] && target_ip="0.0.0.0"
-
-    case "$ip_choice" in
-        1) target_ip="0.0.0.0" ;;
-        2) target_ip="127.0.0.1" ;;
-        *) [[ -n "$ip_choice" ]] && target_ip="$ip_choice" ;;
-    esac
-
-    # 重新拼接干净的执行参数
-    local final_args="--webui-port=${new_port}"
-    [[ "$target_ip" != "0.0.0.0" ]] && final_args="--webui-port=${new_port} --bind-to=${target_ip}"
-
-    # 重新用全新参数覆盖服务文件里的 ExecStart 行
-    sudo sed -i "s|ExecStart=$BIN_PATH.*|ExecStart=$BIN_PATH ${final_args} --profile=$CONFIG_DIR|g" "$SERVICE_FILE"
-    
-    sudo systemctl daemon-reload
-    sudo systemctl restart "$SERVICE_NAME"
-    echo -e "${GREEN}配置修改成功并已重启服务！${RESET}"
-}
-
-start_qbittorrent() { sudo systemctl start ${SERVICE_NAME} && echo -e "${GREEN}qBittorrent 已启动${RESET}"; }
-stop_qbittorrent() { sudo systemctl stop ${SERVICE_NAME} && echo -e "${YELLOW}qBittorrent 已停止${RESET}"; }
-restart_qbittorrent() { sudo systemctl restart ${SERVICE_NAME} && echo -e "${GREEN}qBittorrent 已重启${RESET}"; }
-logs_qbittorrent() { sudo journalctl -u ${SERVICE_NAME} -n 50 -f; }
-
-show_node_info() {
-    get_status_info
-    local d_ip="$ip_show"
-    [[ "$d_ip" == *"公网"* ]] && d_ip=$(get_public_ip)
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    qBittorrent 访问与配置信息    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}WebUI 地址 : http://${d_ip}:${port_show}${RESET}"
-    echo -e "${YELLOW}当前绑定 IP: ${ip_show}${RESET}"
-    echo -e "${YELLOW}默认用户名 : admin${RESET}"
-    echo -ne "${YELLOW}初始密码   : ${RESET}"
-    get_qb_password
-    echo -e "${GREEN}================================${RESET}"
-}
-
-menu() {
-    clear
-    get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     qBittorrent 自动管理面板     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}绑定IP :${RESET} ${YELLOW}${ip_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 qBittorrent (自动最新版)${RESET}"
-    echo -e "${GREEN}2. 检查并更新 qBittorrent${RESET}"
-    echo -e "${GREEN}3. 卸载 qBittorrent${RESET}"
-    echo -e "${GREEN}4. 修改端口/IP绑定配置${RESET}"
-    echo -e "${GREEN}5. 启动 qBittorrent${RESET}"
-    echo -e "${GREEN}6. 停止 qBittorrent${RESET}"
-    echo -e "${GREEN}7. 重启 qBittorrent${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_qbittorrent ;;
-        2) update_qbittorrent ;;
-        3) uninstall_qbittorrent ;;
-        4) edit_config ;;
-        5) start_qbittorrent ;;
-        6) stop_qbittorrent ;;
-        7) restart_qbittorrent ;;
-        8) logs_qbittorrent ;;
-        9) show_node_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
 }
 
 while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
+    clear
+    if [ -x "/usr/local/bin/yt-dlp" ]; then
+        STATUS="${GREEN}已安装${RESET}"
+    else
+        STATUS="${RED}未安装${RESET}"
+    fi
+
+    # 检测 Cookies 状态赋予人性化提示
+    if [ -f "$COOKIE_FILE" ]; then
+        COOKIE_STATUS="${GREEN}已就绪 (/media/cookies.txt)${RESET}"
+    else
+        COOKIE_STATUS="${YELLOW}未配置 (如遇风控请上传至 /media/cookies.txt)${RESET}"
+    fi
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}          yt-dlp 高级管理脚本 PRO+                  ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN} 核心状态: $STATUS${RESET}"
+    echo -e "${GREEN} Cookie状态: $COOKIE_STATUS${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN} 1. 安装环境 (含 yt-dlp、Node.js、Aria2加速)${RESET}"
+    echo -e "${GREEN} 2. 更新 yt-dlp${RESET}"
+    echo -e "${GREEN} 3. 卸载 yt-dlp${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    echo -e "${GREEN} 5. 单个视频下载 (16线程极速)${RESET}"
+    echo -e "${GREEN} 6. 批量视频下载 (编辑 urls.txt)${RESET}"
+    echo -e "${GREEN} 7. 自定义参数下载${RESET}"
+    echo -e "${GREEN} 8. 下载为最佳音质 MP3${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    echo -e "${GREEN} 9. 删除视频目录${RESET}"
+    echo -e "${GREEN} 10. 查看下载列表${RESET}"
+    echo -e "${GREEN} 0. 退出脚本${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    
+    read -e -p "$PROMPT_CHOICE" choice
+
+    case $choice in
+        1) install_yt ;;
+        2) update_yt ;;
+        3) uninstall_yt ;;
+        5) download_single ;;
+        6) download_batch ;;
+        7) download_custom ;;
+        8) download_mp3 ;;
+        9) delete_video ;;
+        10) show_list ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
+    esac
+
+    echo
+    read -p "$PROMPT_CONTINUE"
 done

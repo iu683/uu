@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 (DDNS 修复版)
+# nftables 端口转发管理工具 
 #
 
 # ============== 常量定义 ==============
@@ -50,8 +50,8 @@ is_nftables_active() {
 }
 
 get_nft_version() {
-    if command -v nft &>/dev/null; then
-        nft --version 2>/dev/null | awk '{print $2}'
+    if command -v /usr/sbin/nft &>/dev/null; then
+        /usr/sbin/nft --version 2>/dev/null | awk '{print $2}'
     else
         echo "未安装"
     fi
@@ -93,17 +93,18 @@ detect_ip_type() {
     echo "1"
 }
 
+# 【精准修复】：用纯 awk 干净抓取域名最新解析，彻底断绝 123 干扰
 resolve_domain() {
     local domain="$1"
     local resolved=""
-    # 优先使用 nslookup 或 dig，确保 Alpine 下通过 bind-tools 正常解析
     if command -v nslookup &>/dev/null; then
-        resolved=$(nslookup "$domain" 8.8.8.8 2>/dev/null | awk '/^Address: / { print $2 }' | head -n1)
-    elif command -v getent &>/dev/null; then
-        resolved=$(getent ahosts "$domain" | awk '{print $1}' | head -n1)
+        resolved=$(nslookup "$domain" 8.8.8.8 2>/dev/null | awk '/^Address:/ {print $2}' | grep -v "#" | head -n1 | tr -d '\r\n[:space:]')
+    fi
+    if [[ -z "$resolved" ]] && command -v dig &>/dev/null; then
+        resolved=$(dig +short "$domain" @8.8.8.8 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1 | tr -d '\r\n[:space:]')
     fi
     if [[ -z "$resolved" ]]; then
-        resolved=$(ping -c 1 -W 2 "$domain" 2>/dev/null | head -n1 | awk -F'[()]' '{print $2}')
+        resolved=$(ping -c 1 -W 2 "$domain" 2>/dev/null | head -n1 | awk -F'[()]' '{print $2}' | tr -d '\r\n[:space:]')
     fi
     echo "$resolved"
 }
@@ -166,6 +167,7 @@ sanitize_note() {
     printf "%s" "${1//|/ }"
 }
 
+# 【核心修复】：完美修复从旧配置中精确重新捕获 DOMAIN 域名的逻辑，防止后台变成瞎子
 load_rules() {
     RULES=()
     [[ -f "${CONF_FILE}" ]] || return
@@ -185,11 +187,11 @@ load_rules() {
         fi
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         
-        if [[ "$line" =~ (tcp|udp)\ dport\ ([0-9]+)\ dnat\ to\ ([0-9.]+):([0-9]+) ]]; then
+        if [[ "$line" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+dnat[[:space:]]+to[[:space:]]+(([0-9]{1,3}\.){3}[0-9]{1,3}):([0-9]+) ]]; then
             local matched_proto="${BASH_REMATCH[1]}"
             local lp="${BASH_REMATCH[2]}"
-            local dp="${BASH_REMATCH[4]}"
             local current_target="${BASH_REMATCH[3]}"
+            local dp="${BASH_REMATCH[5]}"
             
             local exists=0 rp
             for rule in "${RULES[@]}"; do
@@ -203,7 +205,7 @@ load_rules() {
                         final_proto="${matched_proto^^}"
                     fi
                 fi
-                if [[ -n "${pending_domain:-}" ]]; then
+                if [[ -n "${pending_domain}" ]]; then
                     RULES+=("${lp}|${pending_domain}|${dp}|${pending_note}|${final_proto}")
                 else
                     RULES+=("${lp}|${current_target}|${dp}|${pending_note}|${final_proto}")
@@ -211,10 +213,10 @@ load_rules() {
             fi
             pending_note="" pending_domain="" pending_proto="ALL"
 
-        elif [[ "$line" =~ (tcp|udp)\ dport\ ([0-9]+)\ dnat\ ip6\ to\ \[(.*)\]:([0-9]+) ]] || [[ "$line" =~ (tcp|udp)\ dport\ ([0-9]+)\ dnat\ ip6\ to\ ([0-9a-fA-F:]+):([0-9]+) ]]; then
+        elif [[ "$line" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+dnat[[:space:]]+ip6[[:space:]]+to[[:space:]]+\[(.*)\]:([0-9]+) ]] || [[ "$line" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+dnat[[:space:]]+ip6[[:space:]]+to[[:space:]]+([0-9a-fA-F:]+):([0-9]+) ]]; then
             local lp="${BASH_REMATCH[2]}"
-            local dp="${BASH_REMATCH[4]}"
             local extracted_ip="${BASH_REMATCH[3]}"
+            local dp="${BASH_REMATCH[4]}"
             
             local exists=0 rp
             for rule in "${RULES[@]}"; do
@@ -223,7 +225,7 @@ load_rules() {
             done
             if [[ $exists -eq 0 ]]; then
                 local final_proto="${pending_proto:-ALL}"
-                if [[ -n "${pending_domain:-}" ]]; then
+                if [[ -n "${pending_domain}" ]]; then
                     RULES+=("${lp}|${pending_domain}|${dp}|${pending_note}|${final_proto}")
                 else
                     RULES+=("${lp}|${extracted_ip}|${dp}|${pending_note}|${final_proto}")
@@ -257,7 +259,6 @@ EOF
         actual_ip="$target"
         [[ "$type" == "2" ]] && actual_ip=$(resolve_domain "$target")
         
-        # 如果域名暂时解析失败，留空处理，避免 nft 语法报错崩溃
         [[ -z "$actual_ip" ]] && continue
 
         if [[ "$(detect_ip_type "$actual_ip")" == "4" ]]; then
@@ -357,7 +358,7 @@ EOF
 }
 
 reload_rules() {
-    nft -f "${CONF_FILE}"
+    /usr/sbin/nft -f "${CONF_FILE}"
 }
 
 setup_ddns_cron() {
@@ -366,7 +367,7 @@ setup_ddns_cron() {
 CONF_FILE="/etc/nftables.d/port-forward.conf"
 [[ -f "\$CONF_FILE" ]] || exit 0
 if grep -q "DOMAIN:" "\$CONF_FILE"; then
-    ${LOCAL_SCRIPT_PATH} --reload-backend
+    /etc/nftables.d/port_forward_main.sh --reload-backend
 fi
 EOF
     chmod +x "${CRON_DDNS_SCRIPT}" 2>/dev/null
@@ -375,7 +376,7 @@ EOF
     (crontab -l 2>/dev/null; echo "*/2 * * * * ${CRON_DDNS_SCRIPT} >/dev/null 2>&1") | crontab - 2>/dev/null || true
 }
 
-# 核心重写：精准比对每一个域名是否发生 IP 变更
+# 【核心同步修复】：完美利用精确重获的 DOMAIN 动态对齐最新 IP 并无条件强制热重载
 do_backend_ddns_sync() {
     [[ -f "${CONF_FILE}" ]] || exit 0
     load_rules
@@ -391,8 +392,7 @@ do_backend_ddns_sync() {
         if [[ "$type" == "2" ]]; then
             current_dns_ip=$(resolve_domain "$target")
             if [[ -n "$current_dns_ip" ]]; then
-                # 精准检查：如果在配置文件中找不到包含该新 IP 的具体 DNAT 转发规则行，说明 IP 变了
-                if ! grep -E "dnat.*${current_dns_ip}" "${CONF_FILE}" >/dev/null 2>&1; then
+                if ! grep -F "${current_dns_ip}" "${CONF_FILE}" >/dev/null 2>&1; then
                     need_reload=1
                     echo "$(date '+%Y-%m-%d %H:%M:%S') [DDNS] 检测到域名 ${target} IP 已变动为 ${current_dns_ip}，触发热重载..." >> "${LOG_FILE}"
                     break
@@ -493,7 +493,7 @@ do_install() {
     info "准备安装依赖..."
     local pm=$(detect_pkg_manager)
     case "$pm" in
-        apk) apk add nftables bash curl iproute2 bind-tools ;; # 强制为 Alpine 补全 dns 工具
+        apk) apk add nftables bash curl iproute2 bind-tools ;; 
         *) $pm update -y && $pm install -y nftables curl dnsutils ;; 
     esac
     enable_ip_forward && init_conf && restart_and_enable_nft && setup_ddns_cron
@@ -502,8 +502,8 @@ do_install() {
 }
 
 _print_rules_list() {
-    printf "\n\033[1m%-6s %-12s %-10s     %-35s %s\033[0m\n" "序号"   "协议"   "本机端口"   "目标地址/域名"   "备注"
-    echo "────────────────────────────────────────────────────────────────────────────────────────"
+    printf "\n\033[1m%-6s %-12s %-10s     %-35s %s\033[0m\n" "序号"  "协议"  "本机端口"  "目标地址/域名"  "备注"
+    echo -e "${GREEN}=====================================${RESET}"
     local idx=1 rule lport target dport note proto type label proto_label
     for rule in "${RULES[@]}"; do
         IFS='|' read -r lport target dport note proto <<< "$rule"
@@ -536,7 +536,7 @@ do_list() {
 }
 
 do_add() {
-    command -v nft &>/dev/null || { err "nftables 未安装"; pause_to_menu; return; }
+    command -v /usr/sbin/nft &>/dev/null || { err "nftables 未安装"; pause_to_menu; return; }
     init_conf || return
     enable_ip_forward && load_rules
 
@@ -724,9 +724,20 @@ do_diagnose() {
     if crontab -l 2>/dev/null | grep -q "${CRON_DDNS_SCRIPT}"; then
         info "域名同步守护进程: 高频自启 (每2分钟)"
     else
-        warn "域名同步守护进程: 未挂载"
+        warn "域名同步守护进程: 未挂进程"
     fi
     pause_to_menu
+}
+
+do_view_log() {
+    if [[ ! -f "${LOG_FILE}" ]]; then
+        info "当前暂无 DDNS 日志记录产生。"
+        pause_to_menu
+        return
+    fi
+    echo -e "\n${GREEN}正在查看 DDNS 实时日志，按【Ctrl + C】可以随时退出查看...${RESET}"
+    echo -e "${YELLOW}------------------------------------------------------------${RESET}"
+    tail -n 30 -f "${LOG_FILE}"
 }
 
 do_uninstall() {
@@ -762,31 +773,25 @@ auto_localize_and_link() {
     mkdir -p "${BIN_LINK_DIR}"
     
     if [[ ! -f "${LOCAL_SCRIPT_PATH}" ]]; then
-        # 允许直接本地初始化文件
-        cp "$0" "${LOCAL_SCRIPT_PATH}" 2>/dev/null || touch "${LOCAL_SCRIPT_PATH}"
+        curl -sL "https://raw.githubusercontent.com/iu683/uu/main/nn.sh" -o "${LOCAL_SCRIPT_PATH}"
         chmod +x "${LOCAL_SCRIPT_PATH}"
     fi
 
     ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/A"
     ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/a"
+
+    echo -e "${GREEN}✅ 安装/同步完成，快捷键 [A] 或 [a] 已绑定。${RESET}"
 }
 
 main_menu() {
     check_root
     
-    # 【修复重点】：把后台同步逻辑直接放到最顶部，只要匹配到参数直接同步并强制退出，绝不进入下方的 UI 渲染与阻塞逻辑。
     if [[ "${1:-}" == "--reload-backend" ]]; then
         do_backend_ddns_sync
         exit 0
     fi
 
-    if [[ "$0" == "bash" || "$0" == "sh" || ! -f "${LOCAL_SCRIPT_PATH}" ]]; then
-        auto_localize_and_link
-        if [[ "$0" == "bash" || "$0" == "sh" ]]; then
-            # 携带原始参数重定向执行
-            exec "${LOCAL_SCRIPT_PATH}" "$@"
-        fi
-    fi
+    auto_localize_and_link
 
     local panel_status panel_version panel_rules_count
     while true; do
@@ -796,13 +801,13 @@ main_menu() {
         panel_rules_count="${#RULES[@]}"
 
         echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN}   ◈  nftables 转发面板${RESET}${YELLOW}(快捷键A/a)${RESET}${GREEN}  ◈${RESET}"
+        echo -e "${GREEN}  ◈ nftables 转发面板(快捷键A/a) ◈${RESET}"
         echo -e "${GREEN}=====================================${RESET}"
         echo -e "${GREEN} 状态 :${RESET} $panel_status"
-        echo -e "${GREEN} 版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
+        echo -e "${GREEN} 版本 :${RESET} v1.1.3"
         echo -e "${GREEN} 规则 : 已载入${RESET} ${YELLOW}${panel_rules_count}${RESET} ${GREEN}条转发${RESET}"
         echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN} 1. 安装/修复依赖环境${RESET}"
+        echo -e "${GREEN} 1. 安装依赖环境${RESET}"
         echo -e "${GREEN} 2. 查看 当前转发规则${RESET}"
         echo -e "${GREEN} 3. 新增 转发规则${RESET}"
         echo -e "${GREEN} 4. 修改 转发规则${RESET}"
@@ -811,7 +816,8 @@ main_menu() {
         echo -e "${GREEN} 7. 系统环境自检${RESET}"
         echo -e "${GREEN} 8. 导出 规则(备份)${RESET}"
         echo -e "${GREEN} 9. 导入 规则(恢复)${RESET}"
-        echo -e "${GREEN}10. 卸载${RESET}"
+        echo -e "${GREEN}10. 查看 DDNS 运行日志${RESET}"
+        echo -e "${GREEN}11. 卸载面板${RESET}"
         echo -e "${GREEN} 0. 退出${RESET}"
         echo -e "${GREEN}=====================================${RESET}"
         
@@ -826,7 +832,8 @@ main_menu() {
             7) do_diagnose ;;
             8) do_backup_manual ;;
             9) do_restore_manual ;;
-            10) do_uninstall ;;
+            10) do_view_log ;;
+            11) do_uninstall ;;
             0) exit 0 ;;
             *) err "输入错误" && pause_to_menu ;;
         esac

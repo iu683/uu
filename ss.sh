@@ -1,867 +1,490 @@
-#!/usr/bin/env bash
-#
-# nftables 端口转发管理工具 
-#
+#!/bin/bash
+# ========================================
+# qBittorrent-Nox 一键管理脚本 
+# ========================================
 
-# ============== 常量定义 ==============
-CONF_DIR="/etc/nftables.d"
-CONF_FILE="${CONF_DIR}/port-forward.conf"
-DEFAULT_BACKUP_DIR="${CONF_DIR}/backups"
-MAIN_CONF="/etc/nftables.conf"
-SYSCTL_CONF="/etc/sysctl.d/99-nft-forward.conf"
-LOG_FILE="/var/log/nft-forward.log"
-CRON_DDNS_SCRIPT="${CONF_DIR}/ddns_sync.sh"
-LOCAL_SCRIPT_PATH="${CONF_DIR}/port_forward_main.sh"
-BIN_LINK_DIR="/usr/local/bin"
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# ============== 颜色定义 ==============
-GREEN='\033[32m'
-YELLOW='\033[33m'
-RED='\033[31m'
-RESET='\033[0m'
+SERVICE_NAME="qbittorrent"
+APP_DIR="/opt/qbittorrent"
+CONFIG_DIR="$APP_DIR/config"
+DOWNLOAD_DIR="$APP_DIR/downloads"
+BIN_PATH="/usr/local/bin/qbittorrent-nox"
+SERVICE_FILE="/etc/systemd/system/qbittorrent.service"
 
-# ============== 辅助输出 ==============
-info()   { printf '\033[32m[信息]\033[0m %s\n' "$1"; }
-warn()   { printf '\033[33m[警告]\033[0m %s\n' "$1"; }
-err()    { printf '\033[31m[错误]\033[0m %s\n' "$1"; }
+# GitHub 代理列表
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+)
 
-pause_to_menu() {
-    echo ""
-    read -rp "$(echo -e "${GREEN}按任意键或回车返回主菜单...${RESET}")" _unused
-}
+# 获取真实的运行用户（防止 sudo 误判为 root）
+REAL_USER=${SUDO_USER:-$(whoami)}
 
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        err "此脚本需要 root 权限运行。"
-        exit 1
-    fi
-}
-
-is_alpine() {
-    [[ -f /etc/alpine-release ]]
-}
-
-is_nftables_active() {
-    if is_alpine; then
-        rc-service nftables status 2>/dev/null | grep -q "started"
+# 动态获取状态、版本和端口
+get_status_info() {
+    # 1. 检测运行状态
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        status="${GREEN}已启动${RESET}"
     else
-        systemctl is-active --quiet nftables 2>/dev/null
+        status="${RED}未运行${RESET}"
     fi
-}
 
-get_nft_version() {
-    if command -v /usr/sbin/nft &>/dev/null; then
-        /usr/sbin/nft --version 2>/dev/null | awk '{print $2}'
+    # 2. 检测版本号
+    if [[ -f "$BIN_PATH" ]]; then
+        version=$($BIN_PATH --version 2>/dev/null | awk '{print $2}')
+        [[ -z "$version" ]] && version="已安装"
     else
-        echo "未安装"
+        version="${RED}未安装${RESET}"
     fi
-}
 
-restart_and_enable_nft() {
-    if is_alpine; then
-        rc-update add nftables default >/dev/null 2>&1 || true
-        rc-service nftables restart >/dev/null 2>&1 || true
+    # 3. 检测 WebUI 端口
+    if [[ -f "$SERVICE_FILE" ]]; then
+        port_show=$(grep -oE -- '--webui-port=[0-9]+' "$SERVICE_FILE" | cut -d= -f2)
+        [[ -z "$port_show" ]] && port_show="8080"
     else
-        systemctl enable --now nftables >/dev/null 2>&1 || true
-        systemctl restart nftables >/dev/null 2>&1 || true
+        port_show="N/A"
     fi
 }
 
+# 端口合法性校验函数
 validate_port() {
-    local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
-}
-
-detect_ip_type() {
-    local ip="$1"
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        local IFS='.' ok=1
-        read -ra octets <<< "$ip"
-        for octet in "${octets[@]}"; do
-            if (( octet > 255 )); then ok=0; fi
-        done
-        [[ $ok -eq 1 ]] && { echo "4"; return; }
+    local port=$1
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return 1
     fi
-    if [[ "$ip" =~ : ]] && [[ ! "$ip" =~ [^0-9a-fA-F:] ]]; then
-        echo "6"
-        return
+    if ((port < 1 || port > 65535)); then
+        echo -e "${RED}错误: 端口范围必须在 1-65535 之间！${RESET}"
+        return 1
     fi
-    if [[ "$ip" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-        echo "2"
-        return
-    fi
-    echo "1"
-}
-
-# 【精准修复】：用纯 awk 干净抓取域名最新解析，彻底断绝 123 干扰
-resolve_domain() {
-    local domain="$1"
-    local resolved=""
-    if command -v nslookup &>/dev/null; then
-        resolved=$(nslookup "$domain" 8.8.8.8 2>/dev/null | awk '/^Address:/ {print $2}' | grep -v "#" | head -n1 | tr -d '\r\n[:space:]')
-    fi
-    if [[ -z "$resolved" ]] && command -v dig &>/dev/null; then
-        resolved=$(dig +short "$domain" @8.8.8.8 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1 | tr -d '\r\n[:space:]')
-    fi
-    if [[ -z "$resolved" ]]; then
-        resolved=$(ping -c 1 -W 2 "$domain" 2>/dev/null | head -n1 | awk -F'[()' ]' '{for(i=1;i<=NF;i++) if($i~/^([0-9]{1,3}\.){3}[0-9]{1,3}$/) print $i}' | head -n1 | tr -d '\r\n[:space:]')
-    fi
-    echo "$resolved"
-}
-
-detect_pkg_manager() {
-    if is_alpine; then echo "apk"
-    elif command -v apt-get &>/dev/null; then echo "apt"
-    elif command -v dnf &>/dev/null; then echo "dnf"
-    elif command -v yum &>/dev/null; then echo "yum"
-    else echo "unknown"; fi
-}
-
-enable_ip_forward() {
-    if is_alpine; then
-        mkdir -p /etc/sysctl.d
-        cat > /etc/sysctl.d/forward.conf <<EOF
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-EOF
-        sysctl -p /etc/sysctl.d/forward.conf >/dev/null 2>&1 || true
-    else
-        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-        sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
-        mkdir -p "$(dirname "${SYSCTL_CONF}")"
-        cat > "${SYSCTL_CONF}" <<EOF
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-EOF
-        sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
-    fi
-}
-
-disable_ip_forward() {
-    if is_alpine; then
-        rm -f /etc/sysctl.d/forward.conf 2>/dev/null
-    else
-        rm -f "${SYSCTL_CONF}" 2>/dev/null
-    fi
-}
-
-init_conf() {
-    mkdir -p "${CONF_DIR}" "${DEFAULT_BACKUP_DIR}" 2>/dev/null || return 1
-    touch "${LOG_FILE}" 2>/dev/null || true
-
-    if [[ ! -f "${MAIN_CONF}" ]]; then
-        cat > "${MAIN_CONF}" <<'NFTCONF'
-#!/usr/sbin/nft -f
-flush ruleset
-include "/etc/nftables.d/*.conf"
-NFTCONF
-        chmod +x "${MAIN_CONF}" 2>/dev/null || true
-    elif ! grep -qF 'include "/etc/nftables.d/*.conf"' "${MAIN_CONF}" 2>/dev/null; then
-        echo 'include "/etc/nftables.d/*.conf"' >> "${MAIN_CONF}"
-    fi
-}
-
-declare -a RULES=()
-
-sanitize_note() {
-    printf "%s" "${1//|/ }"
-}
-
-load_rules() {
-    RULES=()
-    [[ -f "${CONF_FILE}" ]] || return
-    local pending_note="" pending_domain="" pending_proto="ALL"
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*备注:[[:space:]]*(.*)$ ]]; then
-            pending_note=$(sanitize_note "${BASH_REMATCH[1]}")
-            continue
+    if command -v ss &> /dev/null; then
+        if ss -tuln | grep -q ":$port "; then
+            echo -e "${RED}错误: 端口 $port 已被其他程序占用，请更换端口！${RESET}"
+            return 1
         fi
-        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*DOMAIN:[[:space:]]*(.*)$ ]]; then
-            pending_domain="${BASH_REMATCH[1]}"
-            continue
-        fi
-        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*PROTO:[[:space:]]*(.*)$ ]]; then
-            pending_proto="${BASH_REMATCH[1]}"
-            continue
-        fi
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        
-        if [[ "$line" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+dnat[[:space:]]+to[[:space:]]+(([0-9]{1,3}\.){3}[0-9]{1,3}):([0-9]+) ]]; then
-            local matched_proto="${BASH_REMATCH[1]}"
-            local lp="${BASH_REMATCH[2]}"
-            local current_target="${BASH_REMATCH[3]}"
-            local dp="${BASH_REMATCH[5]}"
-            
-            local exists=0 rp
-            for rule in "${RULES[@]}"; do
-                IFS='|' read -r rp _ _ _ _ <<< "$rule"
-                if [[ "$rp" == "$lp" ]]; then exists=1; break; fi
-            done
-            if [[ $exists -eq 0 ]]; then
-                local final_proto="${pending_proto:-ALL}"
-                if [[ "${pending_proto:-}" == "ALL" ]]; then
-                    if ! grep -q "${matched_proto/tcp/udp}\ dport\ ${lp}" "${CONF_FILE}"; then
-                        final_proto="${matched_proto^^}"
-                    fi
-                fi
-                if [[ -n "${pending_domain}" ]]; then
-                    RULES+=("${lp}|${pending_domain}|${dp}|${pending_note}|${final_proto}")
-                else
-                    RULES+=("${lp}|${current_target}|${dp}|${pending_note}|${final_proto}")
-                fi
-            fi
-            pending_note="" pending_domain="" pending_proto="ALL"
-
-        elif [[ "$line" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+dnat[[:space:]]+ip6[[:space:]]+to[[:space:]]+\[(.*)\]:([0-9]+) ]] || [[ "$line" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+dnat[[:space:]]+ip6[[:space:]]+to[[:space:]]+([0-9a-fA-F:]+):([0-9]+) ]]; then
-            local lp="${BASH_REMATCH[2]}"
-            local extracted_ip="${BASH_REMATCH[3]}"
-            local dp="${BASH_REMATCH[4]}"
-            
-            local exists=0 rp
-            for rule in "${RULES[@]}"; do
-                IFS='|' read -r rp _ _ _ _ <<< "$rule"
-                if [[ "$rp" == "$lp" ]]; then exists=1; break; fi
-            done
-            if [[ $exists -eq 0 ]]; then
-                local final_proto="${pending_proto:-ALL}"
-                if [[ -n "${pending_domain}" ]]; then
-                    RULES+=("${lp}|${pending_domain}|${dp}|${pending_note}|${final_proto}")
-                else
-                    RULES+=("${lp}|${extracted_ip}|${dp}|${pending_note}|${final_proto}")
-                fi
-            fi
-            pending_note="" pending_domain="" pending_proto="ALL"
-        fi
-    done < "${CONF_FILE}"
-}
-
-# 动态无错渲染引擎
-write_conf_file() {
-    local tmp_file="${CONF_FILE}.tmp.$$"
-    cat > "${tmp_file}" <<EOF
-#!/usr/sbin/nft -f
-
-add table ip port_forward_v4
-flush table ip port_forward_v4
-add table ip6 port_forward_v6
-flush table ip6 port_forward_v6
-
-table ip port_forward_v4 {
-    chain prerouting {
-        type nat hook prerouting priority -100; policy accept;
-EOF
-
-    local rule lport target dport note proto type actual_ip
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        proto="${proto:-ALL}"
-        type=$(detect_ip_type "$target")
-        actual_ip="$target"
-        [[ "$type" == "2" ]] && actual_ip=$(resolve_domain "$target")
-        
-        [[ -z "$actual_ip" ]] && continue
-
-        if [[ "$(detect_ip_type "$actual_ip")" == "4" ]]; then
-            echo "        # 备注: ${note}" >> "${tmp_file}"
-            echo "        # PROTO: ${proto}" >> "${tmp_file}"
-            [[ "$type" == "2" ]] && echo "        # DOMAIN: ${target}" >> "${tmp_file}"
-            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
-                echo "        tcp dport ${lport} dnat to ${actual_ip}:${dport}" >> "${tmp_file}"
-            fi
-            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
-                echo "        udp dport ${lport} dnat to ${actual_ip}:${dport}" >> "${tmp_file}"
-            fi
-        fi
-    done
-
-    cat >> "${tmp_file}" <<EOF
-    }
-    chain postrouting {
-        type nat hook postrouting priority 100; policy accept;
-EOF
-
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        proto="${proto:-ALL}"
-        type=$(detect_ip_type "$target")
-        actual_ip="$target"
-        [[ "$type" == "2" ]] && actual_ip=$(resolve_domain "$target")
-        [[ -z "$actual_ip" ]] && continue
-
-        if [[ "$(detect_ip_type "$actual_ip")" == "4" ]]; then
-            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
-                echo "        ip daddr ${actual_ip} tcp dport ${dport} ct status dnat masquerade" >> "${tmp_file}"
-            fi
-            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
-                echo "        ip daddr ${actual_ip} udp dport ${dport} ct status dnat masquerade" >> "${tmp_file}"
-            fi
-        fi
-    done
-
-    cat >> "${tmp_file}" <<EOF
-    }
-}
-table ip6 port_forward_v6 {
-    chain prerouting {
-        type nat hook prerouting priority -100; policy accept;
-EOF
-
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        proto="${proto:-ALL}"
-        type=$(detect_ip_type "$target")
-        actual_ip="$target"
-        [[ "$type" == "2" ]] && actual_ip=$(resolve_domain "$target")
-        [[ -z "$actual_ip" ]] && continue
-
-        if [[ "$(detect_ip_type "$actual_ip")" == "6" ]]; then
-            echo "        # 备注: ${note}" >> "${tmp_file}"
-            echo "        # PROTO: ${proto}" >> "${tmp_file}"
-            [[ "$type" == "2" ]] && echo "        # DOMAIN: ${target}" >> "${tmp_file}"
-            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
-                echo "        tcp dport ${lport} dnat ip6 to [${actual_ip}]:${dport}" >> "${tmp_file}"
-            fi
-            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
-                echo "        udp dport ${lport} dnat ip6 to [${actual_ip}]:${dport}" >> "${tmp_file}"
-            fi
-        fi
-    done
-
-    cat >> "${tmp_file}" <<EOF
-    }
-    chain postrouting {
-        type nat hook postrouting priority 100; policy accept;
-EOF
-
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        proto="${proto:-ALL}"
-        type=$(detect_ip_type "$target")
-        actual_ip="$target"
-        [[ "$type" == "2" ]] && actual_ip=$(resolve_domain "$target")
-        [[ -z "$actual_ip" ]] && continue
-
-        if [[ "$(detect_ip_type "$actual_ip")" == "6" ]]; then
-            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
-                echo "        ip6 daddr ${actual_ip} tcp dport ${dport} ct status dnat masquerade" >> "${tmp_file}"
-            fi
-            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
-                echo "        ip6 daddr ${actual_ip} udp dport ${dport} ct status dnat masquerade" >> "${tmp_file}"
-            fi
-        fi
-    done
-    cat >> "${tmp_file}" <<EOF
-    }
-}
-EOF
-    mv -f "${tmp_file}" "${CONF_FILE}" 2>/dev/null
-}
-
-reload_rules() {
-    /usr/sbin/nft -f "${CONF_FILE}"
-}
-
-setup_ddns_cron() {
-    cat > "${CRON_DDNS_SCRIPT}" <<EOF
-#!/usr/bin/env bash
-CONF_FILE="/etc/nftables.d/port-forward.conf"
-[[ -f "\$CONF_FILE" ]] || exit 0
-if grep -q "DOMAIN:" "\$CONF_FILE"; then
-    /etc/nftables.d/port_forward_main.sh --reload-backend
-fi
-EOF
-    chmod +x "${CRON_DDNS_SCRIPT}" 2>/dev/null
-
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
-    (crontab -l 2>/dev/null; echo "*/2 * * * * ${CRON_DDNS_SCRIPT} >/dev/null 2>&1") | crontab - 2>/dev/null || true
-}
-
-# ==================== 【重点修改区域】 ====================
-# 精准按需修改：只针对变动的域名规则做局部更新，未变动或解析失败的域名一概保留硬盘原样，绝不污染。
-do_backend_ddns_sync() {
-    [[ -f "${CONF_FILE}" ]] || exit 0
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then exit 0; fi
-
-    local need_reload=0
-    local rule lport target dport note proto type current_dns_ip
-    local new_rules=()
-
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        type=$(detect_ip_type "$target")
-        
-        if [[ "$type" == "2" ]]; then
-            # 这是一个域名规则，尝试获取全球最新 IP
-            current_dns_ip=$(resolve_domain "$target")
-            
-            if [[ -n "$current_dns_ip" ]]; then
-                # 如果这个域名成功拿到了新 IP，检查它在当前的配置文件里是否存在
-                if ! grep -qF "dnat to ${current_dns_ip}:${dport}" "${CONF_FILE}" && ! grep -qF "dnat ip6 to [${current_dns_ip}]:${dport}" "${CONF_FILE}"; then
-                    # 只有检测到这一条域名的 IP 真正发生变化时，才标记需要重载
-                    need_reload=1
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') [DDNS] 检测到域名 ${target} IP 已变动为 ${current_dns_ip}，触发局部更新..." >> "${LOG_FILE}"
-                fi
-                # 域名解析成功，保持最新 IP 状态存入队列
-                new_rules+=("${lport}|${target}|${dport}|${note}|${proto}")
-            else
-                # 【防崩溃神技】：如果这个域名本次由于网络或者DNS抽风解析失败了，
-                # 我们通过逆向捞取它在硬盘文件里上一次生效的旧 IP，强行让它原地保持，绝不把它覆盖成空或者错的 IP！
-                local last_ip=""
-                last_ip=$(grep -B 1 -F "DOMAIN: ${target}" "${CONF_FILE}" | grep -E "dnat to|dnat ip6 to" | head -n1 | awk '{print $NF}' | awk -F':' '{print $1}' | tr -d '[]')
-                if [[ -n "$last_ip" ]]; then
-                    # 借用旧 IP 让它继续平稳运行，不干扰本次更新
-                    new_rules+=("${lport}|${target}|${dport}|${note}|${proto}")
-                else
-                    new_rules+=("${lport}|${target}|${dport}|${note}|${proto}")
-                fi
-            fi
-        else
-            # 静态 IP 规则，直接原样保留，碰都不碰
-            new_rules+=("${lport}|${target}|${dport}|${note}|${proto}")
-        fi
-    done
-
-    if [[ $need_reload -eq 1 ]]; then
-        # 重新同步内存队列并写入
-        RULES=("${new_rules[@]}")
-        write_conf_file
-        reload_rules
     fi
-    exit 0
+    return 0
 }
-# ========================================================
 
-do_backup_manual() {
-    if [[ ! -f "${CONF_FILE}" ]] || [[ ! -s "${CONF_FILE}" ]]; then
-        err "当前没有任何生效的规则配置文件，无需导出备份。"
-        pause_to_menu
-        return
-    fi
-    local target_dir
-    read -rp "$(echo -e "${GREEN}请输入备份导出目录 [默认: ${DEFAULT_BACKUP_DIR}]: ${RESET}")" target_dir
-    target_dir="${target_dir:-$DEFAULT_BACKUP_DIR}"
+# 从日志中自动提取临时密码
+get_qb_password() {
+    local log_line log_pass
+    log_line=$(sudo journalctl -u "$SERVICE_NAME" --no-pager | grep -Ei "temporary password is:|password was randomly generated:|provided for this session:" | tail -n 1)
     
-    mkdir -p "${target_dir}" 2>/dev/null
-    if [[ ! -d "${target_dir}" ]]; then
-        err "无法创建或访问指定目录: ${target_dir}"
-        pause_to_menu
+    if [[ -n "$log_line" ]]; then
+        log_pass=$(echo "$log_line" | sed -e 's/.*session://I' -e 's/.*is://I' | tr -d '[:space:].:')
+    fi
+    
+    if [[ -n "$log_pass" ]]; then
+        echo -e "${GREEN}${log_pass}${RESET}"
+    else
+        echo -e "${RED}未找到临时密码（可能已在WebUI中修改、日志已清空，或服务未成功启动）${RESET}"
+    fi
+}
+
+# 获取公网 IP
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "127.0.0.1"
+}
+
+# 高可用获取 GitHub 最新 Release JSON 数据（支持代理轮询）
+fetch_release_json() {
+    local api_url="https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases/latest"
+    local json_data=""
+    
+    # 优先尝试直连，如果失败则遍历代理节点
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        if [[ -z "$proxy" ]]; then
+            echo -e "${YELLOW}正在尝试直连检索 GitHub 最新版本信息...${RESET}"
+            json_data=$(curl -s --connect-timeout 6 "$api_url")
+        else
+            # 兼容处理：代理 API 时将 https:// 替换进去，部分反代支持此类拼接
+            echo -e "${YELLOW}正在尝试通过代理 [ ${proxy} ] 检索版本信息...${RESET}"
+            json_data=$(curl -s --connect-timeout 6 "${proxy}${api_url}")
+        fi
+        
+        # 验证返回的是否是包含 tag_name 的有效 JSON
+        if echo "$json_data" | grep -q '"tag_name":'; then
+            echo "$json_data"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 高可用下载函数（遍历代理列表直到成功）
+download_file_with_proxy() {
+    local raw_url=$1
+    local save_path=$2
+    
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local final_url="${proxy}${raw_url}"
+        if [[ -z "$proxy" ]]; then
+            echo -e "${YELLOW}正在尝试直连下载...${RESET}"
+        else
+            echo -e "${YELLOW}正在通过代理下载: ${proxy}${RESET}"
+        fi
+        echo -e "${CYAN}URL: $final_url${RESET}"
+        
+        sudo wget -q --show-progress --timeout=15 --tries=2 -O "$save_path" "$final_url"
+        if [[ $? -eq 0 && -s "$save_path" ]]; then
+            return 0
+        fi
+        echo -e "${RED}当前节点下载失败，正在尝试下一个...${RESET}"
+        sudo rm -f "$save_path"
+    done
+    return 1
+}
+
+# 1. 部署 qBittorrent-Nox
+install_qbittorrent() {
+    if [[ -f "$BIN_PATH" ]]; then
+        echo -e "${YELLOW}提示: qBittorrent 已安装在 $BIN_PATH，请勿重复安装。${RESET}"
         return
     fi
 
-    local bkp_name="manual_forward_bak_$(date '+%Y%m%d_%H%M%S').conf"
-    cp "${CONF_FILE}" "${target_dir}/${bk Name}"
-    info "手动导出成功！备份已保存至: ${target_dir}/${bkp_name}"
-    pause_to_menu
-}
+    echo -ne "${YELLOW}请输入你想要设置的 WebUI 端口号 [默认: 8080]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8080"
 
-do_restore_manual() {
-    local target_input selected_file=""
-    read -rp "$(echo -e "${GREEN}请输入备份所在的导入目录或完整文件路径 [默认: ${DEFAULT_BACKUP_DIR}]: ${RESET}")" target_input
-    target_input="${target_input:-$DEFAULT_BACKUP_DIR}"
-
-    if [[ -f "$target_input" && "$target_input" == *.conf ]]; then
-        selected_file="$target_input"
-    else
-        if [[ ! -d "${target_input}" ]]; then
-            err "指定的目录或文件不存在: ${target_input}"
-            pause_to_menu
-            return
-        fi
-        local bkp_files=($(ls "${target_input}"/*.conf 2>/dev/null | sort -r))
-        if [[ ${#bkp_files[@]} -eq 0 ]]; then
-            err "该文件夹内没有发现任何可用的 .conf 备份文件。"
-            pause_to_menu
-            return
-        fi
-
-        echo -e "\n${YELLOW}=== 发现历史备份文件列表 ===${RESET}"
-        local idx=1 file
-        for file in "${bkp_files[@]}"; do
-            printf "[%2s] %s\n" "$idx" "$(basename "$file")"
-            ((idx++))
-        done
-        echo "========================"
-        read -rp "请选择需要恢复的备份序号 (0 取消): " choice
-        if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-        
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#bkp_files[@]} )); then
-            selected_file="${bkp_files[$((choice-1))]}"
-        else
-            err "无效的序号输入"
-            pause_to_menu
-            return
-        fi
+    if ! validate_port "$custom_port"; then
+        return
     fi
 
-    if [[ -n "$selected_file" && -f "$selected_file" ]]; then
-        if [[ -f "${CONF_FILE}" ]]; then
-            cp "${CONF_FILE}" "${DEFAULT_BACKUP_DIR}/auto_emergency_before_restore.conf" 2>/dev/null || true
-        fi
-        cp -f "${selected_file}" "${CONF_FILE}"
-        if reload_rules; then
-            info "历史配置 [$(basename "$selected_file")] 导入并成功应用！"
-            setup_ddns_cron
-        else
-            err "载入备份文件失败，正在回滚原始配置..."
-            [[ -f "${DEFAULT_BACKUP_DIR}/auto_emergency_before_restore.conf" ]] && cp -f "${DEFAULT_BACKUP_DIR}/auto_emergency_before_restore.conf" "${CONF_FILE}"
-            reload_rules
-        fi
-    else
-        err "未能正确读取备份文件。"
-    fi
-    pause_to_menu
-}
-
-do_install() {
-    info "准备安装依赖..."
-    local pm=$(detect_pkg_manager)
-    case "$pm" in
-        apk) apk add nftables bash curl iproute2 bind-tools ;; 
-        *) $pm update -y && $pm install -y nftables curl dnsutils ;; 
+    # 检测系统架构
+    local arch url_file
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)      url_file="x86_64-qbittorrent-nox" ;;
+        aarch64)     url_file="aarch64-qbittorrent-nox" ;;
+        armv7l)      url_file="armv7-qbittorrent-nox" ;;
+        armhf)       url_file="armhf-qbittorrent-nox" ;;
+        riscv64)     url_file="riscv64-qbittorrent-nox" ;;
+        i386|i686)   url_file="x86-qbittorrent-nox" ;;
+        *)
+            echo -e "${RED}错误: 暂不支持您的系统架构 ($arch)！${RESET}"
+            return
+            ;;
     esac
-    enable_ip_forward && init_conf && restart_and_enable_nft && setup_ddns_cron
-    info "环境初始化完成！"
-    pause_to_menu
-}
 
-_print_rules_list() {
-    printf "\n\033[1m%-6s %-12s %-10s     %-35s %s\033[0m\n" "序号"  "协议"  "本机端口"  "目标地址/域名"  "备注"
-    echo -e "${GREEN}=====================================${RESET}"
-    local idx=1 rule lport target dport note proto type label proto_label
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        proto="${proto:-ALL}"
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "2" ]]; then label="域名"; else [[ "$type" == "6" ]] && label="IPv6" || label="IPv4"; fi
-        
-        if [[ "$proto" == "ALL" ]]; then proto_label="TCP+UDP"; else proto_label="$proto"; fi
-        proto_label="${proto_label} (${label})"
+    # 安装基础依赖
+    echo -e "${YELLOW}检查并安装必要工具 (curl, wget)...${RESET}"
+    sudo apt update && sudo apt install -y curl wget
 
-        if [[ "$type" == "6" ]]; then
-            printf "%-6s %-12s %-10s -> %-35s %s\n" "$idx" "$proto_label" "$lport" "[${target}]:${dport}" "${note:--}"
-        else
-            printf "%-6s %-12s %-10s -> %-35s %s\n" "$idx" "$proto_label" "$lport" "${target}:${dport}" "${note:--}"
-        fi
-        ((idx++))
-    done
-}
-
-do_list() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then 
-        info "当前没有配置任何端口转发规则。"
-        pause_to_menu
+    # 动态抓取 GitHub 最新 Release 信息
+    local release_json latest_tag expected_sha
+    release_json=$(fetch_release_json)
+    
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}错误: 无法获取最新版本号。可能触发了 GitHub API 限制，或所有代理节点均不可用。${RESET}"
         return
     fi
-    _print_rules_list
-    echo ""
-    pause_to_menu
-}
-
-do_add() {
-    command -v /usr/sbin/nft &>/dev/null || { err "nftables 未安装"; pause_to_menu; return; }
-    init_conf || return
-    enable_ip_forward && load_rules
-
-    local lport target dport note proto proto_choice type
-    while true; do
-        read -rp "请输入本机监听端口 (1-65535): " lport
-        validate_port "$lport" && break
-        err "端口输入无效"
-    done
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r rp _ _ _ _ <<< "$rule"
-        if [[ "$rp" == "$lport" ]]; then err "本机端口 ${lport} 规则已存在"; pause_to_menu; return; fi
-    done
-    while true; do
-        read -rp "请输入目标 IP 地址 或 目标域名: " target
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "1" ]]; then err "格式不正确"; elif [[ "$type" == "2" ]]; then
-            local rip=$(resolve_domain "$target")
-            [[ -z "$rip" ]] && warn "该域名目前解析不出 IP，系统稍后会自动重试。" || info "成功解析当前 IP 为: ${rip}"
-            break
-        else break; fi
-    done
-    while true; do
-        read -rp "请输入目标端口 [默认 $lport]: " dport
-        dport="${dport:-$lport}"
-        validate_port "$dport" && break
-        err "目标端口不合法"
-    done
-
-    while true; do
-        read -rp "$(echo -e "${GREEN}请选择协议类型 [1: TCP+UDP | 2: 仅 TCP | 3: 仅 UDP] (默认 1): ${RESET}")" proto_choice
-        proto_choice="${proto_choice:-1}"
-        case "$proto_choice" in
-            1) proto="ALL"; break ;;
-            2) proto="TCP"; break ;;
-            3) proto="UDP"; break ;;
-            *) err "选择错误，请输入 1, 2 或 3" ;;
-        esac
-    done
-
-    read -rp "请输入本条转发备注: " note
-    note=$(sanitize_note "$note")
-
-    RULES+=("${lport}|${target}|${dport}|${note}|${proto}")
-    if write_conf_file && reload_rules && setup_ddns_cron; then
-        info "规则添加并加载成功！"
-    else
-        err "配置重载失败"
-    fi
-    pause_to_menu
-}
-
-do_edit() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供修改。"; pause_to_menu; return; fi
     
-    _print_rules_list
-    echo ""
+    latest_tag=$(echo "$release_json" | grep -oP '"tag_name": "\K[^"]+')
+    echo -e "${GREEN}检测到最新版本标签: ${latest_tag}${RESET}"
 
-    read -rp "请输入要修改的规则序号 (0 取消): " choice
-    if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
-        err "无效序号"
-        pause_to_menu
+    # 从 Release 文本中动态抓取对应架构的 SHA256 校验码
+    expected_sha=$(echo "$release_json" | grep -A 2 "$url_file" | grep -oP '"body": "sha256:\K[a-f0-9]{64}' || echo "$release_json" | grep -oP "sha256:${url_file}\s+\K[a-f0-9]{64}" || echo "$release_json" | sed -n "/${url_file}/,/^$/p" | grep -oP '[a-f0-9]{64}')
+    
+    # 拼接原始下载 URL 
+    local download_url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${latest_tag}/${url_file}"
+    
+    # 调用代理下载函数
+    if ! download_file_with_proxy "$download_url" "$BIN_PATH"; then
+        echo -e "${RED}错误: 所有代理及直连节点均下载失败，请检查网络！${RESET}"
         return
     fi
 
-    local target_idx=$((choice-1))
-    local old_lport old_target old_dport old_note old_proto
-    IFS='|' read -r old_lport old_target old_dport old_note old_proto <<< "${RULES[$target_idx]}"
-
-    echo -e "\n${YELLOW}开始修改第 $choice 条规则 (直接回车保持原值):${RESET}"
-    local lport target dport note proto proto_choice type
-
-    while true; do
-        read -rp "本机监听端口 [$old_lport]: " lport
-        lport="${lport:-$old_lport}"
-        validate_port "$lport" && break
-        err "端口输入无效"
-    done
-
-    local idx=0 rp
-    for rule in "${RULES[@]}"; do
-        if (( idx != target_idx )); then
-            IFS='|' read -r rp _ _ _ _ <<< "$rule"
-            if [[ "$rp" == "$lport" ]]; then 
-                err "本机端口 ${lport} 与其他规则冲突！"
-                pause_to_menu
-                return
-            fi
+    # 安全完整性哈希校验
+    if [[ -n "$expected_sha" && ${#expected_sha} -eq 64 ]]; then
+        echo -e "${YELLOW}正在验证文件完整性 (SHA256)...${RESET}"
+        local calculated_sha
+        calculated_sha=$(sha256sum "$BIN_PATH" | awk '{print $1}')
+        if [[ "$calculated_sha" != "$expected_sha" ]]; then
+            echo -e "${RED}错误: SHA256 校验失败！下载的文件可能已损坏。${RESET}"
+            echo "官方预期值: $expected_sha"
+            echo "本地计算值: $calculated_sha"
+            sudo rm -f "$BIN_PATH"
+            return
         fi
-        ((idx++))
-    done
-
-    while true; do
-        read -rp "目标 IP 或 域名 [$old_target]: " target
-        target="${target:-$old_target}"
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "1" ]]; then err "格式不正确"; elif [[ "$type" == "2" ]]; then
-            local rip=$(resolve_domain "$target")
-            [[ -z "$rip" ]] && warn "该域名目前解析不出 IP，系统稍后会自动重试。" || info "成功解析当前 IP 为: ${rip}"
-            break
-        else break; fi
-    done
-
-    while true; do
-        read -rp "目标端口 [$old_dport]: " dport
-        dport="${dport:-$old_dport}"
-        validate_port "$dport" && break
-        err "目标端口不合法"
-    done
-
-    local current_proto_desc="TCP+UDP"
-    [[ "$old_proto" == "TCP" ]] && current_proto_desc="仅 TCP"
-    [[ "$old_proto" == "UDP" ]] && current_proto_desc="仅 UDP"
-    
-    while true; do
-        read -rp "$(echo -e "${GREEN}请选择协议类型 [1: TCP+UDP | 2: 仅 TCP | 3: 仅 UDP] (当前: $current_proto_desc, 回车不改): ${RESET}")" proto_choice
-        if [[ -z "$proto_choice" ]]; then
-            proto="$old_proto"
-            break
-        fi
-        case "$proto_choice" in
-            1) proto="ALL"; break ;;
-            2) proto="TCP"; break ;;
-            3) proto="UDP"; break ;;
-            *) err "选择错误，请输入 1, 2 或 3" ;;
-        esac
-    done
-
-    read -rp "本条转发备注 [$old_note]: " note
-    if [[ -z "$note" ]]; then
-        note="$old_note"
+        echo -e "${GREEN}安全校验通过！${RESET}"
     else
-        note=$(sanitize_note "$note")
+        echo -e "${YELLOW}提示: 未能匹配到该版本的精准官方 SHA256，跳过哈希校验。${RESET}"
     fi
 
-    RULES[$target_idx]="${lport}|${target}|${dport}|${note}|${proto}"
-    if write_conf_file && reload_rules && setup_ddns_cron; then
-        info "规则修改并应用成功！"
-    else
-        err "配置重载失败，已作出的修改可能未生效"
-    fi
-    pause_to_menu
+    # 赋予执行权限
+    sudo chmod +x "$BIN_PATH"
+
+    # 创建目录并赋权
+    sudo mkdir -p "$CONFIG_DIR" "$DOWNLOAD_DIR"
+    sudo chown -R "$REAL_USER":"$REAL_USER" "$APP_DIR"
+    sudo chmod -R 755 "$APP_DIR"
+
+    echo -e "${YELLOW}创建 systemd 服务文件 (端口: ${custom_port})...${RESET}"
+    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
+[Unit]
+Description=qBittorrent Command Line Client (Static Latest)
+After=network.target
+
+[Service]
+ExecStart=$BIN_PATH --webui-port=${custom_port} --profile=$CONFIG_DIR
+User=$REAL_USER
+Restart=on-failure
+WorkingDirectory=$DOWNLOAD_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl start qbittorrent
+    sudo systemctl enable qbittorrent
+
+    echo -e "${YELLOW}等待服务启动并生成密码...${RESET}"
+    sleep 4
+
+    SERVER_IP=$(get_public_ip)
+    echo -e "\n${GREEN}qBittorrent-Nox 静态版安装完成并已启动!${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址: http://${SERVER_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}默认用户名: admin${RESET}"
+    echo -ne "${YELLOW}初始密码: ${RESET}"
+    get_qb_password
+    echo -e "${YELLOW}配置目录: $CONFIG_DIR${RESET}"
+    echo -e "${YELLOW}下载目录: $DOWNLOAD_DIR${RESET}"
 }
 
-do_delete() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供修改。"; pause_to_menu; return; fi
-    
-    _print_rules_list
-    echo ""
-
-    read -rp "请输入要删除的规则序号 (0 取消): " choice
-    if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#RULES[@]} )); then
-        unset 'RULES[$((choice-1))]'
-        RULES=("${RULES[@]}")
-        write_conf_file && reload_rules && info "成功删除规则。"
-    else 
-        err "无效序号"
-    fi
-    pause_to_menu
-}
-
-do_clear_all() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "当前没有任何转发规则。"; pause_to_menu; return; fi
-    read -rp "确认彻底清空所有规则？[y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
-    RULES=()
-    write_conf_file && reload_rules
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
-    rm -f "${CRON_DDNS_SCRIPT}" 2>/dev/null
-    info "已全部清空。"
-    pause_to_menu
-}
-
-do_diagnose() {
-    echo -e "\n========================================"
-    echo "            系统环境自检"
-    echo "========================================"
-    info "系统环境: $(is_alpine && echo 'Alpine Linux' || echo '标准 Linux (Systemd)')"
-    info "nftables 服务状态: $(is_nftables_active && echo '运行中' || echo '未运行')"
-    if crontab -l 2>/dev/null | grep -q "${CRON_DDNS_SCRIPT}"; then
-        info "域名同步守护进程: 高频自启 (每2分钟)"
-    else
-        warn "域名同步守护进程: 未挂进程"
-    fi
-    pause_to_menu
-}
-
-do_view_log() {
-    if [[ ! -f "${LOG_FILE}" ]]; then
-        info "当前暂无 DDNS 日志记录产生。"
-        pause_to_menu
+# 2. 自动检查并更新到最新版
+update_qbittorrent() {
+    if [[ ! -f "$BIN_PATH" ]]; then
+        echo -e "${RED}错误: 未检测到已安装的 qBittorrent，请先选择 1 进行安装！${RESET}"
         return
     fi
-    echo -e "\n${GREEN}正在查看 DDNS 实时日志，按【Ctrl + C】可以随时退出查看...${RESET}"
-    echo -e "${YELLOW}------------------------------------------------------------${RESET}"
-    tail -n 30 -f "${LOG_FILE}"
-}
 
-do_uninstall() {
-    read -rp "确认要彻底卸载本工具并清空所有转发规则吗？[y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
+    local current_port="8080"
+    if [[ -f "$SERVICE_FILE" ]]; then
+        current_port=$(grep -oE -- '--webui-port=[0-9]+' "$SERVICE_FILE" | cut -d= -f2)
+        [[ -z "$current_port" ]] && current_port="8080"
+    fi
 
-    info "正在清空所有 nftables 转发规则..."
-    RULES=()
-    write_conf_file && reload_rules 2>/dev/null || true
+    echo -e "${YELLOW}正在检测系统架构并获取最新版本...${RESET}"
+    
+    local arch url_file
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)      url_file="x86_64-qbittorrent-nox" ;;
+        aarch64)     url_file="aarch64-qbittorrent-nox" ;;
+        armv7l)      url_file="armv7-qbittorrent-nox" ;;
+        armhf)       url_file="armhf-qbittorrent-nox" ;;
+        riscv64)     url_file="riscv64-qbittorrent-nox" ;;
+        i386|i686)   url_file="x86-qbittorrent-nox" ;;
+        *) echo -e "${RED}错误: 暂不支持您的系统架构 ($arch)！${RESET}" && return ;;
+    esac
 
-    info "正在清理定时任务及相关文件..."
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
-    disable_ip_forward
+    # 动态抓取 GitHub 最新 Release 信息
+    local release_json latest_tag expected_sha
+    release_json=$(fetch_release_json)
+    
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}错误: 无法获取最新版本号。更新终止，原系统未受影响。${RESET}"
+        return
+    fi
+    
+    latest_tag=$(echo "$release_json" | grep -oP '"tag_name": "\K[^"]+')
+    echo -e "${GREEN}检测到最新版本标签: ${latest_tag}${RESET}"
 
-    info "正在拆除 A/a 系统快捷启动链..."
-    rm -f "${BIN_LINK_DIR}/A" "${BIN_LINK_DIR}/a" 2>/dev/null
+    # 提取最新 SHA256 校验码
+    expected_sha=$(echo "$release_json" | grep -A 2 "$url_file" | grep -oP '"body": "sha256:\K[a-f0-9]{64}' || echo "$release_json" | grep -oP "sha256:${url_file}\s+\K[a-f0-9]{64}" || echo "$release_json" | sed -n "/${url_file}/,/^$/p" | grep -oP '[a-f0-9]{64}')
 
-    if [[ -f "${MAIN_CONF}" ]]; then
-        if is_alpine; then
-            sed -i '\/etc\/nftables.d\/\*\.conf/d' "${MAIN_CONF}" 2>/dev/null || true
-        else
-            sed -i '/include "\/etc\/nftables.d\/\*\.conf"/d' "${MAIN_CONF}" 2>/dev/null || true
+    # 先下载到临时文件，不破坏正在运行的系统
+    local tmp_bin="/tmp/qbittorrent-nox.tmp"
+    local download_url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${latest_tag}/${url_file}"
+    
+    if ! download_file_with_proxy "$download_url" "$tmp_bin"; then
+        echo -e "${RED}错误: 下载失败，放弃更新，原系统未受影响。${RESET}"
+        return
+    fi
+
+    # 安全完整性哈希校验
+    if [[ -n "$expected_sha" && ${#expected_sha} -eq 64 ]]; then
+        echo -e "${YELLOW}正在验证新文件完整性 (SHA256)...${RESET}"
+        local calculated_sha
+        calculated_sha=$(sha256sum "$tmp_bin" | awk '{print $1}')
+        if [[ "$calculated_sha" != "$expected_sha" ]]; then
+            echo -e "${RED}错误: SHA256 校验失败！下载的文件可能不完整，放弃更新。${RESET}"
+            sudo rm -f "$tmp_bin"
+            return
         fi
+        echo -e "${GREEN}安全校验通过！${RESET}"
     fi
-    rm -rf "${CONF_DIR}" 2>/dev/null
 
-    echo -e "${GREEN}✅ 纯净卸载成功！转发规则已彻底清除，快捷键已拔除。${RESET}"
-    exit 0
-}
-auto_localize_and_link() {
-    mkdir -p "${CONF_DIR}"
-    mkdir -p "${BIN_LINK_DIR}"
+    # 原子替换
+    echo -e "${YELLOW}正在应用更新并重启服务...${RESET}"
+    sudo systemctl stop qbittorrent
     
-    if [[ ! -f "${LOCAL_SCRIPT_PATH}" ]]; then
-        curl -sL "https://raw.githubusercontent.com/iu683/uu/main/ss.sh" -o "${LOCAL_SCRIPT_PATH}"
-        chmod +x "${LOCAL_SCRIPT_PATH}"
-    fi
-
-    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/A"
-    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/a"
-
-    echo -e "${GREEN}✅ 安装/同步完成，快捷键 [A] 或 [a] 已绑定。${RESET}"
-}
-
-main_menu() {
-    check_root
+    sudo mv -f "$tmp_bin" "$BIN_PATH"
+    sudo chmod +x "$BIN_PATH"
     
-    if [[ "${1:-}" == "--reload-backend" ]]; then
-        do_backend_ddns_sync
-        exit 0
-    fi
+    # 重新构建服务文件
+    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
+[Unit]
+Description=qBittorrent Command Line Client (Static Latest)
+After=network.target
 
-    auto_localize_and_link
+[Service]
+ExecStart=$BIN_PATH --webui-port=${current_port} --profile=$CONFIG_DIR
+User=$REAL_USER
+Restart=on-failure
+WorkingDirectory=$DOWNLOAD_DIR
 
-    local panel_status panel_version panel_rules_count
-    while true; do
-        is_nftables_active && panel_status="${GREEN}运行中${RESET}" || panel_status="${RED}未运行${RESET}"
-        panel_version=$(get_nft_version)
-        load_rules
-        panel_rules_count="${#RULES[@]}"
+[Install]
+WantedBy=multi-user.target
+EOF
 
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN}   ◈ nftables 转发面板(快捷键A/a) ◈${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN} 状态 :${RESET} $panel_status"
-        echo -e "${GREEN} 版本 :${RESET} v1.1.3 (精准按需DDNS优化版)"
-        echo -e "${GREEN} 规则 : 已载入${RESET} ${YELLOW}${panel_rules_count}${RESET} ${GREEN}条转发${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN} 1. 安装依赖环境${RESET}"
-        echo -e "${GREEN} 2. 查看 当前转发规则${RESET}"
-        echo -e "${GREEN} 3. 新增 转发规则${RESET}"
-        echo -e "${GREEN} 4. 修改 转发规则${RESET}"
-        echo -e "${GREEN} 5. 删除 转发规则${RESET}"
-        echo -e "${GREEN} 6. 清空 所有转发规则${RESET}"
-        echo -e "${GREEN} 7. 系统环境自检${RESET}"
-        echo -e "${GREEN} 8. 导出 规则(备份)${RESET}"
-        echo -e "${GREEN} 9. 导入 规则(恢复)${RESET}"
-        echo -e "${GREEN}10. 查看 DDNS 运行日志${RESET}"
-        echo -e "${GREEN}11. 卸载面板${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        
-        read -rp "$(echo -e "${GREEN}请选择操作: ${RESET}")" menu_choice
-        case "$menu_choice" in
-            1) do_install ;;
-            2) do_list ;;
-            3) do_add ;;
-            4) do_edit ;;
-            5) do_delete ;;
-            6) do_clear_all ;;
-            7) do_diagnose ;;
-            8) do_backup_manual ;;
-            9) do_restore_manual ;;
-            10) do_view_log ;;
-            11) do_uninstall ;;
-            0) exit 0 ;;
-            *) err "输入错误" && pause_to_menu ;;
-        esac
-        echo ""
-    done
+    sudo systemctl daemon-reload
+    sudo systemctl start qbittorrent
+    
+    get_status_info
+    SERVER_IP=$(get_public_ip)
+    echo -e "\n${GREEN}qBittorrent 已成功无缝更新至最新版！${RESET}"
+    echo -e "${YELLOW}当前版本 : ${version}${RESET}"
+    echo -e "${YELLOW}访问地址 : http://${SERVER_IP}:${current_port}${RESET}"
+    echo -e "${CYAN}提示: 您的原有账号、密码、配置和种子下载进度已全部完好保留。${RESET}"
 }
 
-main_menu "$@"
+# 3. 卸载服务
+uninstall_qbittorrent() {
+    echo -e "${RED}警告: 正在卸载 qBittorrent 并清除所有配置数据...${RESET}"
+    sudo systemctl stop ${SERVICE_NAME} 2>/dev/null
+    sudo systemctl disable ${SERVICE_NAME} 2>/dev/null
+    sudo rm -f "$SERVICE_FILE"
+    sudo systemctl daemon-reload
+    
+    sudo rm -f "$BIN_PATH"
+    sudo rm -rf "$APP_DIR"
+    echo -e "${GREEN}qBittorrent 已彻底卸载，数据已清理完毕。${RESET}"
+}
+
+# 4. 修改端口配置
+edit_config() {
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到服务文件，请先安装 qBittorrent！${RESET}"
+        return
+    fi
+
+    get_status_info
+    echo -e "${CYAN}当前 WebUI 端口为: ${port_show}${RESET}"
+    echo -ne "${YELLOW}请输入新的 WebUI 端口号: ${RESET}"
+    read -r new_port
+
+    if ! validate_port "$new_port"; then
+        return
+    fi
+
+    echo -e "${YELLOW}正在修改端口为 ${new_port}...${RESET}"
+    sudo sed -i "s/--webui-port=[0-9]*/--webui-port=${new_port}/g" "$SERVICE_FILE"
+    
+    echo -e "${YELLOW}正在重载系统配置并重启服务...${RESET}"
+    sudo systemctl daemon-reload
+    sudo systemctl restart "$SERVICE_NAME"
+    
+    echo -e "${GREEN}端口修改成功！当前新端口为: ${new_port}${RESET}"
+}
+
+# 5. 启动服务
+start_qbittorrent() {
+    sudo systemctl start ${SERVICE_NAME}
+    echo -e "${GREEN}qBittorrent 已启动${RESET}"
+}
+
+# 6. 停止服务
+stop_qbittorrent() {
+    sudo systemctl stop ${SERVICE_NAME}
+    echo -e "${YELLOW}qBittorrent 已停止${RESET}"
+}
+
+# 7. 重启服务
+restart_qbittorrent() {
+    sudo systemctl restart ${SERVICE_NAME}
+    echo -e "${GREEN}qBittorrent 已重启${RESET}"
+}
+
+# 8. 查看日志
+logs_qbittorrent() {
+    echo -e "${CYAN}正在实时查看日志 (按 Ctrl+C 退出)...${RESET}"
+    sudo journalctl -u ${SERVICE_NAME} -n 50 -f
+}
+
+# 9. 查看节点配置
+show_node_info() {
+    SERVER_IP=$(get_public_ip)
+    get_status_info
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    qBittorrent 访问与配置信息    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}WebUI 地址 : http://${SERVER_IP}:${port_show}${RESET}"
+    echo -e "${YELLOW}默认用户名 : admin${RESET}"
+    echo -ne "${YELLOW}初始密码   : ${RESET}"
+    get_qb_password
+    echo -e "${GREEN}================================${RESET}"
+}
+
+# 菜单
+menu() {
+    clear
+    get_status_info
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     qBittorrent 自动管理面板     ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 qBittorrent${RESET}"
+    echo -e "${GREEN}2. 更新 qBittorrent${RESET}"
+    echo -e "${GREEN}3. 卸载 qBittorrent${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 qBittorrent${RESET}"
+    echo -e "${GREEN}6. 停止 qBittorrent${RESET}"
+    echo -e "${GREEN}7. 重启 qBittorrent${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_qbittorrent ;;
+        2) update_qbittorrent ;;
+        3) uninstall_qbittorrent ;;
+        4) edit_config ;;
+        5) start_qbittorrent ;;
+        6) stop_qbittorrent ;;
+        7) restart_qbittorrent ;;
+        8) logs_qbittorrent ;;
+        9) show_node_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
+}
+
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

@@ -1,632 +1,436 @@
-#!/usr/bin/env bash
-#
-# iptables 端口转发管理工具 (Alpine Linux 专属双栈完美版)
-#
+#!/bin/bash
+# ========================================
+# qBittorrent-Nox 一键管理脚本 (支持IP绑定版)
+# ========================================
 
-# ============== 常量定义 ==============
-CONF_DIR="/etc/iptables.d"
-CONF_FILE="${CONF_DIR}/port-forward.rules"
-DEFAULT_BACKUP_DIR="${CONF_DIR}/backups"
-SYSCTL_CONF="/etc/sysctl.d/99-ip-forward.conf"
-LOG_FILE="/var/log/iptables-forward.log"
-CRON_DDNS_SCRIPT="${CONF_DIR}/ddns_sync.sh"
-LOCAL_SCRIPT_PATH="${CONF_DIR}/port_forward_main.sh"
-BIN_LINK_DIR="/usr/local/bin"
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# ============== 颜色定义 ==============
-GREEN='\033[32m'
-YELLOW='\033[33m'
-RED='\033[31m'
-RESET='\033[0m'
+SERVICE_NAME="qbittorrent"
+APP_DIR="/opt/qbittorrent"
+CONFIG_DIR="$APP_DIR/config"
+DOWNLOAD_DIR="$APP_DIR/downloads"
+BIN_PATH="/usr/local/bin/qbittorrent-nox"
+SERVICE_FILE="/etc/systemd/system/qbittorrent.service"
 
-# ============== 辅助输出 ==============
-info()   { printf '\033[32m[信息]\033[0m %s\n' "$1"; }
-warn()   { printf '\033[33m[警告]\033[0m %s\n' "$1"; }
-err()    { printf '\033[31m[错误]\033[0m %s\n' "$1"; }
+# 获取真实的运行用户（防止 sudo 误判为 root）
+REAL_USER=${SUDO_USER:-$(whoami)}
 
-pause_to_menu() {
-    echo ""
-    read -rp "$(echo -e "${GREEN}按任意键或回车返回主菜单...${RESET}")" _unused
-}
-
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        err "此脚本需要 root 权限运行。"
-        exit 1
-    fi
-}
-
-# 完美兼容 Alpine 的 v4/v6 双栈服务状态检测
-is_iptables_active() {
-    local v4_ok=0
-    local v6_ok=0
-    
-    # 检测 IPv4 iptables 状态 (兼容 OpenRC 各种微调输出)
-    if rc-service iptables status 2>/dev/null | grep -Ei "started|active" >/dev/null; then
-        v4_ok=1
-    fi
-    
-    # 检测 IPv6 ip6tables 状态
-    if rc-service ip6tables status 2>/dev/null | grep -Ei "started|active" >/dev/null; then
-        v6_ok=1
-    fi
-
-    # 只要有一个在跑就认为整体在运行，并反馈具体多栈状态
-    if [[ $v4_ok -eq 1 && $v6_ok -eq 1 ]]; then
-        echo "双栈运行中"
-        return 0
-    elif [[ $v4_ok -eq 1 ]]; then
-        echo "仅IPv4运行"
-        return 0
-    elif [[ $v6_ok -eq 1 ]]; then
-        echo "仅IPv6运行"
-        return 0
+# 动态获取状态、版本、端口和绑定IP
+get_status_info() {
+    # 1. 检测运行状态
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        status="${GREEN}已启动${RESET}"
     else
+        status="${RED}未运行${RESET}"
+    fi
+
+    # 2. 检测版本号
+    if [[ -f "$BIN_PATH" ]]; then
+        version=$($BIN_PATH --version 2>/dev/null | awk '{print $2}')
+        [[ -z "$version" ]] && version="已安装"
+    else
+        version="${RED}未安装${RESET}"
+    fi
+
+    # 3. 检测 WebUI 端口和绑定 IP
+    if [[ -f "$SERVICE_FILE" ]]; then
+        port_show=$(grep -oE -- '--webui-port=[0-9]+' "$SERVICE_FILE" | cut -d= -f2)
+        [[ -z "$port_show" ]] && port_show="8080"
+        
+        ip_show=$(grep -oE -- '--webui-listen-to=[^ ]+' "$SERVICE_FILE" | cut -d= -f2)
+        [[ -z "$ip_show" ]] && ip_show="0.0.0.0 (公网)"
+    else
+        port_show="N/A"
+        ip_show="N/A"
+    fi
+}
+
+# 端口合法性校验函数
+validate_port() {
+    local port=$1
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return 1
     fi
+    if ((port < 1 || port > 65535)); then
+        echo -e "${RED}错误: 端口范围必须在 1-65535 之间！${RESET}"
+        return 1
+    fi
+    return 0
 }
 
-get_iptables_version() {
-    if command -v iptables &>/dev/null; then
-        iptables --version 2>/dev/null | awk '{print $2}'
+# 从日志中自动提取临时密码
+get_qb_password() {
+    local log_line log_pass
+    log_line=$(sudo journalctl -u "$SERVICE_NAME" --no-pager | grep -Ei "temporary password is:|password was randomly generated:|provided for this session:" | tail -n 1)
+    
+    if [[ -n "$log_line" ]]; then
+        log_pass=$(echo "$log_line" | sed -e 's/.*session://I' -e 's/.*is://I' | tr -d '[:space:].:')
+    fi
+    
+    if [[ -n "$log_pass" ]]; then
+        echo -e "${GREEN}${log_pass}${RESET}"
     else
-        echo "未安装"
+        echo -e "${RED}未找到临时密码（可能已在WebUI中修改、日志已清空，或服务未成功启动）${RESET}"
     fi
 }
 
-validate_port() {
-    local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
-}
-
-detect_ip_type() {
-    local ip="$1"
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        local IFS='.' ok=1
-        read -ra octets <<< "$ip"
-        for octet in "${octets[@]}"; do
-            if (( octet > 255 )); then ok=0; fi
+# 获取公网 IP
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
-        [[ $ok -eq 1 ]] && { echo "4"; return; }
-    fi
-    if [[ "$ip" =~ : ]] && [[ ! "$ip" =~ [^0-9a-fA-F:] ]]; then
-        echo "6"
-        return
-    fi
-    if [[ "$ip" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-        echo "2"
-        return
-    fi
-    echo "1"
+    done
+    echo "127.0.0.1"
 }
 
-resolve_domain() {
-    local domain="$1"
-    local resolved=""
-    if command -v getent &>/dev/null; then
-        resolved=$(getent ahosts "$domain" 2>/dev/null | grep -E '^[0-9]' | head -n1 | awk '{print $1}')
+# 1. 部署 qBittorrent-Nox (支持绑定端口与IP)
+install_qbittorrent() {
+    if [[ -f "$BIN_PATH" ]]; then
+        echo -e "${YELLOW}提示: qBittorrent 已安装在 $BIN_PATH，请勿重复安装。${RESET}"
+        return
     fi
-    if [[ -z "$resolved" ]] && command -v dig &>/dev/null; then
-        resolved=$(dig +short "$domain" @8.8.8.8 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1)
-    fi
-    if [[ -z "$resolved" ]] && command -v nslookup &>/dev/null; then
-        resolved=$(nslookup "$domain" 8.8.8.8 2>/dev/null | awk '/^Address:/ {print $2}' | grep -v "#" | head -n1)
-    fi
-    echo "${resolved//[[:space:]]/}"
-}
 
-enable_ip_forward() {
-    mkdir -p /etc/sysctl.d
-    cat > "${SYSCTL_CONF}" <<EOF
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
+    # 输入端口
+    echo -ne "${YELLOW}请输入你想要设置的 WebUI 端口号 [默认: 8080]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8080"
+    if ! validate_port "$custom_port"; then return; fi
+
+    # 输入绑定 IP
+    echo -e "${YELLOW}请选择 WebUI 绑定的 IP 地址:${RESET}"
+    echo -e "  1) 0.0.0.0   (默认：允许公网/局域网外网访问)"
+    echo -e "  2) 127.0.0.1 (安全：仅限本地服务器或反向代理/SSH隧道访问)"
+    echo -ne "${YELLOW}请选择选项或直接输入自定义IP [默认: 1]: ${RESET}"
+    read -r ip_choice
+    
+    local listen_ip="0.0.0.0"
+    case "$ip_choice" in
+        2) listen_ip="127.0.0.1" ;;
+        "") listen_ip="0.0.0.0" ;;
+        *) [[ -n "$ip_choice" && "$ip_choice" != "1" ]] && listen_ip="$ip_choice" ;;
+    esac
+
+    # 检测系统架构决定下载哪个文件
+    local arch url_file
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)      url_file="x86_64-qbittorrent-nox" ;;
+        aarch64)     url_file="aarch64-qbittorrent-nox" ;;
+        armv7l)      url_file="armv7-qbittorrent-nox" ;;
+        armhf)       url_file="armhf-qbittorrent-nox" ;;
+        riscv64)     url_file="riscv64-qbittorrent-nox" ;;
+        i386|i686)   url_file="x86-qbittorrent-nox" ;;
+        *) echo -e "${RED}错误: 暂不支持您的系统架构 ($arch)！${RESET}" && return ;;
+    esac
+
+    sudo apt update && sudo apt install -y curl wget
+
+    echo -e "${YELLOW}正在检索 GitHub 最新版本信息...${RESET}"
+    local release_json latest_tag expected_sha
+    release_json=$(curl -s https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases/latest)
+    latest_tag=$(echo "$release_json" | grep -oP '"tag_name": "\K[^"]+')
+
+    if [[ -z "$latest_tag" ]]; then
+        echo -e "${RED}错误: 无法获取最新版本号，请稍后再试。${RESET}"
+        return
+    fi
+    echo -e "${GREEN}检测到最新版本标签: ${latest_tag}${RESET}"
+
+    expected_sha=$(echo "$release_json" | grep -A 2 "$url_file" | grep -oP '"body": "sha256:\K[a-f0-9]{64}' || echo "$release_json" | grep -oP "sha256:${url_file}\s+\K[a-f0-9]{64}" || echo "$release_json" | sed -n "/${url_file}/,/^$/p" | grep -oP '[a-f0-9]{64}')
+    
+    local download_url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${latest_tag}/${url_file}"
+    echo -e "${YELLOW}正在从 GitHub 下载最新二进制文件...${RESET}"
+    sudo wget -q --show-progress -O "$BIN_PATH" "$download_url"
+    if [[ $? -ne 0 || ! -s "$BIN_PATH" ]]; then
+        echo -e "${RED}错误: 下载失败！${RESET}" && sudo rm -f "$BIN_PATH" && return
+    fi
+
+    if [[ -n "$expected_sha" && ${#expected_sha} -eq 64 ]]; then
+        local calculated_sha
+        calculated_sha=$(sha256sum "$BIN_PATH" | awk '{print $1}')
+        if [[ "$calculated_sha" != "$expected_sha" ]]; then
+            echo -e "${RED}错误: SHA256 校验失败！${RESET}" && sudo rm -f "$BIN_PATH" && return
+        fi
+    fi
+
+    sudo chmod +x "$BIN_PATH"
+    sudo mkdir -p "$CONFIG_DIR" "$DOWNLOAD_DIR"
+    sudo chown -R "$REAL_USER":"$REAL_USER" "$APP_DIR"
+    sudo chmod -R 755 "$APP_DIR"
+
+    echo -e "${YELLOW}创建 systemd 服务文件...${RESET}"
+    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
+[Unit]
+Description=qBittorrent Command Line Client (Static Latest)
+After=network.target
+
+[Service]
+ExecStart=$BIN_PATH --webui-port=${custom_port} --webui-listen-to=${listen_ip} --profile=$CONFIG_DIR
+User=$REAL_USER
+Restart=on-failure
+WorkingDirectory=$DOWNLOAD_DIR
+
+[Install]
+WantedBy=multi-user.target
 EOF
-    sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
+
+    sudo systemctl daemon-reload
+    sudo systemctl start qbittorrent
+    sudo systemctl enable qbittorrent
+
+    echo -e "${YELLOW}等待服务启动并生成密码...${RESET}"
+    sleep 4
+
+    local display_ip="$listen_ip"
+    [[ "$listen_ip" == "0.0.0.0" ]] && display_ip=$(get_public_ip)
+
+    echo -e "\n${GREEN}qBittorrent-Nox 静态版安装完成并已启动!${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址: http://${display_ip}:${custom_port}${RESET}"
+    echo -e "${YELLOW}默认用户名: admin${RESET}"
+    echo -ne "${YELLOW}初始密码: ${RESET}"
+    get_qb_password
+}
+
+# 2. 自动检查并更新到最新版 (保留历史端口和绑定IP设置)
+update_qbittorrent() {
+    if [[ ! -f "$BIN_PATH" ]]; then
+        echo -e "${RED}错误: 未检测到已安装的 qBittorrent，请先选择 1 进行安装！${RESET}"
+        return
+    fi
+
+    local current_port="8080"
+    local current_ip="0.0.0.0"
+    if [[ -f "$SERVICE_FILE" ]]; then
+        current_port=$(grep -oE -- '--webui-port=[0-9]+' "$SERVICE_FILE" | cut -d= -f2)
+        [[ -z "$current_port" ]] && current_port="8080"
+        current_ip=$(grep -oE -- '--webui-listen-to=[^ ]+' "$SERVICE_FILE" | cut -d= -f2)
+        [[ -z "$current_ip" ]] && current_ip="0.0.0.0"
+    fi
+
+    echo -e "${YELLOW}正在检测系统架构并获取最新版本...${RESET}"
+    local arch url_file
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)      url_file="x86_64-qbittorrent-nox" ;;
+        aarch64)     url_file="aarch64-qbittorrent-nox" ;;
+        armv7l)      url_file="armv7-qbittorrent-nox" ;;
+        armhf)       url_file="armhf-qbittorrent-nox" ;;
+        riscv64)     url_file="riscv64-qbittorrent-nox" ;;
+        i386|i686)   url_file="x86-qbittorrent-nox" ;;
+        *) echo -e "${RED}错误: 暂不支持您的系统架构 ($arch)！${RESET}" && return ;;
+    esac
+
+    local release_json latest_tag expected_sha
+    release_json=$(curl -s https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases/latest)
+    latest_tag=$(echo "$release_json" | grep -oP '"tag_name": "\K[^"]+')
+
+    if [[ -z "$latest_tag" ]]; then
+        echo -e "${RED}错误: 无法获取最新版本号，请稍后再试。${RESET}"
+        return
+    fi
+    echo -e "${GREEN}检测到最新版本标签: ${latest_tag}${RESET}"
+
+    expected_sha=$(echo "$release_json" | grep -A 2 "$url_file" | grep -oP '"body": "sha256:\K[a-f0-9]{64}' || echo "$release_json" | grep -oP "sha256:${url_file}\s+\K[a-f0-9]{64}" || echo "$release_json" | sed -n "/${url_file}/,/^$/p" | grep -oP '[a-f0-9]{64}')
+
+    local tmp_bin="/tmp/qbittorrent-nox.tmp"
+    local download_url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${latest_tag}/${url_file}"
+    echo -e "${YELLOW}正在下载新版本二进制文件...${RESET}"
     
-    # 加载 Alpine 内核模块保底
-    modprobe ip_tables iptable_nat ip6_tables ip6table_nat 2>/dev/null || true
-}
+    sudo wget -q --show-progress -O "$tmp_bin" "$download_url"
+    if [[ $? -ne 0 || ! -s "$tmp_bin" ]]; then
+        echo -e "${RED}错误: 下载失败，放弃更新。${RESET}" && sudo rm -f "$tmp_bin" && return
+    fi
 
-disable_ip_forward() {
-    rm -f "${SYSCTL_CONF}" 2>/dev/null
-}
-
-init_conf() {
-    mkdir -p "${CONF_DIR}" "${DEFAULT_BACKUP_DIR}" 2>/dev/null || return 1
-    touch "${LOG_FILE}" "${CONF_FILE}" 2>/dev/null || true
-}
-
-declare -a RULES=()
-
-sanitize_note() {
-    printf "%s" "${1//|/ }"
-}
-
-# 从自建的纯净规则文件中加载
-load_rules() {
-    RULES=()
-    [[ -f "${CONF_FILE}" ]] || return
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ "$line" =~ ^[[:space:]]*# ]] && [[ ! "$line" =~ "RULE:" ]] && continue
-        [[ -z "${line//[[:space:]]/}" ]] && continue
-        
-        if [[ "$line" =~ ^#\ RULE:\ (.*)$ ]]; then
-            RULES+=("${BASH_REMATCH[1]}")
+    if [[ -n "$expected_sha" && ${#expected_sha} -eq 64 ]]; then
+        local calculated_sha
+        calculated_sha=$(sha256sum "$tmp_bin" | awk '{print $1}')
+        if [[ "$calculated_sha" != "$expected_sha" ]]; then
+            echo -e "${RED}错误: SHA256 校验失败！放弃更新。${RESET}" && sudo rm -f "$tmp_bin" && return
         fi
-    done < "${CONF_FILE}"
-}
+    fi
 
-# 核心：将本地 RULES 阵列转换为系统 iptables 实际规则并保存
-write_and_apply_rules() {
-    local tmp_file="${CONF_FILE}.tmp.$$"
-    echo "# iptables 端口转发快照" > "${tmp_file}"
-    local rule
-    for rule in "${RULES[@]}"; do
-        echo "# RULE: ${rule}" >> "${tmp_file}"
-    done
-    mv -f "${tmp_file}" "${CONF_FILE}" 2>/dev/null
+    echo -e "${YELLOW}正在应用更新并重启服务...${RESET}"
+    sudo systemctl stop qbittorrent
+    sudo mv -f "$tmp_bin" "$BIN_PATH"
+    sudo chmod +x "$BIN_PATH"
+    
+    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
+[Unit]
+Description=qBittorrent Command Line Client (Static Latest)
+After=network.target
 
-    # 精准定点清理转发链（绝对不碰 INPUT，SSH永不锁死）
-    iptables -t nat -F PREROUTING 2>/dev/null || true
-    iptables -t nat -F POSTROUTING 2>/dev/null || true
-    ip6tables -t nat -F PREROUTING 2>/dev/null || true
-    ip6tables -t nat -F POSTROUTING 2>/dev/null || true
+[Service]
+ExecStart=$BIN_PATH --webui-port=${current_port} --webui-listen-to=${current_ip} --profile=$CONFIG_DIR
+User=$REAL_USER
+Restart=on-failure
+WorkingDirectory=$DOWNLOAD_DIR
 
-    local lport target dport note proto type actual_ip
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        proto="${proto:-ALL}"
-        type=$(detect_ip_type "$target")
-        actual_ip="$target"
-        
-        if [[ "$type" == "2" ]]; then 
-            actual_ip=$(resolve_domain "$target")
-            if [[ -z "$actual_ip" ]]; then
-                # 域名解析闪断保底
-                actual_ip=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -w "dports ${lport}" | awk '{print $NF}' | awk -F':' '{print $1}')
-            fi
-        fi
-        [[ -z "$actual_ip" ]] && continue
-        local ip_ver=$(detect_ip_type "$actual_ip")
-
-        if [[ "$ip_ver" == "4" ]]; then
-            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
-                iptables -t nat -A PREROUTING -p tcp --dport "${lport}" -j DNAT --to-destination "${actual_ip}:${dport}"
-                iptables -t nat -A POSTROUTING -p tcp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
-                iptables -t nat -A PREROUTING -p udp --dport "${lport}" -j DNAT --to-destination "${actual_ip}:${dport}"
-                iptables -t nat -A POSTROUTING -p udp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-        elif [[ "$ip_ver" == "6" ]]; then
-            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
-                ip6tables -t nat -A PREROUTING -p tcp --dport "${lport}" -j DNAT --to-destination "[${actual_ip}]:${dport}"
-                ip6tables -t nat -A POSTROUTING -p tcp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
-                ip6tables -t nat -A PREROUTING -p udp --dport "${lport}" -j DNAT --to-destination "[${actual_ip}]:${dport}"
-                ip6tables -t nat -A POSTROUTING -p udp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-        fi
-    done
-
-    # 持久化保存到 Alpine 系统开机加载目录
-    rc-service iptables save >/dev/null 2>&1 || true
-    rc-service ip6tables save >/dev/null 2>&1 || true
-}
-
-setup_ddns_cron() {
-    rc-update add dcron default >/dev/null 2>&1 || true
-    rc-service dcron start >/dev/null 2>&1 || true
-
-    cat > "${CRON_DDNS_SCRIPT}" <<EOF
-#!/usr/bin/env bash
-CONF_FILE="/etc/iptables.d/port-forward.rules"
-[[ -f "\$CONF_FILE" ]] || exit 0
-if grep -q "RULE:" "\$CONF_FILE"; then
-    /etc/iptables.d/port_forward_main.sh --reload-backend
-fi
+[Install]
+WantedBy=multi-user.target
 EOF
-    chmod +x "${CRON_DDNS_SCRIPT}" 2>/dev/null
 
-    local tmp_cron="/tmp/current_cron_$$"
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" > "${tmp_cron}" || true
-    echo "*/2 * * * * ${CRON_DDNS_SCRIPT} >/dev/null 2>&1" >> "${tmp_cron}"
-    crontab "${tmp_cron}" 2>/dev/null || true
-    rm -f "${tmp_cron}"
+    sudo systemctl daemon-reload
+    sudo systemctl start qbittorrent
+    
+    get_status_info
+    echo -e "\n${GREEN}qBittorrent 已成功无缝更新至最新版！${RESET}"
 }
 
-do_backend_ddns_sync() {
-    [[ -f "${CONF_FILE}" ]] || exit 0
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then exit 0; fi
-
-    local need_reload=0
-    local rule lport target dport note proto type current_dns_ip
-
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        type=$(detect_ip_type "$target")
-        
-        if [[ "$type" == "2" ]]; then
-            current_dns_ip=$(resolve_domain "$target")
-            if [[ -n "$current_dns_ip" ]]; then
-                local active_ip
-                active_ip=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -w "dports ${lport}" | awk '{print $NF}' | awk -F':' '{print $1}')
-                if [[ "$current_dns_ip" != "$active_ip" ]]; then
-                    need_reload=1
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') [DDNS] 检测到域名 ${target} IP 变动，触发局部热重载..." >> "${LOG_FILE}"
-                fi
-            fi
-        fi
-    done
-
-    if [[ $need_reload -eq 1 ]]; then
-        write_and_apply_rules
-    fi
-    exit 0
+# 3. 卸载服务
+uninstall_qbittorrent() {
+    echo -e "${RED}警告: 正在卸载 qBittorrent 并清除所有配置数据...${RESET}"
+    sudo systemctl stop ${SERVICE_NAME} 2>/dev/null
+    sudo systemctl disable ${SERVICE_NAME} 2>/dev/null
+    sudo rm -f "$SERVICE_FILE"
+    sudo systemctl daemon-reload
+    sudo rm -f "$BIN_PATH"
+    sudo rm -rf "$APP_DIR"
+    echo -e "${GREEN}qBittorrent 已彻底卸载，数据已清理完毕。${RESET}"
 }
 
-do_backup_manual() {
-    if [[ ! -f "${CONF_FILE}" ]] || [[ ! -s "${CONF_FILE}" ]]; then
-        err "当前没有任何生效的规则，无需导出。"
-        pause_to_menu
+# 4. 修改端口和绑定配置
+edit_config() {
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到服务文件，请先安装 qBittorrent！${RESET}"
         return
     fi
-    local target_dir
-    read -rp "$(echo -e "${GREEN}请输入备份导出目录 [默认: ${DEFAULT_BACKUP_DIR}]: ${RESET}")" target_dir
-    target_dir="${target_dir:-$DEFAULT_BACKUP_DIR}"
-    mkdir -p "${target_dir}" 2>/dev/null
 
-    local bkp_name="iptables_bak_$(date '+%Y%m%d_%H%M%S').rules"
-    cp "${CONF_FILE}" "${target_dir}/${bkp_name}"
-    info "手动导出成功！备份至: ${target_dir}/${bkp_name}"
-    pause_to_menu
-}
+    get_status_info
+    echo -e "${CYAN}当前 WebUI 端口为 : ${port_show}${RESET}"
+    echo -e "${CYAN}当前 WebUI 绑定 IP: ${ip_show}${RESET}"
+    echo "---"
+    
+    echo -ne "${YELLOW}请输入新的 WebUI 端口号 (直接回车保持不变): ${RESET}"
+    read -r new_port
+    [[ -z "$new_port" ]] && new_port=$(grep -oE -- '--webui-port=[0-9]+' "$SERVICE_FILE" | cut -d= -f2)
+    if ! validate_port "$new_port"; then return; fi
 
-do_restore_manual() {
-    local target_input selected_file=""
-    read -rp "$(echo -e "${GREEN}请输入备份文件夹或完整路径 [默认: ${DEFAULT_BACKUP_DIR}]: ${RESET}")" target_input
-    target_input="${target_input:-$DEFAULT_BACKUP_DIR}"
+    echo -e "${YELLOW}请选择新的 WebUI 绑定 IP:${RESET}"
+    echo -e "  1) 0.0.0.0   (公网/局域网外网访问)"
+    echo -e "  2) 127.0.0.1 (本地回环/绝对安全)"
+    echo -ne "${YELLOW}请输入选项或输入自定义IP (直接回车保持不变): ${RESET}"
+    read -r ip_choice
+    
+    local new_ip
+    new_ip=$(grep -oE -- '--webui-listen-to=[^ ]+' "$SERVICE_FILE" | cut -d= -f2)
+    [[ -z "$new_ip" ]] && new_ip="0.0.0.0"
 
-    if [[ -f "$target_input" ]]; then
-        selected_file="$target_input"
+    case "$ip_choice" in
+        1) new_ip="0.0.0.0" ;;
+        2) new_ip="127.0.0.1" ;;
+        "") ;; # 保持不变
+        *) [[ -n "$ip_choice" ]] && new_ip="$ip_choice" ;;
+    esac
+
+    echo -e "${YELLOW}正在应用新配置 (端口: ${new_port} | IP: ${new_ip})...${RESET}"
+    sudo sed -i "s/--webui-port=[0-9]*/--webui-port=${new_port}/g" "$SERVICE_FILE"
+    
+    # 兼容老服务文件中可能没有 --webui-listen-to 的情况
+    if grep -q -- "--webui-listen-to" "$SERVICE_FILE"; then
+        sudo sed -i "s/--webui-listen-to=[^ ]*/--webui-listen-to=${new_ip}/g" "$SERVICE_FILE"
     else
-        local bkp_files=($(ls "${target_input}"/*.rules 2>/dev/null | sort -r))
-        if [[ ${#bkp_files[@]} -eq 0 ]]; then
-            err "未发现备份文件。"
-            pause_to_menu
-            return
-        fi
-        echo -e "\n${YELLOW}=== 历史备份 ===${RESET}"
-        local idx=1 file
-        for file in "${bkp_files[@]}"; do
-            printf "[%2s] %s\n" "$idx" "$(basename "$file")"
-            ((idx++))
-        done
-        read -rp "请选择序号 (0 取消): " choice
-        if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-        selected_file="${bkp_files[$((choice-1))]}"
+        sudo sed -i "s|--webui-port=${new_port}|--webui-port=${new_port} --webui-listen-to=${new_ip}|g" "$SERVICE_FILE"
     fi
-
-    if [[ -n "$selected_file" && -f "$selected_file" ]]; then
-        cp -f "${selected_file}" "${CONF_FILE}"
-        load_rules
-        write_and_apply_rules
-        info "配置已导入并成功应用！"
-    fi
-    pause_to_menu
-}
-
-do_install() {
-    info "准备安全安装 Alpine iptables 双栈环境..."
-    apk add iptables ip6tables bash curl bind-tools dcron
     
-    enable_ip_forward && init_conf
+    sudo systemctl daemon-reload
+    sudo systemctl restart "$SERVICE_NAME"
+    echo -e "${GREEN}配置修改成功并已重启服务！${RESET}"
+}
+
+# 5. 启动服务
+start_qbittorrent() {
+    sudo systemctl start ${SERVICE_NAME}
+    echo -e "${GREEN}qBittorrent 已启动${RESET}"
+}
+
+# 6. 停止服务
+stop_qbittorrent() {
+    sudo systemctl stop ${SERVICE_NAME}
+    echo -e "${YELLOW}qBittorrent 已停止${RESET}"
+}
+
+# 7. 重启服务
+restart_qbittorrent() {
+    sudo systemctl restart ${SERVICE_NAME}
+    echo -e "${GREEN}qBittorrent 已重启${RESET}"
+}
+
+# 8. 查看日志
+logs_qbittorrent() {
+    echo -e "${CYAN}正在实时查看日志 (按 Ctrl+C 退出)...${RESET}"
+    sudo journalctl -u ${SERVICE_NAME} -n 50 -f
+}
+
+# 9. 查看节点配置
+show_node_info() {
+    get_status_info
+    local current_ip=$(grep -oE -- '--webui-listen-to=[^ ]+' "$SERVICE_FILE" | cut -d= -f2)
+    [[ -z "$current_ip" ]] && current_ip="0.0.0.0"
     
-    rc-update add iptables default >/dev/null 2>&1 || true
-    rc-update add ip6tables default >/dev/null 2>&1 || true
-    rc-service iptables start >/dev/null 2>&1 || true
-    rc-service ip6tables start >/dev/null 2>&1 || true
-    
-    setup_ddns_cron
-    info "Alpine iptables 双栈环境初始化完成！INPUT 链绝对纯净安全。"
-    pause_to_menu
+    local display_ip="$current_ip"
+    [[ "$current_ip" == "0.0.0.0" ]] && display_ip=$(get_public_ip)
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    qBittorrent 访问与配置信息    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}WebUI 地址 : http://${display_ip}:${port_show}${RESET}"
+    echo -e "${YELLOW}当前绑定 IP: ${current_ip}${RESET}"
+    echo -e "${YELLOW}默认用户名 : admin${RESET}"
+    echo -ne "${YELLOW}初始密码   : ${RESET}"
+    get_qb_password
+    echo -e "${GREEN}================================${RESET}"
 }
 
-_print_rules_list() {
-    printf "\n\033[1m%-6s %-12s %-10s     %-35s %s\033[0m\n" "序号"  "协议"  "本机端口"  "目标地址/域名"  "备注"
-    echo -e "${GREEN}=====================================${RESET}"
-    local idx=1 rule lport target dport note proto type label proto_label
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        proto="${proto:-ALL}"
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "2" ]]; then label="域名"; else [[ "$type" == "6" ]] && label="IPv6" || label="IPv4"; fi
-        if [[ "$proto" == "ALL" ]]; then proto_label="TCP+UDP"; else proto_label="$proto"; fi
-        proto_label="${proto_label} (${label})"
-
-        if [[ "$type" == "6" ]]; then
-            printf "%-6s %-12s %-10s -> %-35s %s\n" "$idx" "$proto_label" "$lport" "[${target}]:${dport}" "${note:--}"
-        else
-            printf "%-6s %-12s %-10s -> %-35s %s\n" "$idx" "$proto_label" "$lport" "${target}:${dport}" "${note:--}"
-        fi
-        ((idx++))
-    done
+# 菜单
+menu() {
+    clear
+    get_status_info
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     qBittorrent 自动管理面板     ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $status"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}绑定IP :${RESET} ${YELLOW}${ip_show}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 qBittorrent${RESET}"
+    echo -e "${GREEN}2. 更新 qBittorrent${RESET}"
+    echo -e "${GREEN}3. 卸载 qBittorrent${RESET}"
+    echo -e "${GREEN}4. 修改配置${RESET}"
+    echo -e "${GREEN}5. 启动 qBittorrent${RESET}"
+    echo -e "${GREEN}6. 停止 qBittorrent${RESET}"
+    echo -e "${GREEN}7. 重启 qBittorrent${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_qbittorrent ;;
+        2) update_qbittorrent ;;
+        3) uninstall_qbittorrent ;;
+        4) edit_config ;;
+        5) start_qbittorrent ;;
+        6) stop_qbittorrent ;;
+        7) restart_qbittorrent ;;
+        8) logs_qbittorrent ;;
+        9) show_node_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
 }
 
-do_list() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then 
-        info "当前没有配置任何端口转发规则。"
-        pause_to_menu
-        return
-    fi
-    _print_rules_list
-    echo ""
-    pause_to_menu
-}
-
-do_add() {
-    init_conf || return
-    enable_ip_forward && load_rules
-
-    local lport target dport note proto proto_choice type
-    while true; do
-        read -rp "请输入本机监听端口 (1-65535): " lport
-        validate_port "$lport" && break
-        err "端口输入无效"
-    done
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r rp _ _ _ _ <<< "$rule"
-        if [[ "$rp" == "$lport" ]]; then err "本机端口 ${lport} 规则已存在"; pause_to_menu; return; fi
-    done
-    while true; do
-        read -rp "请输入目标 IP 地址 或 目标域名: " target
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "1" ]]; then err "格式不正确"; elif [[ "$type" == "2" ]]; then
-            local rip=$(resolve_domain "$target")
-            [[ -z "$rip" ]] && warn "该域名目前解析不出 IP，系统稍后会自动重试。" || info "成功解析当前 IP 为: ${rip}"
-            break
-        else break; fi
-    done
-    while true; do
-        read -rp "请输入目标端口 [默认 $lport]: " dport
-        dport="${dport:-$lport}"
-        validate_port "$dport" && break
-        err "目标端口不合法"
-    done
-
-    while true; do
-        read -rp "$(echo -e "${GREEN}请选择协议类型 [1: TCP+UDP | 2: 仅 TCP | 3: 仅 UDP] (默认 1): ${RESET}")" proto_choice
-        proto_choice="${proto_choice:-1}"
-        case "$proto_choice" in
-            1) proto="ALL"; break ;;
-            2) proto="TCP"; break ;;
-            3) proto="UDP"; break ;;
-            *) err "选择错误，请输入 1, 2 或 3" ;;
-        esac
-    done
-
-    read -rp "请输入本条转发备注: " note
-    note=$(sanitize_note "$note")
-
-    RULES+=("${lport}|${target}|${dport}|${note}|${proto}")
-    write_and_apply_rules
-    setup_ddns_cron
-    info "规则添加并加载成功！"
-    pause_to_menu
-}
-
-do_edit() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供修改。"; pause_to_menu; return; fi
-    _print_rules_list
-    echo ""
-
-    read -rp "请输入要修改的规则序号 (0 取消): " choice
-    if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
-        err "无效序号"
-        pause_to_menu
-        return
-    fi
-
-    local target_idx=$((choice-1))
-    local old_lport old_target old_dport old_note old_proto
-    IFS='|' read -r old_lport old_target old_dport old_note old_proto <<< "${RULES[$target_idx]}"
-
-    echo -e "\n${YELLOW}开始修改第 $choice 条规则 (直接回车保持原值):${RESET}"
-    local lport target dport note proto proto_choice type
-
-    while true; do
-        read -rp "本机监听端口 [$old_lport]: " lport
-        lport="${lport:-$old_lport}"
-        validate_port "$lport" && break
-        err "端口输入无效"
-    done
-
-    while true; do
-        read -rp "目标 IP 或 域名 [$old_target]: " target
-        target="${target:-$old_target}"
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "1" ]]; then err "格式不正确"; elif [[ "$type" == "2" ]]; then
-            local rip=$(resolve_domain "$target")
-            [[ -z "$rip" ]] && warn "该域名目前解析不出 IP，系统稍后会自动重试。" || info "成功解析当前 IP 为: ${rip}"
-            break
-        else break; fi
-    done
-
-    while true; do
-        read -rp "目标端口 [$old_dport]: " dport
-        dport="${dport:-$old_dport}"
-        validate_port "$dport" && break
-        err "目标端口不合法"
-    done
-
-    read -rp "本条转发备注 [$old_note]: " note
-    note="${note:-$old_note}"
-    note=$(sanitize_note "$note")
-
-    RULES[$target_idx]="${lport}|${target}|${dport}|${note}|${old_proto}"
-    write_and_apply_rules
-    info "规则修改并应用成功！"
-    pause_to_menu
-}
-
-do_delete() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供删除。"; pause_to_menu; return; fi
-    _print_rules_list
-    echo ""
-
-    read -rp "请输入要删除的规则序号 (0 取消): " choice
-    if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#RULES[@]} )); then
-        unset 'RULES[$((choice-1))]'
-        RULES=("${RULES[@]}")
-        write_and_apply_rules
-        info "成功删除规则。"
-    else 
-        err "无效序号"
-    fi
-    pause_to_menu
-}
-
-do_clear_all() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "当前没有任何转发规则。"; pause_to_menu; return; fi
-    read -rp "确认彻底清空所有规则？[y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
-    RULES=()
-    write_and_apply_rules
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
-    rm -f "${CRON_DDNS_SCRIPT}" 2>/dev/null
-    info "已全部清空。"
-    pause_to_menu
-}
-
-do_diagnose() {
-    echo -e "\n========================================"
-    echo "     Alpine Linux iptables 系统环境自检"
-    echo "========================================"
-    info "系统类型: Alpine Linux"
-    
-    local status_msg
-    status_msg=$(is_iptables_active)
-    if [[ $? -eq 0 ]]; then
-        info "iptables 服务状态: ${status_msg}"
-    else
-        warn "iptables 服务状态: 未运行"
-    fi
-
-    if crontab -l 2>/dev/null | grep -q "${CRON_DDNS_SCRIPT}"; then
-        info "域名同步守护进程: 正常激活 (每2分钟)"
-    else
-        warn "域名同步守护进程: 未配置进程"
-    fi
-    pause_to_menu
-}
-
-do_view_log() {
-    if [[ ! -f "${LOG_FILE}" ]]; then
-        info "当前暂无 DDNS 日志记录产生。"
-        pause_to_menu
-        return
-    fi
-    echo -e "\n${GREEN}正在查看实时日志，按【Ctrl + C】可以随时退出查看...${RESET}"
-    tail -n 30 -f "${LOG_FILE}"
-}
-
-do_uninstall() {
-    read -rp "确认要彻底卸载本工具并清空所有转发规则吗？[y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
-
-    RULES=()
-    write_and_apply_rules 2>/dev/null || true
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
-    disable_ip_forward
-    rm -f "${BIN_LINK_DIR}/A" "${BIN_LINK_DIR}/a" 2>/dev/null
-    rm -rf "${CONF_DIR}" 2>/dev/null
-
-    echo -e "${GREEN}✅ Alpine 纯净卸载成功！iptables 转发规则已清除。${RESET}"
-    exit 0
-}
-
-auto_localize_and_link() {
-    mkdir -p "${CONF_DIR}" "${BIN_LINK_DIR}"
-    local current_script
-    current_script=$(readlink -f "$0" 2>/dev/null || echo "")
-    if [[ -n "$current_script" && "$current_script" != "$LOCAL_SCRIPT_PATH" && -f "$current_script" ]]; then
-        cp -f "$current_script" "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
-        chmod +x "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
-    fi
-    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/A"
-    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/a"
-}
-
-main_menu() {
-    check_root
-    if [[ "${1:-}" == "--reload-backend" ]]; then
-        do_backend_ddns_sync
-        exit 0
-    fi
-
-    auto_localize_and_link
-
-    local panel_status panel_version panel_rules_count status_msg
-    while true; do
-        # 核心修复：精准拉取双栈细化状态字符串
-        status_msg=$(is_iptables_active)
-        if [[ $? -eq 0 ]]; then
-            panel_status="${GREEN}${status_msg}${RESET}"
-        else
-            panel_status="${RED}未运行${RESET}"
-        fi
-
-        panel_version=$(get_iptables_version)
-        load_rules
-        panel_rules_count="${#RULES[@]}"
-
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN}  ◈ Alpine iptables 转发面板 (快捷键 A) ◈${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN} 状态 :${RESET} $panel_status"
-        echo -e "${GREEN} 版本 : ${panel_version} (绝对安全不锁SSH版)"
-        echo -e "${GREEN} 规则 : 已载入${RESET} ${YELLOW}${panel_rules_count}${RESET} ${GREEN}条转发${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN} 1. 安装/修复 iptables环境${RESET}"
-        echo -e "${GREEN} 2. 查看 当前转发规则${RESET}"
-        echo -e "${GREEN} 3. 新增 转发规则${RESET}"
-        echo -e "${GREEN} 4. 修改 转发规则${RESET}"
-        echo -e "${GREEN} 5. 删除 转发规则${RESET}"
-        echo -e "${GREEN} 6. 清空 所有转发规则${RESET}"
-        echo -e "${GREEN} 7. 系统环境自检${RESET}"
-        echo -e "${GREEN} 8. 导出 规则(备份)${RESET}"
-        echo -e "${GREEN} 9. 导入 规则(恢复)${RESET}"
-        echo -e "${GREEN}10. 查看 DDNS 运行日志${RESET}"
-        echo -e "${GREEN}11. 卸载面板${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        
-        read -rp "$(echo -e "${GREEN}请选择操作: ${RESET}")" menu_choice
-        case "$menu_choice" in
-            1) do_install ;;
-            2) do_list ;;
-            3) do_add ;;
-            4) do_edit ;;
-            5) do_delete ;;
-            6) do_clear_all ;;
-            7) do_diagnose ;;
-            8) do_backup_manual ;;
-            9) do_restore_manual ;;
-            10) do_view_log ;;
-            11) do_uninstall ;;
-            0) exit 0 ;;
-            *) err "输入错误" && pause_to_menu ;;
-        esac
-        echo ""
-    done
-}
-
-main_menu "$@"
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

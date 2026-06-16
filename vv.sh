@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 (DDNS 修复日志菜单完美版)
+# nftables 端口转发管理工具 (Alpine Linux 专属轻量版)
 #
 
 # ============== 常量定义 ==============
@@ -37,16 +37,8 @@ check_root() {
     fi
 }
 
-is_alpine() {
-    [[ -f /etc/alpine-release ]]
-}
-
 is_nftables_active() {
-    if is_alpine; then
-        rc-service nftables status 2>/dev/null | grep -q "started"
-    else
-        systemctl is-active --quiet nftables 2>/dev/null
-    fi
+    rc-service nftables status 2>/dev/null | grep -q "started"
 }
 
 get_nft_version() {
@@ -58,13 +50,8 @@ get_nft_version() {
 }
 
 restart_and_enable_nft() {
-    if is_alpine; then
-        rc-update add nftables default >/dev/null 2>&1 || true
-        rc-service nftables restart >/dev/null 2>&1 || true
-    else
-        systemctl enable --now nftables >/dev/null 2>&1 || true
-        systemctl restart nftables >/dev/null 2>&1 || true
-    fi
+    rc-update add nftables default >/dev/null 2>&1 || true
+    rc-service nftables restart >/dev/null 2>&1 || true
 }
 
 validate_port() {
@@ -93,56 +80,34 @@ detect_ip_type() {
     echo "1"
 }
 
-# 【核心终极修复】：tail -n +3 彻底滤除 nslookup 自身的 Server/Address 干扰行，只抓真实目标 IP，且 tr 彻底清除换行尾巴
+# 适配 Alpine BusyBox 环境的 DNS 精准解析
 resolve_domain() {
     local domain="$1"
     local resolved=""
     if command -v nslookup &>/dev/null; then
-        resolved=$(nslookup "$domain" 8.8.8.8 2>/dev/null | tail -n +3 | sed -n 's/^Address:[[:space:]]*\([0-9.]*\).*$/\1/p' | head -n1 | tr -d '\r\n[:space:]')
+        resolved=$(nslookup "$domain" 8.8.8.8 2>/dev/null | awk '/^Address:/ {print $2}' | grep -v "#" | head -n1 | tr -d '\r\n[:space:]')
     fi
     if [[ -z "$resolved" ]] && command -v dig &>/dev/null; then
         resolved=$(dig +short "$domain" @8.8.8.8 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1 | tr -d '\r\n[:space:]')
     fi
     if [[ -z "$resolved" ]]; then
-        resolved=$(ping -c 1 -W 2 "$domain" 2>/dev/null | head -n1 | awk -F'[()]' '{print $2}' | tr -d '\r\n[:space:]')
+        # 移除了所有不兼容的复杂正则括号，完美适配 Alpine 自带 ping
+        resolved=$(ping -c 1 -W 2 "$domain" 2>/dev/null | head -n1 | awk -F'[() ]' '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i}' | head -n1 | tr -d '\r\n[:space:]')
     fi
     echo "$resolved"
 }
 
-detect_pkg_manager() {
-    if is_alpine; then echo "apk"
-    elif command -v apt-get &>/dev/null; then echo "apt"
-    elif command -v dnf &>/dev/null; then echo "dnf"
-    elif command -v yum &>/dev/null; then echo "yum"
-    else echo "unknown"; fi
-}
-
 enable_ip_forward() {
-    if is_alpine; then
-        mkdir -p /etc/sysctl.d
-        cat > /etc/sysctl.d/forward.conf <<EOF
+    mkdir -p /etc/sysctl.d
+    cat > "${SYSCTL_CONF}" <<EOF
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
 EOF
-        sysctl -p /etc/sysctl.d/forward.conf >/dev/null 2>&1 || true
-    else
-        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-        sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
-        mkdir -p "$(dirname "${SYSCTL_CONF}")"
-        cat > "${SYSCTL_CONF}" <<EOF
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-EOF
-        sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
-    fi
+    sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
 }
 
 disable_ip_forward() {
-    if is_alpine; then
-        rm -f /etc/sysctl.d/forward.conf 2>/dev/null
-    else
-        rm -f "${SYSCTL_CONF}" 2>/dev/null
-    fi
+    rm -f "${SYSCTL_CONF}" 2>/dev/null
 }
 
 init_conf() {
@@ -167,7 +132,6 @@ sanitize_note() {
     printf "%s" "${1//|/ }"
 }
 
-# 【核心修复】：收紧更严密精确的 IPv4 提取规则，防止字符串切割发生长短偏离
 load_rules() {
     RULES=()
     [[ -f "${CONF_FILE}" ]] || return
@@ -205,7 +169,7 @@ load_rules() {
                         final_proto="${matched_proto^^}"
                     fi
                 fi
-                if [[ -n "${pending_domain:-}" ]]; then
+                if [[ -n "${pending_domain}" ]]; then
                     RULES+=("${lp}|${pending_domain}|${dp}|${pending_note}|${final_proto}")
                 else
                     RULES+=("${lp}|${current_target}|${dp}|${pending_note}|${final_proto}")
@@ -225,7 +189,7 @@ load_rules() {
             done
             if [[ $exists -eq 0 ]]; then
                 local final_proto="${pending_proto:-ALL}"
-                if [[ -n "${pending_domain:-}" ]]; then
+                if [[ -n "${pending_domain}" ]]; then
                     RULES+=("${lp}|${pending_domain}|${dp}|${pending_note}|${final_proto}")
                 else
                     RULES+=("${lp}|${extracted_ip}|${dp}|${pending_note}|${final_proto}")
@@ -357,7 +321,6 @@ EOF
     mv -f "${tmp_file}" "${CONF_FILE}" 2>/dev/null
 }
 
-# 【核心修复】：后台执行绝对路径规范化
 reload_rules() {
     /usr/sbin/nft -f "${CONF_FILE}"
 }
@@ -368,7 +331,7 @@ setup_ddns_cron() {
 CONF_FILE="/etc/nftables.d/port-forward.conf"
 [[ -f "\$CONF_FILE" ]] || exit 0
 if grep -q "DOMAIN:" "\$CONF_FILE"; then
-    ${LOCAL_SCRIPT_PATH} --reload-backend
+    /etc/nftables.d/port_forward_main.sh --reload-backend
 fi
 EOF
     chmod +x "${CRON_DDNS_SCRIPT}" 2>/dev/null
@@ -377,7 +340,7 @@ EOF
     (crontab -l 2>/dev/null; echo "*/2 * * * * ${CRON_DDNS_SCRIPT} >/dev/null 2>&1") | crontab - 2>/dev/null || true
 }
 
-# 【核心修复】：改用精准的固定字符串检索 (-F)，防止任何因格式排版变动引发的误触发重载循环
+# ==================== 【精准、防死锁、局部更新内核】 ====================
 do_backend_ddns_sync() {
     [[ -f "${CONF_FILE}" ]] || exit 0
     load_rules
@@ -385,29 +348,40 @@ do_backend_ddns_sync() {
 
     local need_reload=0
     local rule lport target dport note proto type current_dns_ip
-    
+    local new_rules=()
+
     for rule in "${RULES[@]}"; do
         IFS='|' read -r lport target dport note proto <<< "$rule"
         type=$(detect_ip_type "$target")
         
         if [[ "$type" == "2" ]]; then
             current_dns_ip=$(resolve_domain "$target")
+            
             if [[ -n "$current_dns_ip" ]]; then
-                if ! grep -F "${current_dns_ip}" "${CONF_FILE}" >/dev/null 2>&1; then
+                local last_active_ip=""
+                last_active_ip=$(grep -A 3 -F "DOMAIN: ${target}" "${CONF_FILE}" 2>/dev/null | grep -E "dnat (to|ip6 to)" | head -n1 | awk '{print $NF}' | awk -F':' '{print $1}' | tr -d '[] ')
+
+                if [[ "$current_dns_ip" != "$last_active_ip" ]]; then
                     need_reload=1
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') [DDNS] 检测到域名 ${target} IP 已变动为 ${current_dns_ip}，触发热重载..." >> "${LOG_FILE}"
-                    break
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') [DDNS] 检测到域名 ${target} IP 已变动 [旧: ${last_active_ip:-无} -> 新: ${current_dns_ip}]，触发局部热重载..." >> "${LOG_FILE}"
                 fi
+                new_rules+=("${lport}|${target}|${dport}|${note}|${proto}")
+            else
+                new_rules+=("${lport}|${target}|${dport}|${note}|${proto}")
             fi
+        else
+            new_rules+=("${lport}|${target}|${dport}|${note}|${proto}")
         fi
     done
 
     if [[ $need_reload -eq 1 ]]; then
+        RULES=("${new_rules[@]}")
         write_conf_file
         reload_rules
     fi
     exit 0
 }
+# =======================================================================
 
 do_backup_manual() {
     if [[ ! -f "${CONF_FILE}" ]] || [[ ! -s "${CONF_FILE}" ]]; then
@@ -491,14 +465,10 @@ do_restore_manual() {
 }
 
 do_install() {
-    info "准备安装依赖..."
-    local pm=$(detect_pkg_manager)
-    case "$pm" in
-        apk) apk add nftables bash curl iproute2 bind-tools ;; 
-        *) $pm update -y && $pm install -y nftables curl dnsutils ;; 
-    esac
+    info "准备安装 Alpine 依赖环境..."
+    apk add nftables bash curl iproute2 bind-tools
     enable_ip_forward && init_conf && restart_and_enable_nft && setup_ddns_cron
-    info "环境初始化完成！"
+    info "Alpine 环境初始化完成！"
     pause_to_menu
 }
 
@@ -686,7 +656,7 @@ do_edit() {
 
 do_delete() {
     load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供删除。"; pause_to_menu; return; fi
+    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供修改。"; pause_to_menu; return; fi
     
     _print_rules_list
     echo ""
@@ -718,10 +688,10 @@ do_clear_all() {
 
 do_diagnose() {
     echo -e "\n========================================"
-    echo "            系统环境自检"
+    echo "       Alpine Linux 系统环境自检"
     echo "========================================"
-    info "系统环境: $(is_alpine && echo 'Alpine Linux' || echo '标准 Linux (Systemd)')"
-    info "nftables 服务状态: $(is_nftables_active && echo '运行中' || echo '未运行')"
+    info "系统类型: Alpine Linux (轻量系统)"
+    info "nftables 服务状态: $(is_nftables_active && echo '运行中(OpenRC)' || echo '未运行')"
     if crontab -l 2>/dev/null | grep -q "${CRON_DDNS_SCRIPT}"; then
         info "域名同步守护进程: 高频自启 (每2分钟)"
     else
@@ -757,15 +727,11 @@ do_uninstall() {
     rm -f "${BIN_LINK_DIR}/A" "${BIN_LINK_DIR}/a" 2>/dev/null
 
     if [[ -f "${MAIN_CONF}" ]]; then
-        if is_alpine; then
-            sed -i '\/etc\/nftables.d\/\*\.conf/d' "${MAIN_CONF}" 2>/dev/null || true
-        else
-            sed -i '/include "\/etc\/nftables.d\/\*\.conf"/d' "${MAIN_CONF}" 2>/dev/null || true
-        fi
+        sed -i '\/etc\/nftables.d\/\*\.conf/d' "${MAIN_CONF}" 2>/dev/null || true
     fi
     rm -rf "${CONF_DIR}" 2>/dev/null
 
-    echo -e "${GREEN}✅ 纯净卸载成功！转发规则已彻底清除，快捷键已拔除。${RESET}"
+    echo -e "${GREEN}✅ Alpine 纯净卸载成功！规则已清除，快捷键已拔除。${RESET}"
     exit 0
 }
 
@@ -802,13 +768,13 @@ main_menu() {
         panel_rules_count="${#RULES[@]}"
 
         echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN}  ◈ nftables 转发面板${RESET}${YELLOW}(快捷键A/a)${RESET}${GREEN} ◈${RESET}"
+        echo -e "${GREEN} ◈ Alpine nftables 转发面板(快捷键A/a) ◈${RESET}"
         echo -e "${GREEN}=====================================${RESET}"
         echo -e "${GREEN} 状态 :${RESET} $panel_status"
-        echo -e "${GREEN} 版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
+        echo -e "${GREEN} 版本 :${RESET} v1.2.0 (Alpine 专属轻量优化版)"
         echo -e "${GREEN} 规则 : 已载入${RESET} ${YELLOW}${panel_rules_count}${RESET} ${GREEN}条转发${RESET}"
         echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN} 1. 安装/修复依赖环境${RESET}"
+        echo -e "${GREEN} 1. 安装依赖环境${RESET}"
         echo -e "${GREEN} 2. 查看 当前转发规则${RESET}"
         echo -e "${GREEN} 3. 新增 转发规则${RESET}"
         echo -e "${GREEN} 4. 修改 转发规则${RESET}"
@@ -817,8 +783,8 @@ main_menu() {
         echo -e "${GREEN} 7. 系统环境自检${RESET}"
         echo -e "${GREEN} 8. 导出 规则(备份)${RESET}"
         echo -e "${GREEN} 9. 导入 规则(恢复)${RESET}"
-        echo -e "${GREEN}10. 彻底卸载面板系统${RESET}"
-        echo -e "${GREEN}11. 查看 DDNS 运行日志${RESET}"
+        echo -e "${GREEN}10. 查看 DDNS 运行日志${RESET}"
+        echo -e "${GREEN}11. 卸载面板${RESET}"
         echo -e "${GREEN} 0. 退出${RESET}"
         echo -e "${GREEN}=====================================${RESET}"
         
@@ -833,8 +799,8 @@ main_menu() {
             7) do_diagnose ;;
             8) do_backup_manual ;;
             9) do_restore_manual ;;
-            10) do_uninstall ;;
-            11) do_view_log ;;
+            10) do_view_log ;;
+            11) do_uninstall ;;
             0) exit 0 ;;
             *) err "输入错误" && pause_to_menu ;;
         esac
@@ -843,5 +809,3 @@ main_menu() {
 }
 
 main_menu "$@"
-EOF
-chmod +x /etc/nftables.d/port_forward_main.sh

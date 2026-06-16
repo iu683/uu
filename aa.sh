@@ -1,595 +1,543 @@
 #!/usr/bin/env bash
-#
-# iptables 端口转发管理工具 (Alpine Linux 专属绝对安全版)
-#
 
-# ============== 常量定义 ==============
-CONF_DIR="/etc/iptables.d"
-CONF_FILE="${CONF_DIR}/port-forward.rules"
-DEFAULT_BACKUP_DIR="${CONF_DIR}/backups"
-SYSCTL_CONF="/etc/sysctl.d/99-ip-forward.conf"
-LOG_FILE="/var/log/iptables-forward.log"
-CRON_DDNS_SCRIPT="${CONF_DIR}/ddns_sync.sh"
-LOCAL_SCRIPT_PATH="${CONF_DIR}/port_forward_main.sh"
-BIN_LINK_DIR="/usr/local/bin"
+set -e
 
-# ============== 颜色定义 ==============
-GREEN='\033[32m'
-YELLOW='\033[33m'
-RED='\033[31m'
-RESET='\033[0m'
+# ==================== 配置区 ====================
+CONFIG_FILE="/etc/vnstat_tg.conf"
+PORT_DB_FILE="/etc/vnstat_tg_ports.db"
+PERM_SCRIPT_PATH="/usr/local/bin/vnstat_mgr.sh"
+REMOTE_URL="https://raw.githubusercontent.com/iu683/uu/main/aa.sh"
 
-# ============== 辅助输出 ==============
-info()   { printf '\033[32m[信息]\033[0m %s\n' "$1"; }
-warn()   { printf '\033[33m[警告]\033[0m %s\n' "$1"; }
-err()    { printf '\033[31m[错误]\033[0m %s\n' "$1"; }
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
+CRON_TIME="0 8 * * *" 
+MONITOR_PORTS="22 80 443" 
+VPS_NAME="$(hostname)" 
+# ================================================
 
-pause_to_menu() {
-    echo ""
-    read -rp "$(echo -e "${GREEN}按任意键或回车返回主菜单...${RESET}")" _unused
-}
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        err "此脚本需要 root 权限运行。"
-        exit 1
-    fi
-}
+SERVICE_NAME=""
+PKG_MANAGER=""
+PKG_REMOVE_CMD=""
+PKG_INSTALL_CMD=""
+INIT_SYSTEM=""
 
-is_iptables_active() {
-    rc-service iptables status 2>/dev/null | grep -q "started"
-}
+# 动态探测 iptables 真实路径
+IPTABLES_CMD=$(which iptables 2>/dev/null || which /sbin/iptables 2>/dev/null || which /usr/sbin/iptables 2>/dev/null || echo "")
+IP6TABLES_CMD=$(which ip6tables 2>/dev/null || which /sbin/ip6tables 2>/dev/null || which /usr/sbin/ip6tables 2>/dev/null || echo "")
 
-get_iptables_version() {
-    if command -v iptables &>/dev/null; then
-        iptables --version 2>/dev/null | awk '{print $2}'
+# ==================== 智能防空降/落地克隆逻辑 ====================
+ensure_script_landed() {
+    local need_download=0
+
+    if [ ! -s "$PERM_SCRIPT_PATH" ]; then
+        need_download=1
     else
-        echo "未安装"
-    fi
-}
-
-validate_port() {
-    local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
-}
-
-detect_ip_type() {
-    local ip="$1"
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        local IFS='.' ok=1
-        read -ra octets <<< "$ip"
-        for octet in "${octets[@]}"; do
-            if (( octet > 255 )); then ok=0; fi
-        done
-        [[ $ok -eq 1 ]] && { echo "4"; return; }
-    fi
-    if [[ "$ip" =~ : ]] && [[ ! "$ip" =~ [^0-9a-fA-F:] ]]; then
-        echo "6"
-        return
-    fi
-    if [[ "$ip" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-        echo "2"
-        return
-    fi
-    echo "1"
-}
-
-resolve_domain() {
-    local domain="$1"
-    local resolved=""
-    if command -v getent &>/dev/null; then
-        resolved=$(getent ahosts "$domain" 2>/dev/null | grep -E '^[0-9]' | head -n1 | awk '{print $1}')
-    fi
-    if [[ -z "$resolved" ]] && command -v dig &>/dev/null; then
-        resolved=$(dig +short "$domain" @8.8.8.8 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1)
-    fi
-    if [[ -z "$resolved" ]] && command -v nslookup &>/dev/null; then
-        resolved=$(nslookup "$domain" 8.8.8.8 2>/dev/null | awk '/^Address:/ {print $2}' | grep -v "#" | head -n1)
-    fi
-    echo "${resolved//[[:space:]]/}"
-}
-
-enable_ip_forward() {
-    mkdir -p /etc/sysctl.d
-    cat > "${SYSCTL_CONF}" <<EOF
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-EOF
-    sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
-    
-    # 加载 Alpine 内核模块保底
-    modprobe ip_tables iptable_nat 2>/dev/null || true
-}
-
-disable_ip_forward() {
-    rm -f "${SYSCTL_CONF}" 2>/dev/null
-}
-
-init_conf() {
-    mkdir -p "${CONF_DIR}" "${DEFAULT_BACKUP_DIR}" 2>/dev/null || return 1
-    touch "${LOG_FILE}" "${CONF_FILE}" 2>/dev/null || true
-}
-
-declare -a RULES=()
-
-sanitize_note() {
-    printf "%s" "${1//|/ }"
-}
-
-# 从自建的纯净规则文件中加载
-load_rules() {
-    RULES=()
-    [[ -f "${CONF_FILE}" ]] || return
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        # 仅读取非空且非普通注释行
-        [[ "$line" =~ ^[[:space:]]*# ]] && [[ ! "$line" =~ "RULE:" ]] && continue
-        [[ -z "${line//[[:space:]]/}" ]] && continue
-        
-        if [[ "$line" =~ ^#\ RULE:\ (.*)$ ]]; then
-            RULES+=("${BASH_REMATCH[1]}")
+        if [ -f "$0" ] && ! cmp -s "$0" "$PERM_SCRIPT_PATH"; then
+            need_download=1
         fi
-    done < "${CONF_FILE}"
-}
-
-# 核心：将本地 RULES 阵列转换为系统 iptables 实际规则并保存
-write_and_apply_rules() {
-    # 1. 备份当前的本地数据到配置文件头部，供下次加载
-    local tmp_file="${CONF_FILE}.tmp.$$"
-    echo "# iptables 端口转发快照" > "${tmp_file}"
-    local rule
-    for rule in "${RULES[@]}"; do
-        echo "# RULE: ${rule}" >> "${tmp_file}"
-    done
-    mv -f "${tmp_file}" "${CONF_FILE}" 2>/dev/null
-
-    # 2. 清理系统中由本脚本创建的旧 iptables 转发规则（安全防锁死：绝不碰 INPUT 链）
-    iptables -t nat -F PREROUTING 2>/dev/null || true
-    iptables -t nat -F POSTROUTING 2>/dev/null || true
-    ip6tables -t nat -F PREROUTING 2>/dev/null || true
-    ip6tables -t nat -F POSTROUTING 2>/dev/null || true
-
-    # 3. 逐条渲染并直接注入内核
-    local lport target dport note proto type actual_ip
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        proto="${proto:-ALL}"
-        type=$(detect_ip_type "$target")
-        actual_ip="$target"
-        
-        if [[ "$type" == "2" ]]; then 
-            actual_ip=$(resolve_domain "$target")
-            if [[ -z "$actual_ip" ]]; then
-                # 域名解析闪断保底
-                actual_ip=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -w "dports ${lport}" | awk '{print $NF}' | awk -F':' '{print $1}')
-            fi
+        if [[ "$0" =~ "pipe" ]] || [[ "$0" =~ "fd" ]] || [ "$0" = "bash" ] || [ "$0" = "sh" ]; then
+            need_download=1
         fi
-        [[ -z "$actual_ip" ]] && continue
-        local ip_ver=$(detect_ip_type "$actual_ip")
+    fi
 
-        if [[ "$ip_ver" == "4" ]]; then
-            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
-                iptables -t nat -A PREROUTING -p tcp --dport "${lport}" -j DNAT --to-destination "${actual_ip}:${dport}"
-                iptables -t nat -A POSTROUTING -p tcp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
-                iptables -t nat -A PREROUTING -p udp --dport "${lport}" -j DNAT --to-destination "${actual_ip}:${dport}"
-                iptables -t nat -A POSTROUTING -p udp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-        elif [[ "$ip_ver" == "6" ]]; then
-            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
-                ip6tables -t nat -A PREROUTING -p tcp --dport "${lport}" -j DNAT --to-destination "[${actual_ip}]:${dport}"
-                ip6tables -t nat -A POSTROUTING -p tcp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
-                ip6tables -t nat -A PREROUTING -p udp --dport "${lport}" -j DNAT --to-destination "[${actual_ip}]:${dport}"
-                ip6tables -t nat -A POSTROUTING -p udp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-        fi
-    done
+    if [ "$need_download" -eq 1 ]; then
+        mkdir -p "$(dirname "$PERM_SCRIPT_PATH")"
 
-    # 4. 持久化保存到 Alpine 系统开机加载目录
-    rc-service iptables save >/dev/null 2>&1 || true
-    rc-service ip6tables save >/dev/null 2>&1 || true
-}
-
-setup_ddns_cron() {
-    rc-update add dcron default >/dev/null 2>&1 || true
-    rc-service dcron start >/dev/null 2>&1 || true
-
-    cat > "${CRON_DDNS_SCRIPT}" <<EOF
-#!/usr/bin/env bash
-CONF_FILE="/etc/iptables.d/port-forward.rules"
-[[ -f "\$CONF_FILE" ]] || exit 0
-if grep -q "RULE:" "\$CONF_FILE"; then
-    /etc/iptables.d/port_forward_main.sh --reload-backend
-fi
-EOF
-    chmod +x "${CRON_DDNS_SCRIPT}" 2>/dev/null
-
-    local tmp_cron="/tmp/current_cron_$$"
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" > "${tmp_cron}" || true
-    echo "*/2 * * * * ${CRON_DDNS_SCRIPT} >/dev/null 2>&1" >> "${tmp_cron}"
-    crontab "${tmp_cron}" 2>/dev/null || true
-    rm -f "${tmp_cron}"
-}
-
-do_backend_ddns_sync() {
-    [[ -f "${CONF_FILE}" ]] || exit 0
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then exit 0; fi
-
-    local need_reload=0
-    local rule lport target dport note proto type current_dns_ip
-
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        type=$(detect_ip_type "$target")
-        
-        if [[ "$type" == "2" ]]; then
-            current_dns_ip=$(resolve_domain "$target")
-            if [[ -n "$current_dns_ip" ]]; then
-                # 检查系统内核中当前生效的 IP 是否与最新解析一致
-                local active_ip
-                active_ip=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -w "dports ${lport}" | awk '{print $NF}' | awk -F':' '{print $1}')
-                if [[ "$current_dns_ip" != "$active_ip" ]]; then
-                    need_reload=1
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') [DDNS] 检测到域名 ${target} IP 变动，触发局部热重载..." >> "${LOG_FILE}"
+        # 内部重试下载函数
+        download_with_retry() {
+            # 提取 raw.githubusercontent.com 之后的路径
+            local url_path="${REMOTE_URL#https://raw.githubusercontent.com/}"
+            
+            for proxy in "${GITHUB_PROXY[@]}"; do
+                local final_url=""
+                if [ -z "$proxy" ]; then
+                    final_url="$REMOTE_URL"
+                else
+                    # 确保代理 URL 末尾有斜杠，避免拼接错误
+                    [[ "$proxy" != */ ]] && proxy="${proxy}/"
+                    final_url="${proxy}https://raw.githubusercontent.com/${url_path}"
                 fi
-            fi
-        fi
-    done
 
-    if [[ $need_reload -eq 1 ]]; then
-        write_and_apply_rules
+                if command -v curl >/dev/null 2>&1; then
+                    curl -sL --connect-timeout 5 "$final_url" -o "$PERM_SCRIPT_PATH" && [ -s "$PERM_SCRIPT_PATH" ] && return 0
+                elif command -v wget >/dev/null 2>&1; then
+                    wget -qO "$PERM_SCRIPT_PATH" --timeout=5 "$final_url" && [ -s "$PERM_SCRIPT_PATH" ] && return 0
+                fi
+            done
+            return 1
+        }
+
+        # 执行多代理轮询下载
+        download_with_retry || true
+
+        # 兜底逻辑：如果所有代理都失败了，尝试从当前执行的命令/管道克隆
+        if [ ! -s "$PERM_SCRIPT_PATH" ] && [ -f "$0" ]; then
+            cat "$0" > "$PERM_SCRIPT_PATH" 2>/dev/null || true
+        fi
+
+        # 最终校验
+        if [ ! -s "$PERM_SCRIPT_PATH" ]; then
+            echo -e "${YELLOW}错误: 安装失败！所有 GitHub 代理均不可用，且无法从本地恢复。${RESET}"
+            echo -e "${YELLOW}请检查网络或确认拥有 /usr/local/bin 的写入权限。${RESET}"
+            exit 1
+        fi
+
+        chmod +x "$PERM_SCRIPT_PATH"
+        sleep 0.5
+        
+        exec "$PERM_SCRIPT_PATH" "$@"
     fi
-    exit 0
 }
 
-do_backup_manual() {
-    if [[ ! -f "${CONF_FILE}" ]] || [[ ! -s "${CONF_FILE}" ]]; then
-        err "当前没有任何生效的规则，无需导出。"
-        pause_to_menu
-        return
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE" 2>/dev/null || {
+            local t_token=$(grep "^TG_BOT_TOKEN=" "$CONFIG_FILE" | cut -d'"' -f2)
+            local t_chat=$(grep "^TG_CHAT_ID=" "$CONFIG_FILE" | cut -d'"' -f2)
+            local t_cron=$(grep "^CRON_TIME=" "$CONFIG_FILE" | cut -d'"' -f2)
+            local t_ports=$(grep "^MONITOR_PORTS=" "$CONFIG_FILE" | cut -d'"' -f2)
+            local t_vps=$(grep "^VPS_NAME=" "$CONFIG_FILE" | cut -d'"' -f2)
+            
+            [ -n "$t_token" ] && TG_BOT_TOKEN="$t_token"
+            [ -n "$t_chat" ] && TG_CHAT_ID="$t_chat"
+            [ -n "$t_cron" ] && CRON_TIME="$t_cron"
+            [ -n "$t_ports" ] && MONITOR_PORTS="$t_ports"
+            [ -n "$t_vps" ] && VPS_NAME="$t_vps"
+        }
     fi
-    local target_dir
-    read -rp "$(echo -e "${GREEN}请输入备份导出目录 [默认: ${DEFAULT_BACKUP_DIR}]: ${RESET}")" target_dir
-    target_dir="${target_dir:-$DEFAULT_BACKUP_DIR}"
-    mkdir -p "${target_dir}" 2>/dev/null
-
-    local bkp_name="iptables_bak_$(date '+%Y%m%d_%H%M%S').rules"
-    cp "${CONF_FILE}" "${target_dir}/${bkp_name}"
-    info "手动导出成功！备份至: ${target_dir}/${bkp_name}"
-    pause_to_menu
 }
 
-do_restore_manual() {
-    local target_input selected_file=""
-    read -rp "$(echo -e "${GREEN}请输入备份文件夹或完整路径 [默认: ${DEFAULT_BACKUP_DIR}]: ${RESET}")" target_input
-    target_input="${target_input:-$DEFAULT_BACKUP_DIR}"
+save_config() {
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat << EOF > "$CONFIG_FILE"
+TG_BOT_TOKEN="${TG_BOT_TOKEN}"
+TG_CHAT_ID="${TG_CHAT_ID}"
+CRON_TIME="${CRON_TIME}"
+MONITOR_PORTS="${MONITOR_PORTS}"
+VPS_NAME="${VPS_NAME}"
+EOF
+}
 
-    if [[ -f "$target_input" ]]; then
-        selected_file="$target_input"
-    else
-        local bkp_files=($(ls "${target_input}"/*.rules 2>/dev/null | sort -r))
-        if [[ ${#bkp_files[@]} -eq 0 ]]; then
-            err "未发现备份文件。"
-            pause_to_menu
-            return
-        fi
-        echo -e "\n${YELLOW}=== 历史备份 ===${RESET}"
-        local idx=1 file
-        for file in "${bkp_files[@]}"; do
-            printf "[%2s] %s\n" "$idx" "$(basename "$file")"
-            ((idx++))
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
         done
-        read -rp "请选择序号 (0 取消): " choice
-        if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-        selected_file="${bkp_files[$((choice-1))]}"
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
-
-    if [[ -n "$selected_file" && -f "$selected_file" ]]; then
-        cp -f "${selected_file}" "${CONF_FILE}"
-        load_rules
-        write_and_apply_rules
-        info "配置已导入并成功应用！"
-    fi
-    pause_to_menu
+    echo "127.0.0.1" && return 0
 }
 
-do_install() {
-    info "准备安全安装 Alpine iptables 环境..."
-    apk add iptables ip6tables bash curl bind-tools dcron
-    
-    enable_ip_forward && init_conf
-    
-    rc-update add iptables default >/dev/null 2>&1 || true
-    rc-update add ip6tables default >/dev/null 2>&1 || true
-    rc-service iptables start >/dev/null 2>&1 || true
-    rc-service ip6tables start >/dev/null 2>&1 || true
-    
-    setup_ddns_cron
-    info "Alpine iptables 环境初始化完成！INPUT链未受任何修改，SSH 绝对安全。"
-    pause_to_menu
+get_default_interface() {
+    local iface=$(ip route show | grep default | awk '{print $5}' | head -n 1)
+    echo "${iface:-eth0}"
 }
 
-_print_rules_list() {
-    printf "\n\033[1m%-6s %-12s %-10s     %-35s %s\033[0m\n" "序号"  "协议"  "本机端口"  "目标地址/域名"  "备注"
-    echo -e "${GREEN}=====================================${RESET}"
-    local idx=1 rule lport target dport note proto type label proto_label
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        proto="${proto:-ALL}"
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "2" ]]; then label="域名"; else [[ "$type" == "6" ]] && label="IPv6" || label="IPv4"; fi
-        if [[ "$proto" == "ALL" ]]; then proto_label="TCP+UDP"; else proto_label="$proto"; fi
-        proto_label="${proto_label} (${label})"
+ensure_iptables_installed() {
+    if [ -z "$IPTABLES_CMD" ]; then
+        detect_package_manager
+        bash -c "$PKG_INSTALL_CMD" >/dev/null 2>&1 || true
+        IPTABLES_CMD=$(which iptables 2>/dev/null || which /sbin/iptables 2>/dev/null || which /usr/sbin/iptables 2>/dev/null || echo "")
+        IP6TABLES_CMD=$(which ip6tables 2>/dev/null || which /sbin/ip6tables 2>/dev/null || which /usr/sbin/ip6tables 2>/dev/null || echo "")
+    fi
+}
 
-        if [[ "$type" == "6" ]]; then
-            printf "%-6s %-12s %-10s -> %-35s %s\n" "$idx" "$proto_label" "$lport" "[${target}]:${dport}" "${note:--}"
-        else
-            printf "%-6s %-12s %-10s -> %-35s %s\n" "$idx" "$proto_label" "$lport" "${target}:${dport}" "${note:--}"
+init_port_iptables() {
+    ensure_iptables_installed
+    load_config
+    
+    for port in $MONITOR_PORTS; do
+        [ -z "$port" ] && continue
+        if [ -n "$IPTABLES_CMD" ] && [ -x "$IPTABLES_CMD" ]; then
+            if ! "$IPTABLES_CMD" -L INPUT -nvx 2>/dev/null | grep -q "tcp.*dpt:$port"; then "$IPTABLES_CMD" -A INPUT -p tcp --dport "$port" >/dev/null 2>&1 || true; fi
+            if ! "$IPTABLES_CMD" -L INPUT -nvx 2>/dev/null | grep -q "udp.*dpt:$port"; then "$IPTABLES_CMD" -A INPUT -p udp --dport "$port" >/dev/null 2>&1 || true; fi
+            if ! "$IPTABLES_CMD" -L OUTPUT -nvx 2>/dev/null | grep -q "tcp.*spt:$port"; then "$IPTABLES_CMD" -A OUTPUT -p tcp --sport "$port" >/dev/null 2>&1 || true; fi
+            if ! "$IPTABLES_CMD" -L OUTPUT -nvx 2>/dev/null | grep -q "udp.*spt:$port"; then "$IPTABLES_CMD" -A OUTPUT -p udp --sport "$port" >/dev/null 2>&1 || true; fi
         fi
-        ((idx++))
+        if [ -n "$IP6TABLES_CMD" ] && [ -x "$IP6TABLES_CMD" ]; then
+            if ! "$IP6TABLES_CMD" -L INPUT -nvx 2>/dev/null | grep -q "tcp.*dpt:$port"; then "$IP6TABLES_CMD" -A INPUT -p tcp --dport "$port" >/dev/null 2>&1 || true; fi
+            if ! "$IP6TABLES_CMD" -L INPUT -nvx 2>/dev/null | grep -q "udp.*dpt:$port"; then "$IP6TABLES_CMD" -A INPUT -p udp --dport "$port" >/dev/null 2>&1 || true; fi
+            if ! "$IP6TABLES_CMD" -L OUTPUT -nvx 2>/dev/null | grep -q "tcp.*spt:$port"; then "$IP6TABLES_CMD" -A OUTPUT -p tcp --sport "$port" >/dev/null 2>&1 || true; fi
+            if ! "$IP6TABLES_CMD" -L OUTPUT -nvx 2>/dev/null | grep -q "udp.*spt:$port"; then "$IP6TABLES_CMD" -A OUTPUT -p udp --sport "$port" >/dev/null 2>&1 || true; fi
+        fi
     done
 }
 
-do_list() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then 
-        info "当前没有配置任何端口转发规则。"
-        pause_to_menu
-        return
+format_bytes() {
+    local bytes=$1
+    if [ -z "$bytes" ] || [ "$bytes" -le 0 ] 2>/dev/null; then echo "0 B"; return; fi
+    local units=('B' 'KB' 'MB' 'GB' 'TB')
+    local i=0
+    while [ $(echo "$bytes > 1024" | bc -l 2>/dev/null || [ $((bytes)) -gt 1024 ]) -eq 1 ] && [ $i -lt 4 ]; do
+        bytes=$(echo "scale=2; $bytes / 1024" | bc -l 2>/dev/null || echo $((bytes / 1024)))
+        i=$((i+1))
+    done
+    echo "${bytes} ${units[$i]}"
+}
+
+get_port_raw_bytes() {
+    local port=$1
+    local direction=$2
+    local total_bytes=0
+    
+    if [ -n "$IPTABLES_CMD" ] && [ -x "$IPTABLES_CMD" ]; then
+        local tcp_v4=$("$IPTABLES_CMD" -L $direction -nvx 2>/dev/null | grep "tcp" | grep -E "(dpt:$port|spt:$port)" | awk '{print $2}' | awk '{s+=$1} END {print s}')
+        local udp_v4=$("$IPTABLES_CMD" -L $direction -nvx 2>/dev/null | grep "udp" | grep -E "(dpt:$port|spt:$port)" | awk '{print $2}' | awk '{s+=$1} END {print s}')
+        total_bytes=$(( total_bytes + ${tcp_v4:-0} + ${udp_v4:-0} ))
     fi
-    _print_rules_list
-    echo ""
-    pause_to_menu
+    if [ -n "$IP6TABLES_CMD" ] && [ -x "$IP6TABLES_CMD" ]; then
+        local tcp_v6=$("$IP6TABLES_CMD" -L $direction -nvx 2>/dev/null | grep "tcp" | grep -E "(dpt:$port|spt:$port)" | awk '{print $2}' | awk '{s+=$1} END {print s}')
+        local udp_v6=$("$IP6TABLES_CMD" -L $direction -nvx 2>/dev/null | grep "udp" | grep -E "(dpt:$port|spt:$port)" | awk '{print $2}' | awk '{s+=$1} END {print s}')
+        total_bytes=$(( total_bytes + ${tcp_v6:-0} + ${udp_v6:-0} ))
+    fi
+    echo "$total_bytes"
 }
 
-do_add() {
-    init_conf || return
-    enable_ip_forward && load_rules
+get_db_value() {
+    local key=$1
+    if [ -f "$PORT_DB_FILE" ]; then
+        grep "^${key}=" "$PORT_DB_FILE" | cut -d'=' -f2 || echo "0"
+    else
+        echo "0"
+    fi
+}
 
-    local lport target dport note proto proto_choice type
-    while true; do
-        read -rp "请输入本机监听端口 (1-65535): " lport
-        validate_port "$lport" && break
-        err "端口输入无效"
-    done
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r rp _ _ _ _ <<< "$rule"
-        if [[ "$rp" == "$lport" ]]; then err "本机端口 ${lport} 规则已存在"; pause_to_menu; return; fi
-    done
-    while true; do
-        read -rp "请输入目标 IP 地址 或 目标域名: " target
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "1" ]]; then err "格式不正确"; elif [[ "$type" == "2" ]]; then
-            local rip=$(resolve_domain "$target")
-            [[ -z "$rip" ]] && warn "该域名目前解析不出 IP，系统稍后会自动重试。" || info "成功解析当前 IP 为: ${rip}"
-            break
-        else break; fi
-    done
-    while true; do
-        read -rp "请输入目标端口 [默认 $lport]: " dport
-        dport="${dport:-$lport}"
-        validate_port "$dport" && break
-        err "目标端口不合法"
-    done
+save_db_value() {
+    local key=$1
+    local val=$2
+    mkdir -p "$(dirname "$PORT_DB_FILE")"
+    touch "$PORT_DB_FILE"
+    if grep -q "^${key}=" "$PORT_DB_FILE"; then
+        sed -i "s|^${key}=.*|${key}=${val}|" "$PORT_DB_FILE"
+    else
+        echo "${key}=${val}" >> "$PORT_DB_FILE"
+    fi
+}
 
+send_tg_notification() {
+    local message="$1"
+    load_config
+    if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+        local ip=$(get_public_ip)
+        local full_message="【vnstat 流量看板】%0A====================%0A"
+        full_message+="主机名称: ${VPS_NAME}%0A"  
+        full_message+="公网IP: ${ip}%0A"
+        full_message+="====================%0A"
+        full_message+="${message}"
+        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" -d "chat_id=${TG_CHAT_ID}" -d "text=${full_message}" >/dev/null 2>&1 || true
+    fi
+}
+
+send_traffic_report() {
+    init_port_iptables
+    load_config
+    local report=""
+    local iface=$(get_default_interface)
+    
+    if command -v vnstat >/dev/null 2>&1; then
+        local today_line=$(vnstat -i "$iface" -d --oneline 2>/dev/null | cut -d';' -f4,5,6 || echo "")
+        local month_line=$(vnstat -i "$iface" -m --oneline 2>/dev/null | cut -d';' -f9,10,11 || echo "")
+        report+="📡 默认网卡: ${iface}%0A"
+        if [ -n "$today_line" ]; then report+=" 今日总流量: 下行 $(echo "$today_line" | cut -d';' -f1) | 上行 $(echo "$today_line" | cut -d';' -f2) | 总计 $(echo "$today_line" | cut -d';' -f3)%0A"; fi
+        if [ -n "$month_line" ]; then report+=" 本月总累计: 下行 $(echo "$month_line" | cut -d';' -f1) | 上行 $(echo "$month_line" | cut -d';' -f2) | 总计 $(echo "$month_line" | cut -d';' -f3)%0A"; fi
+        report+="====================%0A"
+    else
+        report+="📡 默认网卡: ${iface} (vnStat未安装)%0A====================%0A"
+    fi
+
+    if [ -n "$IPTABLES_CMD" ] || [ -n "$IP6TABLES_CMD" ]; then
+        report+="✨ 端口流量统计:%0A"
+        for port in $MONITOR_PORTS; do
+            [ -z "$port" ] && continue
+            
+            local current_rx=$(get_port_raw_bytes "$port" "INPUT")
+            local current_tx=$(get_port_raw_bytes "$port" "OUTPUT")
+            
+            local base_day_rx=$(get_db_value "port_${port}_base_day_rx")
+            local base_day_tx=$(get_db_value "port_${port}_base_day_tx")
+            local base_month_rx=$(get_db_value "port_${port}_base_month_rx")
+            local base_month_tx=$(get_db_value "port_${port}_base_month_tx")
+            
+            local day_rx=$((current_rx - base_day_rx))
+            local day_tx=$((current_tx - base_day_tx))
+            [ $day_rx -lt 0 ] && day_rx=$current_rx
+            [ $day_tx -lt 0 ] && day_tx=$current_tx
+            
+            local month_rx=$((current_rx - base_month_rx))
+            local month_tx=$((current_tx - base_month_tx))
+            [ $month_rx -lt 0 ] && month_rx=$current_rx
+            [ $month_tx -lt 0 ] && month_tx=$current_tx
+
+            report+=" 端口 [ ${port} ]%0A"
+            report+="   今日累计(实时) -> 下载: $(format_bytes "$day_rx") | 上传: $(format_bytes "$day_tx") | 总计: $(format_bytes "$((day_rx + day_tx))")%0A"
+            report+="   本月累计(实时) -> 下载: $(format_bytes "$month_rx") | 上传: $(format_bytes "$month_tx") | 总计: $(format_bytes "$((month_rx + month_tx))")%0A"
+        done
+    fi
+    send_tg_notification "$report"
+}
+
+manage_cron() {
+    local action="$1"
+    mkdir -p /root/.cache/crontab 2>/dev/null || true
+    local tmp_cron="/tmp/vnstat_cron_bak"
+    crontab -l 2>/dev/null | grep -v "cron-report" | grep -v "cron-slice" > "$tmp_cron" || true
+
+    if [ "$action" = "set" ]; then
+        load_config
+        if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            echo "0 0 * * * bash $PERM_SCRIPT_PATH --cron-slice >/dev/null 2>&1" >> "$tmp_cron"
+            echo "${CRON_TIME} bash $PERM_SCRIPT_PATH --cron-report >/dev/null 2>&1" >> "$tmp_cron"
+            crontab "$tmp_cron"
+            echo -e "${GREEN}定时任务激活成功！${RESET}"
+        else
+            echo -e "${YELLOW}警告: 未配置 TG 参数。${RESET}"
+        fi
+    elif [ "$action" = "unset" ]; then
+        crontab "$tmp_cron"
+        echo -e "${GREEN}已关闭定时流量通知任务。${RESET}"
+    fi
+    rm -f "$tmp_cron"
+}
+
+menu_cron_config() {
     while true; do
-        read -rp "$(echo -e "${GREEN}请选择协议类型 [1: TCP+UDP | 2: 仅 TCP | 3: 仅 UDP] (默认 1): ${RESET}")" proto_choice
-        proto_choice="${proto_choice:-1}"
-        case "$proto_choice" in
-            1) proto="ALL"; break ;;
-            2) proto="TCP"; break ;;
-            3) proto="UDP"; break ;;
-            *) err "选择错误，请输入 1, 2 或 3" ;;
+        load_config
+        init_port_iptables
+        clear
+        local cron_status="未激活"
+        if crontab -l 2>/dev/null | grep -q "cron-report"; then cron_status="已激活"; fi
+
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN}    ◈  TG 定时通知管理  ◈     ${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN}VPS 名称 :${RESET} ${YELLOW}${VPS_NAME}${RESET}" 
+        echo -e "${GREEN}任务状态 :${RESET} ${YELLOW}${cron_status}${RESET}"
+        echo -e "${GREEN}当前频次 :${RESET} ${YELLOW}${CRON_TIME}${RESET}"
+        echo -e "${GREEN}TG Token :${RESET} ${YELLOW}${TG_BOT_TOKEN:-未配置}${RESET}"
+        echo -e "${GREEN}Chat ID  :${RESET} ${YELLOW}${TG_CHAT_ID:-未配置}${RESET}"
+        echo -e "${GREEN}监控端口 :${RESET} ${YELLOW}${MONITOR_PORTS}${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -e "${GREEN} 1. 修改 Telegram Bot Token${RESET}"
+        echo -e "${GREEN} 2. 修改 Telegram Chat ID${RESET}"
+        echo -e "${GREEN} 3. 修改需要监控的端口${RESET}"
+        echo -e "${GREEN} 4. 修改定时发送时间${RESET}"
+        echo -e "${GREEN} 5. 修改 VPS 自定义名称${RESET}" 
+        echo -e "${GREEN} 6. 开启/更新定时通知任务${RESET}"
+        echo -e "${GREEN} 7. 关闭定时通知任务${RESET}"
+        echo -e "${GREEN} 8. 手动测试发送当前流量报告${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        echo -e "${GREEN}==============================${RESET}"
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read -r cron_choice
+
+        case "$cron_choice" in
+            1) read -rp "请输入新的 TG Bot Token: " TG_BOT_TOKEN; save_config; pause ;;
+            2) read -rp "请输入新的 TG Chat ID: " TG_CHAT_ID; save_config; pause ;;
+            3)
+                echo -e "当前监控的端口为: ${YELLOW}${MONITOR_PORTS}${RESET}"
+                read -rp "请输入新的端口（多个端口请用空格隔开,例如 22 80 443 ）: " input_ports
+                if [ -n "$input_ports" ]; then MONITOR_PORTS="$input_ports"; save_config; init_port_iptables; fi
+                pause ;;
+            4)
+                echo -e "请选择通知发送时间模板:"
+                echo "1) 每天 0:00"
+                echo "2) 每天 22:00 (推荐)"
+                echo "3) 每周一 0:00"
+                echo "4) 每月1号 0:00"
+                echo "5) 手动输入 Cron 表达式"
+                read -rp "请输入选项 [1-5]: " t_choice
+                case "$t_choice" in
+                    1) CRON_TIME="0 0 * * *" ;;
+                    2) CRON_TIME="0 22 * * *" ;;
+                    3) CRON_TIME="0 0 * * 1" ;;
+                    4) CRON_TIME="0 0 1 * *" ;;
+                    5) read -rp "请输入标准的 Cron 表达式 (如 0 12 * * *): " CRON_TIME ;;
+                esac
+                save_config; manage_cron "set"; pause ;;
+            5) read -rp "请输入自定义 VPS 名称: " input_vps_name
+               if [ -n "$input_vps_name" ]; then VPS_NAME="$input_vps_name"; save_config; fi
+               pause ;;
+            6) manage_cron "set"; pause ;;
+            7) manage_cron "unset"; pause ;;
+            8) echo "正在发送测试报告..."; send_traffic_report; echo "已提交发送请求。"; pause ;;
+            0) break ;;
+            *) echo "无效选项"; pause ;;
         esac
     done
-
-    read -rp "请输入本条转发备注: " note
-    note=$(sanitize_note "$note")
-
-    RULES+=("${lport}|${target}|${dport}|${note}|${proto}")
-    write_and_apply_rules
-    setup_ddns_cron
-    info "规则添加并加载成功！"
-    pause_to_menu
 }
 
-do_edit() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供修改。"; pause_to_menu; return; fi
-    _print_rules_list
-    echo ""
+detect_init_system() {
+    if command -v systemctl >/dev/null 2>&1; then INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1; then INIT_SYSTEM="openrc"
+    else echo "未检测到支持的初始化系统"; exit 1; fi
+}
 
-    read -rp "请输入要修改的规则序号 (0 取消): " choice
-    if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
-        err "无效序号"
-        pause_to_menu
-        return
+detect_service() {
+    detect_init_system
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        if systemctl list-unit-files | grep -q '^vnstat\.service'; then SERVICE_NAME="vnstat"
+        elif systemctl list-unit-files | grep -q '^vnstatd\.service'; then SERVICE_NAME="vnstatd"
+        else SERVICE_NAME="vnstat"; fi
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        if [ -f /etc/init.d/vnstatd ]; then SERVICE_NAME="vnstatd"; else SERVICE_NAME="vnstat"; fi
     fi
-
-    local target_idx=$((choice-1))
-    local old_lport old_target old_dport old_note old_proto
-    IFS='|' read -r old_lport old_target old_dport old_note old_proto <<< "${RULES[$target_idx]}"
-
-    echo -e "\n${YELLOW}开始修改第 $choice 条规则 (直接回车保持原值):${RESET}"
-    local lport target dport note proto proto_choice type
-
-    while true; do
-        read -rp "本机监听端口 [$old_lport]: " lport
-        lport="${lport:-$old_lport}"
-        validate_port "$lport" && break
-        err "端口输入无效"
-    done
-
-    while true; do
-        read -rp "目标 IP 或 域名 [$old_target]: " target
-        target="${target:-$old_target}"
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "1" ]]; then err "格式不正确"; elif [[ "$type" == "2" ]]; then
-            local rip=$(resolve_domain "$target")
-            [[ -z "$rip" ]] && warn "该域名目前解析不出 IP，系统稍后会自动重试。" || info "成功解析当前 IP 为: ${rip}"
-            break
-        else break; fi
-    done
-
-    while true; do
-        read -rp "目标端口 [$old_dport]: " dport
-        dport="${dport:-$old_dport}"
-        validate_port "$dport" && break
-        err "目标端口不合法"
-    done
-
-    read -rp "本条转发备注 [$old_note]: " note
-    note="${note:-$old_note}"
-    note=$(sanitize_note "$note")
-
-    RULES[$target_idx]="${lport}|${target}|${dport}|${note}|${old_proto}"
-    write_and_apply_rules
-    info "规则修改并应用成功！"
-    pause_to_menu
 }
 
-do_delete() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供删除。"; pause_to_menu; return; fi
-    _print_rules_list
-    echo ""
+detect_package_manager() {
+    if command -v apk >/dev/null 2>&1; then PKG_MANAGER="apk"; PKG_INSTALL_CMD="apk update && apk add vnstat bc iptables ip6tables cronie || apk add vnstat bc iptables ip6tables dcron"; PKG_REMOVE_CMD="apk del vnstat"
+    elif command -v apt >/dev/null 2>&1; then PKG_MANAGER="apt"; PKG_INSTALL_CMD="apt update && apt install -y vnstat bc iptables ip6tables cron"; PKG_REMOVE_CMD="apt remove -y vnstat && apt autoremove -y"
+    elif command -v dnf >/dev/null 2>&1; then PKG_MANAGER="dnf"; PKG_INSTALL_CMD="dnf install -y epel-release || true; dnf install -y vnstat bc iptables ip6tables crontabs"; PKG_REMOVE_CMD="dnf remove -y vnstat"
+    elif command -v yum >/dev/null 2>&1; then PKG_MANAGER="yum"; PKG_INSTALL_CMD="yum install -y epel-release || true; yum install -y vnstat bc iptables ip6tables crontabs"; PKG_REMOVE_CMD="yum remove -y vnstat"
+    else echo "未检测到支持的包管理器"; exit 1; fi
+}
 
-    read -rp "请输入要删除的规则序号 (0 取消): " choice
-    if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#RULES[@]} )); then
-        unset 'RULES[$((choice-1))]'
-        RULES=("${RULES[@]}")
-        write_and_apply_rules
-        info "成功删除规则。"
-    else 
-        err "无效序号"
+require_root() { if [ "$(id -u)" -ne 0 ]; then echo "请使用 root 身份运行此脚本"; exit 1; fi; }
+pause() { echo -ne "${GREEN}按回车继续...${RESET}"; read -r _ ; }
+
+manage_service_start() { detect_service; if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl enable "$SERVICE_NAME" --now; elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-update add "$SERVICE_NAME" default; rc-service "$SERVICE_NAME" start; fi; }
+manage_service_restart() { detect_service; if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl restart "$SERVICE_NAME"; elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-service "$SERVICE_NAME" restart; fi; }
+manage_service_status() { detect_service; if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl status "$SERVICE_NAME" --no-pager; elif [ "$INIT_SYSTEM" = "openrc" ]; then rc-service "$SERVICE_NAME" status; fi; }
+manage_service_stop() { detect_service; if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true; systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true; elif [ "$INIT_SYSTEM" = "openrc" ] ; then rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true; rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true; fi; }
+
+install_vnstat() { detect_package_manager; echo "正在安装双栈组件..."; bash -c "$PKG_INSTALL_CMD"; manage_service_start; init_port_iptables; echo "配置完成！"; }
+restart_service() { manage_service_restart; }
+show_service_status() { manage_service_status; }
+list_interfaces() { ip -o link show | awk -F': ' '{print $2}' | grep -v lo; }
+add_interface() { list_interfaces; read -rp "网卡名: " iface; [ -n "$iface" ] && vnstat -i "$iface" --add && manage_service_restart; }
+show_default_stats() { vnstat; }
+show_interface_stats() { list_interfaces; read -rp "网卡名: " iface; [ -n "$iface" ] && vnstat -i "$iface"; }
+show_daily_stats() { vnstat -d; }
+show_monthly_stats() { vnstat -m; }
+live_monitor() { vnstat -l; }
+
+remove_vnstat() {
+    detect_package_manager; manage_service_stop; manage_cron "unset"
+    if [ -n "$IPTABLES_CMD" ] && [ -x "$IPTABLES_CMD" ]; then
+        for port in $MONITOR_PORTS; do
+            "$IPTABLES_CMD" -D INPUT -p tcp --dport "$port" >/dev/null 2>&1 || true
+            "$IPTABLES_CMD" -D INPUT -p udp --dport "$port" >/dev/null 2>&1 || true
+            "$IPTABLES_CMD" -D OUTPUT -p tcp --sport "$port" >/dev/null 2>&1 || true
+            "$IPTABLES_CMD" -D OUTPUT -p udp --sport "$port" >/dev/null 2>&1 || true
+        done
     fi
-    pause_to_menu
-}
-
-do_clear_all() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "当前没有任何转发规则。"; pause_to_menu; return; fi
-    read -rp "确认彻底清空所有规则？[y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
-    RULES=()
-    write_and_apply_rules
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
-    rm -f "${CRON_DDNS_SCRIPT}" 2>/dev/null
-    info "已全部清空。"
-    pause_to_menu
-}
-
-do_diagnose() {
-    echo -e "\n========================================"
-    echo "     Alpine Linux iptables 系统环境自检"
-    echo "========================================"
-    info "系统类型: Alpine Linux"
-    info "iptables 服务状态: $(is_iptables_active && echo '运行中' || echo '未运行')"
-    if crontab -l 2>/dev/null | grep -q "${CRON_DDNS_SCRIPT}"; then
-        info "域名同步守护进程: 正常激活 (每2分钟)"
-    else
-        warn "域名同步守护进程: 未配置进程"
+    if [ -n "$IP6TABLES_CMD" ] && [ -x "$IP6TABLES_CMD" ]; then
+        for port in $MONITOR_PORTS; do
+            "$IP6TABLES_CMD" -D INPUT -p tcp --dport "$port" >/dev/null 2>&1 || true
+            "$IP6TABLES_CMD" -D INPUT -p udp --dport "$port" >/dev/null 2>&1 || true
+            "$IP6TABLES_CMD" -D OUTPUT -p tcp --sport "$port" >/dev/null 2>&1 || true
+            "$IP6TABLES_CMD" -D OUTPUT -p udp --sport "$port" >/dev/null 2>&1 || true
+        done
     fi
-    pause_to_menu
+    bash -c "$PKG_REMOVE_CMD"
+    rm -f "$CONFIG_FILE" "$PORT_DB_FILE" "$PERM_SCRIPT_PATH"
+    echo "清理完成！"; exit 0
 }
 
-do_view_log() {
-    if [[ ! -f "${LOG_FILE}" ]]; then
-        info "当前暂无 DDNS 日志记录产生。"
-        pause_to_menu
-        return
-    fi
-    echo -e "\n${GREEN}正在查看实时日志，按【Ctrl + C】可以随时退出查看...${RESET}"
-    tail -n 30 -f "${LOG_FILE}"
+get_panel_info() {
+    detect_service
+    if [ "$INIT_SYSTEM" = "systemd" ] && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then panel_status="运行中"
+    elif [ "$INIT_SYSTEM" = "openrc" ] && rc-service "$SERVICE_NAME" status 2>/dev/null | grep -q "started"; then panel_status="运行中"
+    else panel_status="未运行"; fi
+    if command -v vnstat >/dev/null 2>&1; then panel_version=$(vnstat -v | awk '{print $2}'); panel_port=$(get_default_interface)
+    else panel_version="未安装"; panel_status="未安装"; panel_port="无"; fi
 }
 
-do_uninstall() {
-    read -rp "确认要彻底卸载本工具并清空所有转发规则吗？[y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
-
-    RULES=()
-    write_and_apply_rules 2>/dev/null || true
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
-    disable_ip_forward
-    rm -f "${BIN_LINK_DIR}/A" "${BIN_LINK_DIR}/a" 2>/dev/null
-    rm -rf "${CONF_DIR}" 2>/dev/null
-
-    echo -e "${GREEN}✅ Alpine 纯净卸载成功！iptables 转发规则已清除。${RESET}"
-    exit 0
+show_menu() {
+    clear; get_panel_info
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}      ◈   vnStat 面板   ◈      ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} ${YELLOW}$panel_status${RESET}"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}网卡 :${RESET} ${YELLOW}${panel_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} 1. 安装 vnstat${RESET}"
+    echo -e "${GREEN} 2. 重启 服务${RESET}"
+    echo -e "${GREEN} 3. 查看 服务状态${RESET}"
+    echo -e "${GREEN} 4. 查看 网络接口${RESET}"
+    echo -e "${GREEN} 5. 添加 监控接口${RESET}"
+    echo -e "${GREEN} 6. 查看 默认流量统计${RESET}"
+    echo -e "${GREEN} 7. 查看 指定网卡流量${RESET}"
+    echo -e "${GREEN} 8. 查看 日流量统计${RESET}"
+    echo -e "${GREEN} 9. 查看 月流量统计${RESET}"
+    echo -e "${GREEN}10. 实时 流量监控${RESET}"
+    echo -e "${GREEN}11. 配置 TG 定时通知任务 >>${RESET}"
+    echo -e "${GREEN}12. 卸载 vnstat${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
 }
 
-auto_localize_and_link() {
-    mkdir -p "${CONF_DIR}" "${BIN_LINK_DIR}"
-    local current_script
-    current_script=$(readlink -f "$0" 2>/dev/null || echo "")
-    if [[ -n "$current_script" && "$current_script" != "$LOCAL_SCRIPT_PATH" && -f "$current_script" ]]; then
-        cp -f "$current_script" "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
-        chmod +x "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
-    fi
-    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/A"
-    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/a"
-}
-
-main_menu() {
-    check_root
-    if [[ "${1:-}" == "--reload-backend" ]]; then
-        do_backend_ddns_sync
+main() {
+    if [ "$1" = "--cron-report" ]; then
+        send_traffic_report
         exit 0
     fi
 
-    auto_localize_and_link
-
-    local panel_status panel_version panel_rules_count
+    if [ "$1" = "--cron-slice" ]; then
+        load_config
+        local is_first_day_of_month=$(date +%d)
+        for port in $MONITOR_PORTS; do
+            [ -z "$port" ] && continue
+            local current_rx=$(get_port_raw_bytes "$port" "INPUT")
+            local current_tx=$(get_port_raw_bytes "$port" "OUTPUT")
+            save_db_value "port_${port}_base_day_rx" "$current_rx"
+            save_db_value "port_${port}_base_day_tx" "$current_tx"
+            if [ "$is_first_day_of_month" = "01" ]; then
+                save_db_value "port_${port}_base_month_rx" "$current_rx"
+                save_db_value "port_${port}_base_month_tx" "$current_tx"
+            fi
+        done
+        exit 0
+    fi
+    
+    require_root
+    ensure_script_landed "$@"
+    
+    if [ -f "$CONFIG_FILE" ]; then
+        load_config
+    else
+        save_config
+    fi
+    
+    init_port_iptables
+    
     while true; do
-        is_iptables_active && panel_status="${GREEN}运行中${RESET}" || panel_status="${RED}未运行${RESET}"
-        panel_version=$(get_iptables_version)
-        load_rules
-        panel_rules_count="${#RULES[@]}"
-
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN}  ◈ Alpine iptables 转发面板 (快捷键 A) ◈${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN} 状态 :${RESET} $panel_status"
-        echo -e "${GREEN} 版本 :${RESET} ${panel_version} (绝对安全不锁SSH版)"
-        echo -e "${GREEN} 规则 : 已载入${RESET} ${YELLOW}${panel_rules_count}${RESET} ${GREEN}条转发${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN} 1. 安装/修复 iptables环境${RESET}"
-        echo -e "${GREEN} 2. 查看 当前转发规则${RESET}"
-        echo -e "${GREEN} 3. 新增 转发规则${RESET}"
-        echo -e "${GREEN} 4. 修改 转发规则${RESET}"
-        echo -e "${GREEN} 5. 删除 转发规则${RESET}"
-        echo -e "${GREEN} 6. 清空 所有转发规则${RESET}"
-        echo -e "${GREEN} 7. 系统环境自检${RESET}"
-        echo -e "${GREEN} 8. 导出 规则(备份)${RESET}"
-        echo -e "${GREEN} 9. 导入 规则(恢复)${RESET}"
-        echo -e "${GREEN}10. 查看 DDNS 运行日志${RESET}"
-        echo -e "${GREEN}11. 卸载面板${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        
-        read -rp "$(echo -e "${GREEN}请选择操作: ${RESET}")" menu_choice
-        case "$menu_choice" in
-            1) do_install ;;
-            2) do_list ;;
-            3) do_add ;;
-            4) do_edit ;;
-            5) do_delete ;;
-            6) do_clear_all ;;
-            7) do_diagnose ;;
-            8) do_backup_manual ;;
-            9) do_restore_manual ;;
-            10) do_view_log ;;
-            11) do_uninstall ;;
+        show_menu; read -r choice
+        case "$choice" in
+            1) install_vnstat; pause ;;
+            2) restart_service; pause ;;
+            3) show_service_status; pause ;;
+            4) list_interfaces; pause ;;
+            5) add_interface; pause ;;
+            6) show_default_stats; pause ;;
+            7) show_interface_stats; pause ;;
+            8) show_daily_stats; pause ;;
+            9) show_monthly_stats; pause ;;
+            10) live_monitor ;;
+            11) menu_cron_config ;;
+            12) remove_vnstat ;;
             0) exit 0 ;;
-            *) err "输入错误" && pause_to_menu ;;
+            *) echo "无效选项"; pause ;;
         esac
-        echo ""
     done
 }
 
-main_menu "$@"
+main "$@"

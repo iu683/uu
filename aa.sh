@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 (全功能版: Alpine/双栈/域名动态同步/备份与恢复)
+# nftables 端口转发管理工具 (完全自动化闭环版 - 回车返回菜单)
 #
 
 # ============== 常量定义 ==============
@@ -8,8 +8,11 @@ CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 BACKUP_DIR="${CONF_DIR}/backups"
 MAIN_CONF="/etc/nftables.conf"
+SYSCTL_CONF="/etc/sysctl.d/99-nft-forward.conf"
 LOG_FILE="/var/log/nft-forward.log"
 CRON_DDNS_SCRIPT="${CONF_DIR}/ddns_sync.sh"
+LOCAL_SCRIPT_PATH="${CONF_DIR}/port_forward_main.sh" # 本地化固定的脚本路径
+BIN_LINK_DIR="/usr/local/bin"                        # 系统可执行文件目录
 
 # ============== 颜色定义 ==============
 GREEN='\033[32m'
@@ -21,6 +24,12 @@ RESET='\033[0m'
 info()   { printf '\033[32m[信息]\033[0m %s\n' "$1"; }
 warn()   { printf '\033[33m[警告]\033[0m %s\n' "$1"; }
 err()    { printf '\033[31m[错误]\033[0m %s\n' "$1"; }
+
+# 停顿并等待回车返回主菜单
+pause_to_menu() {
+    echo ""
+    read -rp "$(echo -e "${GREEN}按任意键或回车返回主菜单...${RESET}")" _unused
+}
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -127,6 +136,14 @@ EOF
     fi
 }
 
+disable_ip_forward() {
+    if is_alpine; then
+        rm -f /etc/sysctl.d/forward.conf 2>/dev/null
+    else
+        rm -f "${SYSCTL_CONF}" 2>/dev/null
+    fi
+}
+
 init_conf() {
     mkdir -p "${CONF_DIR}" "${BACKUP_DIR}" 2>/dev/null || return 1
     touch "${LOG_FILE}" 2>/dev/null || true
@@ -196,8 +213,13 @@ write_conf_file() {
     local tmp_file="${CONF_FILE}.tmp.$$"
     cat > "${tmp_file}" <<EOF
 #!/usr/sbin/nft -f
-table ip port_forward_v4 { destroy; }
-table ip6 port_forward_v6 { destroy; }
+
+# 经典兼容型清空逻辑（完美适配高/低版本 nftables）
+add table ip port_forward_v4
+flush table ip port_forward_v4
+add table ip6 port_forward_v6
+flush table ip6 port_forward_v6
+
 table ip port_forward_v4 {
     chain prerouting {
         type nat hook prerouting priority -100; policy accept;
@@ -283,14 +305,14 @@ reload_rules() {
 }
 
 setup_ddns_cron() {
-    cat > "${CRON_DDNS_SCRIPT}" <<'EOF'
+    cat > "${CRON_DDNS_SCRIPT}" <<EOF
 #!/usr/bin/env bash
 CONF_FILE="/etc/nftables.d/port-forward.conf"
-[[ -f "$CONF_FILE" ]] || exit 0
-if grep -q "DOMAIN:" "$CONF_FILE"; then
+[[ -f "\$CONF_FILE" ]] || exit 0
+if grep -q "DOMAIN:" "\$CONF_FILE"; then
+    ${LOCAL_SCRIPT_PATH} --reload-backend
+fi
 EOF
-    echo "    $(realpath "$0") --reload-backend" >> "${CRON_DDNS_SCRIPT}"
-    echo "fi" >> "${CRON_DDNS_SCRIPT}"
     chmod +x "${CRON_DDNS_SCRIPT}" 2>/dev/null
 
     if ! crontab -l 2>/dev/null | grep -q "${CRON_DDNS_SCRIPT}"; then
@@ -298,27 +320,29 @@ EOF
     fi
 }
 
-# ============== 备份与恢复模块 ==============
 do_backup_manual() {
     if [[ ! -f "${CONF_FILE}" ]] || [[ ! -s "${CONF_FILE}" ]]; then
         err "当前没有任何生效的规则配置文件，无需备份。"
+        pause_to_menu
         return
     fi
     mkdir -p "${BACKUP_DIR}"
     local bkp_name="manual_forward_bak_$(date '+%Y%m%d_%H%M%S').conf"
     cp "${CONF_FILE}" "${BACKUP_DIR}/${bkp_name}"
     info "手动备份成功！备份文件已保存至: ${YELLOW}${BACKUP_DIR}/${bkp_name}${RESET}"
+    pause_to_menu
 }
 
 do_restore_manual() {
     if [[ ! -d "${BACKUP_DIR}" ]]; then
         err "未检测到任何备份目录。"
+        pause_to_menu
         return
     fi
-    
     local bkp_files=($(ls "${BACKUP_DIR}"/*.conf 2>/dev/null | sort -r))
     if [[ ${#bkp_files[@]} -eq 0 ]]; then
         err "备份文件夹内没有发现可用的 .conf 备份文件。"
+        pause_to_menu
         return
     fi
 
@@ -329,18 +353,14 @@ do_restore_manual() {
         ((idx++))
     done
     echo "========================"
-    
     read -rp "请选择需要恢复的备份序号 (0 取消): " choice
     if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
     
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#bkp_files[@]} )); then
         local selected_file="${bkp_files[$((choice-1))]}"
-        
-        # 恢复前对当前环境做一次紧急兜底备份
         if [[ -f "${CONF_FILE}" ]]; then
             cp "${CONF_FILE}" "${BACKUP_DIR}/auto_emergency_before_restore.conf"
         fi
-        
         cp -f "${selected_file}" "${CONF_FILE}"
         if reload_rules; then
             info "历史备份恢复并应用成功！"
@@ -350,12 +370,10 @@ do_restore_manual() {
             [[ -f "${BACKUP_DIR}/auto_emergency_before_restore.conf" ]] && cp -f "${BACKUP_DIR}/auto_emergency_before_restore.conf" "${CONF_FILE}"
             reload_rules
         fi
-    else
-        err "无效的序号输入"
-    fi
+    else err "无效的序号输入"; fi
+    pause_to_menu
 }
 
-# ============== 传统业务功能 ==============
 do_install() {
     if ! command -v nft &>/dev/null; then
         info "准备安装依赖..."
@@ -367,11 +385,16 @@ do_install() {
     fi
     enable_ip_forward && init_conf && restart_and_enable_nft && setup_ddns_cron
     info "环境初始化圆满完成！已开启每5分钟域名动态同步机制。"
+    pause_to_menu
 }
 
 do_list() {
     load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "当前没有配置任何端口转发规则。"; return; fi
+    if [[ ${#RULES[@]} -eq 0 ]]; then 
+        info "当前没有配置任何端口转发规则。"
+        pause_to_menu
+        return
+    fi
     printf "\n\033[1m%-6s %-8s %-10s    %-35s %s\033[0m\n" "序号" "类型" "本机端口" "目标地址/域名" "备注"
     echo "────────────────────────────────────────────────────────────────────────────────────────"
     local idx=1 rule lport target dport note type label
@@ -387,10 +410,11 @@ do_list() {
         ((idx++))
     done
     echo ""
+    pause_to_menu
 }
 
 do_add() {
-    command -v nft &>/dev/null || { err "nftables 未安装"; return; }
+    command -v nft &>/dev/null || { err "nftables 未安装"; pause_to_menu; return; }
     init_conf || return
     enable_ip_forward && load_rules
 
@@ -402,7 +426,7 @@ do_add() {
     done
     for rule in "${RULES[@]}"; do
         IFS='|' read -r rp _ _ _ <<< "$rule"
-        if [[ "$rp" == "$lport" ]]; then err "本机端口 ${lport} 规则已存在"; return; fi
+        if [[ "$rp" == "$lport" ]]; then err "本机端口 ${lport} 规则已存在"; pause_to_menu; return; fi
     done
     while true; do
         read -rp "请输入目标 IP 地址 或 目标域名: " target
@@ -423,25 +447,50 @@ do_add() {
     note=$(sanitize_note "$note")
 
     RULES+=("${lport}|${target}|${dport}|${note}")
-    write_conf_file && reload_rules && setup_ddns_cron && info "规则添加并加载成功！" || err "配置重载失败"
+    if write_conf_file && reload_rules && setup_ddns_cron; then
+        info "规则添加并加载成功！"
+    else
+        err "配置重载失败"
+    fi
+    pause_to_menu
 }
 
 do_delete() {
     load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供删除。"; return; fi
-    do_list
+    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供删除。"; pause_to_menu; return; fi
+    
+    # 打印规则列表供选择
+    printf "\n\033[1m%-6s %-8s %-10s    %-35s %s\033[0m\n" "序号" "类型" "本机端口" "目标地址/域名" "备注"
+    echo "────────────────────────────────────────────────────────────────────────────────────────"
+    local idx=1 rule lport target dport note type label
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r lport target dport note <<< "$rule"
+        type=$(detect_ip_type "$target")
+        if [[ "$type" == "2" ]]; then label="域名"; else [[ "$type" == "6" ]] && label="IPv6" || label="IPv4"; fi
+        if [[ "$type" == "6" ]]; then
+            printf "%-6s %-8s %-10s -> %-35s %s\n" "$idx" "$label" "$lport" "[${target}]:${dport}" "${note:--}"
+        else
+            printf "%-6s %-8s %-10s -> %-35s %s\n" "$idx" "$label" "$lport" "${target}:${dport}" "${note:--}"
+        fi
+        ((idx++))
+    done
+    echo ""
+
     read -rp "请输入要删除的规则序号 (0 取消): " choice
     if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#RULES[@]} )); then
         unset 'RULES[$((choice-1))]'
         RULES=("${RULES[@]}")
         write_conf_file && reload_rules && info "成功删除规则。"
-    else err "无效序号"; fi
+    else 
+        err "无效序号"
+    fi
+    pause_to_menu
 }
 
 do_clear_all() {
     load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then return; fi
+    if [[ ${#RULES[@]} -eq 0 ]]; then info "当前没有任何转发规则。"; pause_to_menu; return; fi
     read -rp "确认彻底清空所有规则？[y/N]: " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return
     RULES=()
@@ -449,6 +498,7 @@ do_clear_all() {
     crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
     rm -f "${CRON_DDNS_SCRIPT}" 2>/dev/null
     info "已全部清空。"
+    pause_to_menu
 }
 
 do_diagnose() {
@@ -457,15 +507,81 @@ do_diagnose() {
     echo "========================================"
     info "系统环境: $(is_alpine && echo 'Alpine Linux' || echo '标准 Linux (Systemd)')"
     info "nftables 服务状态: $(is_nftables_active && echo '运行中' || echo '未运行')"
+    if crontab -l 2>/dev/null | grep -q "${CRON_DDNS_SCRIPT}"; then
+        info "域名同步守护进程: ${GREEN}已挂载${RESET}"
+    else
+        warn "域名同步守护进程: ${RED}未挂载${RESET}"
+    fi
+    pause_to_menu
+}
+
+# ============== 彻底卸载模块 ==============
+do_uninstall() {
+    read -rp "确认要彻底卸载本工具并清空所有转发规则吗？[y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return
+
+    info "正在清空所有 nftables 转发规则..."
+    RULES=()
+    write_conf_file && reload_rules 2>/dev/null || true
+
+    info "正在清理定时任务及相关文件..."
+    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
+    disable_ip_forward
+
+    info "正在拆除 A/a 系统快捷启动链..."
+    rm -f "${BIN_LINK_DIR}/A" "${BIN_LINK_DIR}/a" 2>/dev/null
+
+    # 移除主程序目录及主配置引用
+    if [[ -f "${MAIN_CONF}" ]]; then
+        if is_alpine; then
+            sed -i '\/etc\/nftables.d\/\*\.conf/d' "${MAIN_CONF}" 2>/dev/null || true
+        else
+            sed -i '/include "\/etc\/nftables.d\/\*\.conf"/d' "${MAIN_CONF}" 2>/dev/null || true
+        fi
+    fi
+    rm -rf "${CONF_DIR}" 2>/dev/null
+
+    echo -e "${GREEN}✅ 纯净卸载成功！转发规则已彻底清除，快捷键已拔除。${RESET}"
+    exit 0
+}
+
+# ============== 自动化本地化与 软链接快捷键（A/a） 处理核心 ==============
+auto_localize_and_link() {
+    mkdir -p "${CONF_DIR}"
+    mkdir -p "${BIN_LINK_DIR}"
+    
+    # 1. 检查并同步实体脚本到本地固定路径
+    if [[ ! -f "${LOCAL_SCRIPT_PATH}" ]]; then
+        curl -sL "https://raw.githubusercontent.com/iu683/uu/main/aa.sh" -o "${LOCAL_SCRIPT_PATH}"
+        chmod +x "${LOCAL_SCRIPT_PATH}"
+    fi
+
+    # 2. 创建快捷链接 A/a (软链接方式)
+    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/A"
+    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/a"
+
+    echo -e "${GREEN}✅ 安装完成${RESET}"
+    echo -e "${GREEN}✅ 快捷键已添加：A 或 a 可快速启动${RESET}"
 }
 
 # ============== 交互菜单主循环 ==============
 main_menu() {
     check_root
+    
+    # 静默刷新后端入口
     if [[ "${1:-}" == "--reload-backend" ]]; then
         load_rules
         [[ ${#RULES[@]} -gt 0 ]] && { write_conf_file; reload_rules; }
         exit 0
+    fi
+
+    # 只要是在线管道流运行，或者本地物理文件被删了，立即执行本地化和创建快捷键
+    if [[ "$0" == "bash" || "$0" == "sh" || ! -f "${LOCAL_SCRIPT_PATH}" ]]; then
+        auto_localize_and_link
+        # 在线管道流运行时，自动将执行权无缝移交给本地的物理实体脚本，防止管道 fd/63 中断
+        if [[ "$0" == "bash" || "$0" == "sh" ]]; then
+            exec "${LOCAL_SCRIPT_PATH}" "$@"
+        fi
     fi
 
     local panel_status panel_version panel_rules_count
@@ -490,10 +606,12 @@ main_menu() {
         echo -e "${GREEN} 6. 运行系统环境自检${RESET}"
         echo -e "${GREEN} 7. 备份当前转发规则${RESET}"
         echo -e "${GREEN} 8. 恢复历史转发规则${RESET}"
+        echo -e "${GREEN} 9. 卸载该端口转发管理工具${RESET}"
         echo -e "${GREEN} 0. 退出面板${RESET}"
         echo -e "${GREEN}========================================${RESET}"
         
-        read -rp "请选择操作 [0-8]: " menu_choice
+        # 绿色输入高亮提示行
+        read -rp "$(echo -e "${GREEN}请选择操作 [0-9]: ${RESET}")" menu_choice
         case "$menu_choice" in
             1) do_install ;;
             2) do_list ;;
@@ -503,8 +621,9 @@ main_menu() {
             6) do_diagnose ;;
             7) do_backup_manual ;;
             8) do_restore_manual ;;
+            9) do_uninstall ;;
             0) info "感谢使用。" && exit 0 ;;
-            *) err "输入错误" ;;
+            *) err "输入错误" && pause_to_menu ;;
         esac
         echo ""
     done

@@ -1,352 +1,262 @@
 #!/bin/bash
 # ========================================
-# qBittorrent-Nox 一键管理脚本 (全自动最新静态版)
+# aria2 系统原生包管理器全能管理与下载工具
+# 支持 APT (Debian/Ubuntu) / APK (Alpine)
 # ========================================
 
-# 颜色
-RED="\033[31m"
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-SERVICE_NAME="qbittorrent"
-APP_DIR="/opt/qbittorrent"
-CONFIG_DIR="$APP_DIR/config"
-DOWNLOAD_DIR="$APP_DIR/downloads"
-BIN_PATH="/usr/local/bin/qbittorrent-nox"
-SERVICE_FILE="/etc/systemd/system/qbittorrent.service"
+# 默认保存目录
+DOWNLOAD_DIR="/opt/aria2_downloads"
+mkdir -p "$DOWNLOAD_DIR"
 
-# 获取真实的运行用户（防止 sudo 误判为 root）
-REAL_USER=${SUDO_USER:-$(whoami)}
+# 内置 GitHub 反代加速节点（仅用于拉取 BT 加速 Tracker）
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+)
 
-# 动态获取状态、版本和端口
-get_status_info() {
-    # 1. 检测运行状态
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        status="${GREEN}已启动${RESET}"
+# 统一定义 Prompt 提示符
+PROMPT_CHOICE=$(echo -e "${GREEN}请输入选项: ${RESET}")
+PROMPT_CONTINUE=$(echo -e "${GREEN}按回车继续...${RESET}")
+
+# 动态获取 aria2 状态
+get_aria_status() {
+    if command -v aria2c &>/dev/null; then
+        echo -e "${GREEN}运行 (已就绪)${RESET}"
     else
-        status="${RED}未运行${RESET}"
-    fi
-
-    # 2. 检测版本号
-    if [[ -f "$BIN_PATH" ]]; then
-        version=$($BIN_PATH --version 2>/dev/null | awk '{print $2}')
-        [[ -z "$version" ]] && version="已安装"
-    else
-        version="${RED}未安装${RESET}"
-    fi
-
-    # 3. 检测 WebUI 端口
-    if [[ -f "$SERVICE_FILE" ]]; then
-        port_show=$(grep -oE -- '--webui-port=[0-9]+' "$SERVICE_FILE" | cut -d= -f2)
-        [[ -z "$port_show" ]] && port_show="8080"
-    else
-        port_show="N/A"
+        echo -e "${RED}停止 (未安装)${RESET}"
     fi
 }
 
-# 端口合法性校验函数
-validate_port() {
-    local port=$1
-    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return 1
+# 动态获取当前本地安装的 aria2 版本
+get_aria_version() {
+    if command -v aria2c &>/dev/null; then
+        aria2c -v | head -n 1 | awk '{print $3}'
+    else
+        echo "无"
     fi
-    if ((port < 1 || port > 65535)); then
-        echo -e "${RED}错误: 端口范围必须在 1-65535 之间！${RESET}"
-        return 1
+}
+
+# 智能识别包管理器并一键安装/更新
+install_or_update_aria2() {
+    if [ "$EUID" -ne 0 ] && [ -f /etc/debian_version ]; then
+        echo -e "${RED}错误：请使用 root 权限或 sudo 运行此脚本！${RESET}"
+        return
     fi
-    if command -v ss &> /dev/null; then
-        if ss -tuln | grep -q ":$port "; then
-            echo -e "${RED}错误: 端口 $port 已被其他程序占用，请更换端口！${RESET}"
-            return 1
-        fi
+
+    echo -e "${GREEN}正在检测系统包管理器环境...${RESET}"
+    
+    if command -v apt &>/dev/null; then
+        echo -e "${GREEN}检测到基于 Debian/Ubuntu 的系统，正在使用 ${YELLOW}apt${GREEN} 进行部署...${RESET}"
+        apt update -y
+        apt install aria2 curl grep -y
+    elif command -v apk &>/dev/null; then
+        echo -e "${GREEN}检测到基于 Alpine Linux 的系统，正在使用 ${YELLOW}apk${GREEN} 进行部署...${RESET}"
+        apk update
+        apk add aria2 curl grep bash
+    else
+        echo -e "${RED}❌ 抱歉，当前系统既不是 APT 也不支持 APK，无法进行自动化安装。${RESET}"
+        return
+    fi
+
+    if command -v aria2c &>/dev/null; then
+        local NEW_VER=$(get_aria_version)
+        echo -e "${GREEN}🎉 aria2 v${NEW_VER} 原生包管理器版成功部署！${RESET}"
+    else
+        echo -e "${RED}❌ 安装失败，请检查您的软件源或网络连接！${RESET}"
+    fi
+}
+
+# 智能卸载
+uninstall_aria2() {
+    echo -e "${YELLOW}正在清理 aria2 相关程序...${RESET}"
+    if command -v apt &>/dev/null; then
+        apt remove aria2 -y
+        apt autoremove -y
+    elif command -v apk &>/dev/null; then
+        apk del aria2
+    else
+        # 兜底清理手动残留
+        rm -f /usr/local/bin/aria2c /usr/bin/aria2c
+    fi
+    echo -e "${GREEN}卸载完成。${RESET}"
+}
+
+# 设置保存目录
+set_download_dir() {
+    read -e -p "$(echo -e "${GREEN}当前保存目录为: ${YELLOW}$DOWNLOAD_DIR${RESET}\n${GREEN}请输入新的保存路径: ${RESET}")" new_dir
+    if [ -n "$new_dir" ]; then
+        DOWNLOAD_DIR="$new_dir"
+        mkdir -p "$DOWNLOAD_DIR"
+        echo -e "${GREEN}保存路径已成功修改为: ${YELLOW}$DOWNLOAD_DIR${RESET}"
+    else
+        echo -e "${YELLOW}输入为空，路径保持不变. ${RESET}"
+    fi
+}
+
+# 辅助检查 aria2c 是否就绪
+check_aria_ready() {
+    if ! command -v aria2c &>/dev/null; then
+        echo -e "${RED}错误：请先选择选项 1 安装 aria2 才能使用下载功能！${RESET}"
+        return 1
     fi
     return 0
 }
 
-
-# 从日志中自动提取临时密码
-get_qb_password() {
-    local log_line log_pass
-    # 1. 抓取核心日志行
-    log_line=$(sudo journalctl -u "$SERVICE_NAME" --no-pager | grep -Ei "temporary password is:|password was randomly generated:|provided for this session:" | tail -n 1)
+# 通过自定义的反代代理池，安全且加速地拉取云端最新 Tracker 列表
+get_dynamic_trackers() {
+    echo -e "${GREEN}正在通过反代节点池拉取最新 BT 加速 Tracker 列表...${RESET}"
     
-    if [[ -n "$log_line" ]]; then
-        # 2. 无论后面带不带标点，直接用 sed 提取 session: 或 is: 后面的所有文本，并去掉两边空格
-        log_pass=$(echo "$log_line" | sed -e 's/.*session://I' -e 's/.*is://I' | tr -d '[:space:].:')
-    fi
-    
-    if [[ -n "$log_pass" ]]; then
-        echo -e "${GREEN}${log_pass}${RESET}"
-    else
-        echo -e "${RED}未找到临时密码（可能已在WebUI中修改、日志已清空，或服务未成功启动）${RESET}"
-    fi
-}
+    local raw_script_path="XIU2/TrackersListCollection/master/tracker.sh"
+    local tmp_script="/tmp/aria2_tracker_exec.sh"
+    local trackers=""
+    local fetch_success=false
 
-# 获取公网 IP
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "127.0.0.1"
-}
-
-# 1. 部署 qBittorrent-Nox (自动获取 GitHub 最新版并校验)
-install_qbittorrent() {
-    if [[ -f "$BIN_PATH" ]]; then
-        echo -e "${YELLOW}提示: qBittorrent 已安装在 $BIN_PATH，请勿重复安装。${RESET}"
-        return
-    fi
-
-    echo -ne "${YELLOW}请输入你想要设置的 WebUI 端口号 [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-
-    if ! validate_port "$custom_port"; then
-        return
-    fi
-
-    # 检测系统架构决定下载哪个文件
-    local arch url_file
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64)      url_file="x86_64-qbittorrent-nox" ;;
-        aarch64)     url_file="aarch64-qbittorrent-nox" ;;
-        armv7l)      url_file="armv7-qbittorrent-nox" ;;
-        armhf)       url_file="armhf-qbittorrent-nox" ;;
-        riscv64)     url_file="riscv64-qbittorrent-nox" ;;
-        i386|i686)   url_file="x86-qbittorrent-nox" ;;
-        *)
-            echo -e "${RED}错误: 暂不支持您的系统架构 ($arch)！${RESET}"
-            return
-            ;;
-    esac
-
-    # 安装基础依赖
-    echo -e "${YELLOW}检查并安装必要工具 (curl, wget)...${RESET}"
-    sudo apt update && sudo apt install -y curl wget
-
-    # 动态抓取 GitHub 最新 Release 信息
-    echo -e "${YELLOW}正在检索 GitHub 最新版本信息...${RESET}"
-    local release_json latest_tag expected_sha
-    release_json=$(curl -s https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases/latest)
-    latest_tag=$(echo "$release_json" | grep -oP '"tag_name": "\K[^"]+')
-
-    if [[ -z "$latest_tag" ]]; then
-        echo -e "${RED}错误: 无法获取最新版本号，可能触发了 GitHub API 频率限制，请稍后再试。${RESET}"
-        return
-    fi
-    echo -e "${GREEN}检测到最新版本标签: ${latest_tag}${RESET}"
-
-    # 从 Release 文本中动态抓取对应架构的 SHA256 校验码
-    expected_sha=$(echo "$release_json" | grep -A 2 "$url_file" | grep -oP '"body": "sha256:\K[a-f0-9]{64}' || echo "$release_json" | grep -oP "sha256:${url_file}\s+\K[a-f0-9]{64}" || echo "$release_json" | sed -n "/${url_file}/,/^$/p" | grep -oP '[a-f0-9]{64}')
-    
-    # 下载静态编译二进制文件
-    local download_url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${latest_tag}/${url_file}"
-    echo -e "${YELLOW}正在从 GitHub 下载最新二进制文件...${RESET}"
-    echo -e "${CYAN}URL: $download_url${RESET}"
-    
-    sudo wget -q --show-progress -O "$BIN_PATH" "$download_url"
-    if [[ $? -ne 0 || ! -s "$BIN_PATH" ]]; then
-        echo -e "${RED}错误: 下载失败，请检查网络！${RESET}"
-        sudo rm -f "$BIN_PATH"
-        return
-    fi
-
-    # 安全完整性哈希校验
-    if [[ -n "$expected_sha" && ${#expected_sha} -eq 64 ]]; then
-        echo -e "${YELLOW}正在验证文件完整性 (SHA256)...${RESET}"
-        local calculated_sha
-        calculated_sha=$(sha256sum "$BIN_PATH" | awk '{print $1}')
-        if [[ "$calculated_sha" != "$expected_sha" ]]; then
-            echo -e "${RED}错误: SHA256 校验失败！下载的文件可能已损坏。${RESET}"
-            echo "官方预期值: $expected_sha"
-            echo "本地计算值: $calculated_sha"
-            sudo rm -f "$BIN_PATH"
-            return
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local tracker_url="${proxy}https://raw.githubusercontent.com/${raw_script_path}"
+        echo -e "${GREEN}正在尝试连接 Tracker 节点: ${YELLOW}${proxy:-'GitHub官方Raw链接'}${RESET}"
+        
+        rm -f "$tmp_script"
+        curl -L -m 15 "$tracker_url" -o "$tmp_script" 2>/dev/null
+        
+        if [ -s "$tmp_script" ] && grep -q "Aria2" "$tmp_script"; then
+            trackers=$(bash "$tmp_script" cat 2>/dev/null)
+            if [ -n "$trackers" ]; then
+                fetch_success=true
+                break
+            fi
         fi
-        echo -e "${GREEN}安全校验通过！${RESET}"
+    done
+
+    rm -f "$tmp_script"
+
+    if [ "$fetch_success" = true ]; then
+        echo -e "${GREEN}Tracker 列表获取成功并已成功注入！正在调动 P2P 网络...${RESET}"
+        echo "$trackers"
     else
-        echo -e "${YELLOW}提示: 未能匹配到该版本的精准官方 SHA256，跳过哈希校验。${RESET}"
+        echo -e "${YELLOW}警告：所有反代代理节点均拉取 Tracker 超时，将转入常规多线程 DHT 模式。${RESET}"
+        echo ""
     fi
-
-    # 赋予执行权限
-    sudo chmod +x "$BIN_PATH"
-
-    # 创建目录并赋权
-    sudo mkdir -p "$CONFIG_DIR" "$DOWNLOAD_DIR"
-    sudo chown -R "$REAL_USER":"$REAL_USER" "$APP_DIR"
-    sudo chmod -R 755 "$APP_DIR"
-
-    echo -e "${YELLOW}创建 systemd 服务文件 (端口: ${custom_port})...${RESET}"
-    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
-[Unit]
-Description=qBittorrent Command Line Client (Static Latest)
-After=network.target
-
-[Service]
-ExecStart=$BIN_PATH --webui-port=${custom_port} --profile=$CONFIG_DIR
-User=$REAL_USER
-Restart=on-failure
-WorkingDirectory=$DOWNLOAD_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    sudo systemctl daemon-reload
-    sudo systemctl start qbittorrent
-    sudo systemctl enable qbittorrent
-
-    echo -e "${YELLOW}等待服务启动并生成密码...${RESET}"
-    sleep 4
-
-    SERVER_IP=$(get_public_ip)
-    echo -e "\n${GREEN}qBittorrent-Nox 静态版安装完成并已启动!${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址: http://${SERVER_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}默认用户名: admin${RESET}"
-    echo -ne "${YELLOW}初始密码: ${RESET}"
-    get_qb_password
-    echo -e "${YELLOW}配置目录: $CONFIG_DIR${RESET}"
-    echo -e "${YELLOW}下载目录: $DOWNLOAD_DIR${RESET}"
 }
 
-# 2. 自动检查并更新到最新版
-update_qbittorrent() {
-    if [[ ! -f "$BIN_PATH" ]]; then
-        echo -e "${RED}错误: 未检测到已安装的 qBittorrent，请先选择 1 进行安装！${RESET}"
-        return
-    fi
-    echo -e "${YELLOW}正在获取最新版本并准备覆盖安装...${RESET}"
-    sudo systemctl stop qbittorrent
-    sudo rm -f "$BIN_PATH"
-    install_qbittorrent
+# 4. 普通网络链接下载
+download_http() {
+    check_aria_ready || return
+    read -e -p "$(echo -e "${GREEN}请输入 HTTP/HTTPS/FTP 下载链接: ${RESET}")" url
+    [ -z "$url" ] && return
+    aria2c -c -s 16 -x 16 -k 1M -d "$DOWNLOAD_DIR" "$url"
 }
 
-# 3. 卸载服务
-uninstall_qbittorrent() {
-    echo -e "${RED}警告: 正在卸载 qBittorrent 并清除所有配置数据...${RESET}"
-    sudo systemctl stop ${SERVICE_NAME} 2>/dev/null
-    sudo systemctl disable ${SERVICE_NAME} 2>/dev/null
-    sudo rm -f "$SERVICE_FILE"
-    sudo systemctl daemon-reload
+# 5. 磁力链接下载 (主程序 + Tracker 双重反代加速)
+download_magnet() {
+    check_aria_ready || return
+    read -e -p "$(echo -e "${GREEN}请输入 Magnet 磁力链接: ${RESET}")" magnet
+    [ -z "$magnet" ] && return
     
-    # 清理二进制文件和目录
-    sudo rm -f "$BIN_PATH"
-    sudo rm -rf "$APP_DIR"
-    echo -e "${GREEN}qBittorrent 已彻底卸载，数据已清理完毕。${RESET}"
-}
-
-# 4. 修改端口配置
-edit_config() {
-    if [[ ! -f "$SERVICE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到服务文件，请先安装 qBittorrent！${RESET}"
-        return
-    fi
-
-    get_status_info
-    echo -e "${CYAN}当前 WebUI 端口为: ${port_show}${RESET}"
-    echo -ne "${YELLOW}请输入新的 WebUI 端口号: ${RESET}"
-    read -r new_port
-
-    if ! validate_port "$new_port"; then
-        return
-    fi
-
-    echo -e "${YELLOW}正在修改端口为 ${new_port}...${RESET}"
-    sudo sed -i "s/--webui-port=[0-9]*/--webui-port=${new_port}/g" "$SERVICE_FILE"
+    local trackers_arg=$(get_dynamic_trackers)
     
-    echo -e "${YELLOW}正在重载系统配置并重启服务...${RESET}"
-    sudo systemctl daemon-reload
-    sudo systemctl restart "$SERVICE_NAME"
+    aria2c --seed-time=0 \
+           --enable-dht=true \
+           --enable-peer-exchange=true \
+           --bt-max-peers=128 \
+           --max-connection-per-server=16 \
+           ${trackers_arg:+--bt-tracker="$trackers_arg"} \
+           -d "$DOWNLOAD_DIR" "$magnet"
+}
+
+# 6. 种子文件下载 (主程序 + Tracker 双重反代加速)
+download_torrent() {
+    check_aria_ready || return
+    read -e -p "$(echo -e "${GREEN}请输入 .torrent 种子文件路径或下载链接: ${RESET}")" torrent
+    [ -z "$torrent" ] && return
     
-    echo -e "${GREEN}端口修改成功！当前新端口为: ${new_port}${RESET}"
+    local trackers_arg=$(get_dynamic_trackers)
+    
+    aria2c --seed-time=0 \
+           --enable-dht=true \
+           --enable-peer-exchange=true \
+           --bt-max-peers=128 \
+           --max-connection-per-server=16 \
+           ${trackers_arg:+--bt-tracker="$trackers_arg"} \
+           -d "$DOWNLOAD_DIR" "$torrent"
 }
 
-# 5. 启动服务
-start_qbittorrent() {
-    sudo systemctl start ${SERVICE_NAME}
-    echo -e "${GREEN}qBittorrent 已启动${RESET}"
+# 7. 批量文本链接下载
+download_batch_txt() {
+    check_aria_ready || return
+    echo -e "${GREEN}请连续输入需要下载的链接，每输完一个按一次回车。${RESET}"
+    echo -e "${GREEN}输入完毕后，输入英文字母 ${YELLOW}q${GREEN} 即可开始批量下载。${RESET}"
+    
+    local tmp_txt="/tmp/aria2_urls.txt"
+    > "$tmp_txt"
+    local count=1
+    while true; do
+        read -e -p "$(echo -e "${GREEN}输入第 [${YELLOW}$count${GREEN}] 个链接 (输入 q 开始): ${RESET}")" input_url
+        if [ "$input_url" = "q" ] || [ "$input_url" = "Q" ]; then break; fi
+        if [ -n "$input_url" ]; then
+            echo "$input_url" >> "$tmp_txt"
+            ((count++))
+        fi
+    done
+
+    if [ -s "$tmp_txt" ]; then
+        echo -e "${GREEN}正在启动批量下载...${RESET}"
+        aria2c -c -s 16 -x 16 -k 1M -d "$DOWNLOAD_DIR" -i "$tmp_txt"
+    else
+        echo -e "${YELLOW}未输入任何链接。${RESET}"
+    fi
+    rm -f "$tmp_txt"
 }
 
-# 6. 停止服务
-stop_qbittorrent() {
-    sudo systemctl stop ${SERVICE_NAME}
-    echo -e "${YELLOW}qBittorrent 已停止${RESET}"
-}
-
-# 7. 重启服务
-restart_qbittorrent() {
-    sudo systemctl restart ${SERVICE_NAME}
-    echo -e "${GREEN}qBittorrent 已重启${RESET}"
-}
-
-# 8. 查看日志
-logs_qbittorrent() {
-    echo -e "${CYAN}正在实时查看日志 (按 Ctrl+C 退出)...${RESET}"
-    sudo journalctl -u ${SERVICE_NAME} -n 50 -f
-}
-
-# 9. 查看节点配置
-show_node_info() {
-    SERVER_IP=$(get_public_ip)
-    get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    qBittorrent 访问与配置信息    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}WebUI 地址 : http://${SERVER_IP}:${port_show}${RESET}"
-    echo -e "${YELLOW}默认用户名 : admin${RESET}"
-    echo -ne "${YELLOW}初始密码   : ${RESET}"
-    get_qb_password
-    echo -e "${GREEN}================================${RESET}"
-}
-
-# 菜单
-menu() {
-    clear
-    get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     qBittorrent 自动管理面板     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 qBittorrent (自动最新版)${RESET}"
-    echo -e "${GREEN}2. 检查并更新 qBittorrent${RESET}"
-    echo -e "${GREEN}3. 卸载 qBittorrent${RESET}"
-    echo -e "${GREEN}4. 修改端口配置${RESET}"
-    echo -e "${GREEN}5. 启动 qBittorrent${RESET}"
-    echo -e "${GREEN}6. 停止 qBittorrent${RESET}"
-    echo -e "${GREEN}7. 重启 qBittorrent${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_qbittorrent ;;
-        2) update_qbittorrent ;;
-        3) uninstall_qbittorrent ;;
-        4) edit_config ;;
-        5) start_qbittorrent ;;
-        6) stop_qbittorrent ;;
-        7) restart_qbittorrent ;;
-        8) logs_qbittorrent ;;
-        9) show_node_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
-}
-
+# 主菜单
 while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
+    clear
+    STATUS=$(get_aria_status)
+    VERSION=$(get_aria_version)
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}         aria2 智能系统原生部署与全能下载工具          ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN} 核心状态: $STATUS${RESET}"
+    echo -e "${GREEN} 当前版本: ${YELLOW}v$VERSION${RESET}"
+    echo -e "${GREEN} 保存目录: ${YELLOW}$DOWNLOAD_DIR${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN} [环境管理]${RESET}"
+    echo -e "${GREEN}  1. 安装/更新 aria2 (系统原生 APT / APK 智能识配)${RESET}"
+    echo -e "${GREEN}  2. 卸载 aria2 下载器${RESET}"
+    echo -e "${GREEN}  3. 修改当前自定义保存目录${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    echo -e "${GREEN} [实用下载功能]${RESET}"
+    echo -e "${GREEN}  4. HTTP / HTTPS / FTP 常用链接下载 (16线程)${RESET}"
+    echo -e "${GREEN}  5. Magnet 磁力下载 (🔥反代Tracker+128多线程加速)${RESET}"
+    echo -e "${GREEN}  6. BitTorrent 种子下载 (🔥反代Tracker+128多线程加速)${RESET}"
+    echo -e "${GREEN}  7. 批量多链接交互下载${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    echo -e "${GREEN}  0. 退出脚本${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    
+    read -e -p "$PROMPT_CHOICE" choice
+
+    case $choice in
+        1) install_or_update_aria2 ;;
+        2) uninstall_aria2 ;;
+        3) set_download_dir ;;
+        4) download_http ;;
+        5) download_magnet ;;
+        6) download_torrent ;;
+        7) download_batch_txt ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
+    esac
+
+    echo
+    read -p "$PROMPT_CONTINUE"
 done

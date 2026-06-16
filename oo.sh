@@ -1,634 +1,301 @@
-#!/usr/bin/env bash
-#
-# iptables 端口转发管理工具 (Alpine Linux 专属双栈完美版)
-#
+#!/bin/bash
+# ========================================
+# yt-dlp 一键管理脚本 (支持 Alpine & Debian/Ubuntu)
+# ========================================
 
-# ============== 常量定义 ==============
-CONF_DIR="/etc/iptables.d"
-CONF_FILE="${CONF_DIR}/port-forward.rules"
-DEFAULT_BACKUP_DIR="${CONF_DIR}/backups"
-SYSCTL_CONF="/etc/sysctl.d/99-ip-forward.conf"
-LOG_FILE="/var/log/iptables-forward.log"
-CRON_DDNS_SCRIPT="${CONF_DIR}/ddns_sync.sh"
-LOCAL_SCRIPT_PATH="${CONF_DIR}/port_forward_main.sh"
-BIN_LINK_DIR="/usr/local/bin"
+VIDEO_DIR="/opt/yt-dlp"
+URL_FILE="$VIDEO_DIR/urls.txt"
+COOKIE_FILE="$VIDEO_DIR/cookies.txt"
 
-# ============== 颜色定义 ==============
-GREEN='\033[32m'
-YELLOW='\033[33m'
-RED='\033[31m'
-RESET='\033[0m'
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
 
-# ============== 辅助输出 ==============
-info()   { printf '\033[32m[信息]\033[0m %s\n' "$1"; }
-warn()   { printf '\033[33m[警告]\033[0m %s\n' "$1"; }
-err()    { printf '\033[31m[错误]\033[0m %s\n' "$1"; }
+mkdir -p "$VIDEO_DIR"
 
-pause_to_menu() {
-    echo ""
-    read -rp "$(echo -e "${GREEN}按任意键或回车返回主菜单...${RESET}")" _unused
-}
+# 统一定义带颜色的 Prompt 提示符
+PROMPT_CHOICE=$(echo -e "${GREEN}请输入选项: ${RESET}")
+PROMPT_URL=$(echo -e "${GREEN}请输入视频链接: ${RESET}")
+PROMPT_CUSTOM=$(echo -e "${GREEN}请输入完整 yt-dlp 参数（不含 yt-dlp）: ${RESET}")
+PROMPT_DEL=$(echo -e "${GREEN}请输入要删除的目录名称: ${RESET}")
+PROMPT_CONTINUE=$(echo -e "${GREEN}按回车继续...${RESET}")
 
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        err "此脚本需要 root 权限运行。"
-        exit 1
-    fi
-}
-
-# 完美兼容 Alpine 的 v4/v6 双栈服务状态检测
-is_iptables_active() {
-    local v4_ok=0
-    local v6_ok=0
-    
-    # 检测 IPv4 iptables 状态 (兼容 OpenRC 各种微调输出)
-    if rc-service iptables status 2>/dev/null | grep -Ei "started|active" >/dev/null; then
-        v4_ok=1
-    fi
-    
-    # 检测 IPv6 ip6tables 状态
-    if rc-service ip6tables status 2>/dev/null | grep -Ei "started|active" >/dev/null; then
-        v6_ok=1
-    fi
-
-    # 只要有一个在跑就认为整体在运行，并反馈具体多栈状态
-    if [[ $v4_ok -eq 1 && $v6_ok -eq 1 ]]; then
-        echo "双栈运行中"
-        return 0
-    elif [[ $v4_ok -eq 1 ]]; then
-        echo "仅IPv4运行"
-        return 0
-    elif [[ $v6_ok -eq 1 ]]; then
-        echo "仅IPv6运行"
-        return 0
+# 自动检测并获取 Cookies 参数
+get_cookie_args() {
+    if [ -f "$COOKIE_FILE" ]; then
+        echo "--cookies $COOKIE_FILE"
     else
+        echo ""
+    fi
+}
+
+# 动态获取 yt-dlp 版本
+get_yt_version() {
+    if command -v yt-dlp &>/dev/null; then
+        yt-dlp --version 2>/dev/null || echo "未知版本"
+    else
+        echo "无"
+    fi
+}
+
+install_yt() {
+    echo -e "${GREEN}开始检查并安装所需组件...${RESET}"
+    
+    # 检测包管理器
+    local pkg_manager=""
+    if command -v apk &>/dev/null; then
+        pkg_manager="apk"
+    elif command -v apt &>/dev/null; then
+        pkg_manager="apt"
+    else
+        echo -e "${RED}未检测到受支持的包管理器 (apk/apt)，请手动安装依赖！${RESET}"
         return 1
     fi
-}
 
-get_iptables_version() {
-    if command -v iptables &>/dev/null; then
-        iptables --version 2>/dev/null | awk '{print $2}'
+    # 待检查的命令列表与对应的包名
+    local deps=("ffmpeg" "curl" "node" "aria2c")
+    local to_install=()
+
+    # 针对不同系统映射包名
+    for dep in "${deps[@]}"; do
+        if command -v "$dep" &>/dev/null; then
+            echo -e "检查 ${YELLOW}$dep${RESET} ... [${GREEN}已安装，跳过${RESET}]"
+        else
+            echo -e "检查 ${YELLOW}$dep${RESET} ... [${RED}未安装${RESET}]"
+            if [ "$pkg_manager" = "apk" ]; then
+                # Alpine 包名映射
+                case "$dep" in
+                    "node") to_install+=("nodejs") ;;
+                    "aria2c") to_install+=("aria2") ;;
+                    *) to_install+=("$dep") ;;
+                esac
+            else
+                # Apt 包名映射
+                case "$dep" in
+                    "node") to_install+=("nodejs") ;;
+                    "aria2c") to_install+=("aria2") ;;
+                    *) to_install+=("$dep") ;;
+                esac
+            fi
+        fi
+    done
+
+    # 执行必要的安装
+    if [ ${#to_install[@]} -ne 0 ]; then
+        echo -e "${GREEN}正在通过 $pkg_manager 安装缺失组件: ${to_install[*]}...${RESET}"
+        if [ "$pkg_manager" = "apk" ]; then
+            apk update
+            # Alpine 默认可能缺少 bash 和 python3，yt-dlp 运行必须依赖 python3
+            apk add bash python3 "${to_install[@]}"
+        else
+            apt update -y
+            apt install -y "${to_install[@]}"
+        fi
     else
-        echo "未安装"
+        echo -e "${GREEN}所有系统依赖组件均已就绪。${RESET}"
+    fi
+
+    # 检查或安装 yt-dlp 本体
+    if ! command -v yt-dlp &>/dev/null; then
+        echo -e "${GREEN}正在下载安装 yt-dlp...${RESET}"
+        # 统一安装到 /usr/local/bin
+        curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+        chmod a+rx /usr/local/bin/yt-dlp
+    else
+        echo -e "${GREEN}yt-dlp 主程序已存在，如需更新请在菜单选择选项 2。${RESET}"
+    fi
+
+    # 配置永久识别 Node.js 环境（兼容 Alpine 和 Debian 的 node 路径）
+    NODE_PATH=$(command -v node)
+    mkdir -p ~/.config/yt-dlp
+    echo "--js-runtimes node:$NODE_PATH" > ~/.config/yt-dlp/config
+
+    echo -e "${GREEN}环境检查与配置全部完成！${RESET}"
+}
+
+update_yt() {
+    echo -e "${GREEN}正在更新 yt-dlp...${RESET}"
+    if command -v yt-dlp &>/dev/null; then
+        yt-dlp -U
+    else
+        echo -e "${RED}未检测到 yt-dlp，请先执行安装！${RESET}"
     fi
 }
 
-validate_port() {
-    local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
-}
-
-detect_ip_type() {
-    local ip="$1"
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        local IFS='.' ok=1
-        read -ra octets <<< "$ip"
-        for octet in "${octets[@]}"; do
-            if (( octet > 255 )); then ok=0; fi
-        done
-        [[ $ok -eq 1 ]] && { echo "4"; return; }
-    fi
-    if [[ "$ip" =~ : ]] && [[ ! "$ip" =~ [^0-9a-fA-F:] ]]; then
-        echo "6"
-        return
-    fi
-    if [[ "$ip" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-        echo "2"
-        return
-    fi
-    echo "1"
-}
-
-resolve_domain() {
-    local domain="$1"
-    local resolved=""
-    if command -v getent &>/dev/null; then
-        resolved=$(getent ahosts "$domain" 2>/dev/null | grep -E '^[0-9]' | head -n1 | awk '{print $1}')
-    fi
-    if [[ -z "$resolved" ]] && command -v dig &>/dev/null; then
-        resolved=$(dig +short "$domain" @8.8.8.8 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1)
-    fi
-    if [[ -z "$resolved" ]] && command -v nslookup &>/dev/null; then
-        resolved=$(nslookup "$domain" 8.8.8.8 2>/dev/null | awk '/^Address:/ {print $2}' | grep -v "#" | head -n1)
-    fi
-    echo "${resolved//[[:space:]]/}"
-}
-
-enable_ip_forward() {
-    mkdir -p /etc/sysctl.d
-    cat > "${SYSCTL_CONF}" <<EOF
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-EOF
-    sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
-    
-    # 加载 Alpine 内核模块保底
-    modprobe ip_tables iptable_nat ip6_tables ip6table_nat 2>/dev/null || true
-}
-
-disable_ip_forward() {
-    rm -f "${SYSCTL_CONF}" 2>/dev/null
-}
-
-init_conf() {
-    mkdir -p "${CONF_DIR}" "${DEFAULT_BACKUP_DIR}" 2>/dev/null || return 1
-    touch "${LOG_FILE}" "${CONF_FILE}" 2>/dev/null || true
-}
-
-declare -a RULES=()
-
-sanitize_note() {
-    printf "%s" "${1//|/ }"
-}
-
-# 从自建的纯净规则文件中加载
-load_rules() {
-    RULES=()
-    [[ -f "${CONF_FILE}" ]] || return
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ "$line" =~ ^[[:space:]]*# ]] && [[ ! "$line" =~ "RULE:" ]] && continue
-        [[ -z "${line//[[:space:]]/}" ]] && continue
-        
-        if [[ "$line" =~ ^#\ RULE:\ (.*)$ ]]; then
-            RULES+=("${BASH_REMATCH[1]}")
-        fi
-    done < "${CONF_FILE}"
-}
-
-# 核心：将本地 RULES 阵列转换为系统 iptables 实际规则并保存
-write_and_apply_rules() {
-    local tmp_file="${CONF_FILE}.tmp.$$"
-    echo "# iptables 端口转发快照" > "${tmp_file}"
-    local rule
-    for rule in "${RULES[@]}"; do
-        echo "# RULE: ${rule}" >> "${tmp_file}"
-    done
-    mv -f "${tmp_file}" "${CONF_FILE}" 2>/dev/null
-
-    # 精准定点清理转发链（绝对不碰 INPUT，SSH永不锁死）
-    iptables -t nat -F PREROUTING 2>/dev/null || true
-    iptables -t nat -F POSTROUTING 2>/dev/null || true
-    ip6tables -t nat -F PREROUTING 2>/dev/null || true
-    ip6tables -t nat -F POSTROUTING 2>/dev/null || true
-
-    local lport target dport note proto type actual_ip
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        proto="${proto:-ALL}"
-        type=$(detect_ip_type "$target")
-        actual_ip="$target"
-        
-        if [[ "$type" == "2" ]]; then 
-            actual_ip=$(resolve_domain "$target")
-            if [[ -z "$actual_ip" ]]; then
-                # 域名解析闪断保底
-                actual_ip=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -w "dports ${lport}" | awk '{print $NF}' | awk -F':' '{print $1}')
-            fi
-        fi
-        [[ -z "$actual_ip" ]] && continue
-        local ip_ver=$(detect_ip_type "$actual_ip")
-
-        if [[ "$ip_ver" == "4" ]]; then
-            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
-                iptables -t nat -A PREROUTING -p tcp --dport "${lport}" -j DNAT --to-destination "${actual_ip}:${dport}"
-                iptables -t nat -A POSTROUTING -p tcp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
-                iptables -t nat -A PREROUTING -p udp --dport "${lport}" -j DNAT --to-destination "${actual_ip}:${dport}"
-                iptables -t nat -A POSTROUTING -p udp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-        elif [[ "$ip_ver" == "6" ]]; then
-            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
-                ip6tables -t nat -A PREROUTING -p tcp --dport "${lport}" -j DNAT --to-destination "[${actual_ip}]:${dport}"
-                ip6tables -t nat -A POSTROUTING -p tcp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
-                ip6tables -t nat -A PREROUTING -p udp --dport "${lport}" -j DNAT --to-destination "[${actual_ip}]:${dport}"
-                ip6tables -t nat -A POSTROUTING -p udp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
-            fi
-        fi
-    done
-
-    # 持久化保存到 Alpine 系统开机加载目录
-    rc-service iptables save >/dev/null 2>&1 || true
-    rc-service ip6tables save >/dev/null 2>&1 || true
-}
-
-setup_ddns_cron() {
-    rc-update add dcron default >/dev/null 2>&1 || true
-    rc-service dcron start >/dev/null 2>&1 || true
-
-    cat > "${CRON_DDNS_SCRIPT}" <<EOF
-#!/usr/bin/env bash
-CONF_FILE="/etc/iptables.d/port-forward.rules"
-[[ -f "\$CONF_FILE" ]] || exit 0
-if grep -q "RULE:" "\$CONF_FILE"; then
-    /etc/iptables.d/port_forward_main.sh --reload-backend
-fi
-EOF
-    chmod +x "${CRON_DDNS_SCRIPT}" 2>/dev/null
-
-    local tmp_cron="/tmp/current_cron_$$"
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" > "${tmp_cron}" || true
-    echo "*/2 * * * * ${CRON_DDNS_SCRIPT} >/dev/null 2>&1" >> "${tmp_cron}"
-    crontab "${tmp_cron}" 2>/dev/null || true
-    rm -f "${tmp_cron}"
-}
-
-do_backend_ddns_sync() {
-    [[ -f "${CONF_FILE}" ]] || exit 0
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then exit 0; fi
-
-    local need_reload=0
-    local rule lport target dport note proto type current_dns_ip
-
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        type=$(detect_ip_type "$target")
-        
-        if [[ "$type" == "2" ]]; then
-            current_dns_ip=$(resolve_domain "$target")
-            if [[ -n "$current_dns_ip" ]]; then
-                local active_ip
-                active_ip=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -w "dports ${lport}" | awk '{print $NF}' | awk -F':' '{print $1}')
-                if [[ "$current_dns_ip" != "$active_ip" ]]; then
-                    need_reload=1
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') [DDNS] 检测到域名 ${target} IP 变动，触发局部热重载..." >> "${LOG_FILE}"
-                fi
-            fi
-        fi
-    done
-
-    if [[ $need_reload -eq 1 ]]; then
-        write_and_apply_rules
-    fi
+uninstall_yt() {
+    rm -f /usr/local/bin/yt-dlp
+    rm -rf /opt/yt-dlp
+    rm -rf ~/.config/yt-dlp
+    echo -e "${GREEN}已卸载 yt-dlp 及相关配置文件${RESET}"
     exit 0
 }
 
-do_backup_manual() {
-    if [[ ! -f "${CONF_FILE}" ]] || [[ ! -s "${CONF_FILE}" ]]; then
-        err "当前没有任何生效的规则，无需导出。"
-        pause_to_menu
-        return
-    fi
-    local target_dir
-    read -rp "$(echo -e "${GREEN}请输入备份导出目录 [默认: ${DEFAULT_BACKUP_DIR}]: ${RESET}")" target_dir
-    target_dir="${target_dir:-$DEFAULT_BACKUP_DIR}"
-    mkdir -p "${target_dir}" 2>/dev/null
-
-    local bkp_name="iptables_bak_$(date '+%Y%m%d_%H%M%S').rules"
-    cp "${CONF_FILE}" "${target_dir}/${bkp_name}"
-    info "手动导出成功！备份至: ${target_dir}/${bkp_name}"
-    pause_to_menu
-}
-
-do_restore_manual() {
-    local target_input selected_file=""
-    read -rp "$(echo -e "${GREEN}请输入备份文件夹或完整路径 [默认: ${DEFAULT_BACKUP_DIR}]: ${RESET}")" target_input
-    target_input="${target_input:-$DEFAULT_BACKUP_DIR}"
-
-    if [[ -f "$target_input" ]]; then
-        selected_file="$target_input"
-    else
-        local bkp_files=($(ls "${target_input}"/*.rules 2>/dev/null | sort -r))
-        if [[ ${#bkp_files[@]} -eq 0 ]]; then
-            err "未发现备份文件。"
-            pause_to_menu
-            return
-        fi
-        echo -e "\n${YELLOW}=== 历史备份 ===${RESET}"
-        local idx=1 file
-        for file in "${bkp_files[@]}"; do
-            printf "[%2s] %s\n" "$idx" "$(basename "$file")"
-            ((idx++))
-        done
-        read -rp "请选择序号 (0 取消): " choice
-        if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-        selected_file="${bkp_files[$((choice-1))]}"
-    fi
-
-    if [[ -n "$selected_file" && -f "$selected_file" ]]; then
-        cp -f "${selected_file}" "${CONF_FILE}"
-        load_rules
-        write_and_apply_rules
-        info "配置已导入并成功应用！"
-    fi
-    pause_to_menu
-}
-
-do_install() {
-    info "准备安全安装 Alpine iptables 双栈环境..."
-    apk add iptables ip6tables bash curl bind-tools dcron
+download_single() {
+    read -e -p "$PROMPT_URL" url
+    [ -z "$url" ] && return
     
-    enable_ip_forward && init_conf
+    yt-dlp $(get_cookie_args) \
+        --external-downloader aria2c \
+        --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
+        -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
+        --write-subs --sub-langs all \
+        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites "$url"
+}
+
+download_batch() {
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}                进入交互式批量下载模式               ${RESET}"
+    echo -e "${GREEN} 请连续输入视频链接，每输完一个按一次回车。         ${RESET}"
+    echo -e "${GREEN} 输入完毕后，输入英文字母 ${YELLOW}q${GREEN} 即可开始下载。         ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
     
-    rc-update add iptables default >/dev/null 2>&1 || true
-    rc-update add ip6tables default >/dev/null 2>&1 || true
-    rc-service iptables start >/dev/null 2>&1 || true
-    rc-service ip6tables start >/dev/null 2>&1 || true
+    # 清空或初始化链接临时文件
+    > "$URL_FILE"
     
-    setup_ddns_cron
-    info "Alpine iptables 双栈环境初始化完成！INPUT 链绝对纯净安全。"
-    pause_to_menu
-}
-
-_print_rules_list() {
-    printf "\n\033[1m%-6s %-12s %-10s     %-35s %s\033[0m\n" "序号"  "协议"  "本机端口"  "目标地址/域名"  "备注"
-    echo -e "${GREEN}=====================================${RESET}"
-    local idx=1 rule lport target dport note proto type label proto_label
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport target dport note proto <<< "$rule"
-        proto="${proto:-ALL}"
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "2" ]]; then label="域名"; else [[ "$type" == "6" ]] && label="IPv6" || label="IPv4"; fi
-        if [[ "$proto" == "ALL" ]]; then proto_label="TCP+UDP"; else proto_label="$proto"; fi
-        proto_label="${proto_label} (${label})"
-
-        if [[ "$type" == "6" ]]; then
-            printf "%-6s %-12s %-10s -> %-35s %s\n" "$idx" "$proto_label" "$lport" "[${target}]:${dport}" "${note:--}"
-        else
-            printf "%-6s %-12s %-10s -> %-35s %s\n" "$idx" "$proto_label" "$lport" "${target}:${dport}" "${note:--}"
-        fi
-        ((idx++))
-    done
-}
-
-do_list() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then 
-        info "当前没有配置任何端口转发规则。"
-        pause_to_menu
-        return
-    fi
-    _print_rules_list
-    echo ""
-    pause_to_menu
-}
-
-do_add() {
-    init_conf || return
-    enable_ip_forward && load_rules
-
-    local lport target dport note proto proto_choice type
+    local count=1
     while true; do
-        read -rp "请输入本机监听端口 (1-65535): " lport
-        validate_port "$lport" && break
-        err "端口输入无效"
-    done
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r rp _ _ _ _ <<< "$rule"
-        if [[ "$rp" == "$lport" ]]; then err "本机端口 ${lport} 规则已存在"; pause_to_menu; return; fi
-    done
-    while true; do
-        read -rp "请输入目标 IP 地址 或 目标域名: " target
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "1" ]]; then err "格式不正确"; elif [[ "$type" == "2" ]]; then
-            local rip=$(resolve_domain "$target")
-            [[ -z "$rip" ]] && warn "该域名目前解析不出 IP，系统稍后会自动重试。" || info "成功解析当前 IP 为: ${rip}"
+        read -e -p "$(echo -e "${GREEN}请输入第 [${YELLOW}$count${GREEN}] 个链接 (输入 q 开始下载): ${RESET}")" input_url
+        if [ "$input_url" = "q" ] || [ "$input_url" = "Q" ]; then
             break
-        else break; fi
-    done
-    while true; do
-        read -rp "请输入目标端口 [默认 $lport]: " dport
-        dport="${dport:-$lport}"
-        validate_port "$dport" && break
-        err "目标端口不合法"
-    done
-
-    while true; do
-        read -rp "$(echo -e "${GREEN}请选择协议类型 [1: TCP+UDP | 2: 仅 TCP | 3: 仅 UDP] (默认 1): ${RESET}")" proto_choice
-        proto_choice="${proto_choice:-1}"
-        case "$proto_choice" in
-            1) proto="ALL"; break ;;
-            2) proto="TCP"; break ;;
-            3) proto="UDP"; break ;;
-            *) err "选择错误，请输入 1, 2 或 3" ;;
-        esac
-    done
-
-    read -rp "请输入本条转发备注: " note
-    note=$(sanitize_note "$note")
-
-    RULES+=("${lport}|${target}|${dport}|${note}|${proto}")
-    write_and_apply_rules
-    setup_ddns_cron
-    info "规则添加并加载成功！"
-    pause_to_menu
-}
-
-do_edit() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供修改。"; pause_to_menu; return; fi
-    _print_rules_list
-    echo ""
-
-    read -rp "请输入要修改的规则序号 (0 取消): " choice
-    if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
-        err "无效序号"
-        pause_to_menu
-        return
-    fi
-
-    local target_idx=$((choice-1))
-    local old_lport old_target old_dport old_note old_proto
-    IFS='|' read -r old_lport old_target old_dport old_note old_proto <<< "${RULES[$target_idx]}"
-
-    echo -e "\n${YELLOW}开始修改第 $choice 条规则 (直接回车保持原值):${RESET}"
-    local lport target dport note proto proto_choice type
-
-    while true; do
-        read -rp "本机监听端口 [$old_lport]: " lport
-        lport="${lport:-$old_lport}"
-        validate_port "$lport" && break
-        err "端口输入无效"
-    done
-
-    while true; do
-        read -rp "目标 IP 或 域名 [$old_target]: " target
-        target="${target:-$old_target}"
-        type=$(detect_ip_type "$target")
-        if [[ "$type" == "1" ]]; then err "格式不正确"; elif [[ "$type" == "2" ]]; then
-            local rip=$(resolve_domain "$target")
-            [[ -z "$rip" ]] && warn "该域名目前解析不出 IP，系统稍后会自动重试。" || info "成功解析当前 IP 为: ${rip}"
-            break
-        else break; fi
-    done
-
-    while true; do
-        read -rp "目标端口 [$old_dport]: " dport
-        dport="${dport:-$old_dport}"
-        validate_port "$dport" && break
-        err "目标端口不合法"
-    done
-
-    read -rp "本条转发备注 [$old_note]: " note
-    note="${note:-$old_note}"
-    note=$(sanitize_note "$note")
-
-    RULES[$target_idx]="${lport}|${target}|${dport}|${note}|${old_proto}"
-    write_and_apply_rules
-    info "规则修改并应用成功！"
-    pause_to_menu
-}
-
-do_delete() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供删除。"; pause_to_menu; return; fi
-    _print_rules_list
-    echo ""
-
-    read -rp "请输入要删除的规则序号 (0 取消): " choice
-    if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#RULES[@]} )); then
-        unset 'RULES[$((choice-1))]'
-        RULES=("${RULES[@]}")
-        write_and_apply_rules
-        info "成功删除规则。"
-    else 
-        err "无效序号"
-    fi
-    pause_to_menu
-}
-
-do_clear_all() {
-    load_rules
-    if [[ ${#RULES[@]} -eq 0 ]]; then info "当前没有任何转发规则。"; pause_to_menu; return; fi
-    read -rp "确认彻底清空所有规则？[y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
-    RULES=()
-    write_and_apply_rules
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
-    rm -f "${CRON_DDNS_SCRIPT}" 2>/dev/null
-    info "已全部清空。"
-    pause_to_menu
-}
-
-do_diagnose() {
-    echo -e "\n========================================"
-    echo "     Alpine Linux iptables 系统环境自检"
-    echo "========================================"
-    info "系统类型: Alpine Linux"
-    
-    local status_msg
-    status_msg=$(is_iptables_active)
-    if [[ $? -eq 0 ]]; then
-        info "iptables 服务状态: ${status_msg}"
-    else
-        warn "iptables 服务状态: 未运行"
-    fi
-
-    if crontab -l 2>/dev/null | grep -q "${CRON_DDNS_SCRIPT}"; then
-        info "域名同步守护进程: 正常激活 (每2分钟)"
-    else
-        warn "域名同步守护进程: 未配置进程"
-    fi
-    pause_to_menu
-}
-
-do_view_log() {
-    if [[ ! -f "${LOG_FILE}" ]]; then
-        info "当前暂无 DDNS 日志记录产生。"
-        pause_to_menu
-        return
-    fi
-    echo -e "\n${GREEN}正在查看实时日志，按【Ctrl + C】可以随时退出查看...${RESET}"
-    tail -n 30 -f "${LOG_FILE}"
-}
-
-do_uninstall() {
-    read -rp "确认要彻底卸载本工具并清空所有转发规则吗？[y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
-
-    RULES=()
-    write_and_apply_rules 2>/dev/null || true
-    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
-    disable_ip_forward
-    rm -f "${BIN_LINK_DIR}/A" "${BIN_LINK_DIR}/a" 2>/dev/null
-    rm -rf "${CONF_DIR}" 2>/dev/null
-
-    echo -e "${GREEN}✅ Alpine 纯净卸载成功！iptables 转发规则已清除。${RESET}"
-    exit 0
-}
-
-auto_localize_and_link() {
-    mkdir -p "${CONF_DIR}"
-    mkdir -p "${BIN_LINK_DIR}"
-    
-    if [[ ! -f "${LOCAL_SCRIPT_PATH}" ]]; then
-        curl -sL "https://raw.githubusercontent.com/iu683/uu/main/oo.sh" -o "${LOCAL_SCRIPT_PATH}"
-        chmod +x "${LOCAL_SCRIPT_PATH}"
-    fi
-
-    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/A"
-    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/a"
-
-    echo -e "${GREEN}✅ 安装/同步完成，快捷键 [A] 或 [a] 已绑定。${RESET}"
-}
-main_menu() {
-    check_root
-    if [[ "${1:-}" == "--reload-backend" ]]; then
-        do_backend_ddns_sync
-        exit 0
-    fi
-
-    auto_localize_and_link
-
-    local panel_status panel_version panel_rules_count status_msg
-    while true; do
-        # 核心修复：精准拉取双栈细化状态字符串
-        status_msg=$(is_iptables_active)
-        if [[ $? -eq 0 ]]; then
-            panel_status="${GREEN}${status_msg}${RESET}"
-        else
-            panel_status="${RED}未运行${RESET}"
         fi
-
-        panel_version=$(get_iptables_version)
-        load_rules
-        panel_rules_count="${#RULES[@]}"
-
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN}  ◈ Alpine iptables 转发面板 (快捷键 A) ◈${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN} 状态 :${RESET} $panel_status"
-        echo -e "${GREEN} 版本 : ${panel_version} (绝对安全不锁SSH版)"
-        echo -e "${GREEN} 规则 : 已载入${RESET} ${YELLOW}${panel_rules_count}${RESET} ${GREEN}条转发${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN} 1. 安装/修复 iptables环境${RESET}"
-        echo -e "${GREEN} 2. 查看 当前转发规则${RESET}"
-        echo -e "${GREEN} 3. 新增 转发规则${RESET}"
-        echo -e "${GREEN} 4. 修改 转发规则${RESET}"
-        echo -e "${GREEN} 5. 删除 转发规则${RESET}"
-        echo -e "${GREEN} 6. 清空 所有转发规则${RESET}"
-        echo -e "${GREEN} 7. 系统环境自检${RESET}"
-        echo -e "${GREEN} 8. 导出 规则(备份)${RESET}"
-        echo -e "${GREEN} 9. 导入 规则(恢复)${RESET}"
-        echo -e "${GREEN}10. 查看 DDNS 运行日志${RESET}"
-        echo -e "${GREEN}11. 卸载面板${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
+        if [ -n "$input_url" ]; then
+            echo "$input_url" >> "$URL_FILE"
+            ((count++))
+        fi
+    done
+    
+    # 检查是否有有效输入
+    if [ ! -s "$URL_FILE" ]; then
+        echo -e "${YELLOW}未输入任何链接，已取消批量下载。${RESET}"
+        return
+    fi
+    
+    echo -e "${GREEN}正在开始批量下载，共 $(($count-1)) 个任务...${RESET}"
+    
+    yt-dlp $(get_cookie_args) \
+        --external-downloader aria2c \
+        --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
+        -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
+        --write-subs --sub-langs all \
+        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
+        --write-info-json \
+        -a "$URL_FILE" \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites
         
-        read -rp "$(echo -e "${GREEN}请选择操作: ${RESET}")" menu_choice
-        case "$menu_choice" in
-            1) do_install ;;
-            2) do_list ;;
-            3) do_add ;;
-            4) do_edit ;;
-            5) do_delete ;;
-            6) do_clear_all ;;
-            7) do_diagnose ;;
-            8) do_backup_manual ;;
-            9) do_restore_manual ;;
-            10) do_view_log ;;
-            11) do_uninstall ;;
-            0) exit 0 ;;
-            *) err "输入错误" && pause_to_menu ;;
-        esac
-        echo ""
-    done
+    # 下载完成后清理临时链接文件
+    rm -f "$URL_FILE"
 }
 
-main_menu "$@"
+download_custom() {
+    read -e -p "$PROMPT_CUSTOM" custom
+    [ -z "$custom" ] && return
+    
+    yt-dlp $(get_cookie_args) -P "$VIDEO_DIR" $custom \
+        --write-subs --sub-langs all \
+        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites
+}
+
+download_mp3() {
+    read -e -p "$PROMPT_URL" url
+    [ -z "$url" ] && return
+    
+    yt-dlp $(get_cookie_args) \
+        --external-downloader aria2c \
+        --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
+        -P "$VIDEO_DIR" -x --audio-format mp3 --audio-quality 0 \
+        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
+        --write-info-json \
+        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
+        --no-overwrites --no-post-overwrites "$url"
+}
+
+delete_video() {
+    echo -e "${GREEN}当前视频目录：${RESET}"
+    ls "$VIDEO_DIR"
+    read -e -p "$PROMPT_DEL" name
+    [ -z "$name" ] && return
+    
+    if [ -d "$VIDEO_DIR/$name" ]; then
+        rm -rf "$VIDEO_DIR/$name"
+        echo -e "${GREEN}已成功删除目录: $name${RESET}"
+    else
+        echo -e "${RED}未找到该目录！${RESET}"
+    fi
+}
+
+show_list() {
+    echo -e "${GREEN}已下载视频列表：${RESET}"
+    if [ -d "$VIDEO_DIR" ] && [ "$(ls -A $VIDEO_DIR)" ]; then
+        ls -td "$VIDEO_DIR"/*/ 2>/dev/null | sed "s|$VIDEO_DIR/||g"
+    else
+        echo -e "${YELLOW}暂无视频${RESET}"
+    fi
+}
+
+while true; do
+    clear
+    if command -v yt-dlp &>/dev/null; then
+        STATUS="${GREEN}运行${RESET}"
+    else
+        STATUS="${RED}停止${RESET}"
+    fi
+
+    # 获取实时版本号
+    VERSION=$(get_yt_version)
+
+    # 检测统一路径下的 Cookies 状态
+    if [ -f "$COOKIE_FILE" ]; then
+        COOKIE_STATUS="${GREEN}已就绪 ($COOKIE_FILE)${RESET}"
+    else
+        COOKIE_STATUS="${YELLOW}未配置 (请上传至 $COOKIE_FILE)${RESET}"
+    fi
+
+    echo -e "${GREEN}=================================${RESET}"
+    echo -e "${GREEN}     ◈   yt-dlp 管理面板   ◈     ${RESET}"
+    echo -e "${GREEN}=================================${RESET}"
+    echo -e "${GREEN} 核心状态: $STATUS${RESET}"
+    echo -e "${GREEN} 软件版本: ${YELLOW}$VERSION${RESET}"
+    echo -e "${GREEN} 保存目录: ${YELLOW}$VIDEO_DIR${RESET}"
+    echo -e "${GREEN} Cookie状态: $COOKIE_STATUS${RESET}"
+    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN} 1. 安装 yt-dlp${RESET}"
+    echo -e "${GREEN} 2. 更新 yt-dlp${RESET}"
+    echo -e "${GREEN} 3. 卸载 yt-dlp${RESET}"
+    echo -e "${GREEN}----------------------------------${RESET}"
+    echo -e "${GREEN} 5. 单个视频下载 (16线程极速)${RESET}"
+    echo -e "${GREEN} 6. 批量视频下载 (交互式输入多链接)${RESET}"
+    echo -e "${GREEN} 7. 自定义参数下载${RESET}"
+    echo -e "${GREEN} 8. 下载为最佳音质 MP3${RESET}"
+    echo -e "${GREEN}----------------------------------${RESET}"
+    echo -e "${GREEN} 9. 删除视频目录${RESET}"
+    echo -e "${GREEN}10. 查看下载列表${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}==================================${RESET}"
+    
+    read -e -p "$PROMPT_CHOICE" choice
+
+    case $choice in
+        1) install_yt ;;
+        2) update_yt ;;
+        3) uninstall_yt ;;
+        5) download_single ;;
+        6) download_batch ;;
+        7) download_custom ;;
+        8) download_mp3 ;;
+        9) delete_video ;;
+        10) show_list ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
+    esac
+
+    echo
+    read -p "$PROMPT_CONTINUE"
+done

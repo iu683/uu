@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具
+# nftables 端口转发管理工具 (DDNS 修复日志菜单版)
 #
 
 # ============== 常量定义 ==============
@@ -96,13 +96,14 @@ detect_ip_type() {
 resolve_domain() {
     local domain="$1"
     local resolved=""
-    if command -v getent &>/dev/null; then
+    # 优先使用 nslookup 或 dig，确保 Alpine 下通过 bind-tools 正常解析
+    if command -v nslookup &>/dev/null; then
+        resolved=$(nslookup "$domain" 8.8.8.8 2>/dev/null | awk '/^Address: / { print $2 }' | head -n1)
+    elif command -v getent &>/dev/null; then
         resolved=$(getent ahosts "$domain" | awk '{print $1}' | head -n1)
-    elif command -v nslookup &>/dev/null; then
-        resolved=$(nslookup "$domain" 2>/dev/null | awk '/^Address: / { print $2 }' | head -n1)
     fi
     if [[ -z "$resolved" ]]; then
-        resolved=$(ping -c 1 -W 1 "$domain" 2>/dev/null | head -n1 | awk -F'[()]' '{print $2}')
+        resolved=$(ping -c 1 -W 2 "$domain" 2>/dev/null | head -n1 | awk -F'[()]' '{print $2}')
     fi
     echo "$resolved"
 }
@@ -255,6 +256,10 @@ EOF
         type=$(detect_ip_type "$target")
         actual_ip="$target"
         [[ "$type" == "2" ]] && actual_ip=$(resolve_domain "$target")
+        
+        # 如果域名暂时解析失败，留空处理，避免 nft 语法报错崩溃
+        [[ -z "$actual_ip" ]] && continue
+
         if [[ "$(detect_ip_type "$actual_ip")" == "4" ]]; then
             echo "        # 备注: ${note}" >> "${tmp_file}"
             echo "        # PROTO: ${proto}" >> "${tmp_file}"
@@ -280,6 +285,8 @@ EOF
         type=$(detect_ip_type "$target")
         actual_ip="$target"
         [[ "$type" == "2" ]] && actual_ip=$(resolve_domain "$target")
+        [[ -z "$actual_ip" ]] && continue
+
         if [[ "$(detect_ip_type "$actual_ip")" == "4" ]]; then
             if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
                 echo "        ip daddr ${actual_ip} tcp dport ${dport} ct status dnat masquerade" >> "${tmp_file}"
@@ -304,6 +311,8 @@ EOF
         type=$(detect_ip_type "$target")
         actual_ip="$target"
         [[ "$type" == "2" ]] && actual_ip=$(resolve_domain "$target")
+        [[ -z "$actual_ip" ]] && continue
+
         if [[ "$(detect_ip_type "$actual_ip")" == "6" ]]; then
             echo "        # 备注: ${note}" >> "${tmp_file}"
             echo "        # PROTO: ${proto}" >> "${tmp_file}"
@@ -329,6 +338,8 @@ EOF
         type=$(detect_ip_type "$target")
         actual_ip="$target"
         [[ "$type" == "2" ]] && actual_ip=$(resolve_domain "$target")
+        [[ -z "$actual_ip" ]] && continue
+
         if [[ "$(detect_ip_type "$actual_ip")" == "6" ]]; then
             if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
                 echo "        ip6 daddr ${actual_ip} tcp dport ${dport} ct status dnat masquerade" >> "${tmp_file}"
@@ -360,11 +371,11 @@ fi
 EOF
     chmod +x "${CRON_DDNS_SCRIPT}" 2>/dev/null
 
-    # 彻底清理旧的 5 分钟定时任务，并强制重写挂载高效的 2 分钟高频任务
     crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
     (crontab -l 2>/dev/null; echo "*/2 * * * * ${CRON_DDNS_SCRIPT} >/dev/null 2>&1") | crontab - 2>/dev/null || true
 }
 
+# 核心同步逻辑：精准比对每一个域名是否发生 IP 变更
 do_backend_ddns_sync() {
     [[ -f "${CONF_FILE}" ]] || exit 0
     load_rules
@@ -377,13 +388,13 @@ do_backend_ddns_sync() {
         IFS='|' read -r lport target dport note proto <<< "$rule"
         type=$(detect_ip_type "$target")
         
-        # 只要规则里是域名
         if [[ "$type" == "2" ]]; then
             current_dns_ip=$(resolve_domain "$target")
             if [[ -n "$current_dns_ip" ]]; then
-                if ! grep -qF "$current_dns_ip" "${CONF_FILE}" 2>/dev/null; then
+                # 精准检查：如果在配置文件中找不到包含该新 IP 的具体 DNAT 转发规则行，说明 IP 变了
+                if ! grep -E "dnat.*${current_dns_ip}" "${CONF_FILE}" >/dev/null 2>&1; then
                     need_reload=1
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') [DDNS] 检测到域名 ${target} IP 已变动，触发热重载..." >> "${LOG_FILE}"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') [DDNS] 检测到域名 ${target} IP 已变动为 ${current_dns_ip}，触发热重载..." >> "${LOG_FILE}"
                     break
                 fi
             fi
@@ -479,23 +490,20 @@ do_restore_manual() {
 }
 
 do_install() {
-    if ! command -v nft &>/dev/null; then
-        info "准备安装依赖..."
-        local pm=$(detect_pkg_manager)
-        case "$pm" in
-            apk) apk add nftables bash curl iproute2 ;;
-            *) $pm update -y && $pm install -y nftables curl ;;
-        esac
-    fi
+    info "准备安装依赖..."
+    local pm=$(detect_pkg_manager)
+    case "$pm" in
+        apk) apk add nftables bash curl iproute2 bind-tools ;; 
+        *) $pm update -y && $pm install -y nftables curl dnsutils ;; 
+    esac
     enable_ip_forward && init_conf && restart_and_enable_nft && setup_ddns_cron
     info "环境初始化完成！"
     pause_to_menu
 }
 
-# 提取出打印规则的内部逻辑，供多处复用
 _print_rules_list() {
-    printf "\n\033[1m%-6s %-12s %-10s    %-35s %s\033[0m\n" "序号" "协议" "本机端口" "目标地址/域名" "备注"
-    echo "────────────────────────────────────────────────────────────────────────────────────────"
+    printf "\n\033[1m%-6s %-12s %-10s     %-35s %s\033[0m\n" "序号"  "协议"  "本机端口"  "目标地址/域名"  "备注"
+    echo -e "${GREEN}=====================================${RESET}"
     local idx=1 rule lport target dport note proto type label proto_label
     for rule in "${RULES[@]}"; do
         IFS='|' read -r lport target dport note proto <<< "$rule"
@@ -581,7 +589,6 @@ do_add() {
     pause_to_menu
 }
 
-# ============== 核心新增: 修改规则函数 ==============
 do_edit() {
     load_rules
     if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供修改。"; pause_to_menu; return; fi
@@ -597,7 +604,6 @@ do_edit() {
         return
     fi
 
-    # 解析选中修改的原有规则
     local target_idx=$((choice-1))
     local old_lport old_target old_dport old_note old_proto
     IFS='|' read -r old_lport old_target old_dport old_note old_proto <<< "${RULES[$target_idx]}"
@@ -605,7 +611,6 @@ do_edit() {
     echo -e "\n${YELLOW}开始修改第 $choice 条规则 (直接回车保持原值):${RESET}"
     local lport target dport note proto proto_choice type
 
-    # 1. 修改本机端口
     while true; do
         read -rp "本机监听端口 [$old_lport]: " lport
         lport="${lport:-$old_lport}"
@@ -613,7 +618,6 @@ do_edit() {
         err "端口输入无效"
     done
 
-    # 检查本机端口冲突（如果是自己原来占用的端口则不视为冲突）
     local idx=0 rp
     for rule in "${RULES[@]}"; do
         if (( idx != target_idx )); then
@@ -627,7 +631,6 @@ do_edit() {
         ((idx++))
     done
 
-    # 2. 修改目标地址
     while true; do
         read -rp "目标 IP 或 域名 [$old_target]: " target
         target="${target:-$old_target}"
@@ -639,7 +642,6 @@ do_edit() {
         else break; fi
     done
 
-    # 3. 修改目标端口
     while true; do
         read -rp "目标端口 [$old_dport]: " dport
         dport="${dport:-$old_dport}"
@@ -647,7 +649,6 @@ do_edit() {
         err "目标端口不合法"
     done
 
-    # 4. 修改协议
     local current_proto_desc="TCP+UDP"
     [[ "$old_proto" == "TCP" ]] && current_proto_desc="仅 TCP"
     [[ "$old_proto" == "UDP" ]] && current_proto_desc="仅 UDP"
@@ -666,7 +667,6 @@ do_edit() {
         esac
     done
 
-    # 5. 修改备注
     read -rp "本条转发备注 [$old_note]: " note
     if [[ -z "$note" ]]; then
         note="$old_note"
@@ -674,7 +674,6 @@ do_edit() {
         note=$(sanitize_note "$note")
     fi
 
-    # 更新数组并保存
     RULES[$target_idx]="${lport}|${target}|${dport}|${note}|${proto}"
     if write_conf_file && reload_rules && setup_ddns_cron; then
         info "规则修改并应用成功！"
@@ -730,6 +729,17 @@ do_diagnose() {
     pause_to_menu
 }
 
+do_view_log() {
+    if [[ ! -f "${LOG_FILE}" ]]; then
+        info "当前暂无 DDNS 日志记录产生。"
+        pause_to_menu
+        return
+    fi
+    echo -e "\n${GREEN}正在查看 DDNS 实时日志，按【Ctrl + C】可以随时退出查看...${RESET}"
+    echo -e "${YELLOW}------------------------------------------------------------${RESET}"
+    tail -n 30 -f "${LOG_FILE}"
+}
+
 do_uninstall() {
     read -rp "确认要彻底卸载本工具并清空所有转发规则吗？[y/N]: " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return
@@ -763,8 +773,8 @@ auto_localize_and_link() {
     mkdir -p "${BIN_LINK_DIR}"
     
     if [[ ! -f "${LOCAL_SCRIPT_PATH}" ]]; then
-        curl -sL "https://raw.githubusercontent.com/iu683/uu/main/aa.sh" -o "${LOCAL_SCRIPT_PATH}"
-        chmod +x "${LOCAL_SCRIPT_PATH}"
+        curl -sL "https://raw.githubusercontent.com/iu683/uu/main/aa.sh" -o "${LOCAL_SCRIPT_PATH}" 2>/dev/null
+        chmod +x "${LOCAL_SCRIPT_PATH}" 2>/dev/null
     fi
 
     ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/A"
@@ -776,8 +786,10 @@ auto_localize_and_link() {
 main_menu() {
     check_root
     
+    # 后台异步执行检测口：匹配到参数直接同步并退出
     if [[ "${1:-}" == "--reload-backend" ]]; then
         do_backend_ddns_sync
+        exit 0
     fi
 
     if [[ "$0" == "bash" || "$0" == "sh" || ! -f "${LOCAL_SCRIPT_PATH}" ]]; then
@@ -795,13 +807,13 @@ main_menu() {
         panel_rules_count="${#RULES[@]}"
 
         echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN}      ◈   nftables 转发面板 ${RESET}${YELLOW}(快捷键A/a) ${RESET}   ${YELLOW}◈      ${RESET}"
+        echo -e "${GREEN}  ◈ nftables 转发面板${RESET}${YELLOW}(快捷键A/a)${RESET}${GREEN} ◈${RESET}"
         echo -e "${GREEN}=====================================${RESET}"
         echo -e "${GREEN} 状态 :${RESET} $panel_status"
         echo -e "${GREEN} 版本 :${RESET} ${YELLOW}${panel_version}${RESET}"
         echo -e "${GREEN} 规则 : 已载入${RESET} ${YELLOW}${panel_rules_count}${RESET} ${GREEN}条转发${RESET}"
         echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN} 1. 安装 nftables${RESET}"
+        echo -e "${GREEN} 1. 安装/修复依赖环境${RESET}"
         echo -e "${GREEN} 2. 查看 当前转发规则${RESET}"
         echo -e "${GREEN} 3. 新增 转发规则${RESET}"
         echo -e "${GREEN} 4. 修改 转发规则${RESET}"
@@ -810,7 +822,8 @@ main_menu() {
         echo -e "${GREEN} 7. 系统环境自检${RESET}"
         echo -e "${GREEN} 8. 导出 规则(备份)${RESET}"
         echo -e "${GREEN} 9. 导入 规则(恢复)${RESET}"
-        echo -e "${GREEN} 10. 卸载${RESET}"
+        echo -e "${GREEN}10. 查看 DDNS 运行日志${RESET}"
+        echo -e "${GREEN}11. 卸载面板系统${RESET}"
         echo -e "${GREEN} 0. 退出${RESET}"
         echo -e "${GREEN}=====================================${RESET}"
         
@@ -825,7 +838,8 @@ main_menu() {
             7) do_diagnose ;;
             8) do_backup_manual ;;
             9) do_restore_manual ;;
-            10) do_uninstall ;;
+            10) do_view_log ;;
+            11) do_uninstall ;;
             0) exit 0 ;;
             *) err "输入错误" && pause_to_menu ;;
         esac

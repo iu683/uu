@@ -1,6 +1,6 @@
 #!/bin/bash
 # ========================================
-# Lucky v2 一键管理脚本
+# AriaNg 一键管理脚本
 # ========================================
 
 GREEN="\033[32m"
@@ -8,7 +8,7 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-APP_NAME="lucky"
+APP_NAME="ariang"
 APP_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -17,87 +17,83 @@ check_docker() {
         echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
         curl -fsSL https://get.docker.com | bash
     fi
+
     if ! docker compose version &>/dev/null; then
         echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
         exit 1
     fi
 }
 
-get_public_ip() {
-    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
+check_port() {
+    if ss -tlnp | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
+        return 1
     fi
-
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
-    echo "127.0.0.1" && return 0
 }
 
 menu() {
-    clear
-    # 1. 动态获取 Lucky 容器的状态
-    local container_status="🔴 未运行 (未检测到容器)"
-    if docker ps -a --format '{{.Names}}' | grep -q "^lucky$"; then
-        local is_running=$(docker ps --format '{{.Names}}' | grep -q "^lucky$" && echo "yes" || echo "no")
-        if [ "$is_running" = "yes" ]; then
-            container_status="🟢 运行中"
+    while true; do
+        clear
+        
+        # 1. 动态获取 AriaNg 容器状态
+        local container_status="🔴 未运行 (未检测到容器)"
+        if command -v docker &>/dev/null; then
+            if docker ps -a --format '{{.Names}}' | grep -q "^ariang$"; then
+                local is_running=$(docker ps --format '{{.Names}}' | grep -q "^ariang$" && echo "yes" || echo "no")
+                if [ "$is_running" = "yes" ]; then
+                    container_status="🟢 运行中"
+                else
+                    container_status="🟡 已停止"
+                fi
+            fi
         else
-            container_status="🟡 已停止"
+            container_status="❌ 未安装 Docker"
         fi
-    fi
 
-    # 2. 渲染菜单头部、状态与端口信息
-    echo -e "${GREEN}========================${RESET}"
-    echo -e "${GREEN}  ◈  Lucky 管理菜单  ◈ ${RESET}"
-    echo -e "${GREEN}========================${RESET}"
-    echo -e "${GREEN}状态:${RESET} ${GREEN}$container_status${RESET}"
-    echo -e "${GREEN}端口:${RESET} ${GREEN}16601${RESET}${GREEN} (Host模式)${RESET}"
-    echo -e "${GREEN}========================${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 查看状态${RESET}"
-    echo -e "${GREEN}6) 卸载${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}========================${RESET}"
-    echo -ne "${GREEN}请选择:${RESET} "
-    read choice
+        # 2. 动态获取当前配置的端口
+        local current_port="6880"
+        if [ -f "$COMPOSE_FILE" ]; then
+            # 从 docker-compose.yml 中提取 127.0.0.1:xxxx:6880 中的端口号
+            local yaml_port=$(grep -oP '127\.0\.0\.1:\K[0-9]+(?=:6880)' "$COMPOSE_FILE" 2>/dev/null)
+            if [ -n "$yaml_port" ]; then
+                current_port="$yaml_port"
+            fi
+        fi
 
-    case $choice in
-        1) install_app ; pause ;;
-        2) update_app ; pause ;;
-        3) restart_app ; pause ;;
-        4) view_logs ;;
-        5) check_status ; pause ;;
-        6) uninstall_app ; pause ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-    esac
+        # 3. 渲染菜单头部、状态与端口信息
+        echo -e "${GREEN}========================${RESET}"
+        echo -e "${GREEN}  ◈ AriaNg 管理菜单 ◈  ${RESET}"
+        echo -e "${GREEN}========================${RESET}"
+        echo -e "${GREEN}状态:${RESET} ${YELLOW}$container_status${RESET}"
+        echo -e "${GREEN}端口:${RESET} ${YELLOW}$current_port${RESET}"
+        echo -e "${GREEN}========================${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}========================${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
 install_app() {
+
     check_docker
-    mkdir -p "$APP_DIR/conf"
+    mkdir -p "$APP_DIR"
 
     if [ -f "$COMPOSE_FILE" ]; then
         echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
@@ -105,28 +101,36 @@ install_app() {
         [[ "$confirm" != "y" ]] && return
     fi
 
-    cat > "$COMPOSE_FILE" <<EOF
+    echo
+    read -p "请输入访问端口 [默认:6880]: " input_port
+    PORT=${input_port:-6880}
+    check_port "$PORT" || return
+
+cat > "$COMPOSE_FILE" <<EOF
 services:
-  lucky:
-    image: gdy666/lucky:v2
-    container_name: lucky
-    volumes:
-      - ./conf:/app/conf
-      - /var/run/docker.sock:/var/run/docker.sock
-    network_mode: host
-    restart: always
+  ariang:
+    container_name: ariang
+    image: p3terx/ariang
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT}:6880"
+    logging:
+      options:
+        max-size: "1m"
 EOF
 
     cd "$APP_DIR" || exit
     docker compose up -d
 
-    SERVER_IP=$(get_public_ip)
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ 启动失败，请检查配置${RESET}"
+        return
+    fi
 
     echo
-    echo -e "${GREEN}✅ Lucky 已启动${RESET}"
-    echo -e "${GREEN}✅ webui http://${SERVER_IP}:16601${RESET}"
-    echo -e "${GREEN}✅ 账号密码: 666/666${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
+    echo -e "${GREEN}✅ AriaNg 已启动${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
+
     read -p "按回车返回菜单..."
 }
 
@@ -134,31 +138,30 @@ update_app() {
     cd "$APP_DIR" || return
     docker compose pull
     docker compose up -d
-    echo -e "${GREEN}✅ Lucky 更新完成${RESET}"
+    echo -e "${GREEN}✅ AriaNg 更新完成${RESET}"
     read -p "按回车返回菜单..."
 }
 
 restart_app() {
-    docker restart lucky
-    echo -e "${GREEN}✅ Lucky 已重启${RESET}"
+    docker restart ariang
+    echo -e "${GREEN}✅ 已重启${RESET}"
     read -p "按回车返回菜单..."
 }
 
 view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f lucky
+    docker logs -f ariang
 }
 
 check_status() {
-    docker ps | grep lucky
+    docker ps | grep ariang
     read -p "按回车返回菜单..."
 }
 
 uninstall_app() {
     cd "$APP_DIR" || return
-    docker compose down
+    docker compose down -v
     rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Lucky 已卸载${RESET}"
+    echo -e "${RED}✅ 已卸载${RESET}"
     read -p "按回车返回菜单..."
 }
 

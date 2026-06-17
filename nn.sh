@@ -1,6 +1,6 @@
 #!/bin/bash
 # =========================================================================
-# IPv4 / IPv6 管理面板 (增强版：支持优先级切换)
+# IPv4 / IPv6 管理面板
 # =========================================================================
 
 if [ "$EUID" -ne 0 ]; then
@@ -11,6 +11,7 @@ fi
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
+BLUE="\033[34m"
 RESET="\033[0m"
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
@@ -72,6 +73,7 @@ get_public_ip() {
 
 get_menu_status() {
     local iface="$1"
+    local current_os=$(get_os_type)
     local v4_addr=$(ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' | head -n1)
     V4_STATUS=$( [ -z "$v4_addr" ] && echo -e "${RED}未启用${RESET}" || echo -e "${GREEN}已启用${RESET}" )
 
@@ -87,8 +89,9 @@ get_menu_status() {
         if [ -z "$v6_addr" ]; then
             V6_STATUS="${YELLOW}已开启(无公网IP)${RESET}"
         else
-            # 检测是否设置了 IPv4 优先
-            if [ -f /etc/gai.conf ] && grep -q "^[[:space:]]*precedence[[:space:]]\+::ffff:0:0/96[[:space:]]\+100" /etc/gai.conf; then
+            if [ "$current_os" = "alpine" ]; then
+                V6_STATUS="${GREEN}已启用 (${RED}Alpine强制v6优先${GREEN})${RESET}"
+            elif [ -f /etc/gai.conf ] && grep -q "^[[:space:]]*precedence[[:space:]]\+::ffff:0:0/96[[:space:]]\+100" /etc/gai.conf; then
                 V6_STATUS="${GREEN}已启用 (${YELLOW}IPv4优先${GREEN})${RESET}"
             else
                 V6_STATUS="${GREEN}已启用 (${YELLOW}默认IPv6优先${GREEN})${RESET}"
@@ -97,32 +100,44 @@ get_menu_status() {
     fi
 }
 
-fix_ubuntu_netplan() {
+# 🛠️ 方案 B 核心：接管 cloud-init 并重写 Netplan
+fix_ubuntu_netplan_cloudinit() {
     local iface="$1"
     local action="$2"
     
     local plan_file=$(ls /etc/netplan/*.yaml 2>/dev/null | head -n1)
-    [ -z "$plan_file" ] && return
     
     if [ "$action" = "disable" ]; then
-        if grep -q "$iface:" "$plan_file"; then
-            cp "$plan_file" "${plan_file}.bak"
-            sed -i "/$iface:/,/^[[:space:]]*[a-zA-Z0-9_-]\+:/ {
-                s/[[:space:]]*dhcp6:.*/      dhcp6: false/
-                s/[[:space:]]*accept-ra:.*/      accept-ra: false/
-            }" "$plan_file"
+        # 1. 产生 cloud-init 屏蔽文件，使其不再重置网络
+        if [ -d /etc/cloud/cloud.cfg.d ]; then
+            echo "network: {config: disabled}" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        fi
+        
+        # 2. 修改现有的 Netplan 文件
+        if [ -n "$plan_file" ] && [ -f "$plan_file" ]; then
+            # 备份原配置以防万一
+            [ ! -f "${plan_file}.bak" ] && cp "$plan_file" "${plan_file}.bak"
             
-            if ! grep -A 5 "$iface:" "$plan_file" | grep -q "dhcp6:"; then
-                sed -i "/$iface:/a \            dhcp6: false" "$plan_file"
+            # 精准替换 dhcp6 状态
+            sed -i "s/dhcp6:[[:space:]]*true/dhcp6: false/g" "$plan_file"
+            
+            # 如果配置中原本没有 accept-ra，在 dhcp6 下方强行追加入网策略控制
+            if ! grep -q "accept-ra:" "$plan_file"; then
+                sed -i "/dhcp6: false/a \            accept-ra: false" "$plan_file"
             fi
         fi
     else
+        # 1. 解除 cloud-init 锁定
+        rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        
+        # 2. 还原 Netplan
         if [ -f "${plan_file}.bak" ]; then
             mv "${plan_file}.bak" "$plan_file"
         else
-            sed -i "/$iface:/,/^[[:space:]]*[a-zA-Z0-9_-]\+:/ {
-                s/[[:space:]]*dhcp6:.*/      dhcp6: true/
-            }" "$plan_file"
+            if [ -n "$plan_file" ] && [ -f "$plan_file" ]; then
+                sed -i "s/dhcp6:[[:space:]]*false/dhcp6: true/g" "$plan_file"
+                sed -i "/accept-ra: false/d" "$plan_file"
+            fi
         fi
     fi
 }
@@ -137,17 +152,17 @@ while true; do
     get_menu_status "$iface"
 
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}    ◈  IPv4 / IPv6 管理面板 (升级版)  ◈       ${RESET}"
+    echo -e "${GREEN}     ◈  IPv4 / IPv6 管理面板  ◈       ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
     echo -e "${GREEN} 当前系统  : ${YELLOW}${os_type}${RESET}"
     echo -e "${GREEN} 活跃网卡  : ${YELLOW}${iface}${RESET}"
     echo -e "${GREEN} IPv4 状态 : ${V4_STATUS}"
     echo -e "${GREEN} IPv6 状态 : ${V6_STATUS}"
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}  1) 彻底禁用 IPv6${RESET}"
-    echo -e "${GREEN}  2) 开启恢复 IPv6${RESET}"
-    echo -e "${GREEN}  3) 设置 IPv4 优先 (推荐:保留双栈但v4快)${RESET}"
-    echo -e "${GREEN}  4) 恢复默认 IPv6 优先${RESET}"
+    echo -e "${GREEN}  1) 禁用 IPv6${RESET}"
+    echo -e "${GREEN}  2) 开启 IPv6${RESET}"
+    echo -e "${GREEN}  3) 设置 IPv4 优先(推荐:保留双栈但v4快)${RESET}"
+    echo -e "${GREEN}  4) 恢复 IPv6 优先${RESET}"
     echo -e "${GREEN}  5) 查看网卡IP与连通性${RESET}"
     echo -e "${GREEN}  0) 退出${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
@@ -163,30 +178,57 @@ while true; do
             
             echo -e "${YELLOW}------ 💾 持久化配置选项 ------${RESET}"
             echo -e "${GREEN}  1) 临时禁用（重启服务器后恢复IPv6）${RESET}"
-            echo -e "${GREEN}  2) 永久禁用${RESET}"
+            echo -e "${GREEN}  2) 永久禁用 (完美适配 Debian/Ubuntu/Alpine)${RESET}"
             echo -ne "${YELLOW} 请选择禁用模式 [默认 1]: ${RESET}"
             read perm_choice
             
             if [ "$perm_choice" = "2" ]; then
-                if [ -f /etc/sysctl.conf ]; then
-                    sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
+                # 1. 基础内核参数写入 (优先采用标准 sysctl.d 目录，防止被冲)
+                mkdir -p /etc/sysctl.d
+                sysctl_file="/etc/sysctl.d/99-disable-ipv6.conf"
+                
+                rm -f /etc/sysctl.d/99-disable-ipv6.conf 2>/dev/null
+                echo "net.ipv6.conf.all.disable_ipv6 = 1" >> "$sysctl_file"
+                echo "net.ipv6.conf.default.disable_ipv6 = 1" >> "$sysctl_file"
+                echo "net.ipv6.conf.${iface}.disable_ipv6 = 1" >> "$sysctl_file"
+                
+                # 同时写入传统文件防老系统漏看
+                if [ "$os_type" != "alpine" ]; then
+                    sed -i '/net.ipv6.conf./d' /etc/sysctl.conf 2>/dev/null
                     echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
                     echo "net.ipv6.conf.default.disable_ipv6 = 1" >> /etc/sysctl.conf
                     echo "net.ipv6.conf.${iface}.disable_ipv6 = 1" >> /etc/sysctl.conf
                 fi
+
+                # 2. 【Debian 专属神级补丁】：通过网卡后置钩子彻底锁死
+                if [ "$os_type" = "debian" ]; then
+                    echo -e "${YELLOW}⏳ 检测到 Debian 系统，正在写入 if-up 强制锁死钩子...${RESET}"
+                    mkdir -p /etc/network/if-up.d
+                    cat << 'EOF' > /etc/network/if-up.d/00-disable-ipv6
+#!/bin/sh
+# 强行在网卡启动后再次摁倒 IPv6，防止 ifupdown 抢跑
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
+if [ -n "$IFACE" ]; then
+    sysctl -w net.ipv6.conf.$IFACE.disable_ipv6=1 >/dev/null 2>&1
+fi
+EOF
+                    chmod +x /etc/network/if-up.d/00-disable-ipv6
+                fi
                 
-                if [ "$os_type" = "ubuntu" ] && has_cmd netplan; then
-                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在重构 Netplan 配置文件防反弹...${RESET}"
-                    fix_ubuntu_netplan "$iface" "disable"
-                    netplan apply >/dev/null 2>&1
+                # 3. 【Ubuntu 专属补丁】
+                if [ "$os_type" = "ubuntu" ]; then
+                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在锁定 cloud-init 并重构 Netplan...${RESET}"
+                    fix_ubuntu_netplan_cloudinit "$iface" "disable"
+                    if has_cmd netplan; then netplan apply >/dev/null 2>&1; fi
                     sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
                 fi
-                echo -e "\n${GREEN}✅ 已成功【永久锁定】禁用 IPv6，重构后绝不失效！${RESET}"
+                
+                echo -e "\n${GREEN}✅ 已成功【永久锁定】禁用 IPv6，当前系统已打上防反弹补丁！${RESET}"
             else
-                if [ -f /etc/sysctl.conf ]; then
-                    sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
-                fi
-                echo -e "\n${GREEN}✅ 已成功【临时禁用】IPv6（重启服务器后将自动恢复）。${RESET}"
+                if [ -f /etc/sysctl.conf ]; then sed -i '/net.ipv6.conf./d' /etc/sysctl.conf; fi
+                if [ -f /etc/sysctl.d/99-disable-ipv6.conf ]; then rm -f /etc/sysctl.d/99-disable-ipv6.conf; fi
+                echo -e "\n${GREEN}✅ 已成功【临时禁用】IPv6（重启将恢复）。${RESET}"
             fi
             read -rp "按回车键返回菜单..."
             ;;
@@ -195,19 +237,20 @@ while true; do
             sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
             sysctl -w net.ipv6.conf.${iface}.disable_ipv6=0 >/dev/null 2>&1
             
-            if [ -f /etc/sysctl.conf ]; then
-                sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
+            [ -f /etc/sysctl.conf ] && sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
+            [ -f /etc/sysctl.d/99-disable-ipv6.conf ] && rm -f /etc/sysctl.d/99-disable-ipv6.conf
+            
+            # 清除 Debian 专属补丁
+            if [ "$os_type" = "debian" ]; then
+                rm -f /etc/network/if-up.d/00-disable-ipv6 2>/dev/null
             fi
             
             if [ "$os_type" = "ubuntu" ]; then
-                if has_cmd netplan; then
-                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在通过 Netplan 恢复网络...${RESET}"
-                    fix_ubuntu_netplan "$iface" "enable"
-                    netplan apply >/dev/null 2>&1
-                    sleep 2
-                fi
-                echo -e "${GREEN}✅ 内核 IPv6 模块已平滑激活。${RESET}"
-                echo -e "${YELLOW}提示：Ubuntu 系统无需重启。如果仍未获取到 IPv6，请尝试断开重连或重启。${RESET}"
+                echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在恢复 cloud-init 网络托管...${RESET}"
+                fix_ubuntu_netplan_cloudinit "$iface" "enable"
+                if has_cmd netplan; then netplan apply >/dev/null 2>&1; fi
+                sleep 1
+                echo -e "${GREEN}✅ 网络控制权已归还云厂商系统，IPv6 模块已平滑激活。${RESET}"
                 read -rp "按回车键返回菜单..."
             else
                 echo -e "${GREEN}✅ 内核 IPv6 模块已激活。${RESET}"
@@ -217,26 +260,28 @@ while true; do
             fi
             ;;
         3)
-            echo -e "${YELLOW}⏳ 正在设置系统网络规则：IPv4 优先...${RESET}"
-            if [ ! -f /etc/gai.conf ]; then
-                touch /etc/gai.conf
+            if [ "$os_type" = "alpine" ]; then
+                echo -e "${RED}❌ 抱歉！Alpine Linux 不支持 /etc/gai.conf 优先级策略。${RESET}"
+                echo -e "${YELLOW}💡 解决方案：请在主菜单选择【 1) 彻底禁用 IPv6 】来强制系统走 IPv4 通道。${RESET}"
+            else
+                echo -e "${YELLOW}⏳ 正在设置系统网络规则：IPv4 优先...${RESET}"
+                [ ! -f /etc/gai.conf ] && touch /etc/gai.conf
+                sed -i '/precedence ::ffff:0:0\/96/d' /etc/gai.conf
+                echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+                echo -e "${GREEN}✅ 设置成功！当前系统已调整为：【IPv4 优先】。${RESET}"
+                echo -e "${YELLOW}无需重启，已实时生效。${RESET}"
             fi
-            # 清理旧的相同配置，防止重复追加
-            sed -i '/precedence ::ffff:0:0\/96/d' /etc/gai.conf
-            # 追加高优先级策略
-            echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
-            echo -e "${GREEN}✅ 设置成功！当前系统已调整为：【IPv4 优先】。${RESET}"
-            echo -e "${YELLOW}无需重启，已实时生效。${RESET}"
             read -rp "按回车键返回菜单..."
             ;;
         4)
-            echo -e "${YELLOW}⏳ 正在恢复系统默认规则：IPv6 优先...${RESET}"
-            if [ -f /etc/gai.conf ]; then
-                # 移除非注释的强制 IPv4 优先行，使系统遵循默认的 IPv6 优先
-                sed -i '/^[[:space:]]*precedence[[:space:]]\+::ffff:0:0\/96[[:space:]]\+100/d' /etc/gai.conf
+            if [ "$os_type" = "alpine" ]; then
+                echo -e "${BLUE}ℹ️  Alpine 默认即为强制 IPv6 优先，无需配置。${RESET}"
+            else
+                echo -e "${YELLOW}⏳ 正在恢复系统默认规则：IPv6 优先...${RESET}"
+                [ -f /etc/gai.conf ] && sed -i '/^[[:space:]]*precedence[[:space:]]\+::ffff:0:0\/96[[:space:]]\+100/d' /etc/gai.conf
+                echo -e "${GREEN}✅ 恢复成功！当前系统已调整回：【默认 IPv6 优先】。${RESET}"
+                echo -e "${YELLOW}无需重启，已实时生效。${RESET}"
             fi
-            echo -e "${GREEN}✅ 恢复成功！当前系统已调整回：【默认 IPv6 优先】。${RESET}"
-            echo -e "${YELLOW}无需重启，已实时生效。${RESET}"
             read -rp "按回车键返回菜单..."
             ;;
         5)
@@ -247,13 +292,15 @@ while true; do
             if [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "1" ]; then
                 echo -e "${RED}❌ 内核与活跃网卡已完全禁用 IPv6${RESET}"
             elif [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "0" ]; then
-                echo -e "${YELLOW}⚠️  警告：内核全局已禁，但活跃网卡 [${iface}] 被 Netplan 强行拉起！${RESET}"
+                echo -e "${YELLOW}⚠️  警告：内核全局已禁，但活跃网卡 [${iface}] 被强行拉起！${RESET}"
             else
                 echo -ne "${GREEN}✅ 内核及网卡已正常启用 IPv6 ${RESET}"
-                if [ -f /etc/gai.conf ] && grep -q "^[[:space:]]*precedence[[:space:]]\+::ffff:0:0/96[[:space:]]\+100" /etc/gai.conf; then
+                if [ "$os_type" = "alpine" ]; then
+                    echo -e "${RED}(Alpine固件：强锁IPv6优先)${RESET}"
+                elif [ -f /etc/gai.conf ] && grep -q "^[[:space:]]*precedence[[:space:]]\+::ffff:0:0/96[[:space:]]\+100" /etc/gai.conf; then
                     echo -e "${YELLOW}(策略锁定：IPv4优先)${RESET}"
                 else
-                    echo -e "${BLUE}(策略锁定：IPv6优先)${RESET}"
+                    echo -e "${YELLOW}(策略锁定：IPv6优先)${RESET}"
                 fi
             fi
 

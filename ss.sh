@@ -1,336 +1,232 @@
 #!/bin/bash
 # ========================================
-# yt-dlp 一键管理脚本 (支持 Alpine & Debian/Ubuntu)
+# aria2 系统原生包管理器全能管理与下载工具
+# 完美适配 cf.trackerslist.com 官方直连分流源
 # ========================================
-
-VIDEO_DIR="/opt/yt-dlp"
-URL_FILE="$VIDEO_DIR/urls.txt"
-COOKIE_FILE="$VIDEO_DIR/cookies.txt"
 
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-mkdir -p "$VIDEO_DIR"
+# 默认保存目录
+DOWNLOAD_DIR="/opt/aria2_downloads"
+mkdir -p "$DOWNLOAD_DIR"
 
-# 统一定义带颜色的 Prompt 提示符
 PROMPT_CHOICE=$(echo -e "${GREEN}请输入选项: ${RESET}")
-PROMPT_URL=$(echo -e "${GREEN}请输入视频链接: ${RESET}")
-PROMPT_CUSTOM=$(echo -e "${GREEN}请输入完整 yt-dlp 参数（不含 yt-dlp）: ${RESET}")
-PROMPT_DEL=$(echo -e "${GREEN}请输入要删除的目录名称: ${RESET}")
 PROMPT_CONTINUE=$(echo -e "${GREEN}按回车继续...${RESET}")
 
-# 自动检测并获取 Cookies 参数
-get_cookie_args() {
-    if [ -f "$COOKIE_FILE" ]; then
-        echo "--cookies $COOKIE_FILE"
+get_aria_status() {
+    if command -v aria2c &>/dev/null; then
+        echo -e "${GREEN}运行 (已就绪)${RESET}"
     else
-        echo ""
+        echo -e "${RED}停止 (未安装)${RESET}"
     fi
 }
 
-# 动态获取 yt-dlp 版本
-get_yt_version() {
-    if command -v yt-dlp &>/dev/null; then
-        yt-dlp --version 2>/dev/null || echo "未知版本"
+get_aria_version() {
+    if command -v aria2c &>/dev/null; then
+        aria2c -v | head -n 1 | awk '{print $3}'
     else
         echo "无"
     fi
 }
 
-install_yt() {
-    echo -e "${GREEN}开始检查并安装所需组件...${RESET}"
-    
-    # 检测包管理器
-    local pkg_manager=""
-    if command -v apk &>/dev/null; then
-        pkg_manager="apk"
-    elif command -v apt &>/dev/null; then
-        pkg_manager="apt"
-    else
-        echo -e "${RED}未检测到受支持的包管理器 (apk/apt)，请手动安装依赖！${RESET}"
-        return 1
+install_or_update_aria2() {
+    if [ "$EUID" -ne 0 ] && [ -f /etc/debian_version ]; then
+        echo -e "${RED}错误：请使用 root 权限或 sudo 运行此脚本！${RESET}"
+        return
     fi
 
-    # 待检查的命令列表与对应的包名
-    local deps=("ffmpeg" "curl" "node" "aria2c")
-    local to_install=()
+    echo -e "${GREEN}正在检测系统包管理器环境...${RESET}"
+    
+    if command -v apt &>/dev/null; then
+        echo -e "${GREEN}检测到基于 Debian/Ubuntu 的系统，正在使用 ${YELLOW}apt${GREEN} 进行部署...${RESET}"
+        apt update -y
+        apt install aria2 curl grep -y
+    elif command -v apk &>/dev/null; then
+        echo -e "${GREEN}检测到基于 Alpine Linux 的系统，正在使用 ${YELLOW}apk${GREEN} 进行部署...${RESET}"
+        apk update
+        apk add aria2 curl grep bash
+    else
+        echo -e "${RED}❌ 抱歉，当前系统既不是 APT 也不支持 APK，无法进行自动化安装。${RESET}"
+        return
+    fi
 
-    # 针对不同系统映射包名
-    for dep in "${deps[@]}"; do
-        if command -v "$dep" &>/dev/null; then
-            echo -e "检查 ${YELLOW}$dep${RESET} ... [${GREEN}已安装，跳过${RESET}]"
-        else
-            echo -e "检查 ${YELLOW}$dep${RESET} ... [${RED}未安装${RESET}]"
-            if [ "$pkg_manager" = "apk" ]; then
-                # Alpine 包名映射
-                case "$dep" in
-                    "node") to_install+=("nodejs") ;;
-                    "aria2c") to_install+=("aria2") ;;
-                    *) to_install+=("$dep") ;;
-                esac
-            else
-                # Apt 包名映射
-                case "$dep" in
-                    "node") to_install+=("nodejs") ;;
-                    "aria2c") to_install+=("aria2") ;;
-                    *) to_install+=("$dep") ;;
-                esac
-            fi
+    if command -v aria2c &>/dev/null; then
+        local NEW_VER=$(get_aria_version)
+        echo -e "${GREEN}🎉 aria2 v${NEW_VER} 原生包管理器版成功部署！${RESET}"
+    else
+        echo -e "${RED}❌ 安装失败，请检查您的软件源或网络连接！${RESET}"
+    fi
+}
+
+uninstall_aria2() {
+    echo -e "${YELLOW}正在清理 aria2 相关程序...${RESET}"
+    if command -v apt &>/dev/null; then
+        apt remove aria2 -y
+        apt autoremove -y
+    elif command -v apk &>/dev/null; then
+        apk del aria2
+    else
+        rm -f /usr/local/bin/aria2c /usr/bin/aria2c
+    fi
+    echo -e "${GREEN}卸载完成。${RESET}"
+}
+
+set_download_dir() {
+    read -e -p "$(echo -e "${GREEN}当前保存目录为: ${YELLOW}$DOWNLOAD_DIR${RESET}\n${GREEN}请输入新的保存路径: ${RESET}")" new_dir
+    if [ -n "$new_dir" ]; then
+        DOWNLOAD_DIR="$new_dir"
+        mkdir -p "$DOWNLOAD_DIR"
+        echo -e "${GREEN}保存路径已成功修改为: ${YELLOW}$DOWNLOAD_DIR${RESET}"
+    else
+        echo -e "${YELLOW}输入为空，路径保持不变。${RESET}"
+    fi
+}
+
+check_aria_ready() {
+    if ! command -v aria2c &>/dev/null; then
+        echo -e "${RED}错误：请先选择选项 1 安装 aria2 才能使用下载功能！${RESET}"
+        return 1
+    fi
+    return 0
+}
+
+# 【全新升级】使用 Cloudflare CDN 官方格式化分流源，实现毫秒级拉取与无缝注入
+get_dynamic_trackers() {
+    echo -e "${GREEN}正在通过 Cloudflare CDN 全速获取精选 Tracker 列表...${RESET}" >&2
+    
+    local trackers=""
+    # 依次尝试：精选最佳源 -> 完整全节点源
+    local cdn_urls=(
+        "https://cf.trackerslist.com/best_aria2.txt"
+        "https://cf.trackerslist.com/all_aria2.txt"
+    )
+    
+    for url in "${cdn_urls[@]}"; do
+        echo -e "${GREEN}正在连接直连加速节点: ${YELLOW}$url${RESET}" >&2
+        # 拉取纯文本并剔除可能存在的首尾空白或空行
+        trackers=$(curl -L -s -k -m 4 "$url" | grep -v '^#' | tr -d '\r' | tr '\n' ',' | sed 's/,,*/,/g' | sed 's/^,//;s/,$//')
+        
+        # 验证抓取到的内容是否包含合法的 tracker 协议前缀
+        if [ -n "$trackers" ] && [[ "$trackers" == *"http"* || "$trackers" == *"udp"* ]]; then
+            echo -e "${GREEN}🎉 Tracker 列表秒级同步成功！已成功注入 Aria2 核心引擎。${RESET}" >&2
+            echo "$trackers"
+            return
         fi
     done
 
-    # 执行必要的安装
-    if [ ${#to_install[@]} -ne 0 ]; then
-        echo -e "${GREEN}正在通过 $pkg_manager 安装缺失组件: ${to_install[*]}...${RESET}"
-        if [ "$pkg_manager" = "apk" ]; then
-            apk update
-            # Alpine 默认可能缺少 bash 和 python3，yt-dlp 运行必须依赖 python3
-            apk add bash python3 "${to_install[@]}"
-        else
-            apt update -y
-            apt install -y "${to_install[@]}"
-        fi
-    else
-        echo -e "${GREEN}所有系统依赖组件均已就绪。${RESET}"
-    fi
-
-    # 检查或安装 yt-dlp 本体
-    if ! command -v yt-dlp &>/dev/null; then
-        echo -e "${GREEN}正在下载安装 yt-dlp...${RESET}"
-        # 统一安装到 /usr/local/bin
-        curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-        chmod a+rx /usr/local/bin/yt-dlp
-    else
-        echo -e "${GREEN}yt-dlp 主程序已存在，如需更新请在菜单选择选项 2。${RESET}"
-    fi
-
-    # 配置永久识别 Node.js 环境（兼容 Alpine 和 Debian 的 node 路径）
-    NODE_PATH=$(command -v node)
-    mkdir -p ~/.config/yt-dlp
-    echo "--js-runtimes node:$NODE_PATH" > ~/.config/yt-dlp/config
-
-    echo -e "${GREEN}环境检查与配置全部完成！${RESET}"
+    echo -e "${YELLOW}警告：Cloudflare 专线分流暂时不可用，转入原生多线程 DHT 去中心化寻源模式。${RESET}" >&2
+    echo ""
 }
 
-update_yt() {
-    echo -e "${GREEN}正在更新 yt-dlp...${RESET}"
-    if command -v yt-dlp &>/dev/null; then
-        yt-dlp -U
-    else
-        echo -e "${RED}未检测到 yt-dlp，请先执行安装！${RESET}"
-    fi
-}
-
-uninstall_yt() {
-    rm -f /usr/local/bin/yt-dlp
-    rm -rf /opt/yt-dlp
-    rm -rf ~/.config/yt-dlp
-    echo -e "${GREEN}已卸载 yt-dlp 及相关配置文件${RESET}"
-    exit 0
-}
-
-download_single() {
-    read -e -p "$PROMPT_URL" url
+# 4. 普通网络链接下载
+download_http() {
+    check_aria_ready || return
+    read -e -p "$(echo -e "${GREEN}请输入 HTTP/HTTPS/FTP 下载链接: ${RESET}")" url
     [ -z "$url" ] && return
-    
-    yt-dlp $(get_cookie_args) \
-        --external-downloader aria2c \
-        --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-        -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
-        --write-subs --sub-langs all \
-        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites "$url"
+    aria2c -c -s 16 -x 16 -k 1M -d "$DOWNLOAD_DIR" "$url"
 }
 
-download_batch() {
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN} 进入交互式批量下载模式               ${RESET}"
-    echo -e "${GREEN} 请连续输入视频链接，每输完一个按一次回车。         ${RESET}"
-    echo -e "${GREEN} 输入完毕后，输入英文字母 ${YELLOW}q${GREEN} 即可开始下载。         ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+# 5. 磁力链接下载 (Cloudflare 专线 Tracker + 128多线程加速)
+download_magnet() {
+    check_aria_ready || return
+    read -e -p "$(echo -e "${GREEN}请输入 Magnet 磁力链接: ${RESET}")" magnet
+    [ -z "$magnet" ] && return
     
-    # 清空或初始化链接临时文件
-    > "$URL_FILE"
+    local trackers_arg=$(get_dynamic_trackers)
     
+    aria2c --seed-time=0 \
+           --enable-dht=true \
+           --enable-peer-exchange=true \
+           --bt-max-peers=128 \
+           --max-connection-per-server=16 \
+           ${trackers_arg:+--bt-tracker="$trackers_arg"} \
+           -d "$DOWNLOAD_DIR" "$magnet"
+}
+
+# 6. 种子文件下载 (Cloudflare 专线 Tracker + 128多线程加速)
+download_torrent() {
+    check_aria_ready || return
+    read -e -p "$(echo -e "${GREEN}请输入 .torrent 种子文件路径或下载链接: ${RESET}")" torrent
+    [ -z "$torrent" ] && return
+    
+    local trackers_arg=$(get_dynamic_trackers)
+    
+    aria2c --seed-time=0 \
+           --enable-dht=true \
+           --enable-peer-exchange=true \
+           --bt-max-peers=128 \
+           --max-connection-per-server=16 \
+           ${trackers_arg:+--bt-tracker="$trackers_arg"} \
+           -d "$DOWNLOAD_DIR" "$torrent"
+}
+
+# 7. 批量文本链接下载
+download_batch_txt() {
+    check_aria_ready || return
+    echo -e "${GREEN}请连续输入需要下载的链接，每输完一个按一次回车。${RESET}"
+    echo -e "${GREEN}输入完毕后，输入英文字母 ${YELLOW}q${GREEN} 即可开始批量下载。${RESET}"
+    
+    local tmp_txt="/tmp/aria2_urls.txt"
+    > "$tmp_txt"
     local count=1
     while true; do
-        read -e -p "$(echo -e "${GREEN}请输入第 [${YELLOW}$count${GREEN}] 个链接 (输入 q 开始下载): ${RESET}")" input_url
-        if [ "$input_url" = "q" ] || [ "$input_url" = "Q" ]; then
-            break
-        fi
+        read -e -p "$(echo -e "${GREEN}输入第 [${YELLOW}$count${GREEN}] 个链接 (输入 q 开始): ${RESET}")" input_url
+        if [ "$input_url" = "q" ] || [ "$input_url" = "Q" ]; then break; fi
         if [ -n "$input_url" ]; then
-            echo "$input_url" >> "$URL_FILE"
+            echo "$input_url" >> "$tmp_txt"
             ((count++))
         fi
     done
-    
-    # 检查是否有有效输入
-    if [ ! -s "$URL_FILE" ]; then
-        echo -e "${YELLOW}未输入任何链接，已取消批量下载。${RESET}"
-        return
-    fi
-    
-    echo -e "${GREEN}正在开始批量下载，共 $(($count-1)) 个任务...${RESET}"
-    
-    yt-dlp $(get_cookie_args) \
-        --external-downloader aria2c \
-        --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-        -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
-        --write-subs --sub-langs all \
-        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
-        --write-info-json \
-        -a "$URL_FILE" \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites
-        
-    # 下载完成后清理临时链接文件
-    rm -f "$URL_FILE"
-}
 
-download_custom() {
-    read -e -p "$PROMPT_CUSTOM" custom
-    [ -z "$custom" ] && return
-    
-    yt-dlp $(get_cookie_args) -P "$VIDEO_DIR" $custom \
-        --write-subs --sub-langs all \
-        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites
-}
-
-download_mp3() {
-    read -e -p "$PROMPT_URL" url
-    [ -z "$url" ] && return
-    
-    yt-dlp $(get_cookie_args) \
-        --external-downloader aria2c \
-        --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-        -P "$VIDEO_DIR" -x --audio-format mp3 --audio-quality 0 \
-        --write-thumbnail --convert-thumbnails jpg --embed-thumbnail \
-        --write-info-json \
-        -o "$VIDEO_DIR/%(title)s/%(title)s.%(ext)s" \
-        --no-overwrites --no-post-overwrites "$url"
-}
-
-delete_video() {
-    echo -e "${GREEN}当前视频目录：${RESET}"
-    
-    # 将目录存入数组（过滤掉 . 和 .. 以及非目录文件）
-    local dirs=()
-    local i=1
-    
-    # 切换到视频目录，方便读取
-    cd "$VIDEO_DIR" || return
-    
-    # 遍历当前目录下的所有子目录
-    for d in */; do
-        # 确保目录存在（防止空目录时匹配到 "*/" 字符串）
-        if [ -d "$d" ]; then
-            # 去掉末尾的斜杠 /
-            dirs+=("${d%/}")
-        fi
-    done
-
-    # 检查是否有可删除的目录
-    if [ ${#dirs[@]} -eq 0 ]; then
-        echo -e "${YELLOW}暂无视频目录可删除。${RESET}"
-        return
-    fi
-
-    # 打印带序号的列表
-    for d in "${dirs[@]}"; do
-        echo -e " [${YELLOW}$i${RESET}] $d"
-        ((i++))
-    done
-    echo "----------------------------------"
-
-    # 读取用户输入的序号
-    read -e -p "$(echo -e "${GREEN}请输入要删除的目录序号 (输入其他任意键取消): ${RESET}")" num
-    
-    # 严格校验：必须是纯数字，且在有效数组范围内
-    if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#dirs[@]}" ]; then
-        # 数组索引从 0 开始，所以要减 1
-        local target_dir="${dirs[$((num-1))]}"
-        
-        # 二次确认，防止手抖
-        read -r -p "$(echo -e "${RED}确定要删除目录 [ $target_dir ] 及其所有内容吗？(y/n): ${RESET}")" confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            rm -rf "$VIDEO_DIR/$target_dir"
-            echo -e "${GREEN}已成功删除目录: $target_dir${RESET}"
-        else
-            echo -e "${YELLOW}已取消删除。${RESET}"
-        fi
+    if [ -s "$tmp_txt" ]; then
+        echo -e "${GREEN}正在启动批量下载...${RESET}"
+        aria2c -c -s 16 -x 16 -k 1M -d "$DOWNLOAD_DIR" -i "$tmp_txt"
     else
-        echo -e "${YELLOW}输入无效或已取消操作。${RESET}"
+        echo -e "${YELLOW}未输入任何链接。${RESET}"
     fi
+    rm -f "$tmp_txt"
 }
 
-show_list() {
-    echo -e "${GREEN}已下载视频列表：${RESET}"
-    if [ -d "$VIDEO_DIR" ] && [ "$(ls -A $VIDEO_DIR)" ]; then
-        ls -td "$VIDEO_DIR"/*/ 2>/dev/null | sed "s|$VIDEO_DIR/||g"
-    else
-        echo -e "${YELLOW}暂无视频${RESET}"
-    fi
-}
-
+# 主菜单
 while true; do
     clear
-    if command -v yt-dlp &>/dev/null; then
-        STATUS="${GREEN}运行${RESET}"
-    else
-        STATUS="${RED}停止${RESET}"
-    fi
+    STATUS=$(get_aria_status)
+    VERSION=$(get_aria_version)
 
-    # 获取实时版本号
-    VERSION=$(get_yt_version)
-
-    # 检测统一路径下的 Cookies 状态
-    if [ -f "$COOKIE_FILE" ]; then
-        COOKIE_STATUS="${GREEN}已就绪 ($COOKIE_FILE)${RESET}"
-    else
-        COOKIE_STATUS="${YELLOW}未配置 (请上传至 $COOKIE_FILE)${RESET}"
-    fi
-
-    echo -e "${GREEN}=================================${RESET}"
-    echo -e "${GREEN}     ◈   yt-dlp 管理面板   ◈     ${RESET}"
-    echo -e "${GREEN}=================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}         aria2 智能系统原生部署与全能下载工具          ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
     echo -e "${GREEN} 核心状态: $STATUS${RESET}"
-    echo -e "${GREEN} 软件版本: ${YELLOW}$VERSION${RESET}"
-    echo -e "${GREEN} 保存目录: ${YELLOW}$VIDEO_DIR${RESET}"
-    echo -e "${GREEN} Cookie状态: $COOKIE_STATUS${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
-    echo -e "${GREEN} 1. 安装 yt-dlp${RESET}"
-    echo -e "${GREEN} 2. 更新 yt-dlp${RESET}"
-    echo -e "${GREEN} 3. 卸载 yt-dlp${RESET}"
-    echo -e "${GREEN}----------------------------------${RESET}"
-    echo -e "${GREEN} 5. 单个视频下载 (16线程极速)${RESET}"
-    echo -e "${GREEN} 6. 批量视频下载 (交互式输入多链接)${RESET}"
-    echo -e "${GREEN} 7. 自定义参数下载${RESET}"
-    echo -e "${GREEN} 8. 下载为最佳音质 MP3${RESET}"
-    echo -e "${GREEN}----------------------------------${RESET}"
-    echo -e "${GREEN} 9. 删除视频目录${RESET}"
-    echo -e "${GREEN}10. 查看下载列表${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN} 当前版本: ${YELLOW}v$VERSION${RESET}"
+    echo -e "${GREEN} 保存目录: ${YELLOW}$DOWNLOAD_DIR${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN} [环境管理]${RESET}"
+    echo -e "${GREEN}  1. 安装/更新 aria2 (系统原生 APT / APK 智能识配)${RESET}"
+    echo -e "${GREEN}  2. 卸载 aria2 下载器${RESET}"
+    echo -e "${GREEN}  3. 修改当前自定义保存目录${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    echo -e "${GREEN} [实用下载功能]${RESET}"
+    echo -e "${GREEN}  4. HTTP / HTTPS / FTP 常用链接下载 (16线程)${RESET}"
+    echo -e "${GREEN}  5. Magnet 磁力下载 (🔥CF专线Tracker+128多线程加速)${RESET}"
+    echo -e "${GREEN}  6. BitTorrent 种子下载 (🔥CF专线Tracker+128多线程加速)${RESET}"
+    echo -e "${GREEN}  7. 批量多链接交互下载${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    echo -e "${GREEN}  0. 退出脚本${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
     
     read -e -p "$PROMPT_CHOICE" choice
 
     case $choice in
-        1) install_yt ;;
-        2) update_yt ;;
-        3) uninstall_yt ;;
-        5) download_single ;;
-        6) download_batch ;;
-        7) download_custom ;;
-        8) download_mp3 ;;
-        9) delete_video ;;
-        10) show_list ;;
+        1) install_or_update_aria2 ;;
+        2) uninstall_aria2 ;;
+        3) set_download_dir ;;
+        4) download_http ;;
+        5) download_magnet ;;
+        6) download_torrent ;;
+        7) download_batch_txt ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
     esac

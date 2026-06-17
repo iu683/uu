@@ -1,261 +1,170 @@
 #!/bin/bash
-
-APP_DIR="/opt/jcqd"
-CONFIG="$APP_DIR/jcqd.json"
-RUN_SCRIPT="$APP_DIR/jcqd_run.sh"
+# ========================================
+# Lucky v2 一键管理脚本
+# ========================================
 
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-mkdir -p $APP_DIR
+APP_NAME="lucky"
+APP_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-init_config(){
-    if [ ! -f "$CONFIG" ]; then
-        echo '{"accounts":[],"tg":{}}' > $CONFIG
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        curl -fsSL https://get.docker.com | bash
+    fi
+    if ! docker compose version &>/dev/null; then
+        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+        exit 1
     fi
 }
 
-pause(){
-    read -rp "按回车返回菜单..."
+get_public_ip() {
+    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    echo "127.0.0.1" && return 0
 }
 
-# 兼容 Alpine (apk) 和 Debian/Ubuntu (apt)
-check_dependencies(){
-    if ! command -v jq >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
-        echo -e "${GREEN}正在安装依赖 (jq/curl)...${RESET}"
-        if command -v apk >/dev/null 2>&1; then
-            apk update >/dev/null 2>&1
-            apk add jq curl bash >/dev/null 2>&1
-        elif command -v apt >/dev/null 2>&1; then
-            apt update -y >/dev/null 2>&1
-            apt install jq curl -y >/dev/null 2>&1
+menu() {
+    # 在这里加上 while true; do 开启循环
+    while true; do
+        clear
+        # 1. 动态获取 Lucky 容器的状态 (先安全检测 docker 命令是否存在，防止菜单本身报错)
+        local container_status="🔴 未运行(未检测到容器)"
+        if command -v docker &>/dev/null; then
+            if docker ps -a --format '{{.Names}}' | grep -q "^lucky$"; then
+                local is_running=$(docker ps --format '{{.Names}}' | grep -q "^lucky$" && echo "yes" || echo "no")
+                if [ "$is_running" = "yes" ]; then
+                    container_status="🟢 运行中"
+                else
+                    container_status="🟡 已停止"
+                fi
+            fi
+        else
+            container_status="❌ 未安装 Docker"
         fi
-    fi
+        # 2. 渲染菜单头部、状态与端口信息
+        echo -e "${GREEN}========================${RESET}"
+        echo -e "${GREEN}  ◈  Lucky 管理菜单  ◈ ${RESET}"
+        echo -e "${GREEN}========================${RESET}"
+        echo -e "${GREEN}状态:${RESET} ${YELLOW}$container_status${RESET}"
+        echo -e "${GREEN}端口:${RESET} ${YELLOW}16601${RESET}${YELLOW} (Host模式)${RESET}"
+        echo -e "${GREEN}========================${RESET}"
+        echo -e "${GREEN}1) 安装启动${RESET}"
+        echo -e "${GREEN}2) 更新${RESET}"
+        echo -e "${GREEN}3) 重启${RESET}"
+        echo -e "${GREEN}4) 查看日志${RESET}"
+        echo -e "${GREEN}5) 查看状态${RESET}"
+        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}========================${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+
+        case $choice in
+            1) install_app ;;
+            2) update_app ;;
+            3) restart_app ;;
+            4) view_logs ;;
+            5) check_status ;;
+            6) uninstall_app ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
+        esac
+    done # 这里的 done 就能闭合上方的 while 了
 }
 
-install_run_script(){
+install_app() {
+    check_docker
+    mkdir -p "$APP_DIR/conf"
 
-cat > $RUN_SCRIPT << 'EOF'
-#!/bin/bash
-
-CONFIG="/opt/jcqd/jcqd.json"
-
-BotToken=$(jq -r '.tg.BotToken // empty' $CONFIG)
-ChatID=$(jq -r '.tg.ChatID // empty' $CONFIG)
-
-TIME=$(date "+%Y-%m-%d %H:%M:%S")
-
-result="🚀 机场签到报告
-时间: $TIME
-"
-
-count=$(jq '.accounts | length' $CONFIG)
-
-for ((i=0;i<count;i++))
-do
-    domain=$(jq -r ".accounts[$i].domain" $CONFIG)
-    user=$(jq -r ".accounts[$i].user" $CONFIG)
-    pass=$(jq -r ".accounts[$i].pass" $CONFIG)
-
-    # 确保域名包含 http(s)://
-    if [[ ! "$domain" =~ ^https?:// ]]; then
-        url="https://$domain"
-    else
-        url="$domain"
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
+        read confirm
+        [[ "$confirm" != "y" ]] && return
     fi
 
-    cookie=$(mktemp)
-
-    login=$(curl -s -c "$cookie" \
-      -H "Content-Type: application/json" \
-      -X POST \
-      -d "{\"email\":\"$user\",\"passwd\":\"$pass\",\"remember_me\":\"on\"}" \
-      "$url/auth/login")
-
-    # 兼容没有 grep -o 的 busybox 环境，改用 jq 解析
-    ret=$(echo "$login" | jq -r '.ret // empty')
-
-    if [ "$ret" != "1" ]; then
-        # 尝试获取登录失败的原因
-        msg=$(echo "$login" | jq -r '.msg // empty')
-        if [ -z "$msg" ]; then msg="❌ 登录失败"; fi
-    else
-        checkin=$(curl -s -b "$cookie" -X POST "$url/user/checkin")
-        
-        # 使用 jq 完美解析并提取返回信息，自动处理 Unicode 转义（\uXXXX），规避 sed 兼容性问题
-        msg=$(echo "$checkin" | jq -r '.msg // empty')
-        if [ -z "$msg" ]; then msg="⚠ 登录成功但签到返回空"; fi
-    fi
-
-    result="$result
-🌐 $domain
-👤 $user
-📝 $msg
-"
-    rm -f "$cookie"
-done
-
-echo "$result"
-
-if [ -n "$BotToken" ] && [ -n "$ChatID" ]; then
-    curl -s -X POST "https://api.telegram.org/bot$BotToken/sendMessage" \
-    -d chat_id="$ChatID" \
-    --data-urlencode text="$result" \
-    > /dev/null
-fi
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  lucky:
+    image: gdy666/lucky:v2
+    container_name: lucky
+    volumes:
+      - ./conf:/app/conf
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: host
+    restart: always
 EOF
 
-chmod +x $RUN_SCRIPT
+    cd "$APP_DIR" || exit
+    docker compose up -d
 
+    SERVER_IP=$(get_public_ip)
+
+    echo
+    echo -e "${GREEN}✅ Lucky 已启动${RESET}"
+    echo -e "${YELLOW}✅ 访问地址: http://${SERVER_IP}:16601${RESET}"
+    echo -e "${YELLOW}✅ 账号密码: 666/666${RESET}"
+    echo -e "${YELLOW}📂 安装目录: $APP_DIR${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-add_account(){
-    read -rp "机场域名(例如 69yun69.com): " domain
-    read -rp "邮箱: " user
-    read -rp "密码: " pass
-
-    # 移除用户输入域名时可能误带的末尾斜杠
-    domain=$(echo "$domain" | sed 's/\/$//')
-
-    tmp=$(mktemp)
-    jq ".accounts += [{\"domain\":\"$domain\",\"user\":\"$user\",\"pass\":\"$pass\"}]" $CONFIG > $tmp
-    mv $tmp $CONFIG
-    echo -e "${GREEN}添加成功${RESET}"
+update_app() {
+    cd "$APP_DIR" || return
+    docker compose pull
+    docker compose up -d
+    echo -e "${GREEN}✅ Lucky 更新完成${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-list_accounts(){
-    jq -r '.accounts | to_entries[] | "\(.key+1)) 🌐 \(.value.domain) | 👤 \(.value.user)"' $CONFIG
+restart_app() {
+    docker restart lucky
+    echo -e "${GREEN}✅ Lucky 已重启${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-delete_account(){
-    list_accounts
-    read -rp "删除第几个: " id
-    if [ -z "$id" ]; then return; fi
-    tmp=$(mktemp)
-    jq "del(.accounts[$((id-1))])" $CONFIG > $tmp
-    mv $tmp $CONFIG
-    echo -e "${GREEN}删除成功${RESET}"
+view_logs() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
+    docker logs -f lucky
 }
 
-set_tg(){
-    read -rp "BotToken: " token
-    read -rp "ChatID: " chat
-    tmp=$(mktemp)
-    jq ".tg.BotToken=\"$token\" | .tg.ChatID=\"$chat\"" $CONFIG > $tmp
-    mv $tmp $CONFIG
-    echo -e "${GREEN}TG设置完成${RESET}"
+check_status() {
+    docker ps | grep lucky
+    read -p "按回车返回菜单..."
 }
 
-set_cron(){
-    echo -e "${GREEN}默认时间：每天0点${RESET}"
-    read -rp "自定义cron(回车默认): " cron
-
-    if [ -z "$cron" ]; then
-        cron="0 0 * * *"
-    fi
-
-    # 兼容 Alpine 的 crontab 写入逻辑
-    current_cron=$(crontab -l 2>/dev/null | grep -v "jcqd_run.sh")
-    echo -e "$current_cron\n$cron bash $RUN_SCRIPT" | sed '/^$/d' | crontab -
-
-    echo -e "${GREEN}定时任务已设置${RESET}"
+uninstall_app() {
+    cd "$APP_DIR" || return
+    docker compose down
+    rm -rf "$APP_DIR"
+    echo -e "${RED}✅ Lucky 已卸载${RESET}"
+    read -p "按回车返回菜单..."
 }
 
-remove_cron(){
-    current_cron=$(crontab -l 2>/dev/null | grep -v "jcqd_run.sh")
-    if [ -z "$current_cron" ]; then
-        crontab -r >/dev/null 2>&1
-    else
-        echo "$current_cron" | crontab -
-    fi
-    echo -e "${GREEN}定时任务已删除${RESET}"
-}
-
-view_cron(){
-    echo -e "${GREEN}当前签到定时任务:${RESET}"
-    cron=$(crontab -l 2>/dev/null | grep jcqd_run.sh)
-    if [ -z "$cron" ]; then
-        echo "未设置定时任务"
-    else
-        echo "$cron"
-    fi
-}
-
-uninstall(){
-    remove_cron
-    rm -rf /opt/jcqd
-    echo -e "${GREEN}已卸载${RESET}"
-    exit
-}
-
-menu(){
-    clear
-
-    # 1. 动态获取状态
-    local cron_status="🔴 未开启"
-    local cron_info=$(crontab -l 2>/dev/null | grep jcqd_run.sh)
-    if [ -n "$cron_info" ]; then
-        # 提取前面的 cron 表达式部分
-        local cron_time=$(echo "$cron_info" | sed 's/ bash.*//')
-        cron_status="🟢 已开启 "
-    fi
-
-    local ac_count=$(jq '.accounts | length' $CONFIG 2>/dev/null || echo "0")
-
-    # 2. 渲染菜单头部和状态
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN} ◈   机场签到管理菜单   ◈ ${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN}定时任务状态:${RESET} ${YELLOW}$cron_status${RESET}"
-    echo -e "${GREEN}当前已加机场:${RESET} ${YELLOW}$ac_count 个${RESET}"
-    echo -e "${GREEN}-------------------------${RESET}"
-    
-    # 如果有机场，直接把列表简要打印在菜单里
-    if [ "$ac_count" -gt 0 ]; then
-        echo -e "${YELLOW}已加机场列表:${RESET}"
-        list_accounts
-        echo -e "${GREEN}-------------------------${RESET}"
-    fi
-
-    echo -e "${GREEN}1) 添加机场${RESET}"
-    echo -e "${GREEN}2) 删除机场${RESET}"
-    echo -e "${GREEN}3) 查看机场${RESET}"
-    echo -e "${GREEN}4) 设置TG推送${RESET}"
-    echo -e "${GREEN}5) 立即签到${RESET}"
-    echo -e "${GREEN}6) 设置定时任务${RESET}"
-    echo -e "${GREEN}7) 删除定时任务${RESET}"
-    echo -e "${GREEN}8) 查看定时任务${RESET}"
-    echo -e "${GREEN}9) 卸载${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}=========================${RESET}"
-    echo -ne "${GREEN}请选择:${RESET} "
-    read num
-
-    case "$num" in
-        1) add_account ; pause ;;
-        2) delete_account ; pause ;;
-        3) list_accounts ; pause ;;
-        4) set_tg ; pause ;;
-        5) bash $RUN_SCRIPT ; pause ;;
-        6) set_cron ; pause ;;
-        7) remove_cron ; pause ;;
-        8) view_cron ; pause ;;
-        9) uninstall ;;
-        0) exit ;;
-        *) echo "无效输入" ; pause ;;
-    esac
-}
-
-init_config
-check_dependencies
-
-if [ ! -f "$RUN_SCRIPT" ]; then
-    install_run_script
-fi
-
-while true
-do
-    menu
-done
+menu

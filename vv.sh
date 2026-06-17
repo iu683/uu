@@ -1,294 +1,302 @@
 #!/bin/bash
 # =========================================================================
-# 一键系统重装脚本（跨平台极致兼容通用版）
-# 支持 Linux 全系列 + Windows 全系列
+# IPv4 / IPv6 管理面板 (修复 local 变量与系统识别 Bug 版)
 # =========================================================================
 
-# 设置颜色
+if [ "$EUID" -ne 0 ]; then
+    echo -e "\033[31m❌ 错误：请使用 root 权限运行此脚本！\033[0m"
+    exit 1
+fi
+
 GREEN="\033[32m"
-YELLOW="\033[33m"
 RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
 RESET="\033[0m"
 
-# 【核心修复】跨平台通用依赖检查（抛弃非标数组，完美兼容 Alpine sh）
-install_dependencies() {
-    local missing_deps=""
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+get_os_type() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$ID"
+    else
+        echo "unknown"
+    fi
+}
+
+install_pkg() {
+    local pkg="$1"
+    local os=$(get_os_type)
+    if has_cmd "$pkg"; then return; fi
     
-    # 用最传统稳健的空格字符串替代数组
-    for dep in curl wget openssl; do
-        if ! command -v "$dep" >/dev/null 2>&1; then
-            missing_deps="$missing_deps $dep"
-        fi
-    done
-
-    # 去除首尾空格
-    missing_deps=$(echo "$missing_deps" | sed 's/^ *//;s/ *$//')
-
-    if [ -z "$missing_deps" ]; then
-        return 0
-    fi
-
-    echo -e "${YELLOW}🔧 发现缺失依赖: ${missing_deps}，正在自动安装...${RESET}"
-
-    # 识别包管理器并全自动打补丁
-    if command -v apk >/dev/null 2>&1; then
-        apk add --no-cache $missing_deps
-    elif command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y && apt-get install -y $missing_deps
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y $missing_deps
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y $missing_deps
-    else
-        echo -e "${RED}❌ 错误: 未知系统包管理器，请手动安装 [ ${missing_deps} ] 后重试。${RESET}"
-        exit 1
-    fi
+    echo -e "${YELLOW}🔧 正在补全系统依赖: $pkg ...${RESET}"
+    case "$os" in
+        ubuntu|debian)
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y "$pkg" >/dev/null 2>&1
+            ;;
+        alpine)
+            apk add --no-cache "$pkg" >/dev/null 2>&1
+            ;;
+        centos|rhel|rocky|almalinux)
+            yum install -y "$pkg" >/dev/null 2>&1 || dnf install -y "$pkg" >/dev/null 2>&1
+            ;;
+    esac
 }
 
-# 运行依赖检查
-install_dependencies
-
-# 随机密码生成函数（生成20位包含大小写字母和数字的随机密码）
-generate_random_password() {
-    if command -v openssl >/dev/null 2>&1; then
-        # 增加随机字节数至 15，确保 Base64 编码并过滤后足够截取 20 位
-        openssl rand -base64 15 | tr -d '+/' | cut -c1-20
-    else
-        # 直接修改截取长度为 20
-        tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 20
-    fi
+check_deps() {
+    local deps=(curl ip ping sysctl awk grep sed)
+    for cmd in "${deps[@]}"; do install_pkg "$cmd"; done
 }
 
-# GitHub 代理镜像列表（用传统的空格字符串替代非标数组，完美兼容 Alpine sh）
-# 第一个节点为空，代表优先尝试直连
-GITHUB_PROXIES="DIRECT https://v6.gh-proxy.org/ https://gh-proxy.com/ https://hub.glowp.xyz/ https://proxy.vvvv.ee/ https://ghproxy.lvedong.eu.org/"
+detect_iface() {
+    ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|docker|veth|br-' | head -n1
+}
 
-download_script() {
-    local type="$1"
-    local raw_url=""
-    local file_name=""
+get_public_ip() {
+    local mode="$1"
+    local ip_res=""
+    local apis=("https://api.ip.sb/ip" "https://icanhazip.com" "https://v4.ident.me")
+    [ "$mode" = "-6" ] && apis=("https://api-ipv6.ip.sb/ip" "https://ipv6.icanhazip.com" "https://v6.ident.me")
 
-    if [ "$type" = "MollyLau" ]; then
-        file_name="InstallNET.sh"
-        raw_url="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh"
-    else
-        file_name="reinstall.sh"
-        raw_url="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
-    fi
-
-    # 遍历空格分隔的代理字符串
-    for proxy in $GITHUB_PROXIES; do
-        local proxy_url=""
-        rm -f "$file_name"
-        
-        if [ "$proxy" = "DIRECT" ]; then
-            proxy_url="$raw_url"
-            echo -e "${YELLOW}📡 正在尝试直连下载...${RESET}"
-        else
-            proxy_url="${proxy}${raw_url}"
-            echo -e "${YELLOW}🔄 正在尝试代理节点: ${proxy}${RESET}"
-        fi
-
-        # 带有 3 秒超时限制的下载块，防止死节点卡网速
-        if command -v wget >/dev/null 2>&1; then
-            wget --no-check-certificate --timeout=3 --tries=1 -qO "$file_name" "$proxy_url" && chmod +x "$file_name"
-        else
-            if [ "$proxy" = "DIRECT" ]; then
-                curl -m 3 -sO "$proxy_url" && chmod +x "$file_name"
-            else
-                # 代理站通常有302重定向，curl 必须加 -L 顺着重定向下载
-                curl -m 3 -sL -o "$file_name" "$proxy_url" && chmod +x "$file_name"
-            fi
-        fi
-
-        # 严格验证：确保文件存在且大小大于 0 字节（防止把代理站的 404 报错网页抓下来）
-        if [ -f "$file_name" ] && [ -s "$file_name" ]; then
-            echo -e "${GREEN}✅ 下载成功！${RESET}"
+    for url in "${apis[@]}"; do
+        ip_res=$(curl "$mode" -sL -A "Mozilla/5.0" --connect-timeout 3 "$url" 2>/dev/null | tr -d '\r\n[:space:]')
+        if [ -n "$ip_res" ] && [[ ! "$ip_res" == *"<"* && ! "$ip_res" == *"html"* ]]; then
+            echo "$ip_res"
             return 0
         fi
     done
-
-    echo -e "${RED}❌ 错误: 尝试了所有渠道及代理节点，均无法下载重装内核！${RESET}"
-    exit 1
+    echo "未获取到公网IP"
+    return 1
 }
 
-# 系统核心数据库表
-systems=(
-"1|debian13|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 13"
-"2|debian12|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 12"
-"3|debian11|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 11"
-"4|debian10|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 10"
-"5|ubuntu26.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 26.04"
-"6|ubuntu24.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 24.04"
-"7|ubuntu22.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 22.04"
-"8|ubuntu20.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 20.04"
-"9|ubuntu18.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 18.04"
-"10|Alpine3.24|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.24"
-"11|Alpine3.23|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.23"
-"12|Alpine3.22|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.22"
-"13|Alpine3.21|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.21"
-"14|AlpineEdge|Alpine|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -alpine"
-"15|rocky10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky"
-"16|rocky9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky 9"
-"17|alma10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux"
-"18|alma9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux 9"
-"19|oracle10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle"
-"20|oracle9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle 9"
-"21|fedora44|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 44"
-"22|fedora43|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 43"
-"23|centos10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 10"
-"24|centos9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 9"
-"25|arch|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh arch"
-"26|kali|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh kali"
-"27|openeuler|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh openeuler"
-"28|opensuseTumbleweed|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh opensuse"
-"29|fnos飞牛公测版|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh fnos"
-"30|windows11|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 11 -lang cn"
-"31|windows10|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 10 -lang cn"
-"32|windows7|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh windows --iso=\"https://download.testip.xyz/windows/cn_windows_7_professional_with_sp1_vl_build_x64_dvd_u_677816.iso\" --image-name='Windows 7 PROFESSIONAL'"
-"33|windowsServer2025|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2025 -lang cn"
-"34|windowsServer2022|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2022 -lang cn"
-"35|windowsServer2019|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2019 -lang cn"
-"36|windowsServer2016|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2016 -lang cn"
-"37|windows11ARM|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh dd --img https://r2.hotdog.eu.org/win11-arm-with-pagefile-15g.xz"
-)
+get_menu_status() {
+    local iface="$1"
+    local current_os=$(get_os_type)
+    local v4_addr=$(ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' | head -n1)
+    V4_STATUS=$( [ -z "$v4_addr" ] && echo -e "${RED}未启用${RESET}" || echo -e "${GREEN}已启用${RESET}" )
 
-# 主循环面板
+    local is_all_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+    local is_iface_disabled=$(sysctl -n net.ipv6.conf.${iface}.disable_ipv6 2>/dev/null)
+    
+    if [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "1" ]; then
+        V6_STATUS="${RED}已禁用${RESET}"
+    elif [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "0" ]; then
+        V6_STATUS="${YELLOW}已禁用(网卡冲突/残留)${RESET}"
+    else
+        local v6_addr=$(ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | grep -v "fe80" | awk '{print $2}' | head -n1)
+        if [ -z "$v6_addr" ]; then
+            V6_STATUS="${YELLOW}已开启(无公网IP)${RESET}"
+        else
+            if [ "$current_os" = "alpine" ]; then
+                V6_STATUS="${GREEN}已启用 (${RED}Alpine强制v6优先${GREEN})${RESET}"
+            elif [ -f /etc/gai.conf ] && grep -q "^[[:space:]]*precedence[[:space:]]\+::ffff:0:0/96[[:space:]]\+100" /etc/gai.conf; then
+                V6_STATUS="${GREEN}已启用 (${YELLOW}IPv4优先${GREEN})${RESET}"
+            else
+                V6_STATUS="${GREEN}已启用 (${YELLOW}默认IPv6优先${GREEN})${RESET}"
+            fi
+        fi
+    fi
+}
+
+fix_ubuntu_netplan() {
+    local iface="$1"
+    local action="$2"
+    
+    local plan_file=$(ls /etc/netplan/*.yaml 2>/dev/null | head -n1)
+    [ -z "$plan_file" ] && return
+    
+    if [ "$action" = "disable" ]; then
+        if grep -q "$iface:" "$plan_file"; then
+            cp "$plan_file" "${plan_file}.bak"
+            sed -i "/$iface:/,/^[[:space:]]*[a-zA-Z0-9_-]\+:/ {
+                s/[[:space:]]*dhcp6:.*/      dhcp6: false/
+                s/[[:space:]]*accept-ra:.*/      accept-ra: false/
+            }" "$plan_file"
+            
+            if ! grep -A 5 "$iface:" "$plan_file" | grep -q "dhcp6:"; then
+                sed -i "/$iface:/a \            dhcp6: false" "$plan_file"
+            fi
+        fi
+    else
+        if [ -f "${plan_file}.bak" ]; then
+            mv "${plan_file}.bak" "$plan_file"
+        else
+            sed -i "/$iface:/,/^[[:space:]]*[a-zA-Z0-9_-]\+:/ {
+                s/[[:space:]]*dhcp6:.*/      dhcp6: true/
+            }" "$plan_file"
+        fi
+    fi
+}
+
+check_deps
+os_type=$(get_os_type)
+
 while true; do
     clear
+    iface=$(detect_iface)
+    [ -z "$iface" ] && iface="未检测到网卡"
+    get_menu_status "$iface"
+
     echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}        ◈  系统重装管理菜单  ◈         ${RESET}"
+    echo -e "${GREEN}    ◈  IPv4 / IPv6 管理面板 (修复版)  ◈       ${RESET}"
     echo -e "${GREEN}=======================================${RESET}"
-
-    # 渲染动态分类菜单
-    last_category=""
-    for sys in "${systems[@]}"; do
-        
-        id=$(echo "$sys" | cut -d'|' -f1)
-        name=$(echo "$sys" | cut -d'|' -f2)
-        category=$(echo "$sys" | cut -d'|' -f3)
-        
-        if [ "$category" != "$last_category" ]; then
-            echo -e "${GREEN}--- ❖ $category 系统 ❖ ---${RESET}"
-            last_category="$category"
-        fi
-        
-        printf "${YELLOW}  %2d) %-22s${RESET}\n" "$id" "$name"
-    done
-    echo -e "${GREEN}---------------------------------------${RESET}"
-    echo -e "${RED}   0) 退出${RESET}"
+    echo -e "${GREEN} 当前系统  : ${YELLOW}${os_type}${RESET}"
+    echo -e "${GREEN} 活跃网卡  : ${YELLOW}${iface}${RESET}"
+    echo -e "${GREEN} IPv4 状态 : ${V4_STATUS}"
+    echo -e "${GREEN} IPv6 状态 : ${V6_STATUS}"
     echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}  1) 彻底禁用 IPv6 (Alpine系统选此项实现v4优先)${RESET}"
+    echo -e "${GREEN}  2) 开启恢复 IPv6${RESET}"
+    echo -e "${GREEN}  3) 设置 IPv4 优先 (仅限 Debian/Ubuntu/CentOS)${RESET}"
+    echo -e "${GREEN}  4) 恢复默认 IPv6 优先${RESET}"
+    echo -e "${GREEN}  5) 查看网卡IP与连通性${RESET}"
+    echo -e "${GREEN}  0) 退出${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    
+    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
+    read choice
 
-    echo -ne "${GREEN}请输入你想要重装的系统编号: ${RESET}"
-    read -r num_choice
-
-    if [ "$num_choice" = "0" ] || [ "$num_choice" = "00" ] || [ -z "$num_choice" ]; then
-        exit 0
-    fi
-
-    found=0
-    for sys in "${systems[@]}"; do
-        # 解构获取单行数据
-        id=$(echo "$sys" | cut -d'|' -f1)
-        
-        if [ "$num_choice" = "$id" ]; then
-            found=1
+    case "$choice" in
+        1)
+            sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
             
-            # 提取各项参数
-            name=$(echo "$sys" | cut -d'|' -f2)
-            category=$(echo "$sys" | cut -d'|' -f3)
-            dl=$(echo "$sys" | cut -d'|' -f4)
-            def_user=$(echo "$sys" | cut -d'|' -f5)
-            def_pass=$(echo "$sys" | cut -d'|' -f6)
-            def_port=$(echo "$sys" | cut -d'|' -f7)
-            cmd=$(echo "$sys" | cut -d'|' -f8)
-
-            echo -e "\n${RED}  💥 极度高危警告：${RESET}"
-            echo -e "${RED}您当前选择的操作将会彻底抹除整台服务器的硬盘，所有数据将灰飞烟灭！${RESET}"
-            echo -e "${YELLOW}请务必确认已经离线备份了您的所有核心资产数据！${RESET}"
-            echo ""
-            echo -ne "${YELLOW}确定要对这台机器重装，强制重装为 [ ${name} ] 吗？(y/n): ${RESET}"
-            read -r confirm
+            echo -e "${YELLOW}------ 💾 持久化配置选项 ------${RESET}"
+            echo -e "${GREEN}  1) 临时禁用（重启服务器后恢复IPv6）${RESET}"
+            echo -e "${GREEN}  2) 永久禁用${RESET}"
+            echo -ne "${YELLOW} 请选择禁用模式 [默认 1]: ${RESET}"
+            read perm_choice
             
-            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-                echo -e "${YELLOW}正在取消重装，返回主菜单...${RESET}"
-                sleep 1.5
-                break
-            fi
-
-            final_cmd="$cmd"
-
-            # 针对 bin456789 且非 Windows 系统的自定义凭据交互
-            if [ "$dl" = "bin456789" ] && [ "$category" != "Windows" ] && [[ "$name" != *"dd"* ]]; then
-                echo -e "\n${GREEN}--- 👤 配置新系统登录凭据 ---${RESET}"
-                
-                # 初始化/清空旧循环的残存变量，防止变量污染
-                custom_user="" custom_key="" custom_pass="" custom_port=""
-
-                read -r -p "请输入用户名 (直接回车默认: ${def_user}): " custom_user
-                custom_user=${custom_user:-$def_user}
-
-                echo -e "${YELLOW}提示: 密钥支持 公钥字符串、URL、github:用户名、gitlab:用户名${RESET}"
-                echo -e "${YELLOW}例如: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPYYSr25hwiXYTbVBlSzNNiYHl6vCD8CJWG70rTU+6qj2T root@localhost${RESET}"
-                read -r -p "请输入 SSH 公钥 (留空则代表使用密码登录): " custom_key
-
-                if [ -z "$custom_key" ]; then
-                    # 动态生成随机密码
-                    rand_pass=$(generate_random_password)
-                    read -r -p "请输入登录密码 (直接回车为您随机生成: ${rand_pass}): " custom_pass
-                    custom_pass=${custom_pass:-$rand_pass}
-                else
-                    echo -e "${GREEN}✓ 检测到您输入了公钥，系统将默认关闭密码登录，大幅增强安全性！${RESET}"
-                fi
-
-                read -r -p "请输入自定义 SSH 端口号 (直接回车默认: ${def_port}): " custom_port
-                custom_port=${custom_port:-$def_port}
-
-                # 动态科学拼接命令
-                if [ -n "$custom_key" ]; then
-                    final_cmd="$cmd --username \"$custom_user\" --ssh-key \"$custom_key\" --ssh-port \"$custom_port\""
-                else
-                    final_cmd="$cmd --username \"$custom_user\" --password \"$custom_pass\" --ssh-port \"$custom_port\""
+            if [ "$perm_choice" = "2" ]; then
+                # 修复：非函数内部不能用 local，改为普通变量
+                sysctl_file="/etc/sysctl.conf"
+                if [ "$os_type" = "alpine" ]; then
+                    sysctl_file="/etc/sysctl.d/local.conf"
+                    # 确保 Alpine 的 sysctl.d 目录存在
+                    mkdir -p /etc/sysctl.d
                 fi
                 
-                # 打印最终核对看板
-                echo -e "\n${YELLOW}=======================================${RESET}"
-                echo -e "${YELLOW}      📌 请截图或复制保存新系统凭据     ${RESET}"
-                echo -e "${YELLOW}=======================================${RESET}"
-                echo -e " 目标系统 : ${GREEN}${name}${RESET}"
-                echo -e " 用户名   : ${GREEN}${custom_user}${RESET}"
-                echo -e " SSH端口  : ${GREEN}${custom_port}${RESET}"
-                if [ -n "$custom_key" ]; then
-                    echo -e " 登录验证 : ${GREEN}仅限私钥证书配对登录${RESET}"
-                else
-                    echo -e " 初始密码 : ${RED}${custom_pass}${RESET}"
+                sed -i '/net.ipv6.conf./d' "$sysctl_file" 2>/dev/null
+                echo "net.ipv6.conf.all.disable_ipv6 = 1" >> "$sysctl_file"
+                echo "net.ipv6.conf.default.disable_ipv6 = 1" >> "$sysctl_file"
+                echo "net.ipv6.conf.${iface}.disable_ipv6 = 1" >> "$sysctl_file"
+                
+                # 修复：精准判断，避免 Alpine 错误触发 Ubuntu 逻辑
+                if [ "$os_type" = "ubuntu" ] && has_cmd netplan; then
+                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在重构 Netplan 配置文件防反弹...${RESET}"
+                    fix_ubuntu_netplan "$iface" "disable"
+                    netplan apply >/dev/null 2>&1
+                    sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
                 fi
-                echo -e "${YELLOW}=======================================${RESET}"
+                echo -e "\n${GREEN}✅ 已成功【永久锁定】禁用 IPv6，重构后绝不失效！${RESET}"
             else
-                # MollyLau 或 Windows 保持默认配置提示
-                echo -e "\n${YELLOW}📌 重装就绪凭据：用户名: ${GREEN}$def_user${RESET} | 初始密码: ${GREEN}$def_pass${RESET} | 远程端口: ${GREEN}$def_port${RESET}"
+                if [ -f /etc/sysctl.conf ]; then sed -i '/net.ipv6.conf./d' /etc/sysctl.conf; fi
+                if [ -f /etc/sysctl.d/local.conf ]; then sed -i '/net.ipv6.conf./d' /etc/sysctl.d/local.conf; fi
+                echo -e "\n${GREEN}✅ 已成功【临时禁用】IPv6（重启服务器后将自动恢复）。${RESET}"
+            fi
+            read -rp "按回车键返回菜单..."
+            ;;
+        2)
+            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=0 >/dev/null 2>&1
+            
+            [ -f /etc/sysctl.conf ] && sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
+            [ -f /etc/sysctl.d/local.conf ] && sed -i '/net.ipv6.conf./d' /etc/sysctl.d/local.conf
+            
+            if [ "$os_type" = "ubuntu" ]; then
+                if has_cmd netplan; then
+                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在通过 Netplan 恢复网络...${RESET}"
+                    fix_ubuntu_netplan "$iface" "enable"
+                    netplan apply >/dev/null 2>&1
+                    sleep 2
+                fi
+                echo -e "${GREEN}✅ 内核 IPv6 模块已平滑激活。${RESET}"
+                echo -e "${YELLOW}提示：Ubuntu 系统无需重启。如果仍未获取到 IPv6，请尝试断开重连或重启。${RESET}"
+                read -rp "按回车键返回菜单..."
+            else
+                echo -e "${GREEN}✅ 内核 IPv6 模块已激活。${RESET}"
+                echo -e "${YELLOW}当前系统为 [${os_type}]，通常需要重启系统才能正确获取公网 IPv6 地址。${RESET}"
+                read -rp "按回车键 [立即重启] 系统，或按 Ctrl+C 取消..."
+                reboot
+            fi
+            ;;
+        3)
+            if [ "$os_type" = "alpine" ]; then
+                echo -e "${RED}❌ 抱歉！Alpine Linux 使用的 musl libc 固件不支持 /etc/gai.conf 优先级策略。${RESET}"
+                echo -e "${YELLOW}💡 解决方案：请在主菜单选择【 1) 彻底禁用 IPv6 】来强制系统走 IPv4 通道。${RESET}"
+            else
+                echo -e "${YELLOW}⏳ 正在设置系统网络规则：IPv4 优先...${RESET}"
+                [ ! -f /etc/gai.conf ] && touch /etc/gai.conf
+                sed -i '/precedence ::ffff:0:0\/96/d' /etc/gai.conf
+                echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+                echo -e "${GREEN}✅ 设置成功！当前系统已调整为：【IPv4 优先】。${RESET}"
+                echo -e "${YELLOW}无需重启，已实时生效. ${RESET}"
+            fi
+            read -rp "按回车键返回菜单..."
+            ;;
+        4)
+            if [ "$os_type" = "alpine" ]; then
+                echo -e "${BLUE}ℹ️  Alpine 默认即为强制 IPv6 优先，无需配置。${RESET}"
+            else
+                echo -e "${YELLOW}⏳ 正在恢复系统默认规则：IPv6 优先...${RESET}"
+                [ -f /etc/gai.conf ] && sed -i '/^[[:space:]]*precedence[[:space:]]\+::ffff:0:0\/96[[:space:]]\+100/d' /etc/gai.conf
+                echo -e "${GREEN}✅ 恢复成功！当前系统已调整回：【默认 IPv6 优先】。${RESET}"
+                echo -e "${YELLOW}无需重启，已实时生效。${RESET}"
+            fi
+            read -rp "按回车键返回菜单..."
+            ;;
+        5)
+            echo -e "${GREEN}🌐 [1/3] 内核 IPv6 状态：${RESET}"
+            is_all_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+            is_iface_disabled=$(sysctl -n net.ipv6.conf.${iface}.disable_ipv6 2>/dev/null)
+            
+            if [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "1" ]; then
+                echo -e "${RED}❌ 内核与活跃网卡已完全禁用 IPv6${RESET}"
+            elif [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "0" ]; then
+                echo -e "${YELLOW}⚠️  警告：内核全局已禁，但活跃网卡 [${iface}] 被强行拉起！${RESET}"
+            else
+                echo -ne "${GREEN}✅ 内核及网卡已正常启用 IPv6 ${RESET}"
+                if [ "$os_type" = "alpine" ]; then
+                    echo -e "${RED}(Alpine固件：强锁IPv6优先)${RESET}"
+                elif [ -f /etc/gai.conf ] && grep -q "^[[:space:]]*precedence[[:space:]]\+::ffff:0:0/96[[:space:]]\+100" /etc/gai.conf; then
+                    echo -e "${YELLOW}(策略锁定：IPv4优先)${RESET}"
+                else
+                    echo -e "${BLUE}(策略锁定：IPv6优先)${RESET}"
+                fi
             fi
 
-            echo ""
-            read -r -p "👉 确认无误？按 [回车键] 开始自动下载重装内核文件 (Ctrl+C 取消)..." dummy
+            echo -e "\n${GREEN}📌 [2/3] 本地网卡 IP 地址分配情况：${RESET}"
+            echo -ne "${YELLOW}  IPv4 地址: ${RESET}"
+            ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' || echo "${RED}未检测到 IPv4${RESET}"
+            echo -ne "${YELLOW}  IPv6 地址: ${RESET}"
+            ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | awk '{print $2}' || echo "${RED}未检测到 IPv6${RESET}"
 
-            echo -e "\n${GREEN}🚀 正在从上游源安全拉取重装驱动内核...${RESET}"
-            download_script "$dl"
-            
-            echo -e "${GREEN}⚙️ 正在向内核注入重装指令参数...${RESET}"
-            eval "$final_cmd"
+            echo -e "\n${GREEN}🔎 [3/3] 公网双栈连通性及公网 IP 测试：${RESET}"
+            if has_cmd ping; then
+                ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv4 路由连通正常${RESET}" || echo -e "${RED}❌ IPv4 路由无法访问公网${RESET}"
+            fi
+            echo -n "    └─ 本机公网 IPv4: "
+            get_public_ip "-4"
 
-            echo -e "\n${GREEN}✔ 系统重装环境已就绪！${RESET}"
-            read -r -p "按 [回车键] 将立即强制重启服务器进行底层安装 (此时断开连接属于正常现象)..." dummy
-            
-            echo -e "${GREEN}>>> 正在重启...${RESET}"
-            reboot
-            exit 0
-        fi
-    done
+            has_v6=false
+            if has_cmd ping6; then ping6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true
+            elif has_cmd ping; then ping -6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true; fi
 
-    if [ "$found" -eq 0 ]; then
-        echo -e "${RED}❌ 错误：无效编号，请重新输入正确的系统选项！${RESET}"
-        sleep 1.5
-    fi
+            if [ "$has_v6" = "true" ] && [ "$is_iface_disabled" = "0" ]; then
+                echo -e "${GREEN}✅ IPv6 路由连通正常${RESET}"
+                echo -n "    └─ 本机公网 IPv6: "
+                get_public_ip "-6"
+            else
+                echo -e "${RED}❌ IPv6 无法访问外部网络 (内核已死锁或网络环境不支持)${RESET}"
+            fi
+            echo
+            read -rp "按回车键返回菜单..."
+            ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
+    esac
 done

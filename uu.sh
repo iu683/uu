@@ -1,250 +1,297 @@
 #!/bin/bash
-# ========================================
-# aria2 系统原生包管理器全能管理与下载工具
-# 完美适配 CF公网加速 + PT站纯净下载 双驱版
-# ========================================
+# =========================================================================
+# IPv4 / IPv6 管理面板
+# =========================================================================
+
+if [ "$EUID" -ne 0 ]; then
+    echo -e "\033[31m❌ 错误：请使用 root 权限运行此脚本！\033[0m"
+    exit 1
+fi
 
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
+BLUE="\033[34m"
 RESET="\033[0m"
 
-# 默认保存目录
-DOWNLOAD_DIR="/opt/aria2_downloads"
-mkdir -p "$DOWNLOAD_DIR"
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-PROMPT_CHOICE=$(echo -e "${GREEN}请输入选项: ${RESET}")
-PROMPT_CONTINUE=$(echo -e "${GREEN}按回车继续...${RESET}")
-
-get_aria_status() {
-    if command -v aria2c &>/dev/null; then
-        echo -e "${GREEN}运行 (已就绪)${RESET}"
+get_os_type() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$ID"
     else
-        echo -e "${RED}停止 (未安装)${RESET}"
+        echo "unknown"
     fi
 }
 
-get_aria_version() {
-    if command -v aria2c &>/dev/null; then
-        aria2c -v | head -n 1 | awk '{print $3}'
-    else
-        echo "无"
-    fi
-}
-
-install_or_update_aria2() {
-    if [ "$EUID" -ne 0 ] && [ -f /etc/debian_version ]; then
-        echo -e "${RED}错误：请使用 root 权限或 sudo 运行此脚本！${RESET}"
-        return
-    fi
-
-    echo -e "${GREEN}正在检测系统包管理器环境...${RESET}"
+install_pkg() {
+    local pkg="$1"
+    local os=$(get_os_type)
+    if has_cmd "$pkg"; then return; fi
     
-    if command -v apt &>/dev/null; then
-        echo -e "${GREEN}检测到基于 Debian/Ubuntu 的系统，正在使用 ${YELLOW}apt${GREEN} 进行部署...${RESET}"
-        apt update -y
-        apt install aria2 curl grep -y
-    elif command -v apk &>/dev/null; then
-        echo -e "${GREEN}检测到基于 Alpine Linux 的系统，正在使用 ${YELLOW}apk${GREEN} 进行部署...${RESET}"
-        apk update
-        apk add aria2 curl grep bash
-    else
-        echo -e "${RED}❌ 抱歉，当前系统既不是 APT 也不支持 APK，无法进行自动化安装。${RESET}"
-        return
-    fi
-
-    if command -v aria2c &>/dev/null; then
-        local NEW_VER=$(get_aria_version)
-        echo -e "${GREEN}🎉 aria2 v${NEW_VER} 原生包管理器版成功部署！${RESET}"
-    else
-        echo -e "${RED}❌ 安装失败，请检查您的软件源或网络连接！${RESET}"
-    fi
+    echo -e "${YELLOW}🔧 正在补全系统依赖: $pkg ...${RESET}"
+    case "$os" in
+        ubuntu|debian)
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y "$pkg" >/dev/null 2>&1
+            ;;
+        alpine)
+            apk add --no-cache "$pkg" >/dev/null 2>&1
+            ;;
+        centos|rhel|rocky|almalinux)
+            yum install -y "$pkg" >/dev/null 2>&1 || dnf install -y "$pkg" >/dev/null 2>&1
+            ;;
+    esac
 }
 
-uninstall_aria2() {
-    echo -e "${YELLOW}正在清理 aria2 相关程序...${RESET}"
-    if command -v apt &>/dev/null; then
-        apt remove aria2 -y
-        apt autoremove -y
-    elif command -v apk &>/dev/null; then
-        apk del aria2
-    else
-        rm -f /usr/local/bin/aria2c /usr/bin/aria2c
-    fi
-    echo -e "${GREEN}卸载完成。${RESET}"
+check_deps() {
+    local deps=(curl ip ping sysctl awk grep sed)
+    for cmd in "${deps[@]}"; do install_pkg "$cmd"; done
 }
 
-set_download_dir() {
-    read -e -p "$(echo -e "${GREEN}当前保存目录为: ${YELLOW}$DOWNLOAD_DIR${RESET}\n${GREEN}请输入新的保存路径: ${RESET}")" new_dir
-    if [ -n "$new_dir" ]; then
-        DOWNLOAD_DIR="$new_dir"
-        mkdir -p "$DOWNLOAD_DIR"
-        echo -e "${GREEN}保存路径已成功修改为: ${YELLOW}$DOWNLOAD_DIR${RESET}"
-    else
-        echo -e "${YELLOW}输入为空，路径保持不变。${RESET}"
-    fi
+detect_iface() {
+    ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|docker|veth|br-' | head -n1
 }
 
-check_aria_ready() {
-    if ! command -v aria2c &>/dev/null; then
-        echo -e "${RED}错误：请先选择选项 1 安装 aria2 才能使用下载功能！${RESET}"
-        return 1
-    fi
-    return 0
-}
+get_public_ip() {
+    local mode="$1"
+    local ip_res=""
+    local apis=("https://api.ip.sb/ip" "https://icanhazip.com" "https://v4.ident.me")
+    [ "$mode" = "-6" ] && apis=("https://api-ipv6.ip.sb/ip" "https://ipv6.icanhazip.com" "https://v6.ident.me")
 
-# 使用 Cloudflare CDN 官方格式化分流源，实现毫秒级拉取与无缝注入（公网BT专用）
-get_dynamic_trackers() {
-    echo -e "${GREEN}正在通过 Cloudflare CDN 全速获取精选 Tracker 列表...${RESET}" >&2
-    
-    local trackers=""
-    local cdn_urls=(
-        "https://cf.trackerslist.com/best_aria2.txt"
-        "https://cf.trackerslist.com/all_aria2.txt"
-    )
-    
-    for url in "${cdn_urls[@]}"; do
-        echo -e "${GREEN}正在连接直连加速节点: ${YELLOW}$url${RESET}" >&2
-        trackers=$(curl -L -s -k -m 4 "$url" | grep -v '^#' | tr -d '\r' | tr '\n' ',' | sed 's/,,*/,/g' | sed 's/^,//;s/,$//')
-        
-        if [ -n "$trackers" ] && [[ "$trackers" == *"http"* || "$trackers" == *"udp"* ]]; then
-            echo -e "${GREEN}🎉 Tracker 列表秒级同步成功！已成功注入 Aria2 核心引擎。${RESET}" >&2
-            echo "$trackers"
-            return
+    for url in "${apis[@]}"; do
+        ip_res=$(curl "$mode" -sL -A "Mozilla/5.0" --connect-timeout 3 "$url" 2>/dev/null | tr -d '\r\n[:space:]')
+        if [ -n "$ip_res" ] && [[ ! "$ip_res" == *"<"* && ! "$ip_res" == *"html"* ]]; then
+            echo "$ip_res"
+            return 0
         fi
     done
-
-    echo -e "${YELLOW}警告：Cloudflare 专线分流暂时不可用，转入原生多线程 DHT 去中心化寻源模式。${RESET}" >&2
-    echo ""
+    echo "未获取到公网IP"
+    return 1
 }
 
-# 4. 普通网络链接下载
-download_http() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 HTTP/HTTPS/FTP 下载链接: ${RESET}")" url
-    [ -z "$url" ] && return
-    aria2c -c -s 16 -x 16 -k 1M -d "$DOWNLOAD_DIR" "$url"
-}
+get_menu_status() {
+    local iface="$1"
+    local os_type=$(get_os_type)
+    local v4_addr=$(ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' | head -n1)
+    V4_STATUS=$( [ -z "$v4_addr" ] && echo -e "${RED}未启用${RESET}" || echo -e "${GREEN}已启用${RESET}" )
 
-# 5. 磁力链接下载 (Cloudflare 专线 Tracker + 128多线程加速)
-download_magnet() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 Magnet 磁力链接: ${RESET}")" magnet
-    [ -z "$magnet" ] && return
+    local is_all_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+    local is_iface_disabled=$(sysctl -n net.ipv6.conf.${iface}.disable_ipv6 2>/dev/null)
     
-    local trackers_arg=$(get_dynamic_trackers)
-    
-    aria2c --seed-time=0 \
-           --enable-dht=true \
-           --enable-peer-exchange=true \
-           --bt-max-peers=128 \
-           --max-connection-per-server=16 \
-           ${trackers_arg:+--bt-tracker="$trackers_arg"} \
-           -d "$DOWNLOAD_DIR" "$magnet"
-}
-
-# 6. 种子文件下载 (Cloudflare 专线 Tracker + 128多线程加速)
-download_torrent() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 .torrent 种子文件路径或下载链接: ${RESET}")" torrent
-    [ -z "$torrent" ] && return
-    
-    local trackers_arg=$(get_dynamic_trackers)
-    
-    aria2c --seed-time=0 \
-           --enable-dht=true \
-           --enable-peer-exchange=true \
-           --bt-max-peers=128 \
-           --max-connection-per-server=16 \
-           ${trackers_arg:+--bt-tracker="$trackers_arg"} \
-           -d "$DOWNLOAD_DIR" "$torrent"
-}
-
-# 7. PT站专属纯净下载通道 (不注入任何外部Tracker，遵循站点原生规则与私钥)
-download_pt_pure() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 PT站专属种子链接 或 .torrent路径: ${RESET}")" pt_target
-    [ -z "$pt_target" ] && return
-    
-    echo -e "${GREEN}正在启动 PT 纯净下载模式（不注入外源 Tracker，严格保护 Passkey 安全）...${RESET}"
-    
-    # PT 下载规范：不允许随便连接 DHT 和 PEX (Peer Exchange)，必须只连接种子内自带的私有 Tracker
-    aria2c --seed-time=0 \
-           --enable-dht=false \
-           --enable-peer-exchange=false \
-           -d "$DOWNLOAD_DIR" "$pt_target"
-}
-
-# 8. 批量文本链接下载
-download_batch_txt() {
-    check_aria_ready || return
-    echo -e "${GREEN}请连续输入需要下载的链接，每输完一个按一次回车。${RESET}"
-    echo -e "${GREEN}输入完毕后，输入英文字母 ${YELLOW}q${GREEN} 即可开始批量下载。${RESET}"
-    
-    local tmp_txt="/tmp/aria2_urls.txt"
-    > "$tmp_txt"
-    local count=1
-    while true; do
-        read -e -p "$(echo -e "${GREEN}输入第 [${YELLOW}$count${GREEN}] 个链接 (输入 q 开始): ${RESET}")" input_url
-        if [ "$input_url" = "q" ] || [ "$input_url" = "Q" ]; then break; fi
-        if [ -n "$input_url" ]; then
-            echo "$input_url" >> "$tmp_txt"
-            ((count++))
-        fi
-    done
-
-    if [ -s "$tmp_txt" ]; then
-        echo -e "${GREEN}正在启动批量下载...${RESET}"
-        aria2c -c -s 16 -x 16 -k 1M -d "$DOWNLOAD_DIR" -i "$tmp_txt"
+    if [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "1" ]; then
+        V6_STATUS="${RED}已禁用${RESET}"
+    elif [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "0" ]; then
+        V6_STATUS="${YELLOW}已禁用(网卡冲突/残留)${RESET}"
     else
-        echo -e "${YELLOW}未输入任何链接。${RESET}"
+        local v6_addr=$(ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | grep -v "fe80" | awk '{print $2}' | head -n1)
+        if [ -z "$v6_addr" ]; then
+            V6_STATUS="${YELLOW}已开启(无公网IP)${RESET}"
+        else
+            if [ "$os_type" = "alpine" ]; then
+                V6_STATUS="${GREEN}已启用 (${RED}Alpine强制v6优先${GREEN})${RESET}"
+            elif [ -f /etc/gai.conf ] && grep -q "^[[:space:]]*precedence[[:space:]]\+::ffff:0:0/96[[:space:]]\+100" /etc/gai.conf; then
+                V6_STATUS="${GREEN}已启用 (${YELLOW}IPv4优先${GREEN})${RESET}"
+            else
+                V6_STATUS="${GREEN}已启用 (${YELLOW}默认IPv6优先${GREEN})${RESET}"
+            fi
+        fi
     fi
-    rm -f "$tmp_txt"
 }
 
-# 主菜单
+fix_ubuntu_netplan() {
+    local iface="$1"
+    local action="$2"
+    
+    local plan_file=$(ls /etc/netplan/*.yaml 2>/dev/null | head -n1)
+    [ -z "$plan_file" ] && return
+    
+    if [ "$action" = "disable" ]; then
+        if grep -q "$iface:" "$plan_file"; then
+            cp "$plan_file" "${plan_file}.bak"
+            sed -i "/$iface:/,/^[[:space:]]*[a-zA-Z0-9_-]\+:/ {
+                s/[[:space:]]*dhcp6:.*/      dhcp6: false/
+                s/[[:space:]]*accept-ra:.*/      accept-ra: false/
+            }" "$plan_file"
+            
+            if ! grep -A 5 "$iface:" "$plan_file" | grep -q "dhcp6:"; then
+                sed -i "/$iface:/a \            dhcp6: false" "$plan_file"
+            fi
+        fi
+    else
+        if [ -f "${plan_file}.bak" ]; then
+            mv "${plan_file}.bak" "$plan_file"
+        else
+            sed -i "/$iface:/,/^[[:space:]]*[a-zA-Z0-9_-]\+:/ {
+                s/[[:space:]]*dhcp6:.*/      dhcp6: true/
+            }" "$plan_file"
+        fi
+    fi
+}
+
+check_deps
+os_type=$(get_os_type)
+
 while true; do
     clear
-    STATUS=$(get_aria_status)
-    VERSION=$(get_aria_version)
+    iface=$(detect_iface)
+    [ -z "$iface" ] && iface="未检测到网卡"
+    get_menu_status "$iface"
 
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}         aria2 智能系统原生部署与全能下载工具          ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN} 核心状态: $STATUS${RESET}"
-    echo -e "${GREEN} 当前版本: ${YELLOW}v$VERSION${RESET}"
-    echo -e "${GREEN} 保存目录: ${YELLOW}$DOWNLOAD_DIR${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN} [环境管理]${RESET}"
-    echo -e "${GREEN}  1. 安装/更新 aria2 (系统原生 APT / APK 智能识配)${RESET}"
-    echo -e "${GREEN}  2. 卸载 aria2 下载器${RESET}"
-    echo -e "${GREEN}  3. 修改当前自定义保存目录${RESET}"
-    echo -e "${GREEN}----------------------------------------------------${RESET}"
-    echo -e "${GREEN} [实用下载功能]${RESET}"
-    echo -e "${GREEN}  4. HTTP / HTTPS / FTP 常用链接下载 (16线程)${RESET}"
-    echo -e "${GREEN}  5. Magnet 磁力下载 (🔥CF专线Tracker+128多线程加速)${RESET}"
-    echo -e "${GREEN}  6. BitTorrent 种子下载 (🔥CF专线Tracker+128多线程加速)${RESET}"
-    echo -e "${YELLOW}  7. ⭐ [PT站专属] 种子/链接纯净下载 (严格保密Passkey)${RESET}"
-    echo -e "${GREEN}  8. 批量多链接交互下载${RESET}"
-    echo -e "${GREEN}----------------------------------------------------${RESET}"
-    echo -e "${GREEN}  0. 退出脚本${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}      ◈  IPv4 / IPv6 管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN} 当前系统  : ${YELLOW}${os_type}${RESET}"
+    echo -e "${GREEN} 活跃网卡  : ${YELLOW}${iface}${RESET}"
+    echo -e "${GREEN} IPv4 状态 : ${V4_STATUS}"
+    echo -e "${GREEN} IPv6 状态 : ${V6_STATUS}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}  1) 禁用 IPv6${RESET}"
+    echo -e "${GREEN}  2) 开启 IPv6${RESET}"
+    echo -e "${GREEN}  3) 设置 IPv4 优先${RESET}"
+    echo -e "${GREEN}  4) 恢复 IPv6 优先${RESET}"
+    echo -e "${GREEN}  5) 查看网卡IP与连通性${RESET}"
+    echo -e "${GREEN}  0) 退出${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
     
-    read -e -p "$PROMPT_CHOICE" choice
+    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
+    read choice
 
-    case $choice in
-        1) install_or_update_aria2 ;;
-        2) uninstall_aria2 ;;
-        3) set_download_dir ;;
-        4) download_http ;;
-        5) download_magnet ;;
-        6) download_torrent ;;
-        7) download_pt_pure ;;
-        8) download_batch_txt ;;
+    case "$choice" in
+        1)
+            sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
+            
+            echo -e "${YELLOW}------ 💾 持久化配置选项 ------${RESET}"
+            echo -e "${GREEN}  1) 临时禁用（重启服务器后恢复IPv6）${RESET}"
+            echo -e "${GREEN}  2) 永久禁用${RESET}"
+            echo -ne "${YELLOW} 请选择禁用模式 [默认 1]: ${RESET}"
+            read perm_choice
+            
+            if [ "$perm_choice" = "2" ]; then
+                # Alpine 的持久化配置文件是 /etc/sysctl.d/
+                local sysctl_file="/etc/sysctl.conf"
+                [ "$os_type" = "alpine" ] && sysctl_file="/etc/sysctl.d/local.conf"
+                
+                sed -i '/net.ipv6.conf./d' "$sysctl_file" 2>/dev/null
+                echo "net.ipv6.conf.all.disable_ipv6 = 1" >> "$sysctl_file"
+                echo "net.ipv6.conf.default.disable_ipv6 = 1" >> "$sysctl_file"
+                echo "net.ipv6.conf.${iface}.disable_ipv6 = 1" >> "$sysctl_file"
+                
+                if [ "$os_type" = "ubuntu" ] && has_cmd netplan; then
+                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在重构 Netplan 配置文件防反弹...${RESET}"
+                    fix_ubuntu_netplan "$iface" "disable"
+                    netplan apply >/dev/null 2>&1
+                    sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
+                fi
+                echo -e "\n${GREEN}✅ 已成功【永久锁定】禁用 IPv6，重构后绝不失效！${RESET}"
+            else
+                if [ -f /etc/sysctl.conf ]; then sed -i '/net.ipv6.conf./d' /etc/sysctl.conf; fi
+                if [ -f /etc/sysctl.d/local.conf ]; then sed -i '/net.ipv6.conf./d' /etc/sysctl.d/local.conf; fi
+                echo -e "\n${GREEN}✅ 已成功【临时禁用】IPv6（重启服务器后将自动恢复）。${RESET}"
+            fi
+            read -rp "按回车键返回菜单..."
+            ;;
+        2)
+            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=0 >/dev/null 2>&1
+            
+            [ -f /etc/sysctl.conf ] && sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
+            [ -f /etc/sysctl.d/local.conf ] && sed -i '/net.ipv6.conf./d' /etc/sysctl.d/local.conf
+            
+            if [ "$os_type" = "ubuntu" ]; then
+                if has_cmd netplan; then
+                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在通过 Netplan 恢复网络...${RESET}"
+                    fix_ubuntu_netplan "$iface" "enable"
+                    netplan apply >/dev/null 2>&1
+                    sleep 2
+                fi
+                echo -e "${GREEN}✅ 内核 IPv6 模块已平滑激活。${RESET}"
+                echo -e "${YELLOW}提示：Ubuntu 系统无需重启。如果仍未获取到 IPv6，请尝试断开重连或重启。${RESET}"
+                read -rp "按回车键返回菜单..."
+            else
+                echo -e "${GREEN}✅ 内核 IPv6 模块已激活。${RESET}"
+                echo -e "${YELLOW}当前系统为 [${os_type}]，通常需要重启系统才能正确获取公网 IPv6 地址。${RESET}"
+                read -rp "按回车键 [立即重启] 系统，或按 Ctrl+C 取消..."
+                reboot
+            fi
+            ;;
+        3)
+            if [ "$os_type" = "alpine" ]; then
+                echo -e "${RED}❌ 抱歉！Alpine Linux 使用的 musl libc 固件不支持 /etc/gai.conf 优先级策略。${RESET}"
+                echo -e "${YELLOW}💡 解决方案：请在主菜单选择【 1) 彻底禁用 IPv6 】来强制系统走 IPv4 通道。${RESET}"
+            else
+                echo -e "${YELLOW}⏳ 正在设置系统网络规则：IPv4 优先...${RESET}"
+                [ ! -f /etc/gai.conf ] && touch /etc/gai.conf
+                sed -i '/precedence ::ffff:0:0\/96/d' /etc/gai.conf
+                echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+                echo -e "${GREEN}✅ 设置成功！当前系统已调整为：【IPv4 优先】。${RESET}"
+                echo -e "${YELLOW}无需重启，已实时生效。${RESET}"
+            fi
+            read -rp "按回车键返回菜单..."
+            ;;
+        4)
+            if [ "$os_type" = "alpine" ]; then
+                echo -e "${BLUE}ℹ️  Alpine 默认即为强制 IPv6 优先，无需配置。${RESET}"
+            else
+                echo -e "${YELLOW}⏳ 正在恢复系统默认规则：IPv6 优先...${RESET}"
+                [ -f /etc/gai.conf ] && sed -i '/^[[:space:]]*precedence[[:space:]]\+::ffff:0:0\/96[[:space:]]\+100/d' /etc/gai.conf
+                echo -e "${GREEN}✅ 恢复成功！当前系统已调整回：【默认 IPv6 优先】。${RESET}"
+                echo -e "${YELLOW}无需重启，已实时生效。${RESET}"
+            fi
+            read -rp "按回车键返回菜单..."
+            ;;
+        5)
+            echo -e "${GREEN}🌐 [1/3] 内核 IPv6 状态：${RESET}"
+            is_all_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+            is_iface_disabled=$(sysctl -n net.ipv6.conf.${iface}.disable_ipv6 2>/dev/null)
+            
+            if [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "1" ]; then
+                echo -e "${RED}❌ 内核与活跃网卡已完全禁用 IPv6${RESET}"
+            elif [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "0" ]; then
+                echo -e "${YELLOW}⚠️  警告：内核全局已禁，但活跃网卡 [${iface}] 被强行拉起！${RESET}"
+            else
+                echo -ne "${GREEN}✅ 内核及网卡已正常启用 IPv6 ${RESET}"
+                if [ "$os_type" = "alpine" ]; then
+                    echo -e "${RED}(Alpine固件：强锁IPv6优先)${RESET}"
+                elif [ -f /etc/gai.conf ] && grep -q "^[[:space:]]*precedence[[:space:]]\+::ffff:0:0/96[[:space:]]\+100" /etc/gai.conf; then
+                    echo -e "${YELLOW}(策略锁定：IPv4优先)${RESET}"
+                else
+                    echo -e "${BLUE}(策略锁定：IPv6优先)${RESET}"
+                fi
+            fi
+
+            echo -e "\n${GREEN}📌 [2/3] 本地网卡 IP 地址分配情况：${RESET}"
+            echo -ne "${YELLOW}  IPv4 地址: ${RESET}"
+            ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' || echo "${RED}未检测到 IPv4${RESET}"
+            echo -ne "${YELLOW}  IPv6 地址: ${RESET}"
+            ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | awk '{print $2}' || echo "${RED}未检测到 IPv6${RESET}"
+
+            echo -e "\n${GREEN}🔎 [3/3] 公网双栈连通性及公网 IP 测试：${RESET}"
+            if has_cmd ping; then
+                ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv4 路由连通正常${RESET}" || echo -e "${RED}❌ IPv4 路由无法访问公网${RESET}"
+            fi
+            echo -n "    └─ 本机公网 IPv4: "
+            get_public_ip "-4"
+
+            has_v6=false
+            if has_cmd ping6; then ping6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true
+            elif has_cmd ping; then ping -6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true; fi
+
+            if [ "$has_v6" = "true" ] && [ "$is_iface_disabled" = "0" ]; then
+                echo -e "${GREEN}✅ IPv6 路由连通正常${RESET}"
+                echo -n "    └─ 本机公网 IPv6: "
+                get_public_ip "-6"
+            else
+                echo -e "${RED}❌ IPv6 无法访问外部网络 (内核已死锁或网络环境不支持)${RESET}"
+            fi
+            echo
+            read -rp "按回车键返回菜单..."
+            ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
+        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
     esac
-
-    echo
-    read -p "$PROMPT_CONTINUE"
 done

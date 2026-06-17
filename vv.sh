@@ -1,424 +1,294 @@
 #!/bin/bash
-# ========================================
-# aria2 系统原生包管理器全能管理与下载工具
-# 支持 Systemd (Ubuntu) / OpenRC (Alpine) 双保活
-# ========================================
+# =========================================================================
+# 一键系统重装脚本（跨平台极致兼容通用版）
+# 支持 Linux 全系列 + Windows 全系列
+# =========================================================================
 
+# 设置颜色
 GREEN="\033[32m"
-RED="\033[31m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
-CONFIG_DIR="/etc/aria2"
-CONFIG_FILE="$CONFIG_DIR/aria2.conf"
-DOWNLOAD_DIR="/opt/aria2_downloads"
-
-mkdir -p "$CONFIG_DIR"
-mkdir -p "$DOWNLOAD_DIR"
-
-PROMPT_CHOICE=$(echo -e "${GREEN}请输入选项: ${RESET}")
-PROMPT_CONTINUE=$(echo -e "${GREEN}按回车继续...${RESET}")
-
-get_aria_status() {
-    if command -v systemctl &>/dev/null && systemctl is-active aria2 &>/dev/null; then
-        echo -e "${GREEN}运行 (Systemd 守护中)${RESET}"
-    elif command -v rc-service &>/dev/null && rc-service aria2 status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}运行 (OpenRC 守护中)${RESET}"
-    elif pgrep aria2c &>/dev/null; then
-        echo -e "${GREEN}运行 (普通后台进程)${RESET}"
-    else
-        echo -e "${RED}停止 (未运行)${RESET}"
-    fi
-}
-
-get_aria_version() {
-    if command -v aria2c &>/dev/null; then
-        aria2c -v | head -n 1 | awk '{print $3}'
-    else
-        echo "无"
-    fi
-}
-
-get_current_token() {
-    if [ -f "$CONFIG_FILE" ]; then
-        grep "^rpc-secret=" "$CONFIG_FILE" | cut -d'=' -f2
-    else
-        echo "未生成"
-    fi
-}
-
-
-get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
+# 【核心修复】跨平台通用依赖检查（抛弃非标数组，完美兼容 Alpine sh）
+install_dependencies() {
+    local missing_deps=""
     
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
-    echo "127.0.0.1" && return 0
-}
-
-# 全自动化环境配置 + 双系统级后台驻留机制
-install_or_update_aria2() {
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}错误：请使用 root 权限或 sudo 运行此脚本！${RESET}"
-        return
-    fi
-
-    echo -e "${GREEN}正在检测系统包管理器环境并拉取主程序...${RESET}"
-    
-    local is_alpine=false
-    if command -v apt &>/dev/null; then
-        apt update -y
-        apt install aria2 curl grep wget -y
-    elif command -v apk &>/dev/null; then
-        apk update
-        apk add aria2 curl grep bash openrc
-        is_alpine=true
-    else
-        echo -e "${RED}❌ 抱歉，当前系统既不是 APT 也不支持 APK，无法进行自动化安装。${RESET}"
-        return
-    fi
-
-    if ! command -v aria2c &>/dev/null; then
-        echo -e "${RED}❌ 安装失败，请检查您的软件源或网络连接！${RESET}"
-        return
-    fi
-
-    # 1. 动态生成或继承安全密钥
-    local current_token=$(get_current_token)
-    if [ "$current_token" = "未生成" ] || [ -z "$current_token" ]; then
-        current_token=$(date +%s | sha256sum | base64 | head -c 16)
-    fi
-
-    # 2. 覆盖写入全局配置文件
-    cat <<EOF > "$CONFIG_FILE"
-dir=$DOWNLOAD_DIR
-continue=true
-max-concurrent-downloads=5
-max-connection-per-server=16
-min-split-size=10M
-split=10
-rpc-listen-port=6800
-enable-rpc=true
-rpc-allow-origin-all=true
-rpc-listen-all=true
-rpc-secret=$current_token
-file-allocation=none
-enable-dht=true
-enable-peer-exchange=true
-bt-max-peers=128
-seed-time=0
-EOF
-
-    # 3. 核心保活：智能判断初始化守护系统
-    if [ "$is_alpine" = true ] && command -v rc-service &>/dev/null; then
-        echo -e "${GREEN}检测到 Alpine 环境，正在注入 OpenRC 服务守护和保活脚本...${RESET}"
-        rc-service aria2 stop &>/dev/null
-        
-        # 编写 Alpine 标准的 OpenRC 服务脚本 (带 respawn 自动崩溃重启保活)
-        cat <<'EOF' > /etc/init.d/aria2
-#!/sbin/openrc-run
-
-description="Aria2 Download Utility"
-command="/usr/bin/aria2c"
-command_args="--conf-path=/etc/aria2/aria2.conf"
-command_background="yes"
-pidfile="/run/aria2.pid"
-
-# OpenRC 的核心保活配置：挂掉后自愈重启
-respawn_delay=5
-respawn_max=10
-
-depend() {
-    need net
-}
-EOF
-        chmod +x /etc/init.d/aria2
-        # 激活开机自启并立刻拉起
-        rc-update add aria2 default &>/dev/null
-        rc-service aria2 start
-    elif command -v systemctl &>/dev/null; then
-        echo -e "${GREEN}检测到 Debian/Ubuntu 环境，正在将 Aria2 挂载为 Systemd 服务...${RESET}"
-        systemctl stop aria2 &>/dev/null
-        
-        cat <<EOF > /etc/systemd/system/aria2.service
-[Unit]
-Description=Aria2 High Performance Download Utility
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/aria2c --conf-path=$CONFIG_FILE
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable aria2 &>/dev/null
-        systemctl start aria2
-    else
-        # 没有任何高级 init 系统的极简容器环境，用传统 nohup 兜底
-        pkill aria2c &>/dev/null
-        nohup aria2c --conf-path="$CONFIG_FILE" >/dev/null 2>&1 &
-    fi
-
-    # 4. 全自动输出 Web 联机配置凭证
-    local public_ip=$(get_public_ip)
-    local current_version=$(get_aria_version)
-
-    clear
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN} 🎉 Aria2 核心及原生系统守护服务 部署完成！       ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN} 软件版本: v$current_version${RESET}"
-    echo -e "${GREEN} 运行状态: $(get_aria_status)${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW} 👇 请直接将以下参数填入你的 AriaNg 或 WebUI 界面中: ${RESET}"
-    echo -e "${GREEN} 🌐 RPC 地址 (域名/IP) : ${RESET}${YELLOW}http://$public_ip:6800/jsonrpc${RESET}"
-    echo -e "${GREEN} 🔌 RPC 端口 (Port)    : ${RESET}${YELLOW}6800${RESET}"
-    echo -e "${GREEN} 🔐 RPC 密钥 (Token)   : ${RESET}${RED}$current_token${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-
-uninstall_aria2() {
-    echo -e "${YELLOW}正在清理 aria2 系统服务及程序...${RESET}"
-    if command -v rc-service &>/dev/null; then
-        rc-service aria2 stop &>/dev/null
-        rc-update del aria2 default &>/dev/null
-        rm -f /etc/init.d/aria2
-    elif command -v systemctl &>/dev/null; then
-        systemctl stop aria2 &>/dev/null
-        systemctl disable aria2 &>/dev/null
-        rm -f /etc/systemd/system/aria2.service
-        systemctl daemon-reload
-    fi
-    pkill aria2c &>/dev/null
-    
-    if command -v apt &>/dev/null; then
-        apt remove aria2 -y && apt autoremove -y
-    elif command -v apk &>/dev/null; then
-        apk del aria2
-    fi
-    rm -rf "$CONFIG_DIR"
-    echo -e "${GREEN}卸载清理完成。${RESET}"
-}
-
-show_rpc_credentials() {
-    local public_ip=$(curl -s -m 4 https://api.ipify.org || curl -s -m 4 https://ifconfig.me || echo "你的VPS公网IP")
-    local current_token=$(get_current_token)
-    
-    if [ "$current_token" = "未生成" ]; then
-        echo -e "${RED}未发现有效的配置文件，请先执行选项 1 安装/初始化环境！${RESET}"
-        return
-    fi
-    
-    clear
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}         Aria2 远程 Web 连接配置凭证查询               ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN} 🌐 RPC 地址 (域名/IP) : ${RESET}${YELLOW}http://$public_ip:6800/jsonrpc${RESET}"
-    echo -e "${GREEN} 🔌 RPC 端口 (Port)    : ${RESET}${YELLOW}6800${RESET}"
-    echo -e "${GREEN} 🔐 RPC 密钥 (Token)   : ${RESET}${RED}$current_token${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-
-
-set_download_dir() {
-    read -e -p "$(echo -e "${GREEN}当前保存目录为: ${YELLOW}$DOWNLOAD_DIR${RESET}\n${GREEN}请输入新的保存路径: ${RESET}")" new_dir
-    if [ -n "$new_dir" ]; then
-        DOWNLOAD_DIR="$new_dir"
-        mkdir -p "$DOWNLOAD_DIR"
-        echo -e "${GREEN}保存路径已成功修改为: ${YELLOW}$DOWNLOAD_DIR${RESET}"
-    else
-        echo -e "${YELLOW}输入为空，路径保持不变。${RESET}"
-    fi
-}
-
-check_aria_ready() {
-    if ! command -v aria2c &>/dev/null; then
-        echo -e "${RED}错误：请先选择选项 1 安装 aria2 才能使用下载功能！${RESET}"
-        return 1
-    fi
-    return 0
-}
-
-# 使用 Cloudflare CDN 官方格式化分流源，实现毫秒级拉取与无缝注入（公网BT专用）
-get_dynamic_trackers() {
-    echo -e "${GREEN}正在通过 Cloudflare CDN 全速获取精选 Tracker 列表...${RESET}" >&2
-    
-    local trackers=""
-    local cdn_urls=(
-        "https://cf.trackerslist.com/best_aria2.txt"
-        "https://cf.trackerslist.com/all_aria2.txt"
-    )
-    
-    for url in "${cdn_urls[@]}"; do
-        echo -e "${GREEN}正在连接直连加速节点: ${YELLOW}$url${RESET}" >&2
-        trackers=$(curl -L -s -k -m 4 "$url" | grep -v '^#' | tr -d '\r' | tr '\n' ',' | sed 's/,,*/,/g' | sed 's/^,//;s/,$//')
-        
-        if [ -n "$trackers" ] && [[ "$trackers" == *"http"* || "$trackers" == *"udp"* ]]; then
-            echo -e "${GREEN}🎉 Tracker 列表秒级同步成功！已成功注入 Aria2 核心引擎。${RESET}" >&2
-            echo "$trackers"
-            return
+    # 用最传统稳健的空格字符串替代数组
+    for dep in curl wget openssl; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            missing_deps="$missing_deps $dep"
         fi
     done
 
-    echo -e "${YELLOW}警告：Cloudflare 专线分流暂时不可用，转入原生多线程 DHT 去中心化寻源模式。${RESET}" >&2
-    echo ""
+    # 去除首尾空格
+    missing_deps=$(echo "$missing_deps" | sed 's/^ *//;s/ *$//')
+
+    if [ -z "$missing_deps" ]; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}🔧 发现缺失依赖: ${missing_deps}，正在自动安装...${RESET}"
+
+    # 识别包管理器并全自动打补丁
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache $missing_deps
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y && apt-get install -y $missing_deps
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y $missing_deps
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y $missing_deps
+    else
+        echo -e "${RED}❌ 错误: 未知系统包管理器，请手动安装 [ ${missing_deps} ] 后重试。${RESET}"
+        exit 1
+    fi
 }
 
-# 4. 普通网络链接下载
-download_http() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 HTTP/HTTPS/FTP 下载链接: ${RESET}")" url
-    [ -z "$url" ] && return
-    aria2c -c -s 16 -x 16 -k 1M -d "$DOWNLOAD_DIR" "$url"
+# 运行依赖检查
+install_dependencies
+
+# 随机密码生成函数（生成20位包含大小写字母和数字的随机密码）
+generate_random_password() {
+    if command -v openssl >/dev/null 2>&1; then
+        # 增加随机字节数至 15，确保 Base64 编码并过滤后足够截取 20 位
+        openssl rand -base64 15 | tr -d '+/' | cut -c1-20
+    else
+        # 直接修改截取长度为 20
+        tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 20
+    fi
 }
 
-# 5. 磁力链接下载 (Cloudflare 专线 Tracker + 128多线程加速)
-download_magnet() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 Magnet 磁力链接: ${RESET}")" magnet
-    [ -z "$magnet" ] && return
-    
-    local trackers_arg=$(get_dynamic_trackers)
-    
-    aria2c --seed-time=0 \
-           --enable-dht=true \
-           --enable-peer-exchange=true \
-           --bt-max-peers=128 \
-           --max-connection-per-server=16 \
-           ${trackers_arg:+--bt-tracker="$trackers_arg"} \
-           -d "$DOWNLOAD_DIR" "$magnet"
-}
+# GitHub 代理镜像列表（用传统的空格字符串替代非标数组，完美兼容 Alpine sh）
+# 第一个节点为空，代表优先尝试直连
+GITHUB_PROXIES="DIRECT https://v6.gh-proxy.org/ https://gh-proxy.com/ https://hub.glowp.xyz/ https://proxy.vvvv.ee/ https://ghproxy.lvedong.eu.org/"
 
-# 6. 种子文件下载 (Cloudflare 专线 Tracker + 128多线程加速)
-download_torrent() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 .torrent 种子文件路径或下载链接: ${RESET}")" torrent
-    [ -z "$torrent" ] && return
-    
-    local trackers_arg=$(get_dynamic_trackers)
-    
-    aria2c --seed-time=0 \
-           --enable-dht=true \
-           --enable-peer-exchange=true \
-           --bt-max-peers=128 \
-           --max-connection-per-server=16 \
-           ${trackers_arg:+--bt-tracker="$trackers_arg"} \
-           -d "$DOWNLOAD_DIR" "$torrent"
-}
+download_script() {
+    local type="$1"
+    local raw_url=""
+    local file_name=""
 
-# 7. PT站专属纯净下载通道 (不注入任何外部Tracker，遵循站点原生规则与私钥)
-download_pt_pure() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 PT站专属种子链接 或 .torrent路径: ${RESET}")" pt_target
-    [ -z "$pt_target" ] && return
-    
-    echo -e "${GREEN}正在启动 PT 纯净下载模式（不注入外源 Tracke）...${RESET}"
-    
-    # PT 下载规范：不允许随便连接 DHT 和 PEX (Peer Exchange)，必须只连接种子内自带的私有 Tracker
-    aria2c --seed-time=0 \
-           --enable-dht=false \
-           --enable-peer-exchange=false \
-           -d "$DOWNLOAD_DIR" "$pt_target"
-}
+    if [ "$type" = "MollyLau" ]; then
+        file_name="InstallNET.sh"
+        raw_url="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh"
+    else
+        file_name="reinstall.sh"
+        raw_url="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+    fi
 
-# 8. 批量文本链接下载
-download_batch_txt() {
-    check_aria_ready || return
-    echo -e "${GREEN}请连续输入需要下载的链接，每输完一个按一次回车。${RESET}"
-    echo -e "${GREEN}输入完毕后，输入英文字母 ${YELLOW}q${GREEN} 即可开始批量下载。${RESET}"
-    
-    local tmp_txt="/tmp/aria2_urls.txt"
-    > "$tmp_txt"
-    local count=1
-    while true; do
-        read -e -p "$(echo -e "${GREEN}输入第 [${YELLOW}$count${GREEN}] 个链接 (输入 q 开始): ${RESET}")" input_url
-        if [ "$input_url" = "q" ] || [ "$input_url" = "Q" ]; then break; fi
-        if [ -n "$input_url" ]; then
-            echo "$input_url" >> "$tmp_txt"
-            ((count++))
+    # 遍历空格分隔的代理字符串
+    for proxy in $GITHUB_PROXIES; do
+        local proxy_url=""
+        rm -f "$file_name"
+        
+        if [ "$proxy" = "DIRECT" ]; then
+            proxy_url="$raw_url"
+            echo -e "${YELLOW}📡 正在尝试直连下载...${RESET}"
+        else
+            proxy_url="${proxy}${raw_url}"
+            echo -e "${YELLOW}🔄 正在尝试代理节点: ${proxy}${RESET}"
+        fi
+
+        # 带有 3 秒超时限制的下载块，防止死节点卡网速
+        if command -v wget >/dev/null 2>&1; then
+            wget --no-check-certificate --timeout=3 --tries=1 -qO "$file_name" "$proxy_url" && chmod +x "$file_name"
+        else
+            if [ "$proxy" = "DIRECT" ]; then
+                curl -m 3 -sO "$proxy_url" && chmod +x "$file_name"
+            else
+                # 代理站通常有302重定向，curl 必须加 -L 顺着重定向下载
+                curl -m 3 -sL -o "$file_name" "$proxy_url" && chmod +x "$file_name"
+            fi
+        fi
+
+        # 严格验证：确保文件存在且大小大于 0 字节（防止把代理站的 404 报错网页抓下来）
+        if [ -f "$file_name" ] && [ -s "$file_name" ]; then
+            echo -e "${GREEN}✅ 下载成功！${RESET}"
+            return 0
         fi
     done
 
-    if [ -s "$tmp_txt" ]; then
-        echo -e "${GREEN}正在启动批量下载...${RESET}"
-        aria2c -c -s 16 -x 16 -k 1M -d "$DOWNLOAD_DIR" -i "$tmp_txt"
-    else
-        echo -e "${YELLOW}未输入任何链接。${RESET}"
-    fi
-    rm -f "$tmp_txt"
+    echo -e "${RED}❌ 错误: 尝试了所有渠道及代理节点，均无法下载重装内核！${RESET}"
+    exit 1
 }
 
-# 主菜单
+# 系统核心数据库表
+systems=(
+"1|debian13|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 13"
+"2|debian12|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 12"
+"3|debian11|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 11"
+"4|debian10|Debian|bin456789|root|123@@@|22|bash reinstall.sh debian 10"
+"5|ubuntu26.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 26.04"
+"6|ubuntu24.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 24.04"
+"7|ubuntu22.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 22.04"
+"8|ubuntu20.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 20.04"
+"9|ubuntu18.04|Ubuntu|bin456789|root|123@@@|22|bash reinstall.sh ubuntu 18.04"
+"10|Alpine3.24|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.24"
+"11|Alpine3.23|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.23"
+"12|Alpine3.22|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.22"
+"13|Alpine3.21|Alpine|bin456789|root|123@@@|22|bash reinstall.sh alpine 3.21"
+"14|AlpineEdge|Alpine|MollyLau|root|LeitboGi0ro|22|bash InstallNET.sh -alpine"
+"15|rocky10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky"
+"16|rocky9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh rocky 9"
+"17|alma10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux"
+"18|alma9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh almalinux 9"
+"19|oracle10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle"
+"20|oracle9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh oracle 9"
+"21|fedora44|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 44"
+"22|fedora43|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh fedora 43"
+"23|centos10|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 10"
+"24|centos9|RedHat系|bin456789|root|123@@@|22|bash reinstall.sh centos 9"
+"25|arch|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh arch"
+"26|kali|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh kali"
+"27|openeuler|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh openeuler"
+"28|opensuseTumbleweed|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh opensuse"
+"29|fnos飞牛公测版|其他Linux|bin456789|root|123@@@|22|bash reinstall.sh fnos"
+"30|windows11|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 11 -lang cn"
+"31|windows10|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 10 -lang cn"
+"32|windows7|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh windows --iso=\"https://download.testip.xyz/windows/cn_windows_7_professional_with_sp1_vl_build_x64_dvd_u_677816.iso\" --image-name='Windows 7 PROFESSIONAL'"
+"33|windowsServer2025|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2025 -lang cn"
+"34|windowsServer2022|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2022 -lang cn"
+"35|windowsServer2019|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2019 -lang cn"
+"36|windowsServer2016|Windows|MollyLau|Administrator|Teddysun.com|3389|bash InstallNET.sh -windows 2016 -lang cn"
+"37|windows11ARM|Windows|bin456789|Administrator|123@@@|3389|bash reinstall.sh dd --img https://r2.hotdog.eu.org/win11-arm-with-pagefile-15g.xz"
+)
+
+# 主循环面板
 while true; do
     clear
-    STATUS=$(get_aria_status)
-    VERSION=$(get_aria_version)
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}        ◈  系统重装管理菜单  ◈         ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
 
-    echo -e "${GREEN}==================================${RESET}"
-    echo -e "${GREEN}     ◈  aria2 全能下载工具  ◈     ${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
-    echo -e "${GREEN} 核心状态: $STATUS${RESET}"
-    echo -e "${GREEN} 当前版本: ${YELLOW}v$VERSION${RESET}"
-    echo -e "${GREEN} 保存目录: ${YELLOW}$DOWNLOAD_DIR${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
-    echo -e "${YELLOW} [环境管理]${RESET}"
-    echo -e "${GREEN}  1. 安装 aria2 ${RESET}"
-    echo -e "${GREEN}  2. 卸载 aria2${RESET}"
-    echo -e "${GREEN}  3. 修改当前自定义保存目录${RESET}"
-    echo -e "${GREEN}  4. 显示当前外部 Web(AriaNg)连接所需的 RPC 凭证${RESET}"
-    echo -e "${GREEN}----------------------------------${RESET}"
-    echo -e "${YELLOW} [下载功能]${RESET}"
-    echo -e "${GREEN}  5. HTTP / HTTPS / FTP 常用链接下载 (16线程)${RESET}"
-    echo -e "${GREEN}  6. Magnet磁力下载(Tracker+128多线程加速)${RESET}"
-    echo -e "${GREEN}  7. BitTorrent种子下载(Tracker+128多线程加速)${RESET}"
-    echo -e "${GREEN}  8. [PT站专属]种子/链接下载${RESET}"
-    echo -e "${GREEN}  9. 批量多链接交互下载${RESET}"
-    echo -e "${GREEN}----------------------------------${RESET}"
-    echo -e "${GREEN}  0. 退出${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
-    
-    read -e -p "$PROMPT_CHOICE" choice
+    # 渲染动态分类菜单
+    last_category=""
+    for sys in "${systems[@]}"; do
+        
+        id=$(echo "$sys" | cut -d'|' -f1)
+        name=$(echo "$sys" | cut -d'|' -f2)
+        category=$(echo "$sys" | cut -d'|' -f3)
+        
+        if [ "$category" != "$last_category" ]; then
+            echo -e "${GREEN}--- ❖ $category 系统 ❖ ---${RESET}"
+            last_category="$category"
+        fi
+        
+        printf "${YELLOW}  %2d) %-22s${RESET}\n" "$id" "$name"
+    done
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${RED}   0) 退出${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
 
-    case $choice in
-        1) install_or_update_aria2 ;;
-        2) uninstall_aria2 ;;
-        3) set_download_dir ;;
-        4) show_rpc_credentials ;;
-        5) download_http ;;
-        6) download_magnet ;;
-        7) download_torrent ;;
-        8) download_pt_pure ;;
-        9) download_batch_txt ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
-    esac
+    echo -ne "${GREEN}请输入你想要重装的系统编号: ${RESET}"
+    read -r num_choice
 
-    echo
-    read -p "$PROMPT_CONTINUE"
+    if [ "$num_choice" = "0" ] || [ "$num_choice" = "00" ] || [ -z "$num_choice" ]; then
+        exit 0
+    fi
+
+    found=0
+    for sys in "${systems[@]}"; do
+        # 解构获取单行数据
+        id=$(echo "$sys" | cut -d'|' -f1)
+        
+        if [ "$num_choice" = "$id" ]; then
+            found=1
+            
+            # 提取各项参数
+            name=$(echo "$sys" | cut -d'|' -f2)
+            category=$(echo "$sys" | cut -d'|' -f3)
+            dl=$(echo "$sys" | cut -d'|' -f4)
+            def_user=$(echo "$sys" | cut -d'|' -f5)
+            def_pass=$(echo "$sys" | cut -d'|' -f6)
+            def_port=$(echo "$sys" | cut -d'|' -f7)
+            cmd=$(echo "$sys" | cut -d'|' -f8)
+
+            echo -e "\n${RED}  💥 极度高危警告：${RESET}"
+            echo -e "${RED}您当前选择的操作将会彻底抹除整台服务器的硬盘，所有数据将灰飞烟灭！${RESET}"
+            echo -e "${YELLOW}请务必确认已经离线备份了您的所有核心资产数据！${RESET}"
+            echo ""
+            echo -ne "${YELLOW}确定要对这台机器重装，强制重装为 [ ${name} ] 吗？(y/n): ${RESET}"
+            read -r confirm
+            
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo -e "${YELLOW}正在取消重装，返回主菜单...${RESET}"
+                sleep 1.5
+                break
+            fi
+
+            final_cmd="$cmd"
+
+            # 针对 bin456789 且非 Windows 系统的自定义凭据交互
+            if [ "$dl" = "bin456789" ] && [ "$category" != "Windows" ] && [[ "$name" != *"dd"* ]]; then
+                echo -e "\n${GREEN}--- 👤 配置新系统登录凭据 ---${RESET}"
+                
+                # 初始化/清空旧循环的残存变量，防止变量污染
+                custom_user="" custom_key="" custom_pass="" custom_port=""
+
+                read -r -p "请输入用户名 (直接回车默认: ${def_user}): " custom_user
+                custom_user=${custom_user:-$def_user}
+
+                echo -e "${YELLOW}提示: 密钥支持 公钥字符串、URL、github:用户名、gitlab:用户名${RESET}"
+                echo -e "${YELLOW}例如: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPYYSr25hwiXYTbVBlSzNNiYHl6vCD8CJWG70rTU+6qj2T root@localhost${RESET}"
+                read -r -p "请输入 SSH 公钥 (留空则代表使用密码登录): " custom_key
+
+                if [ -z "$custom_key" ]; then
+                    # 动态生成随机密码
+                    rand_pass=$(generate_random_password)
+                    read -r -p "请输入登录密码 (直接回车为您随机生成: ${rand_pass}): " custom_pass
+                    custom_pass=${custom_pass:-$rand_pass}
+                else
+                    echo -e "${GREEN}✓ 检测到您输入了公钥，系统将默认关闭密码登录，大幅增强安全性！${RESET}"
+                fi
+
+                read -r -p "请输入自定义 SSH 端口号 (直接回车默认: ${def_port}): " custom_port
+                custom_port=${custom_port:-$def_port}
+
+                # 动态科学拼接命令
+                if [ -n "$custom_key" ]; then
+                    final_cmd="$cmd --username \"$custom_user\" --ssh-key \"$custom_key\" --ssh-port \"$custom_port\""
+                else
+                    final_cmd="$cmd --username \"$custom_user\" --password \"$custom_pass\" --ssh-port \"$custom_port\""
+                fi
+                
+                # 打印最终核对看板
+                echo -e "\n${YELLOW}=======================================${RESET}"
+                echo -e "${YELLOW}      📌 请截图或复制保存新系统凭据     ${RESET}"
+                echo -e "${YELLOW}=======================================${RESET}"
+                echo -e " 目标系统 : ${GREEN}${name}${RESET}"
+                echo -e " 用户名   : ${GREEN}${custom_user}${RESET}"
+                echo -e " SSH端口  : ${GREEN}${custom_port}${RESET}"
+                if [ -n "$custom_key" ]; then
+                    echo -e " 登录验证 : ${GREEN}仅限私钥证书配对登录${RESET}"
+                else
+                    echo -e " 初始密码 : ${RED}${custom_pass}${RESET}"
+                fi
+                echo -e "${YELLOW}=======================================${RESET}"
+            else
+                # MollyLau 或 Windows 保持默认配置提示
+                echo -e "\n${YELLOW}📌 重装就绪凭据：用户名: ${GREEN}$def_user${RESET} | 初始密码: ${GREEN}$def_pass${RESET} | 远程端口: ${GREEN}$def_port${RESET}"
+            fi
+
+            echo ""
+            read -r -p "👉 确认无误？按 [回车键] 开始自动下载重装内核文件 (Ctrl+C 取消)..." dummy
+
+            echo -e "\n${GREEN}🚀 正在从上游源安全拉取重装驱动内核...${RESET}"
+            download_script "$dl"
+            
+            echo -e "${GREEN}⚙️ 正在向内核注入重装指令参数...${RESET}"
+            eval "$final_cmd"
+
+            echo -e "\n${GREEN}✔ 系统重装环境已就绪！${RESET}"
+            read -r -p "按 [回车键] 将立即强制重启服务器进行底层安装 (此时断开连接属于正常现象)..." dummy
+            
+            echo -e "${GREEN}>>> 正在重启...${RESET}"
+            reboot
+            exit 0
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo -e "${RED}❌ 错误：无效编号，请重新输入正确的系统选项！${RESET}"
+        sleep 1.5
+    fi
 done

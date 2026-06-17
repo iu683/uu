@@ -1,528 +1,512 @@
-#!/bin/bash
-# ========================================
-# aria2 系统原生包管理器全能管理与下载工具
-# 支持 Systemd (Ubuntu) / OpenRC (Alpine) 双保活
-# ========================================
+#!/bin/sh
+set -e
 
+# =====================================================================
+# Snell v6 (双栈+DNS增强+工作模式+自定义监听) Alpine OpenRC 独立管理脚本
+# =====================================================================
+
+# ================== 颜色与输出函数 ==================
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-CONFIG_DIR="/etc/aria2"
-CONFIG_FILE="$CONFIG_DIR/aria2.conf"
-DOWNLOAD_DIR="/opt/aria2_downloads"
+_ok()   { echo -e "${GREEN}[OK] $1${RESET}"; }
+_warn() { echo -e "${YELLOW}[WARN] $1${RESET}"; }
+_err()  { echo -e "${RED}[ERROR] $1${RESET}"; return 1; }
+_info() { echo -e "${GREEN}[INFO] $1${RESET}"; }
 
-mkdir -p "$CONFIG_DIR"
-mkdir -p "$DOWNLOAD_DIR"
+# ================== 变量 (已全部加上 v6 后缀独立化) ==================
+SNELL_DIR="/etc/snellv6"
+SNELL_CONFIG="$SNELL_DIR/snell-server-v6.conf"
+SNELL_RC_SERVICE="/etc/init.d/snellv6"
+SNELL_LOG="/var/log/snellv6.log"
+LOG_FILE="/var/log/snellv6_manager.log"
+SNELL_USER="snellv6"
 
-PROMPT_CHOICE=$(echo -e "${GREEN}请输入选项: ${RESET}")
-PROMPT_CONTINUE=$(echo -e "${GREEN}按回车继续...${RESET}")
+# Snell v6 默认保底版本号
+SNELL_DEFAULT_VERSION="6.0.0b3"
 
-get_aria_status() {
-    if command -v systemctl &>/dev/null && systemctl is-active aria2 &>/dev/null; then
-        echo -e "${GREEN}运行 (Systemd 守护中)${RESET}"
-    elif command -v rc-service &>/dev/null && rc-service aria2 status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}运行 (OpenRC 守护中)${RESET}"
-    elif pgrep aria2c &>/dev/null; then
-        echo -e "${GREEN}运行 (普通后台进程)${RESET}"
-    else
-        echo -e "${RED}停止 (未运行)${RESET}"
-    fi
-}
-
-get_aria_version() {
-    if command -v aria2c &>/dev/null; then
-        aria2c -v | head -n 1 | awk '{print $3}'
-    else
-        echo "无"
-    fi
-}
-
-get_config_value() {
-    local key=$1
-    if [ -f "$CONFIG_FILE" ]; then
-        grep "^${key}=" "$CONFIG_FILE" | cut -d'=' -f2
-    else
-        echo ""
-    fi
+# ================== 工具函数 ==================
+create_user() {
+    # 建立独立的系统用户，避免权限交叉
+    id -u "$SNELL_USER" >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin "$SNELL_USER" 2>/dev/null || true
 }
 
 get_public_ip() {
-    local mode=${1:-"auto"} 
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
         done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
         done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
+    done
+    echo "你的服务器IP"
 }
 
-# 平滑重启系统守护服务
-restart_aria_service() {
-    if command -v rc-service &>/dev/null && [ -f /etc/init.d/aria2 ]; then
-        rc-service aria2 restart
-    elif command -v systemctl &>/dev/null && [ -f /etc/systemd/system/aria2.service ]; then
-        systemctl daemon-reload
-        systemctl restart aria2
-    else
-        pkill aria2c &>/dev/null
-        nohup aria2c --conf-path="$CONFIG_FILE" >/dev/null 2>&1 &
-    fi
-}
-
-# 核心渲染：写入配置文件
-write_aria_config() {
-    local path=$1
-    local port=$2
-    local token=$3
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$path"
-
-    cat <<EOF > "$CONFIG_FILE"
-dir=$path
-continue=true
-max-concurrent-downloads=5
-max-connection-per-server=16
-min-split-size=10M
-split=10
-rpc-listen-port=$port
-enable-rpc=true
-rpc-allow-origin-all=true
-rpc-listen-all=true
-rpc-secret=$token
-file-allocation=none
-enable-dht=true
-enable-peer-exchange=true
-bt-max-peers=128
-seed-time=0
-EOF
-}
-
-# 全自动化环境配置 + 双系统级后台驻留机制
-install_or_update_aria2() {
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}错误：请使用 root 权限或 sudo 运行此脚本！${RESET}"
-        return
-    fi
-
-    echo -e "${GREEN}正在检测系统包管理器环境并拉取主程序...${RESET}"
-    
-    local is_alpine=false
-    if command -v apt &>/dev/null; then
-        apt update -y
-        apt install aria2 curl grep wget -y
-    elif command -v apk &>/dev/null; then
-        apk update
-        apk add aria2 curl grep bash openrc
-        is_alpine=true
-    else
-        echo -e "${RED}❌ 抱歉，当前系统既不是 APT 也不支持 APK，无法进行自动化安装。${RESET}"
-        return
-    fi
-
-    if ! command -v aria2c &>/dev/null; then
-        echo -e "${RED}❌ 安装失败，请检查您的软件源或网络连接！${RESET}"
-        return
-    fi
-
-    # 1. 交互式自定义配置参数
-    echo -e "\n${YELLOW}>>> 开始初始化 Aria2 参数配置 (直接回车可使用推荐默认值)${RESET}"
-    
-    # 端口自定义
-    read -e -p "$(echo -e "${GREEN}请输入 RPC 监听端口 [默认 6800]: ${RESET}")" input_port
-    local current_port=${input_port:-6800}
-
-    # 密码自定义
-    local default_token=$(date +%s | sha256sum | base64 | head -c 16)
-    read -e -p "$(echo -e "${GREEN}请输入 RPC 密钥(Token) [默认随机生成 ${RED}${default_token}${GREEN}]: ${RESET}")" input_token
-    local current_token=${input_token:-$default_token}
-
-    # 2. 写入全局配置文件
-    write_aria_config "$DOWNLOAD_DIR" "$current_port" "$current_token"
-
-    # 3. 核心保活：智能判断初始化守护系统
-    if [ "$is_alpine" = true ] && command -v rc-service &>/dev/null; then
-        echo -e "${GREEN}检测到 Alpine 环境，正在注入 OpenRC 服务守护...${RESET}"
-        rc-service aria2 stop &>/dev/null
-        
-        cat <<'EOF' > /etc/init.d/aria2
-#!/sbin/openrc-run
-description="Aria2 Download Utility"
-command="/usr/bin/aria2c"
-command_args="--conf-path=/etc/aria2/aria2.conf"
-command_background="yes"
-pidfile="/run/aria2.pid"
-respawn_delay=5
-respawn_max=10
-depend() {
-    need net
-}
-EOF
-        chmod +x /etc/init.d/aria2
-        rc-update add aria2 default &>/dev/null
-        rc-service aria2 start
-    elif command -v systemctl &>/dev/null; then
-        echo -e "${GREEN}检测到 Debian/Ubuntu 环境，正在将 Aria2 挂载为 Systemd 服务...${RESET}"
-        systemctl stop aria2 &>/dev/null
-        
-        cat <<EOF > /etc/systemd/system/aria2.service
-[Unit]
-Description=Aria2 High Performance Download Utility
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/aria2c --conf-path=$CONFIG_FILE
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable aria2 &>/dev/null
-        systemctl start aria2
-    else
-        pkill aria2c &>/dev/null
-        nohup aria2c --conf-path="$CONFIG_FILE" >/dev/null 2>&1 &
-    fi
-
-    # 4. 输出 Web 联机凭证
-    show_rpc_credentials
-}
-
-uninstall_aria2() {
-    echo -e "${YELLOW}正在清理 aria2 系统服务及程序...${RESET}"
-    if command -v rc-service &>/dev/null; then
-        rc-service aria2 stop &>/dev/null
-        rc-update del aria2 default &>/dev/null
-        rm -f /etc/init.d/aria2
-    elif command -v systemctl &>/dev/null; then
-        systemctl stop aria2 &>/dev/null
-        systemctl disable aria2 &>/dev/null
-        rm -f /etc/systemd/system/aria2.service
-        systemctl daemon-reload
-    fi
-    pkill aria2c &>/dev/null
-    
-    if command -v apt &>/dev/null; then
-        apt remove aria2 -y && apt autoremove -y
-    elif command -v apk &>/dev/null; then
-        apk del aria2
-    fi
-    rm -rf "$CONFIG_DIR"
-    echo -e "${GREEN}卸载清理完成。${RESET}"
-}
-
-show_rpc_credentials() {
-    local current_token=$(get_config_value "rpc-secret")
-    local current_port=$(get_config_value "rpc-listen-port")
-    
-    if [ -z "$current_token" ]; then
-        echo -e "${RED}未发现有效的配置文件，请先执行选项 1 安装/初始化环境！${RESET}"
-        return
-    fi
-    
-    local public_ip=$(get_public_ip)
-    
-    clear
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}           Aria2 远程 Web 连接配置凭证查询           ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN} 🌐 RPC 地址 (域名/IP) : ${RESET}${YELLOW}http://$public_ip:$current_port/jsonrpc${RESET}"
-    echo -e "${GREEN} 🔌 RPC 端口 (Port)    : ${RESET}${YELLOW}$current_port${RESET}"
-    echo -e "${GREEN} 🔐 RPC 密钥 (Token)   : ${RESET}${RED}$current_token${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW} 👇 提示: 如果公网连接失败，请确保云服务器控制台安全组已放行 TCP 端口: $current_port${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-
-# 独立菜单功能：在线修改核心配置
-modify_aria_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}错误：配置文件不存在，请先执行选项 1 安装并初始化服务！${RESET}"
-        return
-    fi
-
-    local old_dir=$(get_config_value "dir")
-    local old_port=$(get_config_value "rpc-listen-port")
-    local old_token=$(get_config_value "rpc-secret")
-
-    clear
-    echo -e "${YELLOW}==================================${RESET}"
-    echo -e "${YELLOW}       在线修改 Aria2 核心配置       ${RESET}"
-    echo -e "${YELLOW}==================================${RESET}"
-    echo -e "当前保存目录: ${GREEN}$old_dir${RESET}"
-    echo -e "当前 RPC 端口: ${GREEN}$old_port${RESET}"
-    echo -e "当前 RPC 密钥: ${GREEN}$old_token${RESET}"
-    echo -e "${YELLOW}----------------------------------${RESET}"
-
-    # 1. 修改路径
-    read -e -p "$(echo -e "${GREEN}1. 输入新保存路径 (回车保持不变): ${RESET}")" new_dir
-    [ -n "$new_dir" ] && old_dir="$new_dir" && mkdir -p "$old_dir"
-
-    # 2. 修改端口
-    read -e -p "$(echo -e "${GREEN}2. 输入新 RPC 端口 (回车保持不变): ${RESET}")" new_port
-    [ -n "$new_port" ] && old_port="$new_port"
-
-    # 3. 修改 Token
-    read -e -p "$(echo -e "${GREEN}3. 输入新 RPC 密钥 (回车保持不变): ${RESET}")" new_token
-    [ -n "$new_token" ] && old_token="$new_token"
-
-    # 更新全局变量防止主菜单显示滞后
-    DOWNLOAD_DIR="$old_dir"
-
-    # 重新写入并重启服务
-    write_aria_config "$old_dir" "$old_port" "$old_token"
-    echo -e "${YELLOW}正在平滑应用新配置并重启守护进程...${RESET}"
-    restart_aria_service
-    
-    echo -e "${GREEN}🎉 配置修改成功并已立即生效！${RESET}"
-    show_rpc_credentials
-}
-
-check_aria_ready() {
-    if ! command -v aria2c &>/dev/null; then
-        echo -e "${RED}错误：请先选择选项 1 安装 aria2 才能使用下载功能！${RESET}"
+check_port() {
+    if netstat -tln | grep -q ":$1 "; then
+        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
         return 1
     fi
-    return 0
 }
 
-get_dynamic_trackers() {
-    echo -e "${GREEN}正在通过 Cloudflare CDN 全速获取精选 Tracker 列表...${RESET}" >&2
-    local trackers=""
-    local cdn_urls=(
-        "https://cf.trackerslist.com/best_aria2.txt"
-        "https://cf.trackerslist.com/all_aria2.txt"
-    )
-    for url in "${cdn_urls[@]}"; do
-        echo -e "${GREEN}正在连接直连加速节点: ${YELLOW}$url${RESET}" >&2
-        trackers=$(curl -L -s -k -m 4 "$url" | grep -v '^#' | tr -d '\r' | tr '\n' ',' | sed 's/,,*/,/g' | sed 's/^,//;s/,$//')
-        if [ -n "$trackers" ] && [[ "$trackers" == *"http"* || "$trackers" == *"udp"* ]]; then
-            echo -e "${GREEN}🎉 Tracker 列表秒级同步成功！已成功注入 Aria2 核心引擎。${RESET}" >&2
-            echo "$trackers"
-            return
-        fi
-    done
-    echo -e "${YELLOW}警告：Cloudflare 专线分流暂时不可用，转入原生多线程 DHT 去中心化寻源模式。${RESET}" >&2
-    echo ""
+random_key() {
+    cat /dev/urandom | tr -dc A-Za-z0-9 | head -c 16
 }
 
-download_http() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 HTTP/HTTPS/FTP 下载链接: ${RESET}")" url
-    [ -z "$url" ] && return
-    aria2c -c -s 16 -x 16 -k 1M -d "$DOWNLOAD_DIR" "$url"
+random_port() {
+    awk 'BEGIN{srand();print int(rand()*(65000-2000+1))+2000}'
 }
 
-download_magnet() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 Magnet 磁力链接: ${RESET}")" magnet
-    [ -z "$magnet" ] && return
-    local trackers_arg=$(get_dynamic_trackers)
-    aria2c --seed-time=0 \
-           --enable-dht=true \
-           --enable-peer-exchange=true \
-           --bt-max-peers=128 \
-           --max-connection-per-server=16 \
-           ${trackers_arg:+--bt-tracker="$trackers_arg"} \
-           -d "$DOWNLOAD_DIR" "$magnet"
+get_system_dns() {
+    grep -E "^nameserver" /etc/resolv.conf | awk '{print $2}' | paste -sd "," -
 }
 
-download_torrent() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 .torrent 种子文件路径或下载链接: ${RESET}")" torrent
-    [ -z "$torrent" ] && return
-    local trackers_arg=$(get_dynamic_trackers)
-    aria2c --seed-time=0 \
-           --enable-dht=true \
-           --enable-peer-exchange=true \
-           --bt-max-peers=128 \
-           --max-connection-per-server=16 \
-           ${trackers_arg:+--bt-tracker="$trackers_arg"} \
-           -d "$DOWNLOAD_DIR" "$torrent"
+pause() {
+    echo -n "按任意键返回菜单..."
+    read -r -n 1 arg
+    echo
 }
 
-download_pt_pure() {
-    check_aria_ready || return
-    read -e -p "$(echo -e "${GREEN}请输入 PT站专属种子链接 或 .torrent路径: ${RESET}")" pt_target
-    [ -z "$pt_target" ] && return
-    echo -e "${GREEN}正在启动 PT 纯净下载模式（不注入外源 Tracker）...${RESET}"
-    aria2c --seed-time=0 \
-           --enable-dht=false \
-           --enable-peer-exchange=false \
-           -d "$DOWNLOAD_DIR" "$pt_target"
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
-download_batch_txt() {
-    check_aria_ready || return
-    echo -e "${GREEN}请连续输入需要下载的链接（支持普通链接、磁力链接混合输入），每输完一个按一次回车。${RESET}"
-    echo -e "${GREEN}输入完毕后，输入英文字母 ${YELLOW}q${GREEN} 即可开始批量下载。${RESET}"
-    
-    local tmp_txt="/tmp/aria2_urls.txt"
-    > "$tmp_txt"
-    local count=1
-    local has_magnet=false
+_map_arch() {
+    local raw_arch=$(uname -m)
+    case "$raw_arch" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *) return 1 ;;
+    esac
+}
 
-    while true; do
-        read -e -p "$(echo -e "${GREEN}输入第 [${YELLOW}$count${GREEN}] 个链接 (输入 q 开始): ${RESET}")" input_url
-        if [ "$input_url" = "q" ] || [ "$input_url" = "Q" ]; then break; fi
-        if [ -n "$input_url" ]; then
-            # 检测输入流中是否包含磁力链接标识
-            if [[ "$input_url" == *"magnet:?"* ]]; then
-                has_magnet=true
-            fi
-            echo "$input_url" >> "$tmp_txt"
-            ((count++))
-        fi
-    done
-
-    if [ -s "$tmp_txt" ]; then
-        echo -e "${GREEN}正在分析下载队列...${RESET}"
-        
-        # 如果队列中有磁力链接，动态抓取最优 Tracker 并作为运行时参数注入
-        if [ "$has_magnet" = true ]; then
-            local trackers_arg=$(get_dynamic_trackers)
-            echo -e "${GREEN}正在启动 BT/磁力 混合批量加速下载模式...${RESET}"
-            aria2c --seed-time=0 \
-                   --enable-dht=true \
-                   --enable-peer-exchange=true \
-                   --bt-max-peers=128 \
-                   -c -s 16 -x 16 -k 1M \
-                   ${trackers_arg:+--bt-tracker="$trackers_arg"} \
-                   -d "$DOWNLOAD_DIR" -i "$tmp_txt"
-        else
-            echo -e "${GREEN}正在启动普通网络链接批量下载...${RESET}"
-            aria2c -c -s 16 -x 16 -k 1M -d "$DOWNLOAD_DIR" -i "$tmp_txt"
-        fi
+_get_snell_latest_version() {
+    local latest_version
+    latest_version=$(curl -sL -A "Mozilla/5.0" "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
+    if [ -n "$latest_version" ]; then
+        echo "${latest_version#v}"
     else
-        echo -e "${YELLOW}未输入任何链接。${RESET}"
-    fi
-    rm -f "$tmp_txt"
-}
-
-
-run_AriaNg() {
-    clear
-    # 用户提供的代理前缀列表
-    local GITHUB_PROXY=(
-        ''
-        'https://v6.gh-proxy.org/'
-        'https://gh-proxy.com/'
-        'https://hub.glowp.xyz/'
-        'https://proxy.vvvv.ee/'
-        'https://ghproxy.lvedong.eu.org/'
-    )
-    
-    local RAW_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/AriaNg.sh"
-    local TEMP_SCRIPT="/tmp/nginx_backup_restore_temp.sh"
-    local success=false
-
-
-    # 循环轮询代理列表
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local target_url="${proxy}${RAW_URL}"
-        if [ -n "$proxy" ]; then
-            echo
-        else
-            echo
-        fi
-
-        # 使用 curl 下载，设置 8 秒超时
-        if curl -fsSL --connect-timeout 8 "$target_url" -o "$TEMP_SCRIPT"; then
-            success=true
-            break
-        fi
-        echo -e "${RED}❌ 当前连接失败，正在切换下一个节点...${RESET}"
-    done
-
-    # 判断是否下载成功并执行
-    if [ "$success" = true ] && [ -f "$TEMP_SCRIPT" ]; then
-        echo
-        chmod +x "$TEMP_SCRIPT"
-        
-        # 真正执行备份恢复脚本
-        bash "$TEMP_SCRIPT"
-        
-        # 执行完毕后清理临时文件
-        rm -f "$TEMP_SCRIPT"
-    else
-        echo -e "${RED}❌ 致命错误：所有 GitHub 代理节点均无法连接，请检查您的 VPS 网络！${RESET}"
+        echo "$SNELL_DEFAULT_VERSION"
     fi
 }
 
+# 精准无误的配置提取引擎
+_get_conf_value() {
+    local key="$1"
+    if [ -f "$SNELL_CONFIG" ]; then
+        grep -E "^${key}\s*=" "$SNELL_CONFIG" | awk -F'=' '{print $2}' | sed 's/ //g' | tr -d '\r\n'
+    fi
+}
 
-# 动态同步当前配置文件的路径显示
-if [ -f "$CONFIG_FILE" ]; then
-    DOWNLOAD_DIR=$(get_config_value "dir")
-fi
+# ================== 配置 Snell (支持独立服务和模式切换) ==================
+configure_snell() {
+    mkdir -p "$SNELL_DIR"
+    echo -e "${GREEN}[信息] 开始配置 Snell v6 独立参数...${RESET}"
 
-# 主菜单
-while true; do
-    clear
-    STATUS=$(get_aria_status)
-    VERSION=$(get_aria_version)
-    CURRENT_PORT=$(get_config_value "rpc-listen-port")
-    [ -z "$CURRENT_PORT" ] && CURRENT_PORT="6800"
+    # 读取并解析旧配置
+    local old_listen=$(_get_conf_value "listen")
+    local old_port=""
+    if [ -n "$old_listen" ]; then
+        local first_listen="${old_listen%%,*}"
+        old_port=$(echo "$first_listen" | awk -F: '{print $NF}')
+    fi
+    local old_key=$(_get_conf_value "psk")
+    local old_mode=$(_get_conf_value "mode")
+    local old_obfs=$(_get_conf_value "obfs")
+    local old_dns_pref=$(_get_conf_value "dns-ip-preference")
+    local old_tfo=$(_get_conf_value "tfo")
+    local old_dns=$(_get_conf_value "dns")
 
-    echo -e "${GREEN}==================================${RESET}"
-    echo -e "${GREEN}     ◈  Aria2 全能下载工具  ◈     ${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
-    echo -e "${GREEN} 核心状态: $STATUS${RESET}"
-    echo -e "${GREEN} 当前版本: ${YELLOW}v$VERSION${RESET}"
-    echo -e "${GREEN} 保存目录: ${YELLOW}$DOWNLOAD_DIR${RESET}"
-    echo -e "${GREEN} RPC 端口: ${YELLOW}$CURRENT_PORT${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
-    echo -e "${YELLOW} [环境管理]${RESET}"
-    echo -e "${GREEN}  1. 安装 Aria2${RESET}"
-    echo -e "${GREEN}  2. 安装 AriaNg${RESET}"
-    echo -e "${GREEN}  3. 更改当前运行配置${RESET}"
-    echo -e "${GREEN}  4. 查看当前外部 Web(AriaNg)连接RPC凭证${RESET}"
-    echo -e "${GREEN}  5. 卸载 Aria2${RESET}"
-    echo -e "${GREEN}----------------------------------${RESET}"
-    echo -e "${YELLOW} [下载功能]${RESET}"
-    echo -e "${GREEN}  6. HTTP / HTTPS / FTP 常用链接下载 (16线程)${RESET}"
-    echo -e "${GREEN}  7. Magnet磁力下载(Tracker+128多线程加速)${RESET}"
-    echo -e "${GREEN}  8. BitTorrent种子下载(Tracker+128多线程加速)${RESET}"
-    echo -e "${GREEN}  9. [PT站专属]种子/链接下载${RESET}"
-    echo -e "${GREEN} 10. 批量多链接交互下载(HTTP/HTTPS/FTP)${RESET}"
-    echo -e "${GREEN}----------------------------------${RESET}"
-    echo -e "${GREEN}  0. 退出${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
-    
-    read -e -p "$PROMPT_CHOICE" choice
+    # 1. 端口引导
+    local default_port="${old_port:-$(random_port)}"
+    echo -n "请输入端口 (当前/默认: $default_port): "
+    read -r input_port
+    port=${input_port:-$default_port}
+    if [ "$port" != "$old_port" ]; then
+        check_port "$port" || return 1
+    fi
 
-    case $choice in
-        1) install_or_update_aria2 ;;
-        2) run_AriaNg ;;
-        3) modify_aria_config ;;
-        4) show_rpc_credentials ;;
-        5) uninstall_aria2 ;;
-        6) download_http ;;
-        7) download_magnet ;;
-        8) download_torrent ;;
-        9) download_pt_pure ;;
-        10) download_batch_txt ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
+    # 2. 密钥引导
+    local default_key="${old_key:-$(random_key)}"
+    echo -n "请输入 Snell 核心密钥 (当前/默认: $default_key): "
+    read -r input_key
+    key=${input_key:-$default_key}
+
+    # 3. 工作模式 (Mode) 引导
+    local current_mode="${old_mode:-default}"
+    echo -e "${YELLOW}请选择 Snell v6 工作模式 (当前配置: $current_mode)：${RESET}"
+    echo "1. default     (流量混淆 + AES 加密)"
+    echo "2. unshaped    (禁用混淆，仅 AES 加密，等同于 v3，吞吐量提升约 10%)"
+    echo "3. unsafe-raw  (明文模式：禁用加密和混淆，仅限内网或安全隧道)"
+    echo -n "请选择序号 (直接回车保持当前不变): "
+    read -r mode_choice
+    case $mode_choice in
+        1) snell_mode="default" ;;
+        2) snell_mode="unshaped" ;;
+        3) snell_mode="unsafe-raw" ;;
+        *) snell_mode="$current_mode" ;;
     esac
 
+    # 4. 监听地址策略引导
+    local current_listen_str="双栈全监听"
+    if [ "$old_listen" = "0.0.0.0:$port" ]; then
+        current_listen_str="仅监听 IPv4"
+    elif [ "$old_listen" = "[::]:$port" ]; then
+        current_listen_str="仅监听 IPv6"
+    fi
+    echo -e "${YELLOW}请选择 Snell v6 监听地址策略 (当前配置: $current_listen_str)：${RESET}"
+    echo "1. 双栈全监听  (0.0.0.0 和 [::] 同时绑定，全能推荐)"
+    echo "2. 仅监听 IPv4 (仅绑定 0.0.0.0)"
+    echo "3. 仅监听 IPv6 (仅绑定 [::]，适合纯 IPv6 小鸡)"
+    echo -n "请选择序号 (直接回车保持当前不变): "
+    read -r listen_choice
+    case $listen_choice in
+        1) listen_addr="0.0.0.0:$port,[::]:$port" ;;
+        2) listen_addr="0.0.0.0:$port" ;;
+        3) listen_addr="[::]:$port" ;;
+        *) listen_addr="${old_listen:-0.0.0.0:$port,[::]:$port}" ;;
+    esac
+
+    # 5. OBFS 混淆引导
+    local current_obfs_str="${old_obfs:-off}"
+    echo -e "${YELLOW}配置 OBFS 混淆 (当前配置: $current_obfs_str)：[注意] 无特殊需求不建议启用${RESET}"
+    echo "1. TLS   2. HTTP   3. 关闭"
+    echo -n "请选择 (直接回车保持当前不变): "
+    read -r obfs_choice
+    case $obfs_choice in
+        1) obfs="tls" ;;
+        2) obfs="http" ;;
+        3) obfs="off" ;;
+        *) obfs="$current_obfs_str" ;;
+    esac
+
+    # 6. DNS IP 家族优先级引导
+    local current_dns_pref="${old_dns_pref:-default}"
+    echo -e "${YELLOW}请选择 Snell v6 DNS 解析 IP 家族优先级 (当前配置: $current_dns_pref)：${RESET}"
+    echo "1. default      (系统默认)"
+    echo "2. prefer-ipv4  (IPv4 优先)"
+    echo "3. prefer-ipv6  (IPv6 优先)"
+    echo "4. ipv4-only    (仅解析 IPv4)"
+    echo "5. ipv6-only    (仅解析 IPv6)"
+    echo -n "请选择序号 (直接回车保持当前不变): "
+    read -r dns_pref_choice
+    case $dns_pref_choice in
+        1) dns_pref="default" ;;
+        2) dns_pref="prefer-ipv4" ;;
+        3) dns_pref="prefer-ipv6" ;;
+        4) dns_pref="ipv4-only" ;;
+        5) dns_pref="ipv6-only" ;;
+        *) dns_pref="$current_dns_pref" ;;
+    esac
+
+    # 7. TFO 引导
+    local current_tfo_str="开启"
+    [ "$old_tfo" = "0" ] || [ "$old_tfo" = "false" ] && current_tfo_str="关闭"
+    echo -e "${YELLOW}是否开启 TCP Fast Open (TFO)？(当前配置: $current_tfo_str)${RESET}"
+    echo "1. 开启   2. 关闭"
+    echo -n "请选择 (直接回车保持当前不变): "
+    read -r tfo_choice
+    case $tfo_choice in
+        1) tfo="true" ;;
+        2) tfo="false" ;;
+        *) tfo="${old_tfo:-true}" ;;
+    esac
+
+    # 8. DNS 引导
+    local system_dns=$(get_system_dns)
+    local default_dns="${old_dns:-${system_dns:-1.1.1.1,8.8.8.8}}"
+    echo -n "请输入自定义 DNS (当前/默认: $default_dns): "
+    read -r input_dns
+    dns=${input_dns:-$default_dns}
+
+    # 规范化 TFO 的值
+    local conf_tfo="true"
+    if [ "$tfo" = "0" ] || [ "$tfo" = "false" ]; then conf_tfo="false"; fi
+
+    # 写入 v6 规范独立配置文件
+    cat > "$SNELL_CONFIG" <<EOF
+[snell-server]
+listen = $listen_addr
+psk = $key
+mode = $snell_mode
+obfs = $obfs
+tfo = $conf_tfo
+dns = $dns
+dns-ip-preference = $dns_pref
+EOF
+
+    IP=$(get_public_ip)
+    HOSTNAME=$(hostname -s | sed 's/ /_/g')
+
+    # 生成规范节点配置 (标识改为 SnellV6 独立命名)
+    cat <<EOF > "$SNELL_DIR/config.txt"
+$HOSTNAME-SnellV6 = snell, $IP, $port, psk=$key, version=6, mode=$snell_mode, tfo=$conf_tfo, reuse=true, ecn=true
+EOF
+
+    _ok "配置已成功安全写入 $SNELL_CONFIG"
+    log "Snell v6 独立配置已成功同步更新。"
+}
+
+# ================== 核心 Alpine 部署逻辑 (防 404/解压兜底) ==================
+_download_and_install_binary() {
+    local sarch=$( _map_arch ) || { _err "不支持的架构"; return 1; }
+    
+    _info "正在安装 Alpine 必要系统依赖 (upx, unzip, curl, gcompat)..."
+    apk add --no-cache upx unzip curl gcompat >/dev/null 2>&1
+
+    _info "正在获取官方最新稳定版版本号..."
+    local version=$( _get_snell_latest_version )
+    version="${version#v}"
+
+    local tmp=$(mktemp -d)
+    local download_url_A="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
+    local download_url_B="https://dl.nssurge.com/snell/snell-server-${version}-linux-${sarch}.zip"
+    local download_url_C="https://dl.nssurge.com/snell/snell-server-v6.0.0b3-linux-${sarch}.zip"
+
+    _info "正在通过智能路由下载 Snell v6 核心组件..."
+    
+    if curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -o "$tmp/snell.zip" --connect-timeout 15 "$download_url_A" && unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
+        _info "方案 A 下载并校验成功！"
+    elif curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o "$tmp/snell.zip" --connect-timeout 15 "$download_url_B" && unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
+        _info "方案 B 下载并校验成功！"
+    else
+        _warn "官方链接探测受限，启动回滚，下载 v6.0.0b3 保底包..."
+        if ! curl -sL -A "Mozilla/5.0" -o "$tmp/snell.zip" --connect-timeout 20 "$download_url_C" || ! unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
+            _err "所有下载源均被防火墙拦截，请稍后再试！"
+            rm -rf "$tmp"; return 1
+        fi
+        version="6.0.0b3"
+    fi
+
+    if unzip -oq "$tmp/snell.zip" -d "$tmp/"; then
+        _info "正在进行 UPX 壳解压兼容处理..."
+        if command -v upx >/dev/null 2>&1; then
+            upx -d "$tmp/snell-server" >/dev/null 2>&1 || _warn "UPX 脱壳失败或无需脱壳"
+        else
+            _err "UPX 工具不可用，无法完成解压"
+            rm -rf "$tmp"; return 1
+        fi
+
+        # 变更为专属文件名，彻底防止交叉冲突
+        install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server-v6
+        rm -rf "$tmp"
+        echo "$version"
+        return 0
+    else
+        _err "未知原因导致解压最终失败"
+        rm -rf "$tmp"
+        return 1
+    fi
+}
+
+_deploy_openrc_service() {
+    _info "正在写入 Alpine OpenRC 独立服务管理配置..."
+    cat > "$SNELL_RC_SERVICE" <<EOF
+#!/sbin/openrc-run
+
+description="Snell Server v6 Independent Instance"
+command="/usr/local/bin/snell-server-v6"
+command_args="-c $SNELL_CONFIG"
+command_background="yes"
+pidfile="/run/snellv6.pid"
+output_log="$SNELL_LOG"
+error_log="$SNELL_LOG"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+    chmod +x "$SNELL_RC_SERVICE"
+    rc-update add snellv6 default >/dev/null 2>&1 || true
+}
+
+install_snell_v5() {
+    if [ -x /usr/local/bin/snell-server-v6 ]; then
+        _ok "Snell v6 独立实例已安装，如需更新请使用选项 2，修改配置请用选项 4。"; return 0
+    fi
+
+    local ver=$(_download_and_install_binary)
+    [ -z "$ver" ] && return 1
+
+    create_user
+    configure_snell || return 1
+    _deploy_openrc_service
+    
+    rc-service snellv6 restart >/dev/null 2>&1 || true
+    _ok "Snell v6 独立实例已在 Alpine Linux 上成功部署并独立运行！"
+    log "Alpine Snell v6 安装成功"
+
     echo
-    read -p "$PROMPT_CONTINUE"
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${GREEN}           🎉 Snell v6 安装成功 🎉             ${RESET}"
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${GREEN}👉 请复制以下配置到你的 Surge 配置文件中：${RESET}"
+    echo
+    if [ -f "$SNELL_DIR/config.txt" ]; then
+        echo -n -e "${YELLOW}"
+        cat "$SNELL_DIR/config.txt"
+        echo -e "${RESET}"
+    else
+        _warn "未找到节点配置文件文本。"
+    fi
+    echo -e "${GREEN}===============================================${RESET}"
+    echo
+}
+
+update_snell_v5() {
+    if [ ! -x /usr/local/bin/snell-server-v6 ]; then
+        _err "检测到系统未安装 Snell v6 ，请先选择选项 1 进行安装！"; return 1
+    fi
+
+    _info "开始检查并更新 Snell v6 二进制程序..."
+    local ver=$(_download_and_install_binary)
+    [ -z "$ver" ] && return 1
+
+    _deploy_openrc_service
+    _restart_snell_process
+    _ok "Snell v6 已成功更新，且当前配置已完好保留并独立重启完毕！"
+    log "Alpine Snell v6 成功更新"
+}
+
+uninstall_snell() {
+    echo -e "${RED}[警告] 正在彻底从 Alpine 卸载 Snell v6 服务...${RESET}"
+    rc-service snellv6 stop >/dev/null 2>&1 || true
+    rc-update del snellv6 >/dev/null 2>&1 || true
+    pkill -f snell-server-v6 || true
+    rm -f "$SNELL_RC_SERVICE"
+    rm -f /usr/local/bin/snell-server-v6
+    rm -rf "$SNELL_DIR"
+    rm -f "$SNELL_LOG"
+    _ok "Alpine Snell v6 服务已完全安全抹除。"
+}
+
+_restart_snell_process() {
+    rc-service snellv6 restart >/dev/null 2>&1 || {
+        pkill -f snell-server-v6 || true
+        touch "$SNELL_LOG"
+        nohup /usr/local/bin/snell-server-v6 -c "$SNELL_CONFIG" >> "$SNELL_LOG" 2>&1 &
+    }
+}
+
+# ================== 菜单 ==================
+show_menu() {
+    clear
+    if rc-service snellv6 status 2>&1 | grep -q "started" || pgrep -x "snell-server-v6" >/dev/null; then
+        STATUS="${GREEN}● 运行中${RESET}"
+    else
+        STATUS="${RED}● 未运行${RESET}"
+    fi
+
+    VERSION_SHOW="未安装"
+    if [ -x /usr/local/bin/snell-server-v6 ]; then
+        VERSION_SHOW=$(/usr/local/bin/snell-server-v6 -v 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?' || echo "v6.x")
+    fi
+
+    PORT_SHOW="-"
+    if [ -f "$SNELL_CONFIG" ]; then
+        local raw_listen=$(_get_conf_value "listen")
+        local first_listen="${raw_listen%%,*}"
+        PORT_SHOW=$(echo "$first_listen" | awk -F: '{print $NF}')
+    fi
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈   Snell v6 管理面板   ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态   :${RESET} $STATUS"
+    echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
+    echo -e "${GREEN}端口   :${RESET} ${YELLOW}$PORT_SHOW${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 Snell v6${RESET}"
+    echo -e "${GREEN}2. 更新 Snell v6${RESET}"
+    echo -e "${GREEN}3. 卸载 Snell v6${RESET}"
+    echo -e "${GREEN}4. 修改自定义配置${RESET}"
+    echo -e "${GREEN}5. 启动 Snell v6${RESET}"
+    echo -e "${GREEN}6. 停止 Snell v6${RESET}"
+    echo -e "${GREEN}7. 重启 Snell v6${RESET}"
+    echo -e "${GREEN}8. 查看运行日志${RESET}"
+    echo -e "${GREEN}9. 查看节点配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+# ================== 主循环 ==================
+while true; do
+    show_menu
+    echo -e -n "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case $choice in
+        1) install_snell_v5; pause ;;
+        2) update_snell_v5; pause ;;
+        3) uninstall_snell; pause ;;
+        4) 
+            if [ ! -f "$SNELL_CONFIG" ]; then 
+                _err "未找到独立配置文件，请先安装！"
+            else
+                configure_snell
+                _restart_snell_process
+                _ok "配置已重载，Snell v6 独立服务已平滑重启！"
+                echo -e "\n${GREEN}👉 最新 Surge 节点配置：${RESET}"
+                if [ -f "$SNELL_DIR/config.txt" ]; then
+                    cat "$SNELL_DIR/config.txt"
+                    echo ""
+                fi
+            fi
+            pause ;;
+        5) 
+            rc-service snellv6 start >/dev/null 2>&1 || { 
+                if ! pgrep -x "snell-server-v6" >/dev/null; then
+                    touch "$SNELL_LOG"
+                    nohup /usr/local/bin/snell-server-v6 -c "$SNELL_CONFIG" >> "$SNELL_LOG" 2>&1 &
+                fi
+            }
+            _ok "Snell v6 已成功启动"
+            pause ;;
+        6) 
+            rc-service snellv6 stop >/dev/null 2>&1 || pkill -f snell-server-v6 || true
+            _ok "Snell v6 已停止"
+            pause ;;
+        7) 
+            _restart_snell_process
+            _ok "Snell v6 已重启"
+            pause ;;
+        8)
+            echo -e "${GREEN}--- Snell v6 核心运行日志 (最新50行) ---${RESET}"
+            if [ -f "$SNELL_LOG" ] && [ -s "$SNELL_LOG" ]; then
+                tail -n 50 "$SNELL_LOG"
+                echo -e "${YELLOW}------------------------------------------------${RESET}"
+                echo -n "是否需要实时追踪新日志输出？(y/n, 默认 n): "
+                read -r watch_choice
+                if [ "$watch_choice" = "y" ] || [ "$watch_choice" = "Y" ]; then
+                    echo -e "${YELLOW}提示: 按 Ctrl+C 即可退出日志实时追踪并返回菜单${RESET}"
+                    tail -f "$SNELL_LOG"
+                fi
+            else
+                _warn "暂无 Snell v6 运行日志或日志文件为空。"
+            fi
+            pause ;;
+        9)
+            if [ -f "$SNELL_CONFIG" ]; then
+                echo -e "${GREEN}====== 当前 Snell v6 内部配置 ======${RESET}"
+                cat "$SNELL_CONFIG"
+                echo -e "${GREEN}====== Surge 专属配置 ======${RESET}"
+                if [ -f "$SNELL_DIR/config.txt" ]; then
+                    cat "$SNELL_DIR/config.txt"
+                    echo ""
+                else
+                    echo "暂无配置文本"
+                fi
+            else
+                echo -e "${RED}独立配置文件不存在，请先安装！${RESET}"
+            fi
+            pause ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效输入${RESET}"; pause ;;
+    esac
 done

@@ -89,6 +89,8 @@ write_aria_config() {
     local path=$1
     local port=$2
     local token=$3
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$path"
 
     cat <<EOF > "$CONFIG_FILE"
 dir=$path
@@ -394,6 +396,57 @@ download_batch_txt() {
     rm -f "$tmp_txt"
 }
 
+
+run_AriaNg() {
+    clear
+    # 用户提供的代理前缀列表
+    local GITHUB_PROXY=(
+        ''
+        'https://v6.gh-proxy.org/'
+        'https://gh-proxy.com/'
+        'https://hub.glowp.xyz/'
+        'https://proxy.vvvv.ee/'
+        'https://ghproxy.lvedong.eu.org/'
+    )
+    
+    local RAW_URL="https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/AriaNg.sh"
+    local TEMP_SCRIPT="/tmp/nginx_backup_restore_temp.sh"
+    local success=false
+
+
+    # 循环轮询代理列表
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local target_url="${proxy}${RAW_URL}"
+        if [ -n "$proxy" ]; then
+            echo
+        else
+            echo
+        fi
+
+        # 使用 curl 下载，设置 8 秒超时
+        if curl -fsSL --connect-timeout 8 "$target_url" -o "$TEMP_SCRIPT"; then
+            success=true
+            break
+        fi
+        echo -e "${RED}❌ 当前连接失败，正在切换下一个节点...${RESET}"
+    done
+
+    # 判断是否下载成功并执行
+    if [ "$success" = true ] && [ -f "$TEMP_SCRIPT" ]; then
+        echo
+        chmod +x "$TEMP_SCRIPT"
+        
+        # 真正执行备份恢复脚本
+        bash "$TEMP_SCRIPT"
+        
+        # 执行完毕后清理临时文件
+        rm -f "$TEMP_SCRIPT"
+    else
+        echo -e "${RED}❌ 致命错误：所有 GitHub 代理节点均无法连接，请检查您的 VPS 网络！${RESET}"
+    fi
+}
+
+
 # 动态同步当前配置文件的路径显示
 if [ -f "$CONFIG_FILE" ]; then
     DOWNLOAD_DIR=$(get_config_value "dir")
@@ -408,7 +461,7 @@ while true; do
     [ -z "$CURRENT_PORT" ] && CURRENT_PORT="6800"
 
     echo -e "${GREEN}==================================${RESET}"
-    echo -e "${GREEN}     ◈  aria2 全能下载工具  ◈     ${RESET}"
+    echo -e "${GREEN}     ◈  Aria2 全能下载工具  ◈     ${RESET}"
     echo -e "${GREEN}==================================${RESET}"
     echo -e "${GREEN} 核心状态: $STATUS${RESET}"
     echo -e "${GREEN} 当前版本: ${YELLOW}v$VERSION${RESET}"
@@ -416,17 +469,18 @@ while true; do
     echo -e "${GREEN} RPC 端口: ${YELLOW}$CURRENT_PORT${RESET}"
     echo -e "${GREEN}==================================${RESET}"
     echo -e "${YELLOW} [环境管理]${RESET}"
-    echo -e "${GREEN}  1. 安装 aria2${RESET}"
-    echo -e "${GREEN}  2. 更改当前运行配置${RESET}"
-    echo -e "${GREEN}  3. 查看当前外部 Web(AriaNg)连接RPC凭证${RESET}"
-    echo -e "${GREEN}  4. 卸载 aria2${RESET}"
+    echo -e "${GREEN}  1. 安装 Aria2${RESET}"
+    echo -e "${GREEN}  2. 安装 AriaNg${RESET}"
+    echo -e "${GREEN}  3. 更改当前运行配置${RESET}"
+    echo -e "${GREEN}  4. 查看当前外部 Web(AriaNg)连接RPC凭证${RESET}"
+    echo -e "${GREEN}  5. 卸载 Aria2${RESET}"
     echo -e "${GREEN}----------------------------------${RESET}"
     echo -e "${YELLOW} [下载功能]${RESET}"
-    echo -e "${GREEN}  5. HTTP / HTTPS / FTP 常用链接下载 (16线程)${RESET}"
-    echo -e "${GREEN}  6. Magnet磁力下载(Tracker+128多线程加速)${RESET}"
-    echo -e "${GREEN}  7. BitTorrent种子下载(Tracker+128多线程加速)${RESET}"
-    echo -e "${GREEN}  8. [PT站专属]种子/链接下载${RESET}"
-    echo -e "${GREEN}  9. 批量多链接交互下载(HTTP/HTTPS/FTP)${RESET}"
+    echo -e "${GREEN}  6. HTTP / HTTPS / FTP 常用链接下载 (16线程)${RESET}"
+    echo -e "${GREEN}  7. Magnet磁力下载(Tracker+128多线程加速)${RESET}"
+    echo -e "${GREEN}  8. BitTorrent种子下载(Tracker+128多线程加速)${RESET}"
+    echo -e "${GREEN}  9. [PT站专属]种子/链接下载${RESET}"
+    echo -e "${GREEN} 10. 批量多链接交互下载(HTTP/HTTPS/FTP)${RESET}"
     echo -e "${GREEN}----------------------------------${RESET}"
     echo -e "${GREEN}  0. 退出${RESET}"
     echo -e "${GREEN}==================================${RESET}"
@@ -435,14 +489,15 @@ while true; do
 
     case $choice in
         1) install_or_update_aria2 ;;
-        2) modify_aria_config ;;
-        3) show_rpc_credentials ;;
-        4) uninstall_aria2 ;;
-        5) download_http ;;
-        6) download_magnet ;;
-        7) download_torrent ;;
-        8) download_pt_pure ;;
-        9) download_batch_txt ;;
+        2) run_AriaNg ;;
+        3) modify_aria_config ;;
+        4) show_rpc_credentials ;;
+        5) uninstall_aria2 ;;
+        6) download_http ;;
+        7) download_magnet ;;
+        8) download_torrent ;;
+        9) download_pt_pure ;;
+        10) download_batch_txt ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
     esac

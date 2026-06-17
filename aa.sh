@@ -1,7 +1,7 @@
 #!/bin/bash
 # ========================================
-# aria2 GitHub 最新版全能管理与下载工具
-# 菜单字体绿色版 + 核心&Tracker全线反代加速版
+# aria2 系统原生包管理器全能管理与下载工具
+# 支持 Systemd (Ubuntu) / OpenRC (Alpine) 双保活
 # ========================================
 
 GREEN="\033[32m"
@@ -9,34 +9,28 @@ RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 默认保存目录
+CONFIG_DIR="/etc/aria2"
+CONFIG_FILE="$CONFIG_DIR/aria2.conf"
 DOWNLOAD_DIR="/opt/aria2_downloads"
+
+mkdir -p "$CONFIG_DIR"
 mkdir -p "$DOWNLOAD_DIR"
 
-# 内置 GitHub 反代加速节点
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
-
-# 统一定义 Prompt 提示符
 PROMPT_CHOICE=$(echo -e "${GREEN}请输入选项: ${RESET}")
 PROMPT_CONTINUE=$(echo -e "${GREEN}按回车继续...${RESET}")
 
-# 动态获取 aria2 状态
 get_aria_status() {
-    if command -v aria2c &>/dev/null; then
-        echo -e "${GREEN}运行 (已就绪)${RESET}"
+    if command -v systemctl &>/dev/null && systemctl is-active aria2 &>/dev/null; then
+        echo -e "${GREEN}运行 (Systemd 守护中)${RESET}"
+    elif command -v rc-service &>/dev/null && rc-service aria2 status 2>/dev/null | grep -q "started"; then
+        echo -e "${GREEN}运行 (OpenRC 守护中)${RESET}"
+    elif pgrep aria2c &>/dev/null; then
+        echo -e "${GREEN}运行 (普通后台进程)${RESET}"
     else
-        echo -e "${RED}停止 (未安装)${RESET}"
+        echo -e "${RED}停止 (未运行)${RESET}"
     fi
 }
 
-# 动态获取当前本地安装的 aria2 版本
 get_aria_version() {
     if command -v aria2c &>/dev/null; then
         aria2c -v | head -n 1 | awk '{print $3}'
@@ -45,120 +39,261 @@ get_aria_version() {
     fi
 }
 
-# 从 GitHub API 获取最新的 release 版本号
-get_latest_release() {
-    local latest_version
-    latest_version=$(curl -s "https://api.github.com/repos/aria2/aria2/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -z "$latest_version" ]; then
-        echo "获取失败"
+get_config_value() {
+    local key=$1
+    if [ -f "$CONFIG_FILE" ]; then
+        grep "^${key}=" "$CONFIG_FILE" | cut -d'=' -f2
     else
-        echo "$latest_version" | sed 's/release-//g' | sed 's/v//g'
+        echo ""
     fi
 }
 
-# 核心下载与安装函数 (包含智能节点轮询)
+get_public_ip() {
+    local mode=${1:-"auto"} 
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
+}
+
+# 平滑重启系统守护服务
+restart_aria_service() {
+    if command -v rc-service &>/dev/null && [ -f /etc/init.d/aria2 ]; then
+        rc-service aria2 restart
+    elif command -v systemctl &>/dev/null && [ -f /etc/systemd/system/aria2.service ]; then
+        systemctl daemon-reload
+        systemctl restart aria2
+    else
+        pkill aria2c &>/dev/null
+        nohup aria2c --conf-path="$CONFIG_FILE" >/dev/null 2>&1 &
+    fi
+}
+
+# 核心渲染：写入配置文件
+write_aria_config() {
+    local path=$1
+    local port=$2
+    local token=$3
+
+    cat <<EOF > "$CONFIG_FILE"
+dir=$path
+continue=true
+max-concurrent-downloads=5
+max-connection-per-server=16
+min-split-size=10M
+split=10
+rpc-listen-port=$port
+enable-rpc=true
+rpc-allow-origin-all=true
+rpc-listen-all=true
+rpc-secret=$token
+file-allocation=none
+enable-dht=true
+enable-peer-exchange=true
+bt-max-peers=128
+seed-time=0
+EOF
+}
+
+# 全自动化环境配置 + 双系统级后台驻留机制
 install_or_update_aria2() {
-    local mode=$1
     if [ "$EUID" -ne 0 ]; then
         echo -e "${RED}错误：请使用 root 权限或 sudo 运行此脚本！${RESET}"
         return
     fi
 
-    echo -e "${GREEN}正在拉取 GitHub 获取最新版本信息...${RESET}"
-    local LATEST_VERSION=$(get_latest_release)
+    echo -e "${GREEN}正在检测系统包管理器环境并拉取主程序...${RESET}"
     
-    if [ "$LATEST_VERSION" = "获取失败" ]; then
-        echo -e "${RED}❌ 无法连接到 GitHub API，请稍后再试。${RESET}"
-        return
-    fi
-
-    if [ "$mode" = "update" ]; then
-        local CURRENT_VERSION=$(get_aria_version)
-        if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ]; then
-            echo -e "${GREEN}当前已是最新版本 v${CURRENT_VERSION}，无需更新！${RESET}"
-            return
-        fi
-        echo -e "${YELLOW}检测到新版本 v${LATEST_VERSION} (当前本地版本: v${CURRENT_VERSION})${RESET}"
-    fi
-
-    apt update -y &>/dev/null
-    apt install curl tar bzip2 -y &>/dev/null
-
-    local ARCH=$(uname -m)
-    local FILE_SUFFIX=""
-    if [ "$ARCH" = "x86_64" ]; then
-        FILE_SUFFIX="linux-gnu-64bit-build1.tar.bz2"
-    elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
-        FILE_SUFFIX="linux-gnu-arm64-build1.tar.bz2"
+    local is_alpine=false
+    if command -v apt &>/dev/null; then
+        apt update -y
+        apt install aria2 curl grep wget -y
+    elif command -v apk &>/dev/null; then
+        apk update
+        apk add aria2 curl grep bash openrc
+        is_alpine=true
     else
-        echo -e "${RED}❌ 暂不支持当前架构 ($ARCH)。${RESET}"
+        echo -e "${RED}❌ 抱歉，当前系统既不是 APT 也不支持 APK，无法进行自动化安装。${RESET}"
         return
     fi
 
-    local RAW_PATH="aria2/aria2/releases/download/release-${LATEST_VERSION}/aria2-${LATEST_VERSION}-${FILE_SUFFIX}"
-    local TMP_DIR="/tmp/aria2_pro_download"
-    mkdir -p "$TMP_DIR"
-    local download_success=false
+    if ! command -v aria2c &>/dev/null; then
+        echo -e "${RED}❌ 安装失败，请检查您的软件源或网络连接！${RESET}"
+        return
+    fi
 
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local download_url="${proxy}https://github.com/${RAW_PATH}"
-        echo -e "${GREEN}正在尝试下载主程序，节点: ${YELLOW}${proxy:-'GitHub官方原始链接'}${RESET}"
-        curl -L -m 30 "$download_url" -o "$TMP_DIR/aria2.tar.bz2"
+    # 1. 交互式自定义配置参数
+    echo -e "\n${YELLOW}>>> 开始初始化 Aria2 参数配置 (直接回车可使用推荐默认值)${RESET}"
+    
+    # 端口自定义
+    read -e -p "$(echo -e "${GREEN}请输入 RPC 监听端口 [默认 6800]: ${RESET}")" input_port
+    local current_port=${input_port:-6800}
+
+    # 密码自定义
+    local default_token=$(date +%s | sha256sum | base64 | head -c 16)
+    read -e -p "$(echo -e "${GREEN}请输入 RPC 密钥(Token) [默认随机生成 ${RED}${default_token}${GREEN}]: ${RESET}")" input_token
+    local current_token=${input_token:-$default_token}
+
+    # 2. 写入全局配置文件
+    write_aria_config "$DOWNLOAD_DIR" "$current_port" "$current_token"
+
+    # 3. 核心保活：智能判断初始化守护系统
+    if [ "$is_alpine" = true ] && command -v rc-service &>/dev/null; then
+        echo -e "${GREEN}检测到 Alpine 环境，正在注入 OpenRC 服务守护...${RESET}"
+        rc-service aria2 stop &>/dev/null
         
-        if [ -s "$TMP_DIR/aria2.tar.bz2" ] && bzip2 -t "$TMP_DIR/aria2.tar.bz2" &>/dev/null; then
-            echo -e "${GREEN}解压测试通过，主程序下载成功！${RESET}"
-            download_success=true
-            break
-        else
-            echo -e "${RED}当前节点下载失败，正在切换...${RESET}"
-            rm -f "$TMP_DIR/aria2.tar.bz2"
-        fi
-    done
+        cat <<'EOF' > /etc/init.d/aria2
+#!/sbin/openrc-run
+description="Aria2 Download Utility"
+command="/usr/bin/aria2c"
+command_args="--conf-path=/etc/aria2/aria2.conf"
+command_background="yes"
+pidfile="/run/aria2.pid"
+respawn_delay=5
+respawn_max=10
+depend() {
+    need net
+}
+EOF
+        chmod +x /etc/init.d/aria2
+        rc-update add aria2 default &>/dev/null
+        rc-service aria2 start
+    elif command -v systemctl &>/dev/null; then
+        echo -e "${GREEN}检测到 Debian/Ubuntu 环境，正在将 Aria2 挂载为 Systemd 服务...${RESET}"
+        systemctl stop aria2 &>/dev/null
+        
+        cat <<EOF > /etc/systemd/system/aria2.service
+[Unit]
+Description=Aria2 High Performance Download Utility
+After=network.target
 
-    if [ "$download_success" = false ]; then
-        echo -e "${RED}❌ 所有内置代理节点均尝试失败！${RESET}"
-        rm -rf "$TMP_DIR"
-        return
-    fi
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/aria2c --conf-path=$CONFIG_FILE
+Restart=on-failure
+RestartSec=5s
 
-    echo -e "${GREEN}正在解压并覆盖部署二进制文件...${RESET}"
-    cd "$TMP_DIR" || return
-    tar -xjf aria2.tar.bz2
-    
-    local BINARY_PATH=$(find . -maxdepth 2 -name "aria2c" -type f)
-    if [ -n "$BINARY_PATH" ]; then
-        apt remove aria2 -y &>/dev/null
-        rm -f /usr/bin/aria2c
-        mv "$BINARY_PATH" /usr/local/bin/aria2c
-        chmod a+rx /usr/local/bin/aria2c
-        echo -e "${GREEN}🎉 aria2 v${LATEST_VERSION} 成功部署！${RESET}"
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable aria2 &>/dev/null
+        systemctl start aria2
     else
-        echo -e "${RED}❌ 压缩包中未检索到可执行文件。${RESET}"
+        pkill aria2c &>/dev/null
+        nohup aria2c --conf-path="$CONFIG_FILE" >/dev/null 2>&1 &
     fi
-    rm -rf "$TMP_DIR"
+
+    # 4. 输出 Web 联机凭证
+    show_rpc_credentials
 }
 
 uninstall_aria2() {
-    echo -e "${YELLOW}正在清理 aria2 相关程序...${RESET}"
-    apt remove aria2 -y &>/dev/null
-    rm -f /usr/local/bin/aria2c
-    rm -f /usr/bin/aria2c
-    echo -e "${GREEN}卸载完成。${RESET}"
-}
-
-# 设置保存目录
-set_download_dir() {
-    read -e -p "$(echo -e "${GREEN}当前保存目录为: ${YELLOW}$DOWNLOAD_DIR${RESET}\n${GREEN}请输入新的保存路径: ${RESET}")" new_dir
-    if [ -n "$new_dir" ]; then
-        DOWNLOAD_DIR="$new_dir"
-        mkdir -p "$DOWNLOAD_DIR"
-        echo -e "${GREEN}保存路径已成功修改为: ${YELLOW}$DOWNLOAD_DIR${RESET}"
-    else
-        echo -e "${YELLOW}输入为空，路径保持不变。${RESET}"
+    echo -e "${YELLOW}正在清理 aria2 系统服务及程序...${RESET}"
+    if command -v rc-service &>/dev/null; then
+        rc-service aria2 stop &>/dev/null
+        rc-update del aria2 default &>/dev/null
+        rm -f /etc/init.d/aria2
+    elif command -v systemctl &>/dev/null; then
+        systemctl stop aria2 &>/dev/null
+        systemctl disable aria2 &>/dev/null
+        rm -f /etc/systemd/system/aria2.service
+        systemctl daemon-reload
     fi
+    pkill aria2c &>/dev/null
+    
+    if command -v apt &>/dev/null; then
+        apt remove aria2 -y && apt autoremove -y
+    elif command -v apk &>/dev/null; then
+        apk del aria2
+    fi
+    rm -rf "$CONFIG_DIR"
+    echo -e "${GREEN}卸载清理完成。${RESET}"
 }
 
-# 辅助检查 aria2c 是否就绪
+show_rpc_credentials() {
+    local current_token=$(get_config_value "rpc-secret")
+    local current_port=$(get_config_value "rpc-listen-port")
+    
+    if [ -z "$current_token" ]; then
+        echo -e "${RED}未发现有效的配置文件，请先执行选项 1 安装/初始化环境！${RESET}"
+        return
+    fi
+    
+    local public_ip=$(get_public_ip)
+    
+    clear
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}           Aria2 远程 Web 连接配置凭证查询           ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN} 🌐 RPC 地址 (域名/IP) : ${RESET}${YELLOW}http://$public_ip:$current_port/jsonrpc${RESET}"
+    echo -e "${GREEN} 🔌 RPC 端口 (Port)    : ${RESET}${YELLOW}$current_port${RESET}"
+    echo -e "${GREEN} 🔐 RPC 密钥 (Token)   : ${RESET}${RED}$current_token${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW} 👇 提示: 如果公网连接失败，请确保云服务器控制台安全组已放行 TCP 端口: $current_port${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+}
+
+# 独立菜单功能：在线修改核心配置
+modify_aria_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}错误：配置文件不存在，请先执行选项 1 安装并初始化服务！${RESET}"
+        return
+    fi
+
+    local old_dir=$(get_config_value "dir")
+    local old_port=$(get_config_value "rpc-listen-port")
+    local old_token=$(get_config_value "rpc-secret")
+
+    clear
+    echo -e "${YELLOW}==================================${RESET}"
+    echo -e "${YELLOW}       在线修改 Aria2 核心配置       ${RESET}"
+    echo -e "${YELLOW}==================================${RESET}"
+    echo -e "当前保存目录: ${GREEN}$old_dir${RESET}"
+    echo -e "当前 RPC 端口: ${GREEN}$old_port${RESET}"
+    echo -e "当前 RPC 密钥: ${GREEN}$old_token${RESET}"
+    echo -e "${YELLOW}----------------------------------${RESET}"
+
+    # 1. 修改路径
+    read -e -p "$(echo -e "${GREEN}1. 输入新保存路径 (回车保持不变): ${RESET}")" new_dir
+    [ -n "$new_dir" ] && old_dir="$new_dir" && mkdir -p "$old_dir"
+
+    # 2. 修改端口
+    read -e -p "$(echo -e "${GREEN}2. 输入新 RPC 端口 (回车保持不变): ${RESET}")" new_port
+    [ -n "$new_port" ] && old_port="$new_port"
+
+    # 3. 修改 Token
+    read -e -p "$(echo -e "${GREEN}3. 输入新 RPC 密钥 (回车保持不变): ${RESET}")" new_token
+    [ -n "$new_token" ] && old_token="$new_token"
+
+    # 更新全局变量防止主菜单显示滞后
+    DOWNLOAD_DIR="$old_dir"
+
+    # 重新写入并重启服务
+    write_aria_config "$old_dir" "$old_port" "$old_token"
+    echo -e "${YELLOW}正在平滑应用新配置并重启守护进程...${RESET}"
+    restart_aria_service
+    
+    echo -e "${GREEN}🎉 配置修改成功并已立即生效！${RESET}"
+    show_rpc_credentials
+}
+
 check_aria_ready() {
     if ! command -v aria2c &>/dev/null; then
         echo -e "${RED}错误：请先选择选项 1 安装 aria2 才能使用下载功能！${RESET}"
@@ -167,47 +302,26 @@ check_aria_ready() {
     return 0
 }
 
-# 【升级核心】通过自定义的反代代理池，安全且加速地拉取云端最新 Tracker 列表
 get_dynamic_trackers() {
-    echo -e "${GREEN}正在通过反代节点池拉取最新 BT 加速 Tracker 列表...${RESET}"
-    
-    local raw_script_path="XIU2/TrackersListCollection/master/tracker.sh"
-    local tmp_script="/tmp/aria2_tracker_exec.sh"
+    echo -e "${GREEN}正在通过 Cloudflare CDN 全速获取精选 Tracker 列表...${RESET}" >&2
     local trackers=""
-    local fetch_success=false
-
-    # 遍历代理节点来下载并运行 tracker.sh
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local tracker_url="${proxy}https://raw.githubusercontent.com/${raw_script_path}"
-        echo -e "${GREEN}正在尝试连接 Tracker 节点: ${YELLOW}${proxy:-'GitHub官方Raw链接'}${RESET}"
-        
-        # 强制下载脚本到本地
-        rm -f "$tmp_script"
-        curl -L -m 15 "$tracker_url" -o "$tmp_script" 2>/dev/null
-        
-        # 验证下载的是否是有效的 bash 脚本（而不是被墙的报错网页内容）
-        if [ -s "$tmp_script" ] && grep -q "Aria2" "$tmp_script"; then
-            # 运行本地脚本并将结果（cat 模式输出的一行文本）存入变量
-            trackers=$(bash "$tmp_script" cat 2>/dev/null)
-            if [ -n "$trackers" ]; then
-                fetch_success=true
-                break
-            fi
+    local cdn_urls=(
+        "https://cf.trackerslist.com/best_aria2.txt"
+        "https://cf.trackerslist.com/all_aria2.txt"
+    )
+    for url in "${cdn_urls[@]}"; do
+        echo -e "${GREEN}正在连接直连加速节点: ${YELLOW}$url${RESET}" >&2
+        trackers=$(curl -L -s -k -m 4 "$url" | grep -v '^#' | tr -d '\r' | tr '\n' ',' | sed 's/,,*/,/g' | sed 's/^,//;s/,$//')
+        if [ -n "$trackers" ] && [[ "$trackers" == *"http"* || "$trackers" == *"udp"* ]]; then
+            echo -e "${GREEN}🎉 Tracker 列表秒级同步成功！已成功注入 Aria2 核心引擎。${RESET}" >&2
+            echo "$trackers"
+            return
         fi
     done
-
-    rm -f "$tmp_script"
-
-    if [ "$fetch_success" = true ]; then
-        echo -e "${GREEN}Tracker 列表获取成功并已成功注入！正在调动 P2P 网络...${RESET}"
-        echo "$trackers"
-    else
-        echo -e "${YELLOW}警告：所有反代代理节点均拉取 Tracker 超时，将转入常规多线程 DHT 模式。${RESET}"
-        echo ""
-    fi
+    echo -e "${YELLOW}警告：Cloudflare 专线分流暂时不可用，转入原生多线程 DHT 去中心化寻源模式。${RESET}" >&2
+    echo ""
 }
 
-# 5. 普通网络链接下载
 download_http() {
     check_aria_ready || return
     read -e -p "$(echo -e "${GREEN}请输入 HTTP/HTTPS/FTP 下载链接: ${RESET}")" url
@@ -215,15 +329,11 @@ download_http() {
     aria2c -c -s 16 -x 16 -k 1M -d "$DOWNLOAD_DIR" "$url"
 }
 
-# 6. 磁力链接下载 (主程序 + Tracker 双重反代加速)
 download_magnet() {
     check_aria_ready || return
     read -e -p "$(echo -e "${GREEN}请输入 Magnet 磁力链接: ${RESET}")" magnet
     [ -z "$magnet" ] && return
-    
     local trackers_arg=$(get_dynamic_trackers)
-    
-    # 注入 Tracker + 128 高连接数 + DHT 网络全开
     aria2c --seed-time=0 \
            --enable-dht=true \
            --enable-peer-exchange=true \
@@ -233,14 +343,11 @@ download_magnet() {
            -d "$DOWNLOAD_DIR" "$magnet"
 }
 
-# 7. 种子文件下载 (主程序 + Tracker 双重反代加速)
 download_torrent() {
     check_aria_ready || return
     read -e -p "$(echo -e "${GREEN}请输入 .torrent 种子文件路径或下载链接: ${RESET}")" torrent
     [ -z "$torrent" ] && return
-    
     local trackers_arg=$(get_dynamic_trackers)
-    
     aria2c --seed-time=0 \
            --enable-dht=true \
            --enable-peer-exchange=true \
@@ -250,7 +357,17 @@ download_torrent() {
            -d "$DOWNLOAD_DIR" "$torrent"
 }
 
-# 8. 批量文本链接下载
+download_pt_pure() {
+    check_aria_ready || return
+    read -e -p "$(echo -e "${GREEN}请输入 PT站专属种子链接 或 .torrent路径: ${RESET}")" pt_target
+    [ -z "$pt_target" ] && return
+    echo -e "${GREEN}正在启动 PT 纯净下载模式（不注入外源 Tracker）...${RESET}"
+    aria2c --seed-time=0 \
+           --enable-dht=false \
+           --enable-peer-exchange=false \
+           -d "$DOWNLOAD_DIR" "$pt_target"
+}
+
 download_batch_txt() {
     check_aria_ready || return
     echo -e "${GREEN}请连续输入需要下载的链接，每输完一个按一次回车。${RESET}"
@@ -277,45 +394,55 @@ download_batch_txt() {
     rm -f "$tmp_txt"
 }
 
+# 动态同步当前配置文件的路径显示
+if [ -f "$CONFIG_FILE" ]; then
+    DOWNLOAD_DIR=$(get_config_value "dir")
+fi
+
 # 主菜单
 while true; do
     clear
     STATUS=$(get_aria_status)
     VERSION=$(get_aria_version)
+    CURRENT_PORT=$(get_config_value "rpc-listen-port")
+    [ -z "$CURRENT_PORT" ] && CURRENT_PORT="6800"
 
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}         aria2 智能管理与全能下载器 PRO               ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}     ◈  aria2 全能下载工具  ◈     ${RESET}"
+    echo -e "${GREEN}==================================${RESET}"
     echo -e "${GREEN} 核心状态: $STATUS${RESET}"
     echo -e "${GREEN} 当前版本: ${YELLOW}v$VERSION${RESET}"
     echo -e "${GREEN} 保存目录: ${YELLOW}$DOWNLOAD_DIR${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN} [环境管理]${RESET}"
-    echo -e "${GREEN}  1. 安装 aria2 (智能代理抓取 GitHub 最新版)${RESET}"
-    echo -e "${GREEN}  2. 检查并更新 aria2 (智能代理版)${RESET}"
-    echo -e "${GREEN}  3. 卸载 aria2 下载器${RESET}"
-    echo -e "${GREEN}  4. 修改当前自定义保存目录${RESET}"
-    echo -e "${GREEN}----------------------------------------------------${RESET}"
-    echo -e "${GREEN} [实用下载功能]${RESET}"
+    echo -e "${GREEN} RPC 端口: ${YELLOW}$CURRENT_PORT${RESET}"
+    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${YELLOW} [环境管理]${RESET}"
+    echo -e "${GREEN}  1. 安装 aria2${RESET}"
+    echo -e "${GREEN}  2. 更改当前运行配置${RESET}"
+    echo -e "${GREEN}  3. 查看当前外部 Web(AriaNg)连接RPC凭证${RESET}"
+    echo -e "${GREEN}  4. 卸载 aria2${RESET}"
+    echo -e "${GREEN}----------------------------------${RESET}"
+    echo -e "${YELLOW} [下载功能]${RESET}"
     echo -e "${GREEN}  5. HTTP / HTTPS / FTP 常用链接下载 (16线程)${RESET}"
-    echo -e "${GREEN}  6. Magnet 磁力下载 (🔥反代Tracker+128多线程加速)${RESET}"
-    echo -e "${GREEN}  7. BitTorrent 种子下载 (🔥反代Tracker+128多线程加速)${RESET}"
-    echo -e "${GREEN}  8. 批量多链接交互下载${RESET}"
-    echo -e "${GREEN}----------------------------------------------------${RESET}"
-    echo -e "${GREEN}  0. 退出脚本${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}  6. Magnet磁力下载(Tracker+128多线程加速)${RESET}"
+    echo -e "${GREEN}  7. BitTorrent种子下载(Tracker+128多线程加速)${RESET}"
+    echo -e "${GREEN}  8. [PT站专属]种子/链接下载${RESET}"
+    echo -e "${GREEN}  9. 批量多链接交互下载(HTTP/HTTPS/FTP)${RESET}"
+    echo -e "${GREEN}----------------------------------${RESET}"
+    echo -e "${GREEN}  0. 退出${RESET}"
+    echo -e "${GREEN}==================================${RESET}"
     
     read -e -p "$PROMPT_CHOICE" choice
 
     case $choice in
-        1) install_or_update_aria2 "install" ;;
-        2) install_or_update_aria2 "update" ;;
-        3) uninstall_aria2 ;;
-        4) set_download_dir ;;
+        1) install_or_update_aria2 ;;
+        2) modify_aria_config ;;
+        3) show_rpc_credentials ;;
+        4) uninstall_aria2 ;;
         5) download_http ;;
         6) download_magnet ;;
         7) download_torrent ;;
-        8) download_batch_txt ;;
+        8) download_pt_pure ;;
+        9) download_batch_txt ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
     esac

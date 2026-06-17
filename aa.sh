@@ -1,430 +1,309 @@
 #!/bin/bash
-# ========================================
-# GOST 一键管理脚本
-# ========================================
+# =========================================================================
+# IPv4 / IPv6 管理面板
+# =========================================================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-RESET="\033[0m"
-
-APP_NAME="flux-panel"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-GOST_SQL_URL="https://github.com/bqlpfy/flux-panel/releases/download/1.4.3/gost.sql"
-NODE_SCRIPT_URL="https://github.com/bqlpfy/flux-panel/raw/main/install.sh"
-
-DOCKER_CMD="docker compose"
-
-
-# 代理前缀列表（第一个留空代表直连尝试）
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
-
-
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! $DOCKER_CMD version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
-        exit 1
-    fi
-}
-
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
-check_ipv6_support() {
-    if ping6 -c 1 ::1 &>/dev/null; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# 代理轮询下载通用函数
-download_file() {
-    local url="$1"
-    local output="$2"
-    local success=false
-
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local target_url="${proxy}${url}"
-        if [ -n "$proxy" ]; then
-            echo "📡 正在尝试通过代理下载: ${proxy}"
-        else
-            echo "📡 正在尝试直连下载..."
-        fi
-        
-        curl -L -k --max-time 15 -o "$output" "$target_url"
-        
-        if [ -s "$output" ]; then
-            success=true
-            break
-        else
-            rm -f "$output"
-        fi
-    done
-
-    if [ "$success" = true ]; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP 地址。" && return
-}
-
-
-configure_docker_ipv6() {
-    # 确保 daemon.json 存在
-    if [ ! -f /etc/docker/daemon.json ]; then
-        echo '{}' > /etc/docker/daemon.json
-    fi
-
-    # 检查是否已经启用 IPv6
-    IPV6_ENABLED=$(jq '.ipv6 // false' /etc/docker/daemon.json)
-    if [ "$IPV6_ENABLED" = "true" ]; then
-        echo -e "${GREEN}✅ Docker 已启用 IPv6，无需重复配置${RESET}"
-        return
-    fi
-
-    # 配置 IPv6
-    jq '. + {ipv6:true, "fixed-cidr-v6":"fd00:dead:beef::/48"}' /etc/docker/daemon.json > /tmp/daemon.json.tmp
-    mv /tmp/daemon.json.tmp /etc/docker/daemon.json
-
-    # 重启 Docker
-    systemctl restart docker
-    echo -e "${GREEN}✅ Docker IPv6 已启用${RESET}"
-}
-
-# 获取容器状态的辅助函数
-get_container_status() {
-    local container_name="$1"
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}未安装Docker${RESET}"
-        return
-    fi
-    
-    local status
-    status=$(docker inspect --format='{{.State.Status}}' "$container_name" 2>/dev/null)
-    
-    if [ "$status" = "running" ]; then
-        echo -e "${GREEN}运行中${RESET}"
-    elif [ -n "$status" ]; then
-        echo -e "${RED}已停止($status)${RESET}"
-    else
-        echo -e "${YELLOW}未创建${RESET}"
-    fi
-}
-
-menu() {
-    while true; do
-        clear
-        # 动态读取当前配置的端口
-        local current_front="-"
-        local current_back="-"
-        if [ -f "$APP_DIR/.env" ]; then
-            current_front=$(grep 'FRONTEND_PORT=' "$APP_DIR/.env" | cut -d= -f2)
-            current_back=$(grep 'BACKEND_PORT=' "$APP_DIR/.env" | cut -d= -f2)
-        fi
-
-        # 动态获取服务状态
-        local frontend_status=$(get_container_status "vite-frontend")
-        local backend_status=$(get_container_status "springboot-backend")
-        local mysql_status=$(get_container_status "gost-mysql")
-
-
-        echo -e "${GREEN}============================${RESET}"
-        echo -e "${GREEN}  ◈   哆啦A梦转发面板   ◈   ${RESET}"
-        echo -e "${GREEN}============================${RESET}"
-        echo -e "${GREEN}前端端口:${RESET} ${YELLOW}${current_front}${RESET} ${GREEN}状态: ${frontend_status}"
-        echo -e "${GREEN}后端端口:${RESET} ${YELLOW}${current_back}${RESET} ${GREEN}状态: ${backend_status}"
-        echo -e "${GREEN}数据库状态:${RESET} ${mysql_status}"
-        echo -e "${GREEN}============================${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}7)${RESET} ${YELLOW}节点管理${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        echo -e "${GREEN}============================${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            7) manage_nodes ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR"
-
-    cd "$APP_DIR" || exit
-
-    
-    # 下载数据库初始化文件
-    echo "📡 准备下载数据库初始化文件..."
-    if [ ! -f gost.sql ] || [ ! -s gost.sql ]; then
-        if ! download_file "$GOST_SQL_URL" "gost.sql"; then
-            echo -e "${RED}❌ 数据库文件下载失败，请检查网络渠道${RESET}"
-            read -p "按回车返回菜单..."
-            return
-        fi
-    fi
-    echo -e "${GREEN}✅ 数据库文件准备完成${RESET}"
-
-    # 设置端口
-    read -p "请输入前端端口 [默认:6366]: " input_front
-    FRONTEND_PORT=${input_front:-6366}
-    check_port "$FRONTEND_PORT" || return
-
-    read -p "请输入后端端口 [默认:6365]: " input_back
-    BACKEND_PORT=${input_back:-6365}
-    check_port "$BACKEND_PORT" || return
-
-    # 设置数据库账户
-    read -p "请输入数据库用户名 [默认:gost]: " input_user
-    DB_USER=${input_user:-gost}
-    read -p "请输入数据库名 [默认:gost]: " input_db
-    DB_NAME=${input_db:-gost}
-    read -p "请输入数据库密码 [默认:123456]: " input_pass
-    DB_PASSWORD=${input_pass:-123456}
-
-    # JWT secret
-    JWT_SECRET=$(openssl rand -hex 16)
-
-    # 检测 IPv6
-    if check_ipv6_support; then
-        echo -e "${GREEN}🚀 系统支持 IPv6，自动启用 IPv6 配置...${RESET}"
-        configure_docker_ipv6
-    else
-        echo -e "${YELLOW}⚠️ 系统不支持 IPv6，跳过配置${RESET}"
-    fi
-
-    # 生成 .env
-    cat > .env <<EOF
-DB_NAME=$DB_NAME
-DB_USER=$DB_USER
-DB_PASSWORD=$DB_PASSWORD
-JWT_SECRET=$JWT_SECRET
-FRONTEND_PORT=$FRONTEND_PORT
-BACKEND_PORT=$BACKEND_PORT
-EOF
-    echo -e "${GREEN}✅ .env 文件生成完成${RESET}"
-
-        # IPv6 设置
-    read -p "是否启用 Docker IPv6 网络? [Y/n] (默认开启): " ipv6_input
-    if [[ "$ipv6_input" =~ ^[Nn]$ ]]; then
-        ENABLE_IPV6=false
-    fi
-
-    # 生成 docker-compose.yml
-    cat > "$COMPOSE_FILE" <<EOF
-
-services:
-  mysql:
-    image: mysql:5.7
-    container_name: gost-mysql
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_USER: ${DB_USER}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
-      TZ: Asia/Shanghai
-    volumes:
-      - mysql_data:/var/lib/mysql
-      - ./gost.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    command: >
-      --default-authentication-plugin=mysql_native_password
-      --character-set-server=utf8mb4
-      --collation-server=utf8mb4_unicode_ci
-      --max_connections=1000
-      --innodb_buffer_pool_size=256M
-    networks:
-      - gost-network
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      timeout: 10s
-      retries: 10
-
-  backend:
-    image: bqlpfy/springboot-backend:1.4.3
-    container_name: springboot-backend
-    restart: unless-stopped
-    environment:
-      DB_HOST: mysql
-      DB_NAME: ${DB_NAME}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      JWT_SECRET: ${JWT_SECRET}
-      LOG_DIR: /app/logs
-      JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
-    ports:
-      - "${BACKEND_PORT}:6365"
-    volumes:
-      - backend_logs:/app/logs
-    depends_on:
-      mysql:
-        condition: service_healthy
-    networks:
-      - gost-network
-    healthcheck:
-      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 90s
-
-  frontend:
-    image: bqlpfy/vite-frontend:1.4.3
-    container_name: vite-frontend
-    restart: unless-stopped
-    ports:
-      - "${FRONTEND_PORT}:80"
-    depends_on:
-      backend:
-        condition: service_healthy
-    networks:
-      - gost-network
-
-volumes:
-  mysql_data:
-    name: mysql_data
-    driver: local
-  backend_logs:
-    name: backend_logs
-    driver: local
-EOF
-
-# 添加 IPv6 网络
-if [ "$ENABLE_IPV6" = true ]; then
-cat >> "$COMPOSE_FILE" <<EOF
-
-networks:
-  gost-network:
-    name: gost-network
-    driver: bridge
-    enable_ipv6: true
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
-        - subnet: fd00:dead:beef::/48
-EOF
-else
-cat >> "$COMPOSE_FILE" <<EOF
-
-networks:
-  gost-network:
-    name: gost-network
-    driver: bridge
-EOF
+if [ "$EUID" -ne 0 ]; then
+    echo -e "\033[31m❌ 错误：请使用 root 权限运行此脚本！\033[0m"
+    exit 1
 fi
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+RESET="\033[0m"
 
-    SERVER_IP=$(get_public_ip)
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-    echo -e "${GREEN}✅ 哆啦A梦转发面板 已启动${RESET}"
-    echo -e "${YELLOW}🌐 前端访问: http://${SERVER_IP}:${FRONTEND_PORT}${RESET}"
-    echo -e "${YELLOW}🌐 后端访问: http://${SERVER_IP}:${BACKEND_PORT}${RESET}"
-    echo -e "${YELLOW}🌐 默认账号: admin_user${RESET}"
-    echo -e "${YELLOW}🌐 默认密码: admin_user${RESET}"
-    echo -e "${GREEN}📂 安装目录: $APP_DIR${RESET}"
-    read -p "按回车返回菜单..."
+get_os_type() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$ID"
+    else
+        echo "unknown"
+    fi
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    $DOCKER_CMD pull
-    $DOCKER_CMD up -d
-    echo -e "${GREEN}✅ 哆啦A梦转发面板 更新完成${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-    docker restart gost-mysql springboot-backend vite-frontend
-    echo -e "${GREEN}✅ 哆啦A梦转发面板 已重启${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-    echo -e "${GREEN}选择容器查看日志:${RESET}"
-    echo "1) MySQL"
-    echo "2) Backend"
-    echo "3) Frontend"
-    read -p "选择: " c
-    case $c in
-        1) docker logs -f gost-mysql ;;
-        2) docker logs -f springboot-backend ;;
-        3) docker logs -f vite-frontend ;;
-        *) echo -e "${RED}无效选择${RESET}" ;;
+install_pkg() {
+    local pkg="$1"
+    local os=$(get_os_type)
+    if has_cmd "$pkg"; then return; fi
+    
+    echo -e "${YELLOW}🔧 正在补全系统依赖: $pkg ...${RESET}"
+    case "$os" in
+        ubuntu|debian)
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y "$pkg" >/dev/null 2>&1
+            ;;
+        alpine)
+            apk add --no-cache "$pkg" >/dev/null 2>&1
+            ;;
+        centos|rhel|rocky|almalinux)
+            yum install -y "$pkg" >/dev/null 2>&1 || dnf install -y "$pkg" >/dev/null 2>&1
+            ;;
     esac
 }
 
-check_status() {
-    docker ps | grep -E "gost-mysql|springboot-backend|vite-frontend"
-    read -p "按回车返回菜单..."
+check_deps() {
+    local deps=(curl ip ping sysctl awk grep sed)
+    for cmd in "${deps[@]}"; do install_pkg "$cmd"; done
 }
 
-manage_nodes() {
-    echo "📡 正在获取节点管理..."
-    if download_file "$NODE_SCRIPT_URL" "node_install.sh"; then
-        chmod +x node_install.sh
-        ./node_install.sh
-        rm -f node_install.sh
+detect_iface() {
+    ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|docker|veth|br-' | head -n1
+}
+
+get_public_ip() {
+    local mode="$1"
+    local ip_res=""
+    local apis=("https://api.ip.sb/ip" "https://icanhazip.com" "https://v4.ident.me")
+    [ "$mode" = "-6" ] && apis=("https://api-ipv6.ip.sb/ip" "https://ipv6.icanhazip.com" "https://v6.ident.me")
+
+    for url in "${apis[@]}"; do
+        ip_res=$(curl "$mode" -sL -A "Mozilla/5.0" --connect-timeout 3 "$url" 2>/dev/null | tr -d '\r\n[:space:]')
+        if [ -n "$ip_res" ] && [[ ! "$ip_res" == *"<"* && ! "$ip_res" == *"html"* ]]; then
+            echo "$ip_res"
+            return 0
+        fi
+    done
+    echo "未获取到公网IP"
+    return 1
+}
+
+get_menu_status() {
+    local iface="$1"
+    local current_os=$(get_os_type)
+    local v4_addr=$(ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' | head -n1)
+    V4_STATUS=$( [ -z "$v4_addr" ] && echo -e "${RED}未启用${RESET}" || echo -e "${GREEN}已启用${RESET}" )
+
+    local is_all_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+    local is_iface_disabled=$(sysctl -n net.ipv6.conf.${iface}.disable_ipv6 2>/dev/null)
+    
+    if [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "1" ]; then
+        V6_STATUS="${RED}已禁用${RESET}"
+    elif [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "0" ]; then
+        V6_STATUS="${YELLOW}已禁用(网卡冲突/残留)${RESET}"
     else
-        echo -e "${RED}❌ 无法下载节点管理，请检查网络！${RESET}"
-        read -p "按回车返回菜单..."
+        local v6_addr=$(ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | grep -v "fe80" | awk '{print $2}' | head -n1)
+        if [ -z "$v6_addr" ]; then
+            V6_STATUS="${YELLOW}已开启(无公网IP)${RESET}"
+        else
+            if [ "$current_os" = "alpine" ]; then
+                V6_STATUS="${GREEN}已启用 (${RED}Alpine强制v6优先${GREEN})${RESET}"
+            elif [ -f /etc/gai.conf ] && grep -q "^[[:space:]]*precedence[[:space:]]\+::ffff:0:0/96[[:space:]]\+100" /etc/gai.conf; then
+                V6_STATUS="${GREEN}已启用 (${YELLOW}IPv4优先${GREEN})${RESET}"
+            else
+                V6_STATUS="${GREEN}已启用 (${YELLOW}默认IPv6优先${GREEN})${RESET}"
+            fi
+        fi
     fi
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down -v
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅  哆啦A梦转发面板 已彻底卸载${RESET}"
-    read -p "按回车返回菜单..."
+# 🛠️ 方案 B 核心：接管 cloud-init 并重写 Netplan
+fix_ubuntu_netplan_cloudinit() {
+    local iface="$1"
+    local action="$2"
+    
+    local plan_file=$(ls /etc/netplan/*.yaml 2>/dev/null | head -n1)
+    
+    if [ "$action" = "disable" ]; then
+        # 1. 产生 cloud-init 屏蔽文件，使其不再重置网络
+        if [ -d /etc/cloud/cloud.cfg.d ]; then
+            echo "network: {config: disabled}" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        fi
+        
+        # 2. 修改现有的 Netplan 文件
+        if [ -n "$plan_file" ] && [ -f "$plan_file" ]; then
+            # 备份原配置以防万一
+            [ ! -f "${plan_file}.bak" ] && cp "$plan_file" "${plan_file}.bak"
+            
+            # 精准替换 dhcp6 状态
+            sed -i "s/dhcp6:[[:space:]]*true/dhcp6: false/g" "$plan_file"
+            
+            # 如果配置中原本没有 accept-ra，在 dhcp6 下方强行追加入网策略控制
+            if ! grep -q "accept-ra:" "$plan_file"; then
+                sed -i "/dhcp6: false/a \            accept-ra: false" "$plan_file"
+            fi
+        fi
+    else
+        # 1. 解除 cloud-init 锁定
+        rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        
+        # 2. 还原 Netplan
+        if [ -f "${plan_file}.bak" ]; then
+            mv "${plan_file}.bak" "$plan_file"
+        else
+            if [ -n "$plan_file" ] && [ -f "$plan_file" ]; then
+                sed -i "s/dhcp6:[[:space:]]*false/dhcp6: true/g" "$plan_file"
+                sed -i "/accept-ra: false/d" "$plan_file"
+            fi
+        fi
+    fi
 }
 
-menu
+check_deps
+os_type=$(get_os_type)
+
+while true; do
+    clear
+    iface=$(detect_iface)
+    [ -z "$iface" ] && iface="未检测到网卡"
+    get_menu_status "$iface"
+
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}     ◈  IPv4 / IPv6 管理面板  ◈       ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN} 当前系统  : ${YELLOW}${os_type}${RESET}"
+    echo -e "${GREEN} 活跃网卡  : ${YELLOW}${iface}${RESET}"
+    echo -e "${GREEN} IPv4 状态 : ${V4_STATUS}"
+    echo -e "${GREEN} IPv6 状态 : ${V6_STATUS}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}  1) 禁用 IPv6${RESET}"
+    echo -e "${GREEN}  2) 开启 IPv6${RESET}"
+    echo -e "${GREEN}  3) 设置 IPv4 优先(推荐:保留双栈但v4快)${RESET}"
+    echo -e "${GREEN}  4) 恢复 IPv6 优先${RESET}"
+    echo -e "${GREEN}  5) 查看网卡IP与连通性${RESET}"
+    echo -e "${GREEN}  0) 退出${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    
+    echo -ne "${GREEN} 请选择操作编号: ${RESET}"
+    read choice
+
+    case "$choice" in
+        1)
+            sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
+            
+            echo -e "${YELLOW}------ 💾 持久化配置选项 ------${RESET}"
+            echo -e "${GREEN}  1) 临时禁用（重启服务器后恢复IPv6）${RESET}"
+            echo -e "${GREEN}  2) 永久禁用 (接管云厂商网络规则)${RESET}"
+            echo -ne "${YELLOW} 请选择禁用模式 [默认 1]: ${RESET}"
+            read perm_choice
+            
+            if [ "$perm_choice" = "2" ]; then
+                sysctl_file="/etc/sysctl.conf"
+                if [ "$os_type" = "alpine" ]; then
+                    sysctl_file="/etc/sysctl.d/local.conf"
+                    mkdir -p /etc/sysctl.d
+                fi
+                
+                sed -i '/net.ipv6.conf./d' "$sysctl_file" 2>/dev/null
+                echo "net.ipv6.conf.all.disable_ipv6 = 1" >> "$sysctl_file"
+                echo "net.ipv6.conf.default.disable_ipv6 = 1" >> "$sysctl_file"
+                echo "net.ipv6.conf.${iface}.disable_ipv6 = 1" >> "$sysctl_file"
+                
+                # 执行方案 B 核心控制逻辑
+                if [ "$os_type" = "ubuntu" ]; then
+                    echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在锁定 cloud-init 并重构 Netplan...${RESET}"
+                    fix_ubuntu_netplan_cloudinit "$iface" "disable"
+                    if has_cmd netplan; then netplan apply >/dev/null 2>&1; fi
+                    sysctl -w net.ipv6.conf.${iface}.disable_ipv6=1 >/dev/null 2>&1
+                fi
+                echo -e "\n${GREEN}✅ 已成功【永久锁定】禁用 IPv6，重构后重启绝不失效！${RESET}"
+            else
+                if [ -f /etc/sysctl.conf ]; then sed -i '/net.ipv6.conf./d' /etc/sysctl.conf; fi
+                if [ -f /etc/sysctl.d/local.conf ]; then sed -i '/net.ipv6.conf./d' /etc/sysctl.d/local.conf; fi
+                echo -e "\n${GREEN}✅ 已成功【临时禁用】IPv6（重启将恢复）。${RESET}"
+            fi
+            read -rp "按回车键返回菜单..."
+            ;;
+        2)
+            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.${iface}.disable_ipv6=0 >/dev/null 2>&1
+            
+            [ -f /etc/sysctl.conf ] && sed -i '/net.ipv6.conf./d' /etc/sysctl.conf
+            [ -f /etc/sysctl.d/local.conf ] && sed -i '/net.ipv6.conf./d' /etc/sysctl.d/local.conf
+            
+            if [ "$os_type" = "ubuntu" ]; then
+                echo -e "${YELLOW}⏳ 检测到 Ubuntu 系统，正在恢复 cloud-init 网络托管...${RESET}"
+                fix_ubuntu_netplan_cloudinit "$iface" "enable"
+                if has_cmd netplan; then netplan apply >/dev/null 2>&1; fi
+                sleep 1
+                echo -e "${GREEN}✅ 网络控制权已归还云厂商系统，IPv6 模块已平滑激活。${RESET}"
+                read -rp "按回车键返回菜单..."
+            else
+                echo -e "${GREEN}✅ 内核 IPv6 模块已激活。${RESET}"
+                echo -e "${YELLOW}当前系统为 [${os_type}]，通常需要重启系统才能正确获取公网 IPv6 地址。${RESET}"
+                read -rp "按回车键 [立即重启] 系统，或按 Ctrl+C 取消..."
+                reboot
+            fi
+            ;;
+        3)
+            if [ "$os_type" = "alpine" ]; then
+                echo -e "${RED}❌ 抱歉！Alpine Linux 不支持 /etc/gai.conf 优先级策略。${RESET}"
+                echo -e "${YELLOW}💡 解决方案：请在主菜单选择【 1) 彻底禁用 IPv6 】来强制系统走 IPv4 通道。${RESET}"
+            else
+                echo -e "${YELLOW}⏳ 正在设置系统网络规则：IPv4 优先...${RESET}"
+                [ ! -f /etc/gai.conf ] && touch /etc/gai.conf
+                sed -i '/precedence ::ffff:0:0\/96/d' /etc/gai.conf
+                echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+                echo -e "${GREEN}✅ 设置成功！当前系统已调整为：【IPv4 优先】。${RESET}"
+                echo -e "${YELLOW}无需重启，已实时生效。${RESET}"
+            fi
+            read -rp "按回车键返回菜单..."
+            ;;
+        4)
+            if [ "$os_type" = "alpine" ]; then
+                echo -e "${BLUE}ℹ️  Alpine 默认即为强制 IPv6 优先，无需配置。${RESET}"
+            else
+                echo -e "${YELLOW}⏳ 正在恢复系统默认规则：IPv6 优先...${RESET}"
+                [ -f /etc/gai.conf ] && sed -i '/^[[:space:]]*precedence[[:space:]]\+::ffff:0:0\/96[[:space:]]\+100/d' /etc/gai.conf
+                echo -e "${GREEN}✅ 恢复成功！当前系统已调整回：【默认 IPv6 优先】。${RESET}"
+                echo -e "${YELLOW}无需重启，已实时生效。${RESET}"
+            fi
+            read -rp "按回车键返回菜单..."
+            ;;
+        5)
+            echo -e "${GREEN}🌐 [1/3] 内核 IPv6 状态：${RESET}"
+            is_all_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+            is_iface_disabled=$(sysctl -n net.ipv6.conf.${iface}.disable_ipv6 2>/dev/null)
+            
+            if [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "1" ]; then
+                echo -e "${RED}❌ 内核与活跃网卡已完全禁用 IPv6${RESET}"
+            elif [ "$is_all_disabled" = "1" ] && [ "$is_iface_disabled" = "0" ]; then
+                echo -e "${YELLOW}⚠️  警告：内核全局已禁，但活跃网卡 [${iface}] 被强行拉起！${RESET}"
+            else
+                echo -ne "${GREEN}✅ 内核及网卡已正常启用 IPv6 ${RESET}"
+                if [ "$os_type" = "alpine" ]; then
+                    echo -e "${RED}(Alpine固件：强锁IPv6优先)${RESET}"
+                elif [ -f /etc/gai.conf ] && grep -q "^[[:space:]]*precedence[[:space:]]\+::ffff:0:0/96[[:space:]]\+100" /etc/gai.conf; then
+                    echo -e "${YELLOW}(策略锁定：IPv4优先)${RESET}"
+                else
+                    echo -e "${YELLOW}(策略锁定：IPv6优先)${RESET}"
+                fi
+            fi
+
+            echo -e "\n${GREEN}📌 [2/3] 本地网卡 IP 地址分配情况：${RESET}"
+            echo -ne "${YELLOW}  IPv4 地址: ${RESET}"
+            ip -4 addr show dev "$iface" 2>/dev/null | grep "inet" | awk '{print $2}' || echo "${RED}未检测到 IPv4${RESET}"
+            echo -ne "${YELLOW}  IPv6 地址: ${RESET}"
+            ip -6 addr show dev "$iface" 2>/dev/null | grep "inet6" | awk '{print $2}' || echo "${RED}未检测到 IPv6${RESET}"
+
+            echo -e "\n${GREEN}🔎 [3/3] 公网双栈连通性及公网 IP 测试：${RESET}"
+            if has_cmd ping; then
+                ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && echo -e "${GREEN}✅ IPv4 路由连通正常${RESET}" || echo -e "${RED}❌ IPv4 路由无法访问公网${RESET}"
+            fi
+            echo -n "    └─ 本机公网 IPv4: "
+            get_public_ip "-4"
+
+            has_v6=false
+            if has_cmd ping6; then ping6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true
+            elif has_cmd ping; then ping -6 -c 2 -W 3 240c::6666 >/dev/null 2>&1 && has_v6=true; fi
+
+            if [ "$has_v6" = "true" ] && [ "$is_iface_disabled" = "0" ]; then
+                echo -e "${GREEN}✅ IPv6 路由连通正常${RESET}"
+                echo -n "    └─ 本机公网 IPv6: "
+                get_public_ip "-6"
+            else
+                echo -e "${RED}❌ IPv6 无法访问外部网络 (内核已死锁或网络环境不支持)${RESET}"
+            fi
+            echo
+            read -rp "按回车键返回菜单..."
+            ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}❌ 输入错误，无此选项${RESET}"; sleep 1 ;;
+    esac
+done

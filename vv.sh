@@ -1,58 +1,30 @@
 #!/bin/bash
 # =================================================================
-# Transmission Docker Compose 管理面板
+# Acgfaka Docker Compose 管理面板 (内置库/远程库/缓存自适应三模版)
 # =================================================================
 
-# 颜色
+# 颜色定义
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="transmission"
-BASE_DIR="/opt/transmission"
+BASE_DIR="/opt/acgfaka"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-WEB_SRC_DIR="$BASE_DIR/web/src"
+DEFAULT_IMAGE="dapiaoliang666/acgfaka"
 
-# GitHub 仓库信息
-REPO_API="https://api.github.com/repos/hisproc/transmission-next-ui/releases/latest"
-
-# 代理前缀列表（第一个留空代表直连尝试）
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
-
-# 检测依赖
+# 检测依赖环境
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    
-    local missing_deps=()
-    ! command -v unzip &> /dev/null && missing_deps+=("unzip")
-    ! command -v wget &> /dev/null && missing_deps+=("wget")
-    ! command -v curl &> /dev/null && missing_deps+=("curl")
-    
-    if [ ${#missing_deps[@]} -ne 0 ]; then
-        echo -e "${YELLOW}提示: 正在安装缺失的工具 (${missing_deps[*]})...${RESET}"
-        if command -v apt-get &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y wget unzip curl
-        elif command -v yum &> /dev/null; then
-            sudo yum install -y wget unzip curl
-        fi
-    fi
 }
 
 
 get_public_ip() {
-    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -80,326 +52,315 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取容器整体状态和端口 (高精度解析版)
 get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
+    if [ -f "$COMPOSE_FILE" ]; then
+        if [ "$(docker ps -q -f name=acgfaka)" ]; then
+            status="${GREEN}运行中${RESET}"
+        elif [ "$(docker ps -aq -f name=acgfaka)" ]; then
+            status="${YELLOW}已停止${RESET}"
+        else
+            status="${RED}未部署${RESET}"
+        fi
+        
+        # 精准定位 acgfaka 服务下的 ports 映射行，提取冒号前的宿主机自定义端口
+        web_port=$(sed -n '/acgfaka:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+        [[ -z "$web_port" ]] && web_port="8000"
     else
-        status="${RED}未部署${RESET}"
-    fi
-
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-    else
-        img_version="${RED}未安装${RESET}"
-    fi
-
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        webui_port=$(grep -E "\-[[:space:]]*[\"']?[0-9]+:9091" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"-')
-        [[ -z "$webui_port" ]] && webui_port="9091"
-
-        download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | tr -d '"' | xargs)
-        [[ -z "$download_dir" ]] && download_dir="$BASE_DIR/downloads"
-    else
-        webui_port="N/A"
-        download_dir="N/A"
+        status="${RED}未初始化${RESET}"
+        web_port="N/A"
     fi
 }
 
-# 提取 Web UI 账号密码
-get_transmission_creds() {
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        local username=$(grep -E "USER=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-        local password=$(grep -E "PASS=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-        echo -e "${GREEN}用户名: ${username} | 密码: ${password}${RESET}"
-    else
-        echo -e "${RED}未部署${RESET}"
-    fi
-}
-
-# 核心下载函数：带代理轮询及重试机制
-download_with_proxy_pool() {
-    local raw_url="$1"
-    local output_path="$2"
-    local download_success=false
-
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        # 拼接代理前缀
-        local final_url="${proxy}${raw_url}"
-        
-        if [[ -z "$proxy" ]]; then
-            echo -e "${YELLOW}正在尝试直连下载...${RESET}"
-        else
-            echo -e "${YELLOW}直连失败或不可用，正在通过代理 [ ${proxy} ] 尝试下载...${RESET}"
-        fi
-        
-        # 使用 wget 下载，设置5秒超时，1次重试
-        if wget --no-check-certificate --timeout=5 --tries=1 -O "$output_path" "$final_url"; then
-            echo -e "${GREEN}下载成功！${RESET}"
-            download_success=true
-            break
-        else
-            echo -e "${RED}当前下载通道失败，正在切换下一个通道...${RESET}"
-        fi
-    done
-
-    if [ "$download_success" = true ]; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# 智能动态在线获取最新版 Web UI
-setup_custom_webui() {
-    echo -ne "${YELLOW}是否自动获取并安装最新版 Next-UI 界面？(y/n) [默认: y]: ${RESET}"
-    read -r enable_ui
-    [[ -z "$enable_ui" ]] && enable_ui="y"
-
-    if [[ "$enable_ui" == "y" || "$enable_ui" == "Y" ]]; then
-        echo -e "${CYAN}--- 正在通过 GitHub API 获取最新版本 ---${RESET}"
-        
-        # 1. 动态获取最新 Release 信息（带代理兜底，防止 API 本身被墙）
-        local api_response=""
-        # 尝试通过代理或者直连获取 API 信息 (API 一般不走普通 GH 代理，通过增加超时重试防挂)
-        api_response=$(curl -s --connect-timeout 5 "$REPO_API")
-        
-        local raw_download_url=""
-        local version_tag=""
-
-        if [[ -z "$api_response" || "$api_response" == *"message"* ]]; then
-            echo -e "${RED}⚠️ 警告: 无法连接到 GitHub API 或触发限制。将启用本地备用静态解析方案。${RESET}"
-            raw_download_url="https://github.com/hisproc/transmission-next-ui/releases/download/v0.3.1/release.zip"
-            version_tag="v0.3.1 (备用)"
-        else
-            raw_download_url=$(echo "$api_response" | grep -E '"browser_download_url":' | grep -i '\.zip' | head -n 1 | awk -F '"' '{print $4}')
-            version_tag=$(echo "$api_response" | grep -E '"tag_name":' | head -n 1 | awk -F '"' '{print $4}')
-        fi
-
-        if [[ -z "$raw_download_url" ]]; then
-            echo -e "${RED}❌ 错误: 无法解析到 zip 压缩包下载地址！将回滚使用原生界面。${RESET}"
-            return 1
-        fi
-
-        echo -e "${GREEN}发现最新版本: ${version_tag}${RESET}"
-        
-        # 2. 清理并创建本地目录
-        echo -e "${YELLOW}正在清理旧的 Web 目录...${RESET}"
-        rm -rf "$WEB_SRC_DIR"
-        mkdir -p "$WEB_SRC_DIR"
-
-        # 3. 调用带代理轮询的下载函数
-        if download_with_proxy_pool "$raw_download_url" "$BASE_DIR/web_ui.zip"; then
-            echo -e "${YELLOW}正在智能解压...${RESET}"
-            mkdir -p "$BASE_DIR/web_tmp"
-            unzip -q "$BASE_DIR/web_ui.zip" -d "$BASE_DIR/web_tmp"
-            
-            # 兼容性处理：判断解压后是直接含 index.html 还是包裹了一层目录
-            if [ $(ls -A "$BASE_DIR/web_tmp" | wc -l) -eq 1 ] && [ -d "$BASE_DIR/web_tmp/$(ls -A $BASE_DIR/web_tmp)" ]; then
-                mv "$BASE_DIR/web_tmp/$(ls -A $BASE_DIR/web_tmp)"/* "$WEB_SRC_DIR/"
-            else
-                mv "$BASE_DIR/web_tmp"/* "$WEB_SRC_DIR/"
-            fi
-
-            # 清理临时文件
-            rm -rf "$BASE_DIR/web_ui.zip" "$BASE_DIR/web_tmp"
-            echo -e "${GREEN}✨ Next-UI (${version_tag}) 静态文件已成功部署！${RESET}"
-            return 0
-        else
-            echo -e "${RED}❌ 严重错误: 所有下载代理通道全部沦陷！将自动回滚为 Transmission 原生界面。${RESET}"
-            return 1
-        fi
-    fi
-    return 1
-}
-
-install_transmission() {
+# 部署 Acgfaka
+install_acgfaka() {
     check_dependencies
-    
-    mkdir -p "$BASE_DIR/config" "$BASE_DIR/watch"
+    mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入 Transmission WebUI 访问端口 [默认: 9091]: ${RESET}"
+    echo -e "${CYAN}====== 数据库/缓存运行模式选择 ======${RESET}"
+    echo -e " 1. 直接部署全新且完整的环境 (包含全新 MySQL 5.7 + Redis)"
+    echo -e " 2. 使用外部已有 MySQL，但在本地部署全新 Redis 缓存"
+    echo -e " 3. 同时使用外部已有 MySQL 和外部已有 Redis"
+    echo -ne "${YELLOW}请选择架构部署模式 [默认: 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
+
+    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Acgfaka Web 访问端口 [默认: 8000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="9091"
+    [[ -z "$custom_port" ]] && custom_port="8000"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -ne "${YELLOW}请输入 Transmission Peer 传入端口 [默认: 51413]: ${RESET}"
-    read -r peer_port
-    [[ -z "$peer_port" ]] && peer_port="51413"
+    # 预设自动化环境目录
+    mkdir -p "$BASE_DIR/acgfaka"
 
-    echo -ne "${YELLOW}请输入宿主机下载文件存储绝对路径 [默认: $BASE_DIR/downloads]: ${RESET}"
-    read -r custom_download
-    [[ -z "$custom_download" ]] && custom_download="$BASE_DIR/downloads"
+    # ------------------ 模式 1：全套本地内置容器化 ------------------
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}正在自动计算生成数据库高强度防破解随机密码...${RESET}"
+        local rand_root_pass=$(openssl rand -hex 12)
+        local rand_user_pass=$(openssl rand -hex 12)
+        local rand_user="acgfaka_user"
+        local rand_db="acgfakadb"
 
-    echo -ne "${YELLOW}请设置 WebUI 登录用户名 [默认: transmission]: ${RESET}"
-    read -r ui_user
-    [[ -z "$ui_user" ]] && ui_user="transmission"
+        mkdir -p "$BASE_DIR/mysql"
 
-    echo -ne "${YELLOW}请设置 WebUI 登录密码 [默认: transmission]: ${RESET}"
-    read -r ui_pass
-    [[ -z "$ui_pass" ]] && ui_pass="transmission"
-
-    # 执行智能化 UI 部署
-    setup_custom_webui
-    has_custom_ui=$?
-
-    # 获取执行脚本用户的 UID/GID 并创建存储目录
-    CURRENT_UID=$(id -u)
-    CURRENT_GID=$(id -g)
-    mkdir -p "$custom_download"
-    
-    # 生成标准的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
-    
-    local env_web_home=""
-    local volume_web_src=""
-    
-    if [ $has_custom_ui -eq 0 ]; then
-        env_web_home="- TRANSMISSION_WEB_HOME=/src"
-        volume_web_src="- ${WEB_SRC_DIR}:/src"
-    fi
-
-    cat <<EOF > "$COMPOSE_FILE"
+        cat << EOF > "$COMPOSE_FILE"
 services:
-  transmission:
-    image: linuxserver/transmission:4.0.0
-    container_name: ${CONTAINER_NAME}
-    environment:
-      - PUID=${CURRENT_UID}
-      - PGID=${CURRENT_GID}
-      - UMASK=022
-      ${env_web_home}
-      - TZ=Asia/Shanghai
-      - USER=${ui_user}
-      - PASS=${ui_pass}
-    volumes:
-      ${volume_web_src}
-      - ${BASE_DIR}/config:/config
-      - ${custom_download}:/downloads
-      - ${BASE_DIR}/watch:/watch
+  acgfaka:
+    image: ${DEFAULT_IMAGE}
+    container_name: acgfaka
+    restart: always
     ports:
-      - "${custom_port}:9091"
-      - "${peer_port}:51413"
-      - "${peer_port}:51413/udp"
-    restart: unless-stopped
+      - "${custom_port}:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      PHP_OPCACHE_ENABLE: 1
+      PHP_OPCACHE_MEMORY_CONSUMPTION: 128
+      PHP_OPCACHE_MAX_ACCELERATED_FILES: 10000
+      PHP_OPCACHE_REVALIDATE_FREQ: 2
+      PHP_REDIS_HOST: redis
+      PHP_REDIS_PORT: 6379
+    volumes:
+      - ${BASE_DIR}/acgfaka:/var/www/html
+
+  mysql:
+    image: mysql:5.7
+    container_name: acgfaka-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${rand_root_pass}
+      MYSQL_DATABASE: ${rand_db}
+      MYSQL_USER: ${rand_user}
+      MYSQL_PASSWORD: ${rand_user_pass}
+    volumes:
+      - ${BASE_DIR}/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p${rand_root_pass}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:latest
+    container_name: acgfaka-redis
+    restart: always
 EOF
 
-    chmod -R 777 "$BASE_DIR" "$custom_download"
+        echo -e "${YELLOW}正在通过 Docker Compose 部署启动全套 Acgfaka 集群...${RESET}"
+        cd "$BASE_DIR" && docker compose up -d --force-recreate
+        
+        if [ $? -ne 0 ]; then echo -e "${RED}部署失败，请检查 Docker 日志。${RESET}"; return; fi
+        
+        echo -e "${GREEN}内置 MySQL 数据库 'acgfakadb' 自动检查并初始化完毕。${RESET}"
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Transmission...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    # ------------------ 模式 2：外部 MySQL + 本地内置 Redis ------------------
+    elif [[ "$db_mode" == "2" ]]; then
+        echo -e "${CYAN}====== 远程/外部 MySQL 数据库信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 MySQL IP/域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_mysql_host
+        [[ -z "$ext_mysql_host" ]] && ext_mysql_host="127.0.0.1"
+        
+        echo -ne "${YELLOW}请输入外部 MySQL 端口 [默认: 3306]: ${RESET}"
+        read -r ext_mysql_port
+        [[ -z "$ext_mysql_port" ]] && ext_mysql_port="3306"
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+        echo -ne "${YELLOW}请输入外部 MySQL 用户名 [默认: root]: ${RESET}"
+        read -r ext_mysql_user
+        [[ -z "$ext_mysql_user" ]] && ext_mysql_user="root"
 
-    SERVER_IP=$(get_public_ip)
+        echo -ne "${YELLOW}请输入外部 MySQL 密码: ${RESET}"
+        read -r ext_mysql_pass
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Transmission 部署成功！    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${SERVER_IP}:${custom_port}${RESET}"
-    get_transmission_creds
-    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR/config${RESET}"
-    echo -e "${YELLOW}宿主机下载路径 : $custom_download${RESET}"
-    echo -e "${YELLOW}Peer 传入端口  : $peer_port${RESET}"
-    if [ $has_custom_ui -eq 0 ]; then
-        echo -e "${GREEN}自定义 Web UI  : 已成功启用并自动挂载最新版${RESET}"
+        echo -ne "${YELLOW}请输入要自动创建的数据库名 [默认: acgfakadb]: ${RESET}"
+        read -r ext_mysql_db
+        [[ -z "$ext_mysql_db" ]] && ext_mysql_db="acgfakadb"
+
+        local connect_host="$ext_mysql_host"
+        if [[ "$ext_mysql_host" == "127.0.0.1" || "$ext_mysql_host" == "localhost" ]]; then
+            ext_mysql_host="172.17.0.1"
+        fi
+
+        # 尝试通过临时客户端容器远程连接并建库
+        echo -e "${YELLOW}正在连接外部数据库并尝试自动创建 '${ext_mysql_db}' 库...${RESET}"
+        docker run --rm mysql:5.7 mysql -h"${connect_host}" -P"${ext_mysql_port}" -u"${ext_mysql_user}" -p"${ext_mysql_pass}" -e "CREATE DATABASE IF NOT EXISTS \`${ext_mysql_db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null
+        
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  acgfaka:
+    image: ${DEFAULT_IMAGE}
+    container_name: acgfaka
+    restart: always
+    ports:
+      - "${custom_port}:80"
+    depends_on:
+      - redis
+    environment:
+      PHP_OPCACHE_ENABLE: 1
+      PHP_OPCACHE_MEMORY_CONSUMPTION: 128
+      PHP_OPCACHE_MAX_ACCELERATED_FILES: 10000
+      PHP_OPCACHE_REVALIDATE_FREQ: 2
+      PHP_REDIS_HOST: redis
+      PHP_REDIS_PORT: 6379
+    volumes:
+      - ${BASE_DIR}/acgfaka:/var/www/html
+
+  redis:
+    image: redis:latest
+    container_name: acgfaka-redis
+    restart: always
+EOF
+        cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    # ------------------ 模式 3：全外部外置（精简模式） ------------------
+    else
+        echo -e "${CYAN}====== 远程/外部 MySQL 与 Redis 配置 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 MySQL IP/域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_mysql_host
+        [[ -z "$ext_mysql_host" ]] && ext_mysql_host="127.0.0.1"
+        
+        echo -ne "${YELLOW}请输入外部 MySQL 用户名与密码(用空格隔开，如 root 123456): ${RESET}"
+        read -r ext_mysql_user ext_mysql_pass
+
+        echo -ne "${YELLOW}请输入外部 Redis IP/域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_redis_host
+        [[ -z "$ext_redis_host" ]] && ext_redis_host="127.0.0.1"
+
+        echo -ne "${YELLOW}请输入外部 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r ext_redis_port
+        [[ -z "$ext_redis_port" ]] && ext_redis_port="6379"
+
+        # 回环重定向桥接
+        [[ "$ext_mysql_host" == "127.0.0.1" || "$ext_mysql_host" == "localhost" ]] && ext_mysql_host="172.17.0.1"
+        [[ "$ext_redis_host" == "127.0.0.1" || "$ext_redis_host" == "localhost" ]] && ext_redis_host="172.17.0.1"
+
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  acgfaka:
+    image: ${DEFAULT_IMAGE}
+    container_name: acgfaka
+    restart: always
+    ports:
+      - "${custom_port}:80"
+    environment:
+      PHP_OPCACHE_ENABLE: 1
+      PHP_OPCACHE_MEMORY_CONSUMPTION: 128
+      PHP_OPCACHE_MAX_ACCELERATED_FILES: 10000
+      PHP_OPCACHE_REVALIDATE_FREQ: 2
+      PHP_REDIS_HOST: ${ext_redis_host}
+      PHP_REDIS_PORT: ${ext_redis_port}
+    volumes:
+      - ${BASE_DIR}/acgfaka:/var/www/html
+EOF
+        cd "$BASE_DIR" && docker compose up -d --force-recreate
     fi
-    echo -e "${GREEN}================================${RESET}"
+
+    if [ $? -ne 0 ]; then echo -e "${RED}服务拉起异常。${RESET}"; return; fi
+
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}             Acgfaka 部署成功！                     ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}访问端点(URL) : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}映射宿主机端口 : ${custom_port}${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}内置库凭证    : 用户:${rand_user} | 密码:${rand_user_pass} | 库名:${rand_db}${RESET}"
+        echo -e "${YELLOW}内置库Host管理 : acgfaka-mysql 或 填写容器内部网段(直接填 mysql 即可)${RESET}"
+    else
+        echo -e "${YELLOW}数据库外部地址 : ${ext_mysql_host}${RESET}"
+    fi
+    echo -e "${YELLOW}部署工作路径   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-update_transmission() {
+# 更新服务
+update_acgfaka() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    
-    # 更新时同时检测是否有更高级的 WebUI
-    echo -e "${YELLOW}正在检查并更新 WebUI 与核心镜像...${RESET}"
-    if grep -q "TRANSMISSION_WEB_HOME" "$COMPOSE_FILE"; then
-        setup_custom_webui
-    fi
-
+    echo -e "${YELLOW}正在拉取 Acgfaka 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器与组件已处于最新状态。${RESET}"
+    echo -e "${GREEN}服务已拉升至最新版本状态！${RESET}"
 }
 
-uninstall_transmission() {
-    echo -ne "${YELLOW}确定要卸载并删除 Transmission 容器吗？(y/n): ${RESET}"
+# 卸载集群
+uninstall_acgfaka() {
+    echo -ne "${RED}⚠️  确定要注销并删除 Acgfaka 服务集群吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和下载的种子文件？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已全部终止移除。${RESET}"
+            echo -ne "${RED}是否同步清理掉本地所有源码、配置及内置数据库数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                cd "$BASE_DIR" && docker compose down -v
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}工作目录及持久化挂载文件已被彻底净化清除。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            docker rm -f acgfaka acgfaka-mysql acgfaka-redis 2>/dev/null
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        echo -e "${GREEN}完全卸载完毕！${RESET}"
     fi
 }
 
-start_trans() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_trans() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_trans() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_trans() { docker logs -f "$CONTAINER_NAME"; }
+# 控制命令
+start_ak() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务集群已正常启动${RESET}"; }
+stop_ak() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务集群已安全暂停${RESET}"; }
+restart_ak() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务集群已完成软重启${RESET}"; }
+logs_ak() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
+# 查看配置信息
 show_info() {
     get_status_info
-    SERVER_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${SERVER_IP}:${webui_port}${RESET}"
-    echo -ne "${YELLOW}当前认证凭据   : ${RESET}"
-    get_transmission_creds
-    echo -e "${YELLOW}宿主机下载路径 : ${download_dir}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}当前运行状态   : $status"
+    echo -e "${YELLOW}实际映射端口   : ${web_port}${RESET}"
+    echo -e "${YELLOW}本地项目路径   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
+# 主菜单
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Transmission 管理面板  ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}       ◈  Acgfaka 管理面板  ◈       ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 当前状态 :${RESET} $status"
+    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 1. 部署启动${RESET}"
+    echo -e "${GREEN} 2. 更新服务${RESET}"
+    echo -e "${GREEN} 3. 卸载服务${RESET}"
+    echo -e "${GREEN} 4. 启动服务${RESET}"
+    echo -e "${GREEN} 5. 停止服务${RESET}"
+    echo -e "${GREEN} 6. 重启服务${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_transmission ;;
-        2) update_transmission ;;
-        3) uninstall_transmission ;;
-        4) start_trans ;;
-        5) stop_trans ;;
-        6) restart_trans ;;
-        7) logs_trans ;;
+        1) install_acgfaka ;;
+        2) update_acgfaka ;;
+        3) uninstall_acgfaka ;;
+        4) start_ak ;;
+        5) stop_ak ;;
+        6) restart_ak ;;
+        7) logs_ak ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

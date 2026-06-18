@@ -16,26 +16,31 @@ fi
 INSTALL_DIR="/www/wwwroot/mcy-shop"
 DOWNLOAD_URL="https://wiki.mcy.im/download.php?q=27"
 
-# ================== 目录限制守卫 ==================
+# ================== 【已修改】自动进入工作目录守卫 ==================
 CURRENT_DIR=$(pwd)
 
 if [ "$CURRENT_DIR" != "$INSTALL_DIR" ]; then
-    echo -e "${RED}❌ 拒绝访问！此管理脚本必须进入程序根目录才能使用！${RESET}"
-    echo -e "${YELLOW}请先执行以下命令进入目录：${RESET}"
-    echo -e "${GREEN}cd $INSTALL_DIR${RESET}"
-    echo ""
-    exit 1
+    echo -e "${YELLOW}检测到当前不在程序根目录，正在自动切换...${RESET}"
+    # 如果目录不存在（如首次安装），则自动创建
+    if [ ! -d "$INSTALL_DIR" ]; then
+        echo -e "${YELLOW}目录 $INSTALL_DIR 不存在，正在自动创建...${RESET}"
+        mkdir -p "$INSTALL_DIR"
+    fi
+    # 自动切换到目标目录
+    cd "$INSTALL_DIR" || { echo -e "${RED}无法进入目录 $INSTALL_DIR，执行失败！${RESET}"; exit 1; }
+    echo -e "${GREEN}已成功切换至工作目录: $(pwd)${RESET}"
+    sleep 1
 fi
 
 # ================== 依赖环境检测与安装 ==================
 check_dependencies() {
-    if ! command -v unzip &> /dev/null; then
+    if ! command -v unzip & /dev/null; then
         echo -e "${YELLOW}检测到系统缺少 unzip 工具，正在尝试自动安装...${RESET}"
-        if command -v apt-get &> /dev/null; then
+        if command -v apt-get & /dev/null; then
             apt-get update && apt-get install -y unzip
-        elif command -v yum &> /dev/null; then
+        elif command -v yum & /dev/null; then
             yum install -y unzip
-        elif command -v dnf &> /dev/null; then
+        elif command -v dnf & /dev/null; then
             dnf install -y unzip
         else
             echo -e "${RED}未找到包管理器，请手动安装 unzip 后重试！${RESET}"
@@ -43,11 +48,11 @@ check_dependencies() {
         fi
     fi
 
-    if ! command -v wget &> /dev/null; then
+    if ! command -v wget & /dev/null; then
         echo -e "${YELLOW}检测到系统缺少 wget 工具，正在尝试自动安装...${RESET}"
-        if command -v apt-get &> /dev/null; then
+        if command -v apt-get & /dev/null; then
             apt-get install -y wget
-        elif command -v yum &> /dev/null; then
+        elif command -v yum & /dev/null; then
             yum install -y wget
         fi
     fi
@@ -132,7 +137,7 @@ show_menu() {
     echo -e "${GREEN}19. 删除 Composer依赖${RESET}"
     echo -e "${GREEN}20. 导入异次元 V3用户数据${RESET}"
     echo -e "${GREEN}0.  退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
+    echo "--------------------------------"
     echo -ne "${GREEN}请选择操作: ${RESET}"
 }
 

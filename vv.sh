@@ -1,27 +1,55 @@
 #!/bin/bash
-# ========================================
-# Lucky v2 一键管理脚本
-# ========================================
+# =================================================================
+# Transmission Docker Compose 管理面板
+# =================================================================
 
+# 颜色
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="lucky"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+CONTAINER_NAME="transmission"
+BASE_DIR="/opt/transmission"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+WEB_SRC_DIR="$BASE_DIR/web/src"
 
-check_docker() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+# GitHub 仓库信息
+REPO_API="https://api.github.com/repos/hisproc/transmission-next-ui/releases/latest"
+
+# 代理前缀列表（第一个留空代表直连尝试）
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+)
+
+# 检测依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
+    
+    local missing_deps=()
+    ! command -v unzip &> /dev/null && missing_deps+=("unzip")
+    ! command -v wget &> /dev/null && missing_deps+=("wget")
+    ! command -v curl &> /dev/null && missing_deps+=("curl")
+    
+    if [ ${#missing_deps[@]} -ne 0 ]; then
+        echo -e "${YELLOW}提示: 正在安装缺失的工具 (${missing_deps[*]})...${RESET}"
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y wget unzip curl
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y wget unzip curl
+        fi
+    fi
 }
+
 
 get_public_ip() {
     local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
@@ -52,117 +80,334 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-menu() {
-    clear
-    # 1. 动态获取 Lucky 容器的状态 (先安全检测 docker 命令是否存在，防止菜单本身报错)
-    local container_status="🔴 未运行(未检测到容器)"
-    if command -v docker &>/dev/null; then
-        if docker ps -a --format '{{.Names}}' | grep -q "^lucky$"; then
-            local is_running=$(docker ps --format '{{.Names}}' | grep -q "^lucky$" && echo "yes" || echo "no")
-            if [ "$is_running" = "yes" ]; then
-                container_status="🟢 运行中"
-            else
-                container_status="🟡 已停止"
-            fi
-        fi
+# 动态获取容器状态、映射端口和数据目录
+get_status_info() {
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
     else
-        container_status="❌ 未安装 Docker"
+        status="${RED}未部署${RESET}"
     fi
-    # 2. 渲染菜单头部、状态与端口信息
-    echo -e "${GREEN}========================${RESET}"
-    echo -e "${GREEN}  ◈  Lucky 管理菜单  ◈ ${RESET}"
-    echo -e "${GREEN}========================${RESET}"
-    echo -e "${GREEN}状态:${RESET} ${YELLOW}$container_status${RESET}"
-    echo -e "${GREEN}端口:${RESET} ${YELLOW}16601${RESET}${YELLOW} (Host模式)${RESET}"
-    echo -e "${GREEN}========================${RESET}"
-    echo -e "${GREEN}1) 安装启动${RESET}"
-    echo -e "${GREEN}2) 更新${RESET}"
-    echo -e "${GREEN}3) 重启${RESET}"
-    echo -e "${GREEN}4) 查看日志${RESET}"
-    echo -e "${GREEN}5) 查看状态${RESET}"
-    echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}========================${RESET}"
-    echo -ne "${GREEN}请选择:${RESET} "
-    read choice
 
-    case $choice in
-        1) install_app ;;
-        2) update_app ;;
-        3) restart_app ;;
-        4) view_logs ;;
-        5) check_status ;;
-        6) uninstall_app ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择${RESET}"; sleep 1 ;;
-    esac
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+    else
+        img_version="${RED}未安装${RESET}"
+    fi
+
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        webui_port=$(grep -E "\-[[:space:]]*[\"']?[0-9]+:9091" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"-')
+        [[ -z "$webui_port" ]] && webui_port="9091"
+
+        download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | tr -d '"' | xargs)
+        [[ -z "$download_dir" ]] && download_dir="$BASE_DIR/downloads"
+    else
+        webui_port="N/A"
+        download_dir="N/A"
+    fi
 }
 
-install_app() {
-    check_docker
-    mkdir -p "$APP_DIR/conf"
+# 提取 Web UI 账号密码
+get_transmission_creds() {
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        local username=$(grep -E "USER=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
+        local password=$(grep -E "PASS=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
+        echo -e "${GREEN}用户名: ${username} | 密码: ${password}${RESET}"
+    else
+        echo -e "${RED}未部署${RESET}"
+    fi
+}
 
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
+# 核心下载函数：带代理轮询及重试机制
+download_with_proxy_pool() {
+    local raw_url="$1"
+    local output_path="$2"
+    local download_success=false
+
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        # 拼接代理前缀
+        local final_url="${proxy}${raw_url}"
+        
+        if [[ -z "$proxy" ]]; then
+            echo -e "${YELLOW}正在尝试直连下载...${RESET}"
+        else
+            echo -e "${YELLOW}直连失败或不可用，正在通过代理 [ ${proxy} ] 尝试下载...${RESET}"
+        fi
+        
+        # 使用 wget 下载，设置5秒超时，1次重试
+        if wget --no-check-certificate --timeout=5 --tries=1 -O "$output_path" "$final_url"; then
+            echo -e "${GREEN}下载成功！${RESET}"
+            download_success=true
+            break
+        else
+            echo -e "${RED}当前下载通道失败，正在切换下一个通道...${RESET}"
+        fi
+    done
+
+    if [ "$download_success" = true ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# 智能动态在线获取最新版 Web UI
+setup_custom_webui() {
+    echo -ne "${YELLOW}是否自动获取并安装最新版 Next-UI 界面？(y/n) [默认: y]: ${RESET}"
+    read -r enable_ui
+    [[ -z "$enable_ui" ]] && enable_ui="y"
+
+    if [[ "$enable_ui" == "y" || "$enable_ui" == "Y" ]]; then
+        echo -e "${CYAN}--- 正在通过 GitHub API 获取最新版本 ---${RESET}"
+        
+        # 1. 动态获取最新 Release 信息（带代理兜底，防止 API 本身被墙）
+        local api_response=""
+        # 尝试通过代理或者直连获取 API 信息 (API 一般不走普通 GH 代理，通过增加超时重试防挂)
+        api_response=$(curl -s --connect-timeout 5 "$REPO_API")
+        
+        local raw_download_url=""
+        local version_tag=""
+
+        if [[ -z "$api_response" || "$api_response" == *"message"* ]]; then
+            echo -e "${RED}⚠️ 警告: 无法连接到 GitHub API 或触发限制。将启用本地备用静态解析方案。${RESET}"
+            raw_download_url="https://github.com/hisproc/transmission-next-ui/releases/download/v0.3.1/release.zip"
+            version_tag="v0.3.1 (备用)"
+        else
+            raw_download_url=$(echo "$api_response" | grep -E '"browser_download_url":' | grep -i '\.zip' | head -n 1 | awk -F '"' '{print $4}')
+            version_tag=$(echo "$api_response" | grep -E '"tag_name":' | head -n 1 | awk -F '"' '{print $4}')
+        fi
+
+        if [[ -z "$raw_download_url" ]]; then
+            echo -e "${RED}❌ 错误: 无法解析到 zip 压缩包下载地址！将回滚使用原生界面。${RESET}"
+            return 1
+        fi
+
+        echo -e "${GREEN}发现最新版本: ${version_tag}${RESET}"
+        
+        # 2. 清理并创建本地目录
+        echo -e "${YELLOW}正在清理旧的 Web 目录...${RESET}"
+        rm -rf "$WEB_SRC_DIR"
+        mkdir -p "$WEB_SRC_DIR"
+
+        # 3. 调用带代理轮询的下载函数
+        if download_with_proxy_pool "$raw_download_url" "$BASE_DIR/web_ui.zip"; then
+            echo -e "${YELLOW}正在智能解压...${RESET}"
+            mkdir -p "$BASE_DIR/web_tmp"
+            unzip -q "$BASE_DIR/web_ui.zip" -d "$BASE_DIR/web_tmp"
+            
+            # 兼容性处理：判断解压后是直接含 index.html 还是包裹了一层目录
+            if [ $(ls -A "$BASE_DIR/web_tmp" | wc -l) -eq 1 ] && [ -d "$BASE_DIR/web_tmp/$(ls -A $BASE_DIR/web_tmp)" ]; then
+                mv "$BASE_DIR/web_tmp/$(ls -A $BASE_DIR/web_tmp)"/* "$WEB_SRC_DIR/"
+            else
+                mv "$BASE_DIR/web_tmp"/* "$WEB_SRC_DIR/"
+            fi
+
+            # 清理临时文件
+            rm -rf "$BASE_DIR/web_ui.zip" "$BASE_DIR/web_tmp"
+            echo -e "${GREEN}✨ Next-UI (${version_tag}) 静态文件已成功部署！${RESET}"
+            return 0
+        else
+            echo -e "${RED}❌ 严重错误: 所有下载代理通道全部沦陷！将自动回滚为 Transmission 原生界面。${RESET}"
+            return 1
+        fi
+    fi
+    return 1
+}
+
+install_transmission() {
+    check_dependencies
+    
+    mkdir -p "$BASE_DIR/config" "$BASE_DIR/watch"
+
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    echo -ne "${YELLOW}请输入 Transmission WebUI 访问端口 [默认: 9091]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="9091"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
     fi
 
-    cat > "$COMPOSE_FILE" <<EOF
+    echo -ne "${YELLOW}请输入 Transmission Peer 传入端口 [默认: 51413]: ${RESET}"
+    read -r peer_port
+    [[ -z "$peer_port" ]] && peer_port="51413"
+
+    echo -ne "${YELLOW}请输入宿主机下载文件存储绝对路径 [默认: $BASE_DIR/downloads]: ${RESET}"
+    read -r custom_download
+    [[ -z "$custom_download" ]] && custom_download="$BASE_DIR/downloads"
+
+    echo -ne "${YELLOW}请设置 WebUI 登录用户名 [默认: transmission]: ${RESET}"
+    read -r ui_user
+    [[ -z "$ui_user" ]] && ui_user="transmission"
+
+    echo -ne "${YELLOW}请设置 WebUI 登录密码 [默认: transmission]: ${RESET}"
+    read -r ui_pass
+    [[ -z "$ui_pass" ]] && ui_pass="transmission"
+
+    # 执行智能化 UI 部署
+    setup_custom_webui
+    has_custom_ui=$?
+
+    # 获取执行脚本用户的 UID/GID 并创建存储目录
+    CURRENT_UID=$(id -u)
+    CURRENT_GID=$(id -g)
+    mkdir -p "$custom_download"
+    
+    # 生成标准的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    
+    local env_web_home=""
+    local volume_web_src=""
+    
+    if [ $has_custom_ui -eq 0 ]; then
+        env_web_home="- TRANSMISSION_WEB_HOME=/src"
+        volume_web_src="- ${WEB_SRC_DIR}:/src"
+    fi
+
+    cat <<EOF > "$COMPOSE_FILE"
 services:
-  lucky:
-    image: gdy666/lucky:v2
-    container_name: lucky
+  transmission:
+    image: linuxserver/transmission:4.0.0
+    container_name: ${CONTAINER_NAME}
+    environment:
+      - PUID=${CURRENT_UID}
+      - PGID=${CURRENT_GID}
+      - UMASK=022
+      ${env_web_home}
+      - TZ=Asia/Shanghai
+      - USER=${ui_user}
+      - PASS=${ui_pass}
     volumes:
-      - ./conf:/app/conf
-      - /var/run/docker.sock:/var/run/docker.sock
-    network_mode: host
-    restart: always
+      ${volume_web_src}
+      - ${BASE_DIR}/config:/config
+      - ${custom_download}:/downloads
+      - ${BASE_DIR}/watch:/watch
+    ports:
+      - "${custom_port}:9091"
+      - "${peer_port}:51413"
+      - "${peer_port}:51413/udp"
+    restart: unless-stopped
 EOF
 
-    cd "$APP_DIR" || exit
-    docker compose up -d
+    chmod -R 777 "$BASE_DIR" "$custom_download"
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Transmission...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
 
     SERVER_IP=$(get_public_ip)
 
-    echo
-    echo -e "${GREEN}✅ Lucky 已启动${RESET}"
-    echo -e "${YELLOW}✅ 访问地址: http://${SERVER_IP}:16601${RESET}"
-    echo -e "${YELLOW}✅ 账号密码: 666/666${RESET}"
-    echo -e "${YELLOW}📂 安装目录: $APP_DIR${RESET}"
-    read -p "按回车返回菜单..."
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    Transmission 部署成功！    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${SERVER_IP}:${custom_port}${RESET}"
+    get_transmission_creds
+    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR/config${RESET}"
+    echo -e "${YELLOW}宿主机下载路径 : $custom_download${RESET}"
+    echo -e "${YELLOW}Peer 传入端口  : $peer_port${RESET}"
+    if [ $has_custom_ui -eq 0 ]; then
+        echo -e "${GREEN}自定义 Web UI  : 已成功启用并自动挂载最新版${RESET}"
+    fi
+    echo -e "${GREEN}================================${RESET}"
 }
 
-update_app() {
-    cd "$APP_DIR" || return
-    docker compose pull
-    docker compose up -d
-    echo -e "${GREEN}✅ Lucky 更新完成${RESET}"
-    read -p "按回车返回菜单..."
+update_transmission() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    
+    # 更新时同时检测是否有更高级的 WebUI
+    echo -e "${YELLOW}正在检查并更新 WebUI 与核心镜像...${RESET}"
+    if grep -q "TRANSMISSION_WEB_HOME" "$COMPOSE_FILE"; then
+        setup_custom_webui
+    fi
+
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器与组件已处于最新状态。${RESET}"
 }
 
-restart_app() {
-    docker restart lucky
-    echo -e "${GREEN}✅ Lucky 已重启${RESET}"
-    read -p "按回车返回菜单..."
+uninstall_transmission() {
+    echo -ne "${YELLOW}确定要卸载并删除 Transmission 容器吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和下载的种子文件？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+            fi
+        else
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
 }
 
-view_logs() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志${RESET}"
-    docker logs -f lucky
+start_trans() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_trans() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_trans() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_trans() { docker logs -f "$CONTAINER_NAME"; }
+
+show_info() {
+    get_status_info
+    SERVER_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${SERVER_IP}:${webui_port}${RESET}"
+    echo -ne "${YELLOW}当前认证凭据   : ${RESET}"
+    get_transmission_creds
+    echo -e "${YELLOW}宿主机下载路径 : ${download_dir}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-check_status() {
-    docker ps | grep lucky
-    read -p "按回车返回菜单..."
+menu() {
+    clear
+    get_status_info
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈  Transmission 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_transmission ;;
+        2) update_transmission ;;
+        3) uninstall_transmission ;;
+        4) start_trans ;;
+        5) stop_trans ;;
+        6) restart_trans ;;
+        7) logs_trans ;;
+        8) show_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
 }
 
-uninstall_app() {
-    cd "$APP_DIR" || return
-    docker compose down
-    rm -rf "$APP_DIR"
-    echo -e "${RED}✅ Lucky 已卸载${RESET}"
-    read -p "按回车返回菜单..."
-}
-
-menu
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

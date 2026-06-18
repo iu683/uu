@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Dnsmgr Docker Compose 管理面板 (内置库/远程库双模 + 自动建库版)
+# OpenFlare Docker Compose 管理面板 
 # =================================================================
 
 # 颜色定义
@@ -10,9 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/dnsmgr"
+BASE_DIR="/opt/openflare"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-DEFAULT_IMAGE="netcccyun/dnsmgr"
+DEFAULT_IMAGE="ghcr.io/rain-kl/openflare:latest"
 
 # 检测依赖环境
 check_dependencies() {
@@ -21,7 +21,6 @@ check_dependencies() {
         exit 1
     fi
 }
-
 
 get_public_ip() {
     local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
@@ -52,259 +51,219 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器整体状态和端口
+# 动态获取容器整体状态和端口 (高精度精准匹配算法)
 get_status_info() {
     if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=dnsmgr-web)" ]; then
+        if [ "$(docker ps -q -f name=openflare-app)" ]; then
             status="${GREEN}运行中${RESET}"
-        elif [ "$(docker ps -aq -f name=dnsmgr-web)" ]; then
+        elif [ "$(docker ps -aq -f name=openflare-app)" ]; then
             status="${YELLOW}已停止${RESET}"
         else
             status="${RED}未部署${RESET}"
         fi
         
-        # 提取 Dnsmgr 宿主机映射端口
-        web_port=$(grep -E "\-[[:space:]]*[\"']?([0-9.]+:)?[0-9]+" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $2 ? $2 : $1}' | tr -d '[:space:]"''-/tcp')
-        [[ -z "$web_port" ]] && web_port="8081"
+        # 精准切分：定位 openflare 下的 ports 行，截取冒号前的自定义宿主机端口
+        web_port=$(sed -n '/openflare:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+        [[ -z "$web_port" ]] && web_port="3000"
     else
         status="${RED}未初始化${RESET}"
         web_port="N/A"
     fi
 }
 
-
-
-# 部署 Dnsmgr
-install_dnsmgr() {
+# 部署 OpenFlare
+install_openflare() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 数据库模式选择 ======${RESET}"
-    echo -e " 1. 直接部署全新的 MySQL 5.7 (Docker 容器化)"
-    echo -e " 2. 使用已有的外部/远程 MySQL (自建/云数据库 RDS)"
+    echo -e "${CYAN}====== 数据库运行模式选择 ======${RESET}"
+    echo -e " 1. 直接部署全新完整环境 (包含全新本地 PostgreSQL 17 容器)"
+    echo -e " 2. 连接外部/远程已有的 PostgreSQL 数据库 (需提前手动创建好数据库)"
     echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
     read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
     echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Dnsmgr Web 访问端口 [默认: 8081]: ${RESET}"
+    echo -ne "${YELLOW}请输入 OpenFlare Web 访问端口 [默认: 3000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8081"
+    [[ -z "$custom_port" ]] && custom_port="3000"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # ------------------ 模式 1：全新 Docker 部署 MySQL 5.7 ------------------
+    # 自动计算高强度的密钥
+    local rand_jwt=$(openssl rand -hex 24)
+    
+    # ------------------ 模式 1：全套本地内置容器化 ------------------
     if [[ "$db_mode" == "1" ]]; then
-        echo -ne "${YELLOW}请为全新 MySQL 设置 root 密码 [默认: 123456]: ${RESET}"
-        read -r db_pass
-        [[ -z "$db_pass" ]] && db_pass="123456"
-
-        echo -e "${YELLOW}正在配置全新容器化 MySQL 5.7 数据库环境...${RESET}"
-        
-        mkdir -p "$BASE_DIR/mysql/conf" "$BASE_DIR/mysql/logs" "$BASE_DIR/mysql/data" "$BASE_DIR/web"
-        
-        if [ ! -f "$BASE_DIR/mysql/conf/my.cnf" ]; then
-            cat << EOF > "$BASE_DIR/mysql/conf/my.cnf"
-[mysqld]
-user=mysql
-default-storage-engine=INNODB
-character-set-server=utf8mb4
-collation-server=utf8mb4_unicode_ci
-EOF
-        fi
+        echo -e "${YELLOW}正在自动计算生成数据库高强度防破解随机密码...${RESET}"
+        local rand_db_pass=$(openssl rand -hex 16)
+        local db_user="openflare"
+        local db_name="openflare"
 
         cat << EOF > "$COMPOSE_FILE"
 services:
-  dnsmgr-web:
-    container_name: dnsmgr-web
-    image: ${DEFAULT_IMAGE}
+  postgres:
+    image: postgres:17-alpine
+    container_name: openflare-db
     restart: unless-stopped
-    stdin_open: true
-    tty: true
-    ports:
-      - "${custom_port}:80"
-    volumes:
-      - ${BASE_DIR}/web:/app/www
-    depends_on:
-      dnsmgr-mysql:
-        condition: service_healthy
-    networks:
-      - dnsmgr-network
-
-  dnsmgr-mysql:
-    container_name: dnsmgr-mysql
-    image: mysql:5.7
-    restart: always
-    ports:
-      - "3306:3306"
-    volumes:
-      - ${BASE_DIR}/mysql/conf/my.cnf:/etc/mysql/my.cnf
-      - ${BASE_DIR}/mysql/logs:/logs
-      - ${BASE_DIR}/mysql/data:/var/lib/mysql
     environment:
-      - MYSQL_ROOT_PASSWORD=${db_pass}
-      - TZ=Asia/Shanghai
+      POSTGRES_DB: ${db_name}
+      POSTGRES_USER: ${db_user}
+      POSTGRES_PASSWORD: ${rand_db_pass}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p${db_pass}"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U ${db_user} -d ${db_name}"]
+      interval: 10s
       timeout: 5s
-      retries: 10
-    networks:
-      - dnsmgr-network
+      retries: 5
 
-networks:
-  dnsmgr-network:
-    driver: bridge
+  openflare:
+    image: ${DEFAULT_IMAGE}
+    container_name: openflare-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${custom_port}:3000"
+    environment:
+      JWT_SECRET: ${rand_jwt}
+      DSN: postgres://${db_user}:${rand_db_pass}@postgres:5432/${db_name}?sslmode=disable
+      GIN_MODE: release
+      LOG_LEVEL: info
+    volumes:
+      - openflare-data:/data
+
+volumes:
+  postgres-data:
+  openflare-data:
 EOF
 
-        echo -e "${YELLOW}正在通过 Docker Compose 启动 Dnsmgr 容器集群...${RESET}"
-        cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}错误: 容器集群启动失败。${RESET}"
-            return
-        fi
-
-        # 核心：利用刚刚健康的本地 mysql 容器一键自动创建 dnsmgr 数据库
-        echo -e "${YELLOW}正在内置 MySQL 容器中自动创建 'dnsmgr' 数据库...${RESET}"
-        docker exec -i dnsmgr-mysql mysql -uroot -p"${db_pass}" -e "CREATE DATABASE IF NOT EXISTS dnsmgr CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null
-        echo -e "${GREEN}数据库 dnsmgr 创建/检查成功！${RESET}"
-
-    # ------------------ 模式 2：连接外部/远程已有 MySQL ------------------
+    # ------------------ 模式 2：连接外部/远程已有的 PostgreSQL（纯写入，免建库） ------------------
     else
-        echo -e "${CYAN}====== 远程/外部 MySQL 信息输入 ======${RESET}"
-        echo -ne "${YELLOW}请输入外部 MySQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+        echo -e "${CYAN}====== 远程/外部 PostgreSQL 信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
         read -r ext_host
         [[ -z "$ext_host" ]] && ext_host="127.0.0.1"
         
-        echo -ne "${YELLOW}请输入 MySQL 端口 [默认: 3306]: ${RESET}"
+        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
         read -r ext_port
-        [[ -z "$ext_port" ]] && ext_port="3306"
-
-        echo -ne "${YELLOW}请输入 MySQL 用户名 [默认: root]: ${RESET}"
+        [[ -z "$ext_port" ]] && ext_port="5432"
+        
+        echo -ne "${YELLOW}请输入数据库用户名 [默认: openflare]: ${RESET}"
         read -r ext_user
-        [[ -z "$ext_user" ]] && ext_user="root"
-
-        echo -ne "${YELLOW}请输入 MySQL 密码: ${RESET}"
+        [[ -z "$ext_user" ]] && ext_user="openflare"
+        
+        echo -ne "${YELLOW}请输入数据库密码: ${RESET}"
         read -r ext_pass
+        
+        echo -ne "${YELLOW}请输入目标数据库名 [默认: openflare]: ${RESET}"
+        read -r ext_dbname
+        [[ -z "$ext_dbname" ]] && ext_dbname="openflare"
 
-        # 临时存储外连地址，用于稍后创建数据库
-        local db_connect_host="$ext_host"
-
-        # 处理本地回环外连突破
+        # 突破 Docker 宿主机回环地址限制
         if [[ "$ext_host" == "127.0.0.1" || "$ext_host" == "localhost" ]]; then
             ext_host="172.17.0.1"
-            echo -e "${YELLOW}提示: 检测到本地回环地址，网页配置时请填写宿主机网关 IP: 172.17.0.1${RESET}"
         fi
-
-        # 核心：使用独立的临时容器去执行远程创建数据库逻辑
-        echo -e "${YELLOW}正在尝试远程连接到 ${db_connect_host}:${ext_port} 并自动创建 'dnsmgr' 数据库...${RESET}"
-        docker run --rm mysql:5.7 mysql -h"${db_connect_host}" -P"${ext_port}" -u"${ext_user}" -p"${ext_pass}" -e "CREATE DATABASE IF NOT EXISTS dnsmgr CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null
-        
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}远程数据库 dnsmgr 创建/检查成功！${RESET}"
-        else
-            echo -e "${RED}⚠️  注意: 自动连接远程库失败，可能是账号无远程建库权限或防火墙拦截。${RESET}"
-            echo -e "${YELLOW}提示: 如果建库失败，请确保目标 MySQL 上已手动存在名为 'dnsmgr' 的数据库，否则网页安装会报错。${RESET}"
-        fi
-
-        mkdir -p "$BASE_DIR/web"
 
         cat << EOF > "$COMPOSE_FILE"
 services:
-  dnsmgr-web:
-    container_name: dnsmgr-web
+  openflare:
     image: ${DEFAULT_IMAGE}
+    container_name: openflare-app
     restart: unless-stopped
-    stdin_open: true
-    tty: true
     ports:
-      - "${custom_port}:80"
+      - "${custom_port}:3000"
+    environment:
+      JWT_SECRET: ${rand_jwt}
+      DSN: postgres://${ext_user}:${ext_pass}@${ext_host}:${ext_port}/${ext_dbname}?sslmode=disable
+      GIN_MODE: release
+      LOG_LEVEL: info
     volumes:
-      - ${BASE_DIR}/web:/app/www
-EOF
+      - openflare-data:/data
 
-        echo -e "${YELLOW}正在通过 Docker Compose 启动 Dnsmgr Web 服务...${RESET}"
-        cd "$BASE_DIR" && docker compose up -d --force-recreate
+volumes:
+  openflare-data:
+EOF
     fi
 
+    # ------------------ 启动集群 ------------------
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 OpenFlare 服务中...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
     if [ $? -ne 0 ]; then
-        echo -e "${RED}====================================================${RESET}"
-        echo -e "${RED} 错误: 容器启动失败。请检查网络环境。               ${RESET}"
-        echo -e "${RED}====================================================${RESET}"
+        echo -e "${RED}部署失败，请检查 Docker 日志。${RESET}"
         return
     fi
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             Dnsmgr 部署成功！                      ${RESET}"
+    echo -e "${GREEN}             OpenFlare 部署成功！                   ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}应用访问地址   : http://${DETECT_IP}:${custom_port}/install${RESET}"
-    echo -e "${YELLOW}宿主机映射端口 : ${custom_port}${RESET}"
-    echo -e "${YELLOW}自动配置数据库 : dnsmgr${RESET}"
-    echo -ne "${YELLOW}数据库运行模式 : ${RESET}"
-    if [[ "$db_mode" == "1" ]]; then 
-        echo -e "${GREEN}全新内置容器 (MySQL 5.7)${RESET}"
-        echo -e "${YELLOW}数据库内部地址 : dnsmgr-mysql:3306${RESET}"
-        echo -e "${YELLOW}数据库初始凭证 : root / ${db_pass}${RESET}"
-    else 
-        echo -e "${GREEN}连接外部/远程已有的 MySQL 数据库${RESET}"
-        echo -e "${YELLOW}网页安装建议目标 : ${ext_host}:${ext_port}${RESET}"
+    echo -e "${YELLOW}访问端点(URL) : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}映射宿主机端口 : ${custom_port}${RESET}"
+    echo -e "${YELLOW}安全 JWT 密钥  : ${rand_jwt}${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}内置库密码凭证 : 用户:${db_user} | 密码:${rand_db_pass} | 库名:${db_name}${RESET}"
+    else
+        echo -e "${YELLOW}连接外部数据库 : ${ext_host}:${ext_port} -> 库名:${ext_dbname}${RESET}"
     fi
-    echo -e "${YELLOW}部署工作目录   : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}默认账号密码   : root/123456${RESET}"
+    echo -e "${YELLOW}部署工作路径   : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新镜像
-update_dnsmgr() {
+# 更新服务
+update_openflare() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取 Dnsmgr 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取 OpenFlare 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}服务更新完成！${RESET}"
+    echo -e "${GREEN}服务已升级并拉升至最新状态！${RESET}"
 }
 
-# 卸载 Dnsmgr
-uninstall_dnsmgr() {
-    echo -ne "${RED}确定要卸载并删除 Dnsmgr 服务吗？(y/n): ${RESET}"
+# 卸载集群
+uninstall_openflare() {
+    echo -ne "${RED} 确定要注销并删除 OpenFlare 服务集群吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}是否同时删除所有网站程序源码、日志及数据库文件？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已全部终止并移除。${RESET}"
+            echo -ne "${RED}是否同步清理掉本地所有挂载的数据卷和数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 cd "$BASE_DIR" && docker compose down -v
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}所有相关数据文件及工作目录已彻底清理。${RESET}"
+                echo -e "${GREEN}工作目录及 Docker 命名数据卷已被彻底净化清除。${RESET}"
             fi
         else
-            docker rm -f dnsmgr-web dnsmgr-mysql 2>/dev/null
+            docker rm -f openflare-app openflare-db 2>/dev/null
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        echo -e "${GREEN}完全卸载完毕！${RESET}"
     fi
 }
 
-# 基础生命周期控制
-start_dm() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}Dnsmgr 服务已启动${RESET}"; }
-stop_dm() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}Dnsmgr 服务已停止${RESET}"; }
-restart_dm() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}Dnsmgr 服务已重启${RESET}"; }
-logs_dm() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+# 周期控制
+start_of() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已正常启动${RESET}"; }
+stop_of() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已安全暂停${RESET}"; }
+restart_of() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已完成软重启${RESET}"; }
+logs_of() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
-# 显示配置面板
+# 配置显示
 show_info() {
     get_status_info
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}当前运行状态   : $status"
-    echo -e "${YELLOW}宿主机映射端口 : ${web_port}${RESET}"
-    echo -e "${YELLOW}工作路径       : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}实际映射端口   : ${web_port}${RESET}"
+    echo -e "${YELLOW}本地项目路径   : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
@@ -313,7 +272,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}       ◈  Dnsmgr 管理面板  ◈        ${RESET}"
+    echo -e "${GREEN}      ◈  OpenFlare 管理面板  ◈      ${RESET}"
     echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 当前状态 :${RESET} $status"
     echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
@@ -331,13 +290,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_dnsmgr ;;
-        2) update_dnsmgr ;;
-        3) uninstall_dnsmgr ;;
-        4) start_dm ;;
-        5) stop_dm ;;
-        6) restart_dm ;;
-        7) logs_dm ;;
+        1) install_openflare ;;
+        2) update_openflare ;;
+        3) uninstall_openflare ;;
+        4) start_of ;;
+        5) stop_of ;;
+        6) restart_of ;;
+        7) logs_of ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

@@ -1,228 +1,309 @@
 #!/bin/bash
+# =================================================================
+# Transmission Docker Compose 管理面板 (智能自动获取最新版 WebUI)
+# =================================================================
 
-# 定义颜色
-YELLOW='\033[33m'
-GREEN='\033[32m'
-RED='\033[31m'
-BLUE='\033[34m'
-RESET='\033[0m'
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# 设置目标目录
-TARGET_DIR="/app/oci-helper"
-KEYS_DIR="$TARGET_DIR/keys"
-COMPOSE_FILE="$TARGET_DIR/docker-compose.yml"
-APP_YML="$TARGET_DIR/application.yml"
+CONTAINER_NAME="transmission"
+BASE_DIR="/opt/transmission"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+WEB_SRC_DIR="$BASE_DIR/web/src"
 
-# ======================
-# 获取服务器IP与展示面板信息
-# ======================
-get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
+# GitHub 仓库信息
+REPO_API="https://api.github.com/repos/hisproc/transmission-next-ui/releases/latest"
 
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
-    echo "127.0.0.1" && return 0
-}
-
-
-show_success_info() {
-    local acc=$(grep "account:" "$APP_YML" 2>/dev/null | awk '{print $2}')
-    local pass=$(grep "password:" "$APP_YML" 2>/dev/null | awk '{print $2}')
-    local ip=$(get_public_ip)
-    local port=$(grep -A 2 "ports:" "$COMPOSE_FILE" 2>/dev/null | grep -oE '[0-9]+:8818' | cut -d':' -f1)
-    [[ -z "$port" ]] && port="8818"
-
-    echo -e "\n${GREEN}==================================================${RESET}"
-    echo -e "${GREEN}🎉 oci-helper 服务运行成功！${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${YELLOW}🌐 访问地址:${RESET} ${YELLOW}http://${ip}:${port}${RESET}"
-    echo -e "${YELLOW}👤 登录账号:${RESET} ${YELLOW}${acc:-未知}${RESET}"
-    echo -e "${YELLOW}🔑 登录密码:${RESET} ${YELLOW}${pass:-未知}${RESET}"
-    echo -e "${YELLOW}📂 安装目录: $TARGET_DIR${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
-}
-
-# ======================
-# 1. 部署启动逻辑 (初次安装/重置)
-# ======================
-deploy() {
-    echo -e "\n⏳ 开始准备环境并下载核心文件..."
-    mkdir -p "$KEYS_DIR" && cd "$TARGET_DIR" || { echo "❌ 无法进入目录：$TARGET_DIR"; return; }
-
-    rm -rf update_version_trigger.flag && : > update_version_trigger.flag
-
-    BASE_URL="https://github.com/Yohann0617/oci-helper/releases/download/deploy"
-    FILES=("application.yml" "oci-helper.db" "docker-compose.yml")
-
-    for file in "${FILES[@]}"; do
-        if [[ -f "$TARGET_DIR/$file" ]]; then
-            echo "✔ 文件 '$file' 已存在，跳过下载。"
-        else
-            echo "⬇️ 正在下载 '$file' ..."
-            curl -LO "$BASE_URL/$file" || { echo "❌ 下载文件 '$file' 失败。"; return; }
-        fi
-    done
-
-    # 路径纠正与移除不兼容挂载
-    [[ -f "$COMPOSE_FILE" ]] && sed -i 's|/opt/oci-helper|/app/oci-helper|g' "$COMPOSE_FILE"
-    sed -i "\|/usr/bin/docker:/usr/bin/docker|d" "$COMPOSE_FILE" 2>/dev/null
-
-    # 环境依赖检查
+# 检测依赖
+check_dependencies() {
     if ! command -v docker &> /dev/null; then
-        echo "Docker 未安装，开始安装中..."
-        curl -fsSL https://get.docker.com | sh && systemctl start docker && systemctl enable docker
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
     fi
-    if ! command -v docker-compose &> /dev/null; then
-        curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-        chmod +x /usr/local/bin/docker-compose
-    fi
-
-    chmod 777 "$TARGET_DIR/oci-helper.db"
-
-    # 凭据配置
-    echo -e "\n${YELLOW}请选择账号密码设置方式：${RESET}"
-    echo "1) 自动生成随机账号和密码"
-    echo "2) 手动输入账号和密码"
-    read -p "输入选项: " ACC_MODE
-
-    if [[ "$ACC_MODE" == "1" ]]; then
-        local new_acc="user_$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
-        local new_pass=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)
-        sed -i "s|^.*account:.*|  account: $new_acc|" "$APP_YML"
-        sed -i "s|^.*password:.*|  password: $new_pass|" "$APP_YML"
-    elif [[ "$ACC_MODE" == "2" ]]; then
-        read -p "请输入账号: " new_acc
-        read -p "请输入密码: " new_pass
-        if [[ -n "$new_acc" && -n "$new_pass" ]]; then
-            sed -i "s|^.*account:.*|  account: $new_acc|" "$APP_YML"
-            sed -i "s|^.*password:.*|  password: $new_pass|" "$APP_YML"
+    
+    # 增加 curl 依赖检测，用于调用 GitHub API
+    local missing_deps=()
+    ! command -v unzip &> /dev/null && missing_deps+=("unzip")
+    ! command -v wget &> /dev/null && missing_deps+=("wget")
+    ! command -v curl &> /dev/null && missing_deps+=("curl")
+    
+    if [ ${#missing_deps[@]} -ne 0 ]; then
+        echo -e "${YELLOW}提示: 正在安装缺失的工具 (${missing_deps[*]})...${RESET}"
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y wget unzip curl
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y wget unzip curl
         fi
     fi
-
-    echo -e "\n🚀 正在拉取镜像并部署容器服务..."
-    docker-compose pull && docker-compose up -d
-    show_success_info
 }
 
-# ======================
-# 2. 纯净更新逻辑
-# ======================
-update_containers() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "\n❌ 未检测到 $COMPOSE_FILE ，请先选择选项 1 进行部署启动。"
+# 动态获取容器状态、映射端口和数据目录
+get_status_info() {
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+    else
+        img_version="${RED}未安装${RESET}"
+    fi
+
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        webui_port=$(grep -E "\-[[:space:]]*[\"']?[0-9]+:9091" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"-')
+        [[ -z "$webui_port" ]] && webui_port="9091"
+
+        download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | tr -d '"' | xargs)
+        [[ -z "$download_dir" ]] && download_dir="$BASE_DIR/downloads"
+    else
+        webui_port="N/A"
+        download_dir="N/A"
+    fi
+}
+
+# 提取 Web UI 账号密码
+get_transmission_creds() {
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        local username=$(grep -E "USER=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
+        local password=$(grep -E "PASS=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
+        echo -e "${GREEN}用户名: ${username} | 密码: ${password}${RESET}"
+    else
+        echo -e "${RED}未部署${RESET}"
+    fi
+}
+
+# 智能动态在线获取最新版 Web UI
+setup_custom_webui() {
+    echo -ne "${YELLOW}是否自动获取并安装最新版 Next-UI 界面？(y/n) [默认: y]: ${RESET}"
+    read -r enable_ui
+    [[ -z "$enable_ui" ]] && enable_ui="y"
+
+    if [[ "$enable_ui" == "y" || "$enable_ui" == "Y" ]]; then
+        echo -e "${CYAN}--- 正在通过 GitHub API 获取最新版本 ---${RESET}"
+        
+        # 1. 动态获取最新 Release 的标签名和下载链接
+        local api_response
+        api_response=$(curl -s --connect-timeout 5 "$REPO_API")
+        
+        if [[ -z "$api_response" || "$api_response" == *"message"* ]]; then
+            echo -e "${RED}❌ 错误: 无法连接到 GitHub API 或触发了速率限制。${RESET}"
+            echo -e "${YELLOW}将尝试使用备用硬编码链接部署...${RESET}"
+            local ui_url="https://github.com/hisproc/transmission-next-ui/releases/download/v0.3.1/release.zip"
+            local version_tag="v0.3.1 (备用)"
+        else
+            # 精准解析最新版下载直链 (匹配扩展名为 .zip 的 browser_download_url)
+            local ui_url
+            ui_url=$(echo "$api_response" | grep -E '"browser_download_url":' | grep -i '\.zip' | head -n 1 | awk -F '"' '{print $4}')
+            # 解析版本号标签
+            local version_tag
+            version_tag=$(echo "$api_response" | grep -E '"tag_name":' | head -n 1 | awk -F '"' '{print $4}')
+        fi
+
+        if [[ -z "$ui_url" ]]; then
+            echo -e "${RED}❌ 错误: 未能在 GitHub Release 中解析到 zip 压缩包！将使用原生界面。${RESET}"
+            return 1
+        fi
+
+        echo -e "${GREEN}发现最新版本: ${version_tag}${RESET}"
+        echo -e "${YELLOW}下载直链: ${ui_url}${RESET}"
+        
+        # 2. 清理并创建本地目录
+        echo -e "${YELLOW}正在清理旧的 Web 目录...${RESET}"
+        rm -rf "$WEB_SRC_DIR"
+        mkdir -p "$WEB_SRC_DIR"
+
+        # 3. 下载并解压
+        echo -e "${YELLOW}正在下载 Web UI 压缩包...${RESET}"
+        if wget --no-check-certificate -O "$BASE_DIR/web_ui.zip" "$ui_url"; then
+            echo -e "${YELLOW}下载成功，正在智能解压...${RESET}"
+            mkdir -p "$BASE_DIR/web_tmp"
+            unzip -q "$BASE_DIR/web_ui.zip" -d "$BASE_DIR/web_tmp"
+            
+            # 兼容性处理：判断解压后是直接含 index.html 还是包裹了一层目录
+            if [ $(ls -A "$BASE_DIR/web_tmp" | wc -l) -eq 1 ] && [ -d "$BASE_DIR/web_tmp/$(ls -A $BASE_DIR/web_tmp)" ]; then
+                mv "$BASE_DIR/web_tmp/$(ls -A $BASE_DIR/web_tmp)"/* "$WEB_SRC_DIR/"
+            else
+                mv "$BASE_DIR/web_tmp"/* "$WEB_SRC_DIR/"
+            fi
+
+            # 清理临时文件
+            rm -rf "$BASE_DIR/web_ui.zip" "$BASE_DIR/web_tmp"
+            echo -e "${GREEN}✨ Next-UI (${version_tag}) 静态文件已成功部署！${RESET}"
+            return 0
+        else
+            echo -e "${RED}❌ 错误: UI 下载失败！将自动回滚为 Transmission 原生界面。${RESET}"
+            return 1
+        fi
+    fi
+    return 1
+}
+
+install_transmission() {
+    check_dependencies
+    
+    mkdir -p "$BASE_DIR/config" "$BASE_DIR/watch"
+
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    echo -ne "${YELLOW}请输入 Transmission WebUI 访问端口 [默认: 9091]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="9091"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
-    echo -e "\n🔄 正在执行更新..."
-    cd "$TARGET_DIR" || return
+
+    echo -ne "${YELLOW}请输入 Transmission Peer 传入端口 [默认: 51413]: ${RESET}"
+    read -r peer_port
+    [[ -z "$peer_port" ]] && peer_port="51413"
+
+    echo -ne "${YELLOW}请输入宿主机下载文件存储绝对路径 [默认: $BASE_DIR/downloads]: ${RESET}"
+    read -r custom_download
+    [[ -z "$custom_download" ]] && custom_download="$BASE_DIR/downloads"
+
+    echo -ne "${YELLOW}请设置 WebUI 登录用户名 [默认: transmission]: ${RESET}"
+    read -r ui_user
+    [[ -z "$ui_user" ]] && ui_user="transmission"
+
+    echo -ne "${YELLOW}请设置 WebUI 登录密码 [默认: transmission]: ${RESET}"
+    read -r ui_pass
+    [[ -z "$ui_pass" ]] && ui_pass="transmission"
+
+    # 执行智能化 UI 部署
+    setup_custom_webui
+    has_custom_ui=$?
+
+    # 获取执行脚本用户的 UID/GID 并创建存储目录
+    CURRENT_UID=$(id -u)
+    CURRENT_GID=$(id -g)
+    mkdir -p "$custom_download"
     
-    # 纯净的两行更新核心命令
-    docker-compose pull && docker-compose up -d
+    # 生成标准的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     
-    show_success_info
-}
-
-# ======================
-# 3. 卸载逻辑
-# ======================
-uninstall() {
-    echo -e "开始卸载 oci-helper ..."
-    cd "$TARGET_DIR" 2>/dev/null && docker-compose down 2>/dev/null
+    local env_web_home=""
+    local volume_web_src=""
     
-    for name in "oci-helper-watcher" "websockify" "oci-helper"; do
-        docker rm -f "$name" &>/dev/null
-    done
-
-    docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep "oci-helper" | awk '{print $2}' | sort -u | xargs -r docker rmi -f &>/dev/null
-    echo "✅ 容器与镜像清理完成"
-
-    read -p "是否清空所有数据并删除 $TARGET_DIR 目录？(y/N): " DEL_DIR
-    if [[ "$DEL_DIR" =~ ^[Yy]$ ]]; then
-        rm -rf "$TARGET_DIR"
-        echo "✅ 已删除目录 $TARGET_DIR"
-    fi
-    echo "oci-helper 卸载完成~"
-}
-
-# ======================
-# 其它控制命令
-# ======================
-start_containers() {
-    echo -e "\n▶️ 正在启动容器..."
-    docker start oci-helper-watcher oci-helper websockify && echo "✅ 容器已成功启动"
-}
-
-stop_containers() {
-    echo -e "\n⏹️ 正在停止容器..."
-    docker stop oci-helper-watcher oci-helper websockify && echo "✅ 容器已停用"
-}
-
-restart_containers() {
-    echo -e "\n🔄 正在重启容器..."
-    docker restart oci-helper-watcher oci-helper websockify && echo "✅ 容器已成功重启"
-}
-
-get_status_info() {
-    local active_count=0
-    for name in "oci-helper-watcher" "oci-helper" "websockify"; do
-        if [[ $(docker ps --filter "name=^/${name}$" --format "{{.Status}}") == Up* ]]; then
-            ((active_count++))
-        fi
-    done
-
-    if [[ $active_count -eq 3 ]]; then
-        status="${GREEN}运行中 (3/3)${RESET}"
-    elif [[ $active_count -gt 0 ]]; then
-        status="${YELLOW}部分运行 ($active_count/3)${RESET}"
-    else
-        status="${RED}已停止${RESET}"
+    if [ $has_custom_ui -eq 0 ]; then
+        env_web_home="- TRANSMISSION_WEB_HOME=/src"
+        volume_web_src="- ${WEB_SRC_DIR}:/src"
     fi
 
-    webui_port="8818"
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        local port_extract=$(grep -A 2 "ports:" "$COMPOSE_FILE" | grep -oE '[0-9]+:8818' | cut -d':' -f1)
-        [[ -n "$port_extract" ]] && webui_port="$port_extract"
-    fi
-}
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  transmission:
+    image: linuxserver/transmission:4.0.0
+    container_name: ${CONTAINER_NAME}
+    environment:
+      - PUID=${CURRENT_UID}
+      - PGID=${CURRENT_GID}
+      - UMASK=022
+      ${env_web_home}
+      - TZ=Asia/Shanghai
+      - USER=${ui_user}
+      - PASS=${ui_pass}
+    volumes:
+      ${volume_web_src}
+      - ${BASE_DIR}/config:/config
+      - ${custom_download}:/downloads
+      - ${BASE_DIR}/watch:/watch
+    ports:
+      - "${custom_port}:9091"
+      - "${peer_port}:51413"
+      - "${peer_port}:51413/udp"
+    restart: unless-stopped
+EOF
 
-show_config() {
-    if [[ -f "$APP_YML" ]]; then
-        echo -e "\n${YELLOW}📋 当前网页配置凭据：${RESET}"
-        grep -E "account:|password:" "$APP_YML"
-    else
-        echo -e "\n❌ 未找到配置文件 $APP_YML"
-    fi
-}
+    chmod -R 777 "$BASE_DIR" "$custom_download"
 
-# ======================
-# 主循环体面板
-# ======================
-while true; do
-    clear
-    get_status_info
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Transmission...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈   Y探长 管理面板   ◈    ${RESET}"
+    echo -e "${GREEN}    Transmission 部署成功！    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://127.0.0.1:${custom_port}${RESET}"
+    get_transmission_creds
+    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR/config${RESET}"
+    echo -e "${YELLOW}宿主机下载路径 : $custom_download${RESET}"
+    echo -e "${YELLOW}Peer 传入端口  : $peer_port (请记得在路由器做端口映射)${RESET}"
+    if [ $has_custom_ui -eq 0 ]; then
+        echo -e "${GREEN}自定义 Web UI  : 已成功启用并自动挂载最新版${RESET}"
+    fi
+    echo -e "${GREEN}================================${RESET}"
+}
+
+update_transmission() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    
+    # 更新时同时检测是否有更高级的 WebUI
+    echo -e "${YELLOW}正在检查并更新 WebUI 与核心镜像...${RESET}"
+    if grep -q "TRANSMISSION_WEB_HOME" "$COMPOSE_FILE"; then
+        setup_custom_webui
+    fi
+
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器与组件已处于最新状态。${RESET}"
+}
+
+uninstall_transmission() {
+    echo -ne "${YELLOW}确定要卸载并删除 Transmission 容器吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和下载的种子文件？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+            fi
+        else
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
+}
+
+start_trans() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_trans() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_trans() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_trans() { docker logs -f "$CONTAINER_NAME"; }
+
+show_info() {
+    get_status_info
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://127.0.0.1:${webui_port}${RESET}"
+    echo -ne "${YELLOW}当前认证凭据   : ${RESET}"
+    get_transmission_creds
+    echo -e "${YELLOW}宿主机下载路径 : ${download_dir}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+menu() {
+    clear
+    get_status_info
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈  Transmission 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -239,23 +320,22 @@ while true; do
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
-
     case "$choice" in
-        1)  deploy ;;
-        2)  update_containers ;;
-        3)  uninstall ;;
-        4)  start_containers ;;
-        5)  stop_containers ;;
-        6)  restart_containers ;;
-        7)
-            echo -e "\n📋 正在追踪实时日志 (按 Ctrl+C 退出日志流)..."
-            docker logs -f oci-helper
-            ;;
-        8)  show_config ;;
-        0)  exit 0 ;;
-        *)  echo -e "\n❌ 无效的选项，请重新选择。" ;;
+        1) install_transmission ;;
+        2) update_transmission ;;
+        3) uninstall_transmission ;;
+        4) start_trans ;;
+        5) stop_trans ;;
+        6) restart_trans ;;
+        7) logs_trans ;;
+        8) show_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+}
 
-    echo -ne "\n${YELLOW}按回车键返回主菜单...${RESET}"
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
     read -r
 done

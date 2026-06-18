@@ -1,1001 +1,317 @@
 #!/bin/bash
-# VPS Toolbox
-# 功能：
-# - 一级菜单加 ▶ 标识，字体绿色
-# - 二级菜单简洁显示，输入 1~99 都可执行
-# - 快捷指令 m / M 自动创建（支持传参，如 m docker 直接直达功能）
-# - 系统信息面板
-# - 彩色菜单和动态彩虹标题
-# - 完整安装/卸载
+# =================================================================
+# OpenFlare Docker Compose 管理面板 
+# =================================================================
 
-INSTALL_PATH="$HOME/vps-toolbox.sh"
-SHORTCUT_PATH="/usr/local/bin/m"
-SHORTCUT_PATH_UPPER="/usr/local/bin/M"
+# 颜色定义
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# 颜色
-green="\033[32m"
-reset="\033[0m"
-yellow="\033[33m"
-red="\033[31m"
-cyan="\033[36m"
-BLUE="\033[34m"
-ORANGE='\033[38;5;208m'
+BASE_DIR="/opt/openflare"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+DEFAULT_IMAGE="ghcr.io/rain-kl/openflare:latest"
 
-# ==========================================
-# GITHUB 代理
-# ==========================================
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
+# 检测依赖环境
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
+    fi
+}
 
-if [ -z "$SUCCESS_PROXY_IDX" ]; then
-    SUCCESS_PROXY_IDX=0
-fi
-
-_smart_download_core() {
-    local clean_url="$1"
-    local mode="$2"
-    local file_name="$3"
-
-    local best_proxy="${GITHUB_PROXY[$SUCCESS_PROXY_IDX]}"
-    local target_url="${best_proxy}${clean_url}"
+get_public_ip() {
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
     
-    if [[ "$mode" == "text" || "$mode" == "pipe" ]]; then
-        if response=$(curl -fsSL --max-time 4 "$target_url" 2>/dev/null) && [[ -n "$response" ]]; then
-            echo "$response"
-            return 0
-        fi
-    elif [[ "$mode" == "file" ]]; then
-        if wget -T 4 -t 1 -q -O "$file_name" "$target_url" 2>/dev/null; then
-            return 0
-        fi
-    fi
-
-    for idx in "${!GITHUB_PROXY[@]}"; do
-        [[ $idx -eq $SUCCESS_PROXY_IDX ]] && continue
-        local proxy="${GITHUB_PROXY[$idx]}"
-        local target_url="${proxy}${clean_url}"
-        
-        if [[ "$mode" == "file" ]]; then
-            echo -e "${yellow}⚡ 正在切换通道，尝试通过 [${proxy:-直连}]打开...${reset}"
-            if wget -T 5 -t 1 -q -O "$file_name" "$target_url" 2>/dev/null; then
-                SUCCESS_PROXY_IDX=$idx
-                return 0
-            fi
-        else
-            if response=$(curl -fsSL --max-time 5 "$target_url" 2>/dev/null) && [[ -n "$response" ]]; then
-                SUCCESS_PROXY_IDX=$idx
-                echo "$response"
-                return 0
-            fi
-        fi
-    done
-    return 1
-}
-
-smart_curl() {
-    local raw_url="$1"
-    if [[ ! "$raw_url" =~ "github" ]] && [[ ! "$raw_url" =~ "raw.githubusercontent.com" ]]; then
-        curl -fsSL --max-time 10 "$raw_url"
-        return $?
-    fi
-    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://github.com/|https://github.com/|g' | sed -E 's|https://[^/]*/https://raw.githubusercontent.com/|https://raw.githubusercontent.com/|g')
-    _smart_download_core "$clean_url" "text"
-    if [[ $? -ne 0 ]]; then
-        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}" >&2
-        return 1
-    fi
-}
-
-smart_wget_run() {
-    local file_name="$1"
-    local raw_url="$2"
-    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://|https://|g')
-    if _smart_download_core "$clean_url" "file" "$file_name"; then
-        echo
-        chmod +x "$file_name"
-        ./"$file_name"
-        return 0
-    else
-        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}"
-        return 1
-    fi
-}
-
-smart_pipe_run() {
-    local raw_url="$1"
-    local bash_args="$2"
-    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://|https://|g')
-    local response
-    response=$(_smart_download_core "$clean_url" "pipe")
-    if [[ -n "$response" ]]; then
-        echo
-        if [[ -n "$bash_args" ]]; then
-            sudo bash -s $bash_args <<< "$response"
-        else
-            sudo bash <<< "$response"
-        fi
-        return 0
-    else
-        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}"
-        return 1
-    fi
-}
-
-rainbow_animate() {
-    local text="$1"
-    local colors=(31 33 32 36 34 35)
-    local len=${#text}
-    for ((i=0; i<len; i++)); do
-        printf "\033[%sm%s" "${colors[$((i % ${#colors[@]}))]}" "${text:$i:1}"
-        sleep 0.002
-    done
-    printf "${reset}\n"
-}
-
-show_system_usage() {
-    local width=36
-    local content_indent="    "
-    format_size() {
-        local size_mb=${1:-0}
-        if [ "$size_mb" -lt 1024 ]; then echo "${size_mb}M"; else awk "BEGIN{printf \"%.1fG\", $size_mb/1024}"; fi
-    }
-    read mem_total mem_used <<< $(LANG=C free -m | awk 'NR==2{print $2, $3}')
-    mem_total=${mem_total:-0}; mem_used=${mem_used:-0}
-    mem_total_fmt=$(format_size "$mem_total"); mem_used_fmt=$(format_size "$mem_used")
-    mem_percent=$(awk "BEGIN{if($mem_total>0){printf \"%.0f\", $mem_used*100/$mem_total}else{print 0}}")"%"
-    read disk_total_h disk_used_h disk_used_percent <<< $(df -m / | awk 'NR==2{print $2, $3, $5}')
-    disk_total_h=${disk_total_h:-0}; disk_used_h=${disk_used_h:-0}; disk_used_percent=${disk_used_percent:-0%}
-    disk_total_fmt=$(format_size "$disk_total_h"); disk_used_fmt=$(format_size "$disk_used_h")
-    cpu_usage=$(awk 'NR==1{usage=($2+$4)*100/($2+$4+$5); if(usage!=""){printf "%.1f", usage}else{print 0}}' /proc/stat)"%"
-    mem_num=${mem_percent%\%}; disk_num=${disk_used_percent%\%}; cpu_num=${cpu_usage%\%}
-    max_level=0
-    for n in $mem_num $disk_num $cpu_num; do
-        if (( $(awk "BEGIN{print ($n>80)?1:0}") )); then max_level=2; fi
-        if (( $(awk "BEGIN{print ($n>60 && $n<=80)?1:0}") )) && [ "$max_level" -lt 2 ]; then max_level=1; fi
-    done
-    if [ "$max_level" -eq 0 ]; then system_status="${green}系统状态：正常 ✔${reset}"
-    elif [ "$max_level" -eq 1 ]; then system_status="${yellow}系统状态：警告 ⚡${reset}"
-    else system_status="${red}系统状态：危险 🔥${reset}"; fi
-    pad_string() { printf "%-${width}s" "${content_indent}${str}"; }
-    echo -e "${green}┌$(printf '─%.0s' $(seq 1 $width))┐${reset}"
-    str="${system_status}"; echo -e "$(pad_string)"
-    str="${yellow}📊 内存：${mem_used_fmt}/${mem_total_fmt} (${mem_percent})${reset}"; echo -e "$(pad_string)"
-    str="${yellow}💽 磁盘：${disk_used_fmt}/${disk_total_fmt} (${disk_used_percent})${reset}"; echo -e "$(pad_string)"
-    str="${yellow} ⚙ CPU ：${cpu_usage}${reset}"; echo -e "$(pad_string)"
-    echo -e "${green}└$(printf '─%.0s' $(seq 1 $width))┘${reset}"
-}
-
-if [ -f /proc/1/cgroup ] && grep -qE '(docker|lxc|kubepods)' /proc/1/cgroup; then container_flag=" (Container)"; else container_flag=""; fi
-if [ -f /etc/os-release ]; then system_name=$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"'); else system_name=$(uname -s); fi
-system_name="${system_name}${container_flag}"
-
-get_timezone() {
-    if command -v timedatectl &>/dev/null; then tz=$(timedatectl show -p Timezone --value 2>/dev/null); [[ -n "$tz" ]] && echo "$tz" && return; fi
-    if [[ -f /etc/timezone ]]; then tz=$(cat /etc/timezone); [[ -n "$tz" ]] && echo "$tz" && return; fi
-    if [[ -L /etc/localtime ]]; then tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##'); [[ -n "$tz" ]] && echo "$tz" && return; fi
-    if [[ -f /etc/localtime ]]; then tz=$(strings /etc/localtime 2>/dev/null | grep -E '^[A-Z][a-z]+/[A-Z][a-zA-Z_]+$' | head -n1); [[ -n "$tz" ]] && echo "$tz" && return; fi
-    echo "未知"
-}
-timezone=$(get_timezone)
-cpu_arch=$(uname -m)
-cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
-[ -z "$cpu_model" ] && cpu_model=$(grep -m1 "Hardware" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
-[ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | grep "Model name" | cut -d: -f2)
-cpu_model=$(echo "$cpu_model" | sed -E -e 's/@.*GHz//g' -e 's/CPU//g' -e 's/Processor//g' -e 's/[0-9]+-Core//g' -e 's/\bv[1-9]\b//g' -e 's/\s+/ /g' | xargs)
-cpu="${cpu_model:-Unknown CPU} (${cpu_arch})"
-datetime=$(date "+%Y-%m-%d %H:%M:%S")
-
-if [ -f /proc/uptime ]; then
-    uptime_seconds=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
-    days=$((uptime_seconds/86400)); hours=$(( (uptime_seconds%86400)/3600 )); minutes=$(( (uptime_seconds%3600)/60 ))
-    if [ "$days" -gt 0 ]; then vps_uptime="${days}天${hours}小时${minutes}分钟"
-    elif [ "$hours" -gt 0 ]; then vps_uptime="${hours}小时${minutes}分钟"
-    else vps_uptime="${minutes}分钟"; fi
-else
-    vps_uptime=$(uptime -p 2>/dev/null | tr -d ' ' || echo "未知")
-fi
-
-MAIN_MENU=(
-    "系统设置"
-    "网络代理"
-    "网络检测"
-    "Docker管理"
-    "应用商店"
-    "证书管理"
-    "系统管理"
-    "备份恢复"
-    "玩具熊ʕ•ᴥ•ʔ"
-    "更新卸载"
-)
-
-SUB_MENU[1]="1 更新系统|2 系统信息|3 修改root密码|4 root登录管理|5 修改SSH端口|6 修改时区|7 时间同步|8 切换v4V6|9 开放所有端口|10 更换系统源|11 DDdebian13|12 DDwindows|13 NAT鸡重装系统|14 DD飞牛|15 修改语言|16 修改主机名|17 DNS优化|18 一键优化✨|19 VPS重启"
-SUB_MENU[2]="20 代理工具箱|21 FRP管理|22 EasyTier组网|23 ShellCrash|24 CFWARP|25 BBRv3|26 BBR+TCP智能调参|27 Socks5/HTTP|28 Reality|29 Snell|30 Shadowsocks|31 Hysteria2|32 Xray-Argo|33 3X-UI|34 nftables|35 Realm|36 哆啦A梦转发面板|37 DDNS动态域名|38 自建DNS解锁|39 流量狗|40 流量监控"
-SUB_MENU[3]="41 NodeQuality|42 融合怪测试|43 YABS测试|44 网络质量体检|45 IP质量体检|46 硬盘质量体检|47 三网延迟检测|48 简单回程测试|49 完整路由检测|50 流媒体解锁|51 三网测速|52 网络PING/DNS检测|53 检查25端口开放|54 网络工具箱"
-SUB_MENU[4]="55 Docker管理|56 DockerCompose管理|57 DockerCompose备份恢复|58 DockerCompose自动更新"
-SUB_MENU[5]="59 应用管理|60 宝塔面板|61 1Panel面板|62 CLICD开小鸡|63 OpenClaw|64 HermesAgent"
-SUB_MENU[6]="65 NGINXV4反代✨|66 NGINXV6反代|67 Caddy反代|68 Acme申请证书|69 Lucky反代"
-SUB_MENU[7]="71 系统清理|72 重装系统|73 系统组件|74 开发环境|75 工作区管理|76 防火墙管理|78 Fail2ban|79 系统监控|80 添加SWAP|81 DNS管理|82 定时任务"
-SUB_MENU[8]="83 系统快照|84 系统恢复|85 本地备份|86 Rsync同步|87 Rclone备份|89 Croc文件传输|90 TGBot备份|91 压缩文件|92 解压文件"
-SUB_MENU[9]="100 GProxy加速|101 Cloudflare隧道|102 1panelapps管理|103 Akile优选DNS|104 自动机场签到|105 关闭哪吒监控SSH|106 AI检测|107 代理工具检测|108 卸载探针"
-SUB_MENU[10]="77 自动更新|88 更新工具箱|99 卸载工具箱"
-
-show_main_menu() {
-    clear
-    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "${ORANGE}📦 VPS Toolbox工具箱${reset}${yellow}(快捷指令:M/m)${reset} ${ORANGE}📦${reset}"
-    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    show_system_usage
-    term_width=$(tput cols 2>/dev/null || echo 80)
-    label_w=8
-    printf "${ORANGE}%s %-*s:${yellow} %s${reset}\n" "💻" $label_w "系统" "$system_name"
-    printf "${ORANGE}%s %-*s:${yellow} %s${reset}\n" "🌍" $label_w "时区" "$timezone"
-    printf "${ORANGE}%s %-*s:${yellow} %s${reset}\n" "🧩" $label_w "架构" "$cpu"
-    printf "${ORANGE}%s %-*s:${yellow} %s${reset}\n" "🕒" $label_w "时间" "$datetime"
-    printf "${ORANGE}%s %-*s:${ORANGE} %s${reset}\n" "🚀" $label_w "在线" "$vps_uptime"
-    echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}"
-    for i in "${!MAIN_MENU[@]}"; do
-        if [[ $i -eq 8 ]]; then
-            printf "${red}▶${reset} ${green}%02d.${reset} ${yellow}%s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
-        else
-            printf "${red}▶${reset} ${green}%02d. %s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
-        fi
-    done
-}
-
-show_sub_menu() {
-    local idx="$1"
-    while true; do
-        IFS='|' read -ra options <<< "${SUB_MENU[idx]}"
-        local map=()
-        echo
-        for opt in "${options[@]}"; do
-            local num="${opt%% *}"
-            local name="${opt#* }"
-            printf "${red}▶${reset} ${yellow}%02d %s${reset}\n" "$num" "$name"
-            map+=("$num")
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
         done
-        echo -ne "${red}请输入要执行的编号${ORANGE}(0返回/X退出)${ORANGE}:${reset}"
-        read -r choice
-
-        if [[ "$choice" =~ ^[xX]$ ]]; then exit 0; fi
-        if [[ -z "$choice" ]]; then clear; continue; fi
-        if [[ "$choice" == "0" || "$choice" == "00" ]]; then return; fi
-        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-            echo -e "${red}无效选项，请输入数字！${reset}"
-            sleep 1; clear; continue
-        fi
-        if [[ ! " ${map[*]} " =~ (^|[[:space:]])$choice($|[[:space:]]) ]]; then
-            echo -e "${red}无效选项${reset}"
-            sleep 1; clear; continue
-        fi
-
-        execute_choice "$choice"
-
-        if [[ "$choice" != "0" && "$choice" != "99" ]]; then
-            read -rp $'\e[31m按回车刷新二级菜单...\e[0m' tmp
-            clear
-        else
-            break
-        fi
-    done
-}
-
-remove_shortcut() {
-    if [[ $EUID -eq 0 ]]; then rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
-    else sudo rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"; fi
-}
-
-create_shortcut() {
-    if [[ ! -f "$INSTALL_PATH" ]]; then
-        mkdir -p "$(dirname "$INSTALL_PATH")"
-        cp "$0" "$INSTALL_PATH" 2>/dev/null || echo "$0" > "$INSTALL_PATH"
-        chmod +x "$INSTALL_PATH"
-    fi
-
-    # 关键点：用 "$@" 把传参完美送到后台
-    local shortcut_content="#!/bin/bash\nexec bash \"$INSTALL_PATH\" \"\$@\""
-    
-    if [[ $EUID -eq 0 ]]; then
-        echo -e "$shortcut_content" > "$SHORTCUT_PATH"
-        echo -e "$shortcut_content" > "$SHORTCUT_PATH_UPPER"
-        chmod +x "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
-    else
-        echo -e "$shortcut_content" | sudo tee "$SHORTCUT_PATH" >/dev/null
-        echo -e "$shortcut_content" | sudo tee "$SHORTCUT_PATH_UPPER" >/dev/null
-        sudo chmod +x "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
-    fi
-}
-
-execute_choice() {
-    case "$1" in
-        1) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/update.sh) ;;
-        2) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vpsinfo.sh) ;;
-        3) sudo passwd root ;;
-        4) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SSHDLGL.sh) ;;
-        5) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/sshdk.sh) ;;
-        6) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/time.sh) ;;
-        7) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/systemdtimesyncd.sh) ;;
-        8) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/qhwl.sh) ;;
-        9) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/UFWFX.sh) ;;
-        10) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/huanyuan.sh) ;;
-        11) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Debian13.sh) ;;
-        12) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/windowos.sh) ;;
-        13) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/DDnat.sh) ;;
-        14) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ddfnos.sh) ;;
-        15) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/xgyu.sh) ;;
-        16) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/home.sh) ;;
-        17) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Mosdnsxos.sh) ;;
-        18) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/vpsupos.sh) ;;
-        19) sudo reboot ;;
-        20) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/proxy.sh) ;;
-        21) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/FRPos.sh) ;;
-        22) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/EasyTierx.sh) ;;
-        23) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/ShellCrash.sh);;
-        24) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/CFWARPtoolos.sh) ;;
-        25) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/BBRv3os.sh) ;;
-        26) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/BBR.sh) ;;
-        27) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/MicaProxyos.sh) ;;
-        28) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/VlessRealityos.sh) ;;
-        29) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Snellos.sh) ;;
-        30) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SSRustos.sh) ;;
-        31) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Hy2os.sh) ;;
-        32) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/2go.sh) ;;
-        33) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/3xuios.sh) ;;
-        34) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/nftablesos.sh) ;;
-        35) smart_pipe_run "https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh" "install" ;;
-        36) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/flux-panel.sh);;
-        37) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DDNS.sh) ;;
-        38) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SNIProxyDNSos.sh) ;;
-        39) smart_wget_run "port-traffic-dog.sh" "https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh" ;;#!/bin/bash
-# VPS Toolbox
-# 功能：
-# - 一级菜单加 ▶ 标识，字体绿色
-# - 二级菜单简洁显示，输入 1~99 都可执行
-# - 快捷指令 m / M 自动创建（支持传参，如 m docker 直接直达功能）
-# - 系统信息面板
-# - 彩色菜单和动态彩虹标题
-# - 完整安装/卸载
-
-INSTALL_PATH="$HOME/vps-toolbox.sh"
-SHORTCUT_PATH="/usr/local/bin/m"
-SHORTCUT_PATH_UPPER="/usr/local/bin/M"
-
-# 颜色
-green="\033[32m"
-reset="\033[0m"
-yellow="\033[33m"
-red="\033[31m"
-cyan="\033[36m"
-BLUE="\033[34m"
-ORANGE='\033[38;5;208m'
-
-# ==========================================
-# GITHUB 代理
-# ==========================================
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
-
-if [ -z "$SUCCESS_PROXY_IDX" ]; then
-    SUCCESS_PROXY_IDX=0
-fi
-
-_smart_download_core() {
-    local clean_url="$1"
-    local mode="$2"
-    local file_name="$3"
-
-    local best_proxy="${GITHUB_PROXY[$SUCCESS_PROXY_IDX]}"
-    local target_url="${best_proxy}${clean_url}"
-    
-    if [[ "$mode" == "text" || "$mode" == "pipe" ]]; then
-        if response=$(curl -fsSL --max-time 4 "$target_url" 2>/dev/null) && [[ -n "$response" ]]; then
-            echo "$response"
-            return 0
-        fi
-    elif [[ "$mode" == "file" ]]; then
-        if wget -T 4 -t 1 -q -O "$file_name" "$target_url" 2>/dev/null; then
-            return 0
-        fi
-    fi
-
-    for idx in "${!GITHUB_PROXY[@]}"; do
-        [[ $idx -eq $SUCCESS_PROXY_IDX ]] && continue
-        local proxy="${GITHUB_PROXY[$idx]}"
-        local target_url="${proxy}${clean_url}"
-        
-        if [[ "$mode" == "file" ]]; then
-            echo -e "${yellow}⚡ 正在切换通道，尝试通过 [${proxy:-直连}]打开...${reset}"
-            if wget -T 5 -t 1 -q -O "$file_name" "$target_url" 2>/dev/null; then
-                SUCCESS_PROXY_IDX=$idx
-                return 0
-            fi
-        else
-            if response=$(curl -fsSL --max-time 5 "$target_url" 2>/dev/null) && [[ -n "$response" ]]; then
-                SUCCESS_PROXY_IDX=$idx
-                echo "$response"
-                return 0
-            fi
-        fi
-    done
-    return 1
-}
-
-smart_curl() {
-    local raw_url="$1"
-    if [[ ! "$raw_url" =~ "github" ]] && [[ ! "$raw_url" =~ "raw.githubusercontent.com" ]]; then
-        curl -fsSL --max-time 10 "$raw_url"
-        return $?
-    fi
-    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://github.com/|https://github.com/|g' | sed -E 's|https://[^/]*/https://raw.githubusercontent.com/|https://raw.githubusercontent.com/|g')
-    _smart_download_core "$clean_url" "text"
-    if [[ $? -ne 0 ]]; then
-        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}" >&2
-        return 1
-    fi
-}
-
-smart_wget_run() {
-    local file_name="$1"
-    local raw_url="$2"
-    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://|https://|g')
-    if _smart_download_core "$clean_url" "file" "$file_name"; then
-        echo
-        chmod +x "$file_name"
-        ./"$file_name"
-        return 0
-    else
-        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}"
-        return 1
-    fi
-}
-
-smart_pipe_run() {
-    local raw_url="$1"
-    local bash_args="$2"
-    local clean_url=$(echo "$raw_url" | sed -E 's|https://[^/]*/https://|https://|g')
-    local response
-    response=$(_smart_download_core "$clean_url" "pipe")
-    if [[ -n "$response" ]]; then
-        echo
-        if [[ -n "$bash_args" ]]; then
-            sudo bash -s $bash_args <<< "$response"
-        else
-            sudo bash <<< "$response"
-        fi
-        return 0
-    else
-        echo -e "${red}❌ 错误: 所有代理节点及直连均无法访问该资源！${reset}"
-        return 1
-    fi
-}
-
-rainbow_animate() {
-    local text="$1"
-    local colors=(31 33 32 36 34 35)
-    local len=${#text}
-    for ((i=0; i<len; i++)); do
-        printf "\033[%sm%s" "${colors[$((i % ${#colors[@]}))]}" "${text:$i:1}"
-        sleep 0.002
-    done
-    printf "${reset}\n"
-}
-
-show_system_usage() {
-    local width=36
-    local content_indent="    "
-    format_size() {
-        local size_mb=${1:-0}
-        if [ "$size_mb" -lt 1024 ]; then echo "${size_mb}M"; else awk "BEGIN{printf \"%.1fG\", $size_mb/1024}"; fi
-    }
-    read mem_total mem_used <<< $(LANG=C free -m | awk 'NR==2{print $2, $3}')
-    mem_total=${mem_total:-0}; mem_used=${mem_used:-0}
-    mem_total_fmt=$(format_size "$mem_total"); mem_used_fmt=$(format_size "$mem_used")
-    mem_percent=$(awk "BEGIN{if($mem_total>0){printf \"%.0f\", $mem_used*100/$mem_total}else{print 0}}")"%"
-    read disk_total_h disk_used_h disk_used_percent <<< $(df -m / | awk 'NR==2{print $2, $3, $5}')
-    disk_total_h=${disk_total_h:-0}; disk_used_h=${disk_used_h:-0}; disk_used_percent=${disk_used_percent:-0%}
-    disk_total_fmt=$(format_size "$disk_total_h"); disk_used_fmt=$(format_size "$disk_used_h")
-    cpu_usage=$(awk 'NR==1{usage=($2+$4)*100/($2+$4+$5); if(usage!=""){printf "%.1f", usage}else{print 0}}' /proc/stat)"%"
-    mem_num=${mem_percent%\%}; disk_num=${disk_used_percent%\%}; cpu_num=${cpu_usage%\%}
-    max_level=0
-    for n in $mem_num $disk_num $cpu_num; do
-        if (( $(awk "BEGIN{print ($n>80)?1:0}") )); then max_level=2; fi
-        if (( $(awk "BEGIN{print ($n>60 && $n<=80)?1:0}") )) && [ "$max_level" -lt 2 ]; then max_level=1; fi
-    done
-    if [ "$max_level" -eq 0 ]; then system_status="${green}系统状态：正常 ✔${reset}"
-    elif [ "$max_level" -eq 1 ]; then system_status="${yellow}系统状态：警告 ⚡${reset}"
-    else system_status="${red}系统状态：危险 🔥${reset}"; fi
-    pad_string() { printf "%-${width}s" "${content_indent}${str}"; }
-    echo -e "${green}┌$(printf '─%.0s' $(seq 1 $width))┐${reset}"
-    str="${system_status}"; echo -e "$(pad_string)"
-    str="${yellow}📊 内存：${mem_used_fmt}/${mem_total_fmt} (${mem_percent})${reset}"; echo -e "$(pad_string)"
-    str="${yellow}💽 磁盘：${disk_used_fmt}/${disk_total_fmt} (${disk_used_percent})${reset}"; echo -e "$(pad_string)"
-    str="${yellow} ⚙ CPU ：${cpu_usage}${reset}"; echo -e "$(pad_string)"
-    echo -e "${green}└$(printf '─%.0s' $(seq 1 $width))┘${reset}"
-}
-
-if [ -f /proc/1/cgroup ] && grep -qE '(docker|lxc|kubepods)' /proc/1/cgroup; then container_flag=" (Container)"; else container_flag=""; fi
-if [ -f /etc/os-release ]; then system_name=$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"'); else system_name=$(uname -s); fi
-system_name="${system_name}${container_flag}"
-
-get_timezone() {
-    if command -v timedatectl &>/dev/null; then tz=$(timedatectl show -p Timezone --value 2>/dev/null); [[ -n "$tz" ]] && echo "$tz" && return; fi
-    if [[ -f /etc/timezone ]]; then tz=$(cat /etc/timezone); [[ -n "$tz" ]] && echo "$tz" && return; fi
-    if [[ -L /etc/localtime ]]; then tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##'); [[ -n "$tz" ]] && echo "$tz" && return; fi
-    if [[ -f /etc/localtime ]]; then tz=$(strings /etc/localtime 2>/dev/null | grep -E '^[A-Z][a-z]+/[A-Z][a-zA-Z_]+$' | head -n1); [[ -n "$tz" ]] && echo "$tz" && return; fi
-    echo "未知"
-}
-timezone=$(get_timezone)
-cpu_arch=$(uname -m)
-cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
-[ -z "$cpu_model" ] && cpu_model=$(grep -m1 "Hardware" /proc/cpuinfo 2>/dev/null | cut -d: -f2)
-[ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | grep "Model name" | cut -d: -f2)
-cpu_model=$(echo "$cpu_model" | sed -E -e 's/@.*GHz//g' -e 's/CPU//g' -e 's/Processor//g' -e 's/[0-9]+-Core//g' -e 's/\bv[1-9]\b//g' -e 's/\s+/ /g' | xargs)
-cpu="${cpu_model:-Unknown CPU} (${cpu_arch})"
-datetime=$(date "+%Y-%m-%d %H:%M:%S")
-
-if [ -f /proc/uptime ]; then
-    uptime_seconds=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
-    days=$((uptime_seconds/86400)); hours=$(( (uptime_seconds%86400)/3600 )); minutes=$(( (uptime_seconds%3600)/60 ))
-    if [ "$days" -gt 0 ]; then vps_uptime="${days}天${hours}小时${minutes}分钟"
-    elif [ "$hours" -gt 0 ]; then vps_uptime="${hours}小时${minutes}分钟"
-    else vps_uptime="${minutes}分钟"; fi
-else
-    vps_uptime=$(uptime -p 2>/dev/null | tr -d ' ' || echo "未知")
-fi
-
-MAIN_MENU=(
-    "系统设置"
-    "网络代理"
-    "网络检测"
-    "Docker管理"
-    "应用商店"
-    "证书管理"
-    "系统管理"
-    "备份恢复"
-    "玩具熊ʕ•ᴥ•ʔ"
-    "更新卸载"
-)
-
-SUB_MENU[1]="1 更新系统|2 系统信息|3 修改root密码|4 root登录管理|5 修改SSH端口|6 修改时区|7 时间同步|8 切换v4V6|9 开放所有端口|10 更换系统源|11 DDdebian13|12 DDwindows|13 NAT鸡重装系统|14 DD飞牛|15 修改语言|16 修改主机名|17 DNS优化|18 一键优化✨|19 VPS重启"
-SUB_MENU[2]="20 代理工具箱|21 FRP管理|22 EasyTier组网|23 ShellCrash|24 CFWARP|25 BBRv3|26 BBR+TCP智能调参|27 Socks5/HTTP|28 Reality|29 Snell|30 Shadowsocks|31 Hysteria2|32 Xray-Argo|33 3X-UI|34 nftables|35 Realm|36 哆啦A梦转发面板|37 DDNS动态域名|38 自建DNS解锁|39 流量狗|40 流量监控"
-SUB_MENU[3]="41 NodeQuality|42 融合怪测试|43 YABS测试|44 网络质量体检|45 IP质量体检|46 硬盘质量体检|47 三网延迟检测|48 简单回程测试|49 完整路由检测|50 流媒体解锁|51 三网测速|52 网络PING/DNS检测|53 检查25端口开放|54 网络工具箱"
-SUB_MENU[4]="55 Docker管理|56 DockerCompose管理|57 DockerCompose备份恢复|58 DockerCompose自动更新"
-SUB_MENU[5]="59 应用管理|60 宝塔面板|61 1Panel面板|62 CLICD开小鸡|63 OpenClaw|64 HermesAgent"
-SUB_MENU[6]="65 NGINXV4反代✨|66 NGINXV6反代|67 Caddy反代|68 Acme申请证书|69 Lucky反代"
-SUB_MENU[7]="71 系统清理|72 重装系统|73 系统组件|74 开发环境|75 工作区管理|76 防火墙管理|78 Fail2ban|79 系统监控|80 添加SWAP|81 DNS管理|82 定时任务"
-SUB_MENU[8]="83 系统快照|84 系统恢复|85 本地备份|86 Rsync同步|87 Rclone备份|89 Croc文件传输|90 TGBot备份|91 压缩文件|92 解压文件"
-SUB_MENU[9]="100 GProxy加速|101 Cloudflare隧道|102 1panelapps管理|103 Akile优选DNS|104 自动机场签到|105 关闭哪吒监控SSH|106 AI检测|107 代理工具检测|108 卸载探针"
-SUB_MENU[10]="77 自动更新|88 更新工具箱|99 卸载工具箱"
-
-show_main_menu() {
-    clear
-    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "${ORANGE}📦 VPS Toolbox工具箱${reset}${yellow}(快捷指令:M/m)${reset} ${ORANGE}📦${reset}"
-    rainbow_animate "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    show_system_usage
-    term_width=$(tput cols 2>/dev/null || echo 80)
-    label_w=8
-    printf "${ORANGE}%s %-*s:${yellow} %s${reset}\n" "💻" $label_w "系统" "$system_name"
-    printf "${ORANGE}%s %-*s:${yellow} %s${reset}\n" "🌍" $label_w "时区" "$timezone"
-    printf "${ORANGE}%s %-*s:${yellow} %s${reset}\n" "🧩" $label_w "架构" "$cpu"
-    printf "${ORANGE}%s %-*s:${yellow} %s${reset}\n" "🕒" $label_w "时间" "$datetime"
-    printf "${ORANGE}%s %-*s:${ORANGE} %s${reset}\n" "🚀" $label_w "在线" "$vps_uptime"
-    echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}"
-    for i in "${!MAIN_MENU[@]}"; do
-        if [[ $i -eq 8 ]]; then
-            printf "${red}▶${reset} ${green}%02d.${reset} ${yellow}%s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
-        else
-            printf "${red}▶${reset} ${green}%02d. %s${reset}\n" "$((i+1))" "${MAIN_MENU[i]}"
-        fi
-    done
-}
-
-show_sub_menu() {
-    local idx="$1"
-    while true; do
-        IFS='|' read -ra options <<< "${SUB_MENU[idx]}"
-        local map=()
-        echo
-        for opt in "${options[@]}"; do
-            local num="${opt%% *}"
-            local name="${opt#* }"
-            printf "${red}▶${reset} ${yellow}%02d %s${reset}\n" "$num" "$name"
-            map+=("$num")
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
         done
-        echo -ne "${red}请输入要执行的编号${ORANGE}(0返回/X退出)${ORANGE}:${reset}"
-        read -r choice
+    else
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
 
-        if [[ "$choice" =~ ^[xX]$ ]]; then exit 0; fi
-        if [[ -z "$choice" ]]; then clear; continue; fi
-        if [[ "$choice" == "0" || "$choice" == "00" ]]; then return; fi
-        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-            echo -e "${red}无效选项，请输入数字！${reset}"
-            sleep 1; clear; continue
-        fi
-        if [[ ! " ${map[*]} " =~ (^|[[:space:]])$choice($|[[:space:]]) ]]; then
-            echo -e "${red}无效选项${reset}"
-            sleep 1; clear; continue
-        fi
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    echo "127.0.0.1" && return 0
+}
 
-        execute_choice "$choice"
-
-        if [[ "$choice" != "0" && "$choice" != "99" ]]; then
-            read -rp $'\e[31m按回车刷新二级菜单...\e[0m' tmp
-            clear
+# 动态获取容器整体状态和端口 (高精度精准匹配算法)
+get_status_info() {
+    if [ -f "$COMPOSE_FILE" ]; then
+        if [ "$(docker ps -q -f name=openflare-app)" ]; then
+            status="${GREEN}运行中${RESET}"
+            # 【终极修复】直接向 Docker 全局守护进程查询 openflare-app 容器 3000 端口映射到宿主机的真实端口
+            web_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' openflare-app 2>/dev/null)
+        elif [ "$(docker ps -aq -f name=openflare-app)" ]; then
+            status="${YELLOW}已停止${RESET}"
+            web_port=""
         else
-            break
+            status="${RED}未部署${RESET}"
+            web_port=""
         fi
-    done
+        
+        # 兜底逻辑：如果容器没启动，或者上面高级查询落空，则退回静态解析 YAML 文件
+        if [ -z "$web_port" ]; then
+            web_port=$(grep -A 6 "openflare:" "$COMPOSE_FILE" 2>/dev/null | grep -E '\-[[:space:]]*["'\'']?[0-9]+:3000' | head -n 1 | grep -oE '[0-9]+:3000' | cut -d':' -f1)
+            [[ -z "$web_port" ]] && web_port=$(grep -A 6 "openflare:" "$COMPOSE_FILE" 2>/dev/null | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | sed -E 's/[^0-9:]//g' | cut -d':' -f1)
+            [[ -z "$web_port" ]] && web_port="3000"
+        fi
+    else
+        status="${RED}未初始化${RESET}"
+        web_port="N/A"
+    fi
 }
 
-remove_shortcut() {
-    if [[ $EUID -eq 0 ]]; then rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
-    else sudo rm -f "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"; fi
-}
+# 部署 OpenFlare
+install_openflare() {
+    check_dependencies
+    mkdir -p "$BASE_DIR"
 
-create_shortcut() {
-    if [[ ! -f "$INSTALL_PATH" ]]; then
-        mkdir -p "$(dirname "$INSTALL_PATH")"
-        cp "$0" "$INSTALL_PATH" 2>/dev/null || echo "$0" > "$INSTALL_PATH"
-        chmod +x "$INSTALL_PATH"
+    echo -e "${CYAN}====== 数据库运行模式选择 ======${RESET}"
+    echo -e " 1. 直接部署全新完整环境 (包含全新本地 PostgreSQL 17 容器)"
+    echo -e " 2. 连接外部/远程已有的 PostgreSQL 数据库 (需提前手动创建好数据库)"
+    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
+
+    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 OpenFlare Web 访问端口 [默认: 3000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3000"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
     fi
 
-    # 关键点：用 "$@" 把传参完美送到后台
-    local shortcut_content="#!/bin/bash\nexec bash \"$INSTALL_PATH\" \"\$@\""
+    # 自动计算高强度的密钥
+    local rand_jwt=$(openssl rand -hex 24)
     
-    if [[ $EUID -eq 0 ]]; then
-        echo -e "$shortcut_content" > "$SHORTCUT_PATH"
-        echo -e "$shortcut_content" > "$SHORTCUT_PATH_UPPER"
-        chmod +x "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
+    # ------------------ 模式 1：全套本地内置容器化 ------------------
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}正在自动计算生成数据库高强度防破解随机密码...${RESET}"
+        local rand_db_pass=$(openssl rand -hex 16)
+        local db_user="openflare"
+        local db_name="openflare"
+
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: openflare-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${db_name}
+      POSTGRES_USER: ${db_user}
+      POSTGRES_PASSWORD: ${rand_db_pass}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${db_user} -d ${db_name}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  openflare:
+    image: ${DEFAULT_IMAGE}
+    container_name: openflare-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${custom_port}:3000"
+    environment:
+      JWT_SECRET: ${rand_jwt}
+      DSN: postgres://${db_user}:${rand_db_pass}@postgres:5432/${db_name}?sslmode=disable
+      GIN_MODE: release
+      LOG_LEVEL: info
+    volumes:
+      - openflare-data:/data
+
+volumes:
+  postgres-data:
+  openflare-data:
+EOF
+
+    # ------------------ 模式 2：连接外部/远程已有的 PostgreSQL（纯写入，免建库） ------------------
     else
-        echo -e "$shortcut_content" | sudo tee "$SHORTCUT_PATH" >/dev/null
-        echo -e "$shortcut_content" | sudo tee "$SHORTCUT_PATH_UPPER" >/dev/null
-        sudo chmod +x "$SHORTCUT_PATH" "$SHORTCUT_PATH_UPPER"
+        echo -e "${CYAN}====== 远程/外部 PostgreSQL 信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_host
+        [[ -z "$ext_host" ]] && ext_host="127.0.0.1"
+        
+        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
+        read -r ext_port
+        [[ -z "$ext_port" ]] && ext_port="5432"
+        
+        echo -ne "${YELLOW}请输入数据库用户名 [默认: openflare]: ${RESET}"
+        read -r ext_user
+        [[ -z "$ext_user" ]] && ext_user="openflare"
+        
+        echo -ne "${YELLOW}请输入数据库密码: ${RESET}"
+        read -r ext_pass
+        
+        echo -ne "${YELLOW}请输入目标数据库名 [默认: openflare]: ${RESET}"
+        read -r ext_dbname
+        [[ -z "$ext_dbname" ]] && ext_dbname="openflare"
+
+        # 突破 Docker 宿主机回环地址限制
+        if [[ "$ext_host" == "127.0.0.1" || "$ext_host" == "localhost" ]]; then
+            ext_host="172.17.0.1"
+        fi
+
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  openflare:
+    image: ${DEFAULT_IMAGE}
+    container_name: openflare-app
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:3000"
+    environment:
+      JWT_SECRET: ${rand_jwt}
+      DSN: postgres://${ext_user}:${ext_pass}@${ext_host}:${ext_port}/${ext_dbname}?sslmode=disable
+      GIN_MODE: release
+      LOG_LEVEL: info
+    volumes:
+      - openflare-data:/data
+
+volumes:
+  openflare-data:
+EOF
+    fi
+
+    # ------------------ 启动集群 ------------------
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 OpenFlare 服务中...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}部署失败，请检查 Docker 日志。${RESET}"
+        return
+    fi
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}             OpenFlare 部署成功！                   ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}访问端点(URL) : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}映射宿主机端口 : ${custom_port}${RESET}"
+    echo -e "${YELLOW}安全 JWT 密钥  : ${rand_jwt}${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}内置库密码凭证 : 用户:${db_user} | 密码:${rand_db_pass} | 库名:${db_name}${RESET}"
+    else
+        echo -e "${YELLOW}连接外部数据库 : ${ext_host}:${ext_port} -> 库名:${ext_dbname}${RESET}"
+    fi
+    echo -e "${YELLOW}默认账号密码   : root/123456${RESET}"
+    echo -e "${YELLOW}部署工作路径   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+}
+
+# 更新服务
+update_openflare() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在拉取 OpenFlare 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}服务已升级并拉升至最新状态！${RESET}"
+}
+
+# 卸载集群
+uninstall_openflare() {
+    echo -ne "${RED} 确定要注销并删除 OpenFlare 服务集群吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已全部终止并移除。${RESET}"
+            echo -ne "${RED}是否同步清理掉本地所有挂载的数据卷和数据？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                cd "$BASE_DIR" && docker compose down -v
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}工作目录及 Docker 命名数据卷已被彻底净化清除。${RESET}"
+            fi
+        else
+            docker rm -f openflare-app openflare-db 2>/dev/null
+        fi
+        echo -e "${GREEN}完全卸载完毕！${RESET}"
     fi
 }
 
-execute_choice() {
-    case "$1" in
-        1) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/update.sh) ;;
-        2) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vpsinfo.sh) ;;
-        3) sudo passwd root ;;
-        4) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SSHDLGL.sh) ;;
-        5) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/sshdk.sh) ;;
-        6) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/time.sh) ;;
-        7) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/systemdtimesyncd.sh) ;;
-        8) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/qhwl.sh) ;;
-        9) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/UFWFX.sh) ;;
-        10) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/huanyuan.sh) ;;
-        11) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Debian13.sh) ;;
-        12) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/windowos.sh) ;;
-        13) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/DDnat.sh) ;;
-        14) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ddfnos.sh) ;;
-        15) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/xgyu.sh) ;;
-        16) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/home.sh) ;;
-        17) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Mosdnsxos.sh) ;;
-        18) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/vpsupos.sh) ;;
-        19) sudo reboot ;;
-        20) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/proxy.sh) ;;
-        21) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/FRPos.sh) ;;
-        22) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/EasyTierx.sh) ;;
-        23) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/ShellCrash.sh);;
-        24) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/CFWARPtoolos.sh) ;;
-        25) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/BBRv3os.sh) ;;
-        26) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/BBR.sh) ;;
-        27) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/MicaProxyos.sh) ;;
-        28) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/VlessRealityos.sh) ;;
-        29) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Snellos.sh) ;;
-        30) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SSRustos.sh) ;;
-        31) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Hy2os.sh) ;;
-        32) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/2go.sh) ;;
-        33) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/3xuios.sh) ;;
-        34) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/nftablesos.sh) ;;
-        35) smart_pipe_run "https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh" "install" ;;
-        36) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/flux-panel.sh);;
-        37) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/DDNS.sh) ;;
-        38) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/SNIProxyDNSos.sh) ;;
-        39) smart_wget_run "port-traffic-dog.sh" "https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh" ;;
-        40) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vnstat.sh) ;;
-        41) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NodeQuality.sh) ;;
-        42) curl -L https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh -o ecs.sh && chmod +x ecs.sh && bash ecs.sh ;;
-        43) curl -sL https://yabs.sh | bash ;;
-        44) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NetQuality.sh) ;;
-        45) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/IPQuality.sh) ;;
-        46) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/HardwareQuality.sh) ;;
-        47) bash <(curl -Ls https://Net.Check.Place) -P ;;
-        48) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
-        49) bash <(curl -Ls https://Net.Check.Place) -R ;;
-        50) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
-        51) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ecsspeed.sh) ;;
-        52) bash <(wget -qO- https://raw.githubusercontent.com/Cd1s/network-latency-tester/main/latency.sh) ;;
-        53) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Telnet.sh) ;;
-        54) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Networktoolx.sh) ;; 
-        55) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Dockersos.sh) ;;
-        56) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockercompose.sh) ;;
-        57) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Dockcompbauck.sh) ;;
-        58) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockerupdate.sh) ;;
-        59) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Store.sh) ;;
-        60) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/Baotax.sh) ;;
-        61) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/1Panelx.sh) ;;
-        62) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/NAT/CLICD.sh) ;;
-        63) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/OpenClaw.sh) ;;
-        64) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/Hermes.sh) ;;
-        65) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginxos.sh) ;;
-        66) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginx6os.sh) ;;
-        67) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Caddyos.sh) ;;
-        68) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Acmeos.sh) ;;
-        69) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/CN/CNLucky.sh) ;;
-        71) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clear.sh) ;;
-        72) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/reinstall.sh) ;;
-        73) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/package.sh) ;;
-        74) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/exploitation.sh) ;;
-        75) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tmux.sh) ;;
-        76) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/firewallos.sh) ;;
-        78) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Fail2banos.sh) ;;
-        79) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/System.sh) ;;
-        80) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SWAP.sh) ;;
-        81) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/DNSos.sh) ;;
-        82) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/crontab.sh) ;;
-        83) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/snapshotBos.sh) ;;
-        84) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/snapshotRos.sh) ;;
-        85) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/beifen.sh) ;;
-        86) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Rrsync.sh) ;;
-        87) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Rcloneos.sh) ;;
-        89) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Croc.sh) ;;
-        90) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/VPSTGbackup.sh) ;;
-        91) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/yasuo.sh) ;;
-        92) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tarzip.sh) ;;
-        100) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/CN/CNGProxy.sh) ;;
-        101) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Cloudflare.sh) ;;
-        102) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/1Pappsx.sh) ;;
-        103) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/AkileDNS.sh) ;;
-        104) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/JCQD.sh) ;;
-        105) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
-        106) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/AIcheck.sh) ;;
-        107) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/test.sh) ;;
-        108) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/unagent.sh) ;;
-        77) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/tool/toolboxupdates.sh) ;; 
-        88)
-            echo -e "${yellow}正在更新工具箱...${reset}"
-            if ! smart_curl "https://raw.githubusercontent.com/sistarry/toolbox/main/tool/vps-toolbox.sh" > "$INSTALL_PATH"; then
-                echo -e "${red}更新失败，所有代理及直连均无法访问，请检查网络！${reset}"
-                return 1
-            fi
-            if [[ ! -s "$INSTALL_PATH" ]]; then
-                echo -e "${red}更新失败：下载的文件为空，已终止覆盖！${reset}"
-                return 1
-            fi
-            chmod +x "$INSTALL_PATH"
-            echo -e "${green}更新完成！${reset}"
-            exec bash "$INSTALL_PATH"
-            ;;
-        99) 
-            echo -e "${yellow}正在卸载工具箱...${reset}"
-            remove_shortcut
-            if [[ -f "$INSTALL_PATH" ]]; then rm -f "$INSTALL_PATH"; echo -e "${green}工具箱已删除${reset}"; fi
-            MARK_FILE="$HOME/.vpstoolbox"
-            if [[ -f "$MARK_FILE" ]]; then rm -f "$MARK_FILE"; fi
-            echo -e "${red}卸载完成！${reset}"
-            exit 0
-            ;;
+# 周期控制
+start_of() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已正常启动${RESET}"; }
+stop_of() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已安全暂停${RESET}"; }
+restart_of() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已完成软重启${RESET}"; }
+logs_of() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+
+# 配置显示
+show_info() {
+    get_status_info
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}当前运行状态   : $status"
+    echo -e "${YELLOW}实际映射端口   : ${web_port}${RESET}"
+    echo -e "${YELLOW}本地项目路径   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+}
+
+# 主菜单
+menu() {
+    clear
+    get_status_info
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}      ◈  OpenFlare 管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 当前状态 :${RESET} $status"
+    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 1. 部署启动${RESET}"
+    echo -e "${GREEN} 2. 更新服务${RESET}"
+    echo -e "${GREEN} 3. 卸载服务${RESET}"
+    echo -e "${GREEN} 4. 启动服务${RESET}"
+    echo -e "${GREEN} 5. 停止服务${RESET}"
+    echo -e "${GREEN} 6. 重启服务${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_openflare ;;
+        2) update_openflare ;;
+        3) uninstall_openflare ;;
+        4) start_of ;;
+        5) stop_of ;;
+        6) restart_of ;;
+        7) logs_of ;;
+        8) show_info ;;
         0) exit 0 ;;
-        *) echo -e "${red}无效选项${reset}"; return 1 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 
-# ========================================================
-# 🚀 入口快捷参数直达逻辑 (核心改动部分)
-# ========================================================
-
-# 1. 静默刷新最新版本的快捷指令软连接（支持传参）
-create_shortcut
-
-# 2. 判断是否有快捷键传入参数
-if [[ -n "$1" ]]; then
-    case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
-        docker)
-            execute_choice 55  # ✨ 核心改动：不弹二级菜单，直接秒开 55 Docker管理
-            exit 0
-            ;;
-        bbr)
-            execute_choice 26  # 例如：m bbr 也可以瞬间直达 26 智能调参
-            exit 0
-            ;;
-        bt|baota)
-            execute_choice 60  # 例如：m bt 直接一键安装宝塔面板
-            exit 0
-            ;;
-        *)
-            # 兼容模式：如果输入的是纯数字 (如 m 55)，也能直接执行对应的底层功能
-            if [[ "$1" =~ ^[0-9]+$ ]]; then
-                execute_choice "$1"
-                exit 0
-            else
-                echo -e "${red}未知快捷参数: $1${reset}"
-                echo -e "${yellow}已为你直达主菜单...${reset}"
-                sleep 1
-            fi
-            ;;
-    esac
-fi
-
-# 3. 正常运行（无参数输入时进入主菜单）
 while true; do
-    show_main_menu
-    echo -ne "${red}请输入要执行的编号${ORANGE}(0退出)${ORANGE}:${reset} "
-    read -r main_choice
-
-    if [[ "$main_choice" =~ ^[xX]$ ]]; then exit 0; fi
-    if [[ -z "$main_choice" ]]; then continue; fi
-    if [[ "$main_choice" == "0" ]]; then exit 0; fi
-
-    if ! [[ "$main_choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${red}无效选项，请输入数字！${reset}"
-        sleep 1; continue
-    fi
-
-    if (( main_choice >= 1 && main_choice <= ${#MAIN_MENU[@]} )); then
-        show_sub_menu "$main_choice"
-    else
-        echo -e "${red}无效选项${reset}"
-        sleep 1
-    fi
-done
-        40) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/vnstat.sh) ;;
-        41) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NodeQuality.sh) ;;
-        42) curl -L https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh -o ecs.sh && chmod +x ecs.sh && bash ecs.sh ;;
-        43) curl -sL https://yabs.sh | bash ;;
-        44) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/NetQuality.sh) ;;
-        45) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/IPQuality.sh) ;;
-        46) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/HardwareQuality.sh) ;;
-        47) bash <(curl -Ls https://Net.Check.Place) -P ;;
-        48) curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh ;;
-        49) bash <(curl -Ls https://Net.Check.Place) -R ;;
-        50) bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh) ;;
-        51) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/ecsspeed.sh) ;;
-        52) bash <(wget -qO- https://raw.githubusercontent.com/Cd1s/network-latency-tester/main/latency.sh) ;;
-        53) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Telnet.sh) ;;
-        54) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Networktoolx.sh) ;; 
-        55) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Dockersos.sh) ;;
-        56) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockercompose.sh) ;;
-        57) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Dockcompbauck.sh) ;;
-        58) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/dockerupdate.sh) ;;
-        59) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Docker/Store.sh) ;;
-        60) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/Baotax.sh) ;;
-        61) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/1Panelx.sh) ;;
-        62) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/NAT/CLICD.sh) ;;
-        63) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/OpenClaw.sh) ;;
-        64) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/Hermes.sh) ;;
-        65) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginxos.sh) ;;
-        66) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Nginx6os.sh) ;;
-        67) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Caddyos.sh) ;;
-        68) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Acmeos.sh) ;;
-        69) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/CN/CNLucky.sh) ;;
-        71) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/clear.sh) ;;
-        72) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/reinstall.sh) ;;
-        73) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/package.sh) ;;
-        74) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/exploitation.sh) ;;
-        75) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tmux.sh) ;;
-        76) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/firewallos.sh) ;;
-        78) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Fail2banos.sh) ;;
-        79) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/System.sh) ;;
-        80) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/SWAP.sh) ;;
-        81) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/DNSos.sh) ;;
-        82) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/crontab.sh) ;;
-        83) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/snapshotBos.sh) ;;
-        84) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/snapshotRos.sh) ;;
-        85) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/beifen.sh) ;;
-        86) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Rrsync.sh) ;;
-        87) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/OS/Rcloneos.sh) ;;
-        89) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/Croc.sh) ;;
-        90) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/VPSTGbackup.sh) ;;
-        91) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/yasuo.sh) ;;
-        92) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/VPS/tarzip.sh) ;;
-        100) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/CN/CNGProxy.sh) ;;
-        101) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/Cloudflare.sh) ;;
-        102) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/Panel/1Pappsx.sh) ;;
-        103) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/AkileDNS.sh) ;;
-        104) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/JCQD.sh) ;;
-        105) sed -i 's/disable_command_execute: false/disable_command_execute: true/' /opt/nezha/agent/config.yml && systemctl restart nezha-agent ;;
-        106) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/AI/AIcheck.sh) ;;
-        107) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/test.sh) ;;
-        108) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/toy/unagent.sh) ;;
-        77) bash <(smart_curl https://raw.githubusercontent.com/sistarry/toolbox/main/tool/toolboxupdates.sh) ;; 
-        88)
-            echo -e "${yellow}正在更新工具箱...${reset}"
-            if ! smart_curl "https://raw.githubusercontent.com/sistarry/toolbox/main/tool/vps-toolbox.sh" > "$INSTALL_PATH"; then
-                echo -e "${red}更新失败，所有代理及直连均无法访问，请检查网络！${reset}"
-                return 1
-            fi
-            if [[ ! -s "$INSTALL_PATH" ]]; then
-                echo -e "${red}更新失败：下载的文件为空，已终止覆盖！${reset}"
-                return 1
-            fi
-            chmod +x "$INSTALL_PATH"
-            echo -e "${green}更新完成！${reset}"
-            exec bash "$INSTALL_PATH"
-            ;;
-        99) 
-            echo -e "${yellow}正在卸载工具箱...${reset}"
-            remove_shortcut
-            if [[ -f "$INSTALL_PATH" ]]; then rm -f "$INSTALL_PATH"; echo -e "${green}工具箱已删除${reset}"; fi
-            MARK_FILE="$HOME/.vpstoolbox"
-            if [[ -f "$MARK_FILE" ]]; then rm -f "$MARK_FILE"; fi
-            echo -e "${red}卸载完成！${reset}"
-            exit 0
-            ;;
-        0) exit 0 ;;
-        *) echo -e "${red}无效选项${reset}"; return 1 ;;
-    esac
-}
-
-# ========================================================
-# 🚀 入口快捷参数直达逻辑 (核心改动部分)
-# ========================================================
-
-# 1. 静默刷新最新版本的快捷指令软连接（支持传参）
-create_shortcut
-
-# 2. 判断是否有快捷键传入参数
-if [[ -n "$1" ]]; then
-    case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
-        docker)
-            execute_choice 55  # ✨ 核心改动：不弹二级菜单，直接秒开 55 Docker管理
-            exit 0
-            ;;
-        bbr)
-            execute_choice 26  # 例如：m bbr 也可以瞬间直达 26 智能调参
-            exit 0
-            ;;
-        bt|baota)
-            execute_choice 60  # 例如：m bt 直接一键安装宝塔面板
-            exit 0
-            ;;
-        *)
-            # 兼容模式：如果输入的是纯数字 (如 m 55)，也能直接执行对应的底层功能
-            if [[ "$1" =~ ^[0-9]+$ ]]; then
-                execute_choice "$1"
-                exit 0
-            else
-                echo -e "${red}未知快捷参数: $1${reset}"
-                echo -e "${yellow}已为你直达主菜单...${reset}"
-                sleep 1
-            fi
-            ;;
-    esac
-fi
-
-# 3. 正常运行（无参数输入时进入主菜单）
-while true; do
-    show_main_menu
-    echo -ne "${red}请输入要执行的编号${ORANGE}(0退出)${ORANGE}:${reset} "
-    read -r main_choice
-
-    if [[ "$main_choice" =~ ^[xX]$ ]]; then exit 0; fi
-    if [[ -z "$main_choice" ]]; then continue; fi
-    if [[ "$main_choice" == "0" ]]; then exit 0; fi
-
-    if ! [[ "$main_choice" =~ ^[0-9]+$ ]]; then
-        echo -e "${red}无效选项，请输入数字！${reset}"
-        sleep 1; continue
-    fi
-
-    if (( main_choice >= 1 && main_choice <= ${#MAIN_MENU[@]} )); then
-        show_sub_menu "$main_choice"
-    else
-        echo -e "${red}无效选项${reset}"
-        sleep 1
-    fi
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
 done

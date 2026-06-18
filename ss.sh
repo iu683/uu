@@ -1,303 +1,281 @@
 #!/bin/bash
-# =================================================================
-# 小桔问卷 (Xiaoju Survey) Docker Compose 管理面板 
-# =================================================================
 
-# 颜色定义
-RED="\033[31m"
+# ================== 颜色定义 ==================
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\03 counseling31m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/xiaoju-survey"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/survey.env"
-DEFAULT_IMAGE="xiaojusurvey/xiaoju-survey:1.3.4-slim"
+# ================== 检查是否 root ==================
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 用户运行此脚本！${RESET}"
+    exit 1
+fi
 
-# 检测依赖环境
+# ================== 配置信息 ==================
+INSTALL_DIR="/www/wwwroot/mcy-shop"
+DOWNLOAD_URL="https://wiki.mcy.im/download.php?q=27"
+
+# ================== 自动进入工作目录守卫 ==================
+CURRENT_DIR=$(pwd)
+
+if [ "$CURRENT_DIR" != "$INSTALL_DIR" ]; then
+    echo -e "${YELLOW}检测到当前不在程序根目录，正在自动切换...${RESET}"
+    # 如果目录不存在（如首次安装），则自动创建
+    if [ ! -d "$INSTALL_DIR" ]; then
+        echo -e "${YELLOW}目录 $INSTALL_DIR 不存在，正在自动创建...${RESET}"
+        mkdir -p "$INSTALL_DIR"
+    fi
+    # 自动切换到目标目录
+    cd "$INSTALL_DIR" || { echo -e "${RED}无法进入目录 $INSTALL_DIR，执行失败！${RESET}"; exit 1; }
+    echo -e "${GREEN}已成功切换至工作目录: $(pwd)${RESET}"
+    sleep 1
+fi
+
+# ================== 依赖环境检测与安装 ==================
 check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
-    fi
-}
-
-get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
-    echo "127.0.0.1" && return 0
-}
-# 动态获取容器整体状态和端口
-get_status_info() {
-    if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=xiaoju-survey)" ]; then
-            status="${GREEN}运行中${RESET}"
-            web_port=$(docker ps -f name=xiaoju-survey --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
-            if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
-                web_port=$(sed -n '/xiaoju-survey:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
-            fi
-        elif [ "$(docker ps -aq -f name=xiaoju-survey)" ]; then
-            status="${YELLOW}已停止${RESET}"
-            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' xiaoju-survey 2>/dev/null)
+    if ! command -v unzip &>/dev/null; then
+        echo -e "${YELLOW}检测到系统缺少 unzip 工具，正在尝试自动安装...${RESET}"
+        if command -v apt-get &>/dev/null; then
+            apt-get update && apt-get install -y unzip
+        elif command -v dnf &>/dev/null; then
+            dnf install -y unzip
+        elif command -v yum &>/dev/null; then
+            yum install -y unzip
         else
-            status="${RED}未部署${RESET}"
+            echo -e "${RED}未找到包管理器，请手动安装 unzip 后重试！${RESET}"
+            exit 1
         fi
-        [[ -z "$web_port" ]] && web_port="8080"
-    else
-        status="${RED}未初始化${RESET}"
-        web_port="N/A"
+    fi
+
+    if ! command -v wget &>/dev/null; then
+        echo -e "${YELLOW}检测到系统缺少 wget 工具，正在尝试自动安装...${RESET}"
+        if command -v apt-get &>/dev/null; then
+            apt-get install -y wget
+        elif command -v dnf &>/dev/null; then
+            dnf install -y wget
+        elif command -v yum &>/dev/null; then
+            yum install -y wget
+        fi
     fi
 }
 
-# 部署小桔问卷
-install_survey() {
+# ================== 检查服务状态 ==================
+check_status() {
+    if [ ! -f "bin" ]; then
+        echo -e "${RED}服务状态: 未安装 (请选择 1 进行系统安装)${RESET}"
+        return
+    fi
+    # 检查前台安装程序 index.php 或常规服务是否在运行
+    STATUS=$(ps aux | grep -v grep | grep -E "bin index.php|mcy service")
+    if [ -n "$STATUS" ]; then
+        echo -e "${GREEN}服务状态: 运行中 (或正在进行前台安装)${RESET}"
+    else
+        echo -e "${YELLOW}服务状态: 未启动${RESET}"
+    fi
+}
+
+# ================== 核心安装函数（前台运行版） ==================
+mcy_install() {
+    echo -e "${GREEN}开始执行全新安装流程...${RESET}"
     check_dependencies
-    mkdir -p "$BASE_DIR"
+    
+    echo -e "${GREEN}开始下载最新版安装包...${RESET}"
+    mkdir -p "$INSTALL_DIR"
+    wget -O /tmp/mcy-latest.zip "$DOWNLOAD_URL"
 
-    # 1. 基础参数配置
-    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入小桔问卷宿主机映射访问端口 [默认: 8585]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8585"
+    echo -e "${GREEN}解压安装包到 $INSTALL_DIR ...${RESET}"
+    unzip -o /tmp/mcy-latest.zip -d "$INSTALL_DIR"
 
-    # 2. 数据库运行模式选择
-    echo -e "\n${CYAN}====== MongoDB 数据库运行模式选择 ======${RESET}"
-    echo -e " 1) 直接部署全新的 MongoDB 4 容器 (包含本地数据卷挂载)"
-    echo -e " 2) 使用已有的外部/远程外部 MongoDB 数据库"
-    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
-    read -r db_mode
-    [[ -z "$db_mode" ]] && db_mode="1"
-
-    local db_host="mongo"
-    local db_port="27017"
-    local db_user="root"
-    local db_pass=""
-    local db_auth_source="admin"
-
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}使用全新内置 Mongo 容器，正在生成高强度随机密码...${RESET}"
-        db_pass=$(openssl rand -hex 16)
-    else
-        echo -ne "${YELLOW}请输入远程 MongoDB 的 IP 或域名 [例如: 47.79.88.134]: ${RESET}"
-        read -r ext_db_ip
-        echo -ne "${YELLOW}请输入远程 MongoDB 端口 [默认: 27017]: ${RESET}"
-        read -r ext_db_port
-        [[ -z "$ext_db_port" ]] && ext_db_port="27017"
-        db_host="$ext_db_ip"
-        db_port="$ext_db_port"
-        echo -ne "${YELLOW}请输入远程 MongoDB 用户名 [默认: root]: ${RESET}"
-        read -r db_user
-        [[ -z "$db_user" ]] && db_user="root"
-        echo -ne "${YELLOW}请输入远程 MongoDB 密码: ${RESET}"
-        read -r db_pass
-        echo -ne "${YELLOW}请输入远程认证数据库 authSource [默认: admin]: ${RESET}"
-        read -r db_auth_source
-        [[ -z "$db_auth_source" ]] && db_auth_source="admin"
-        
-        # 兼容本地宿主机回环网关
-        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
-            db_host="172.17.0.1"
-        fi
+    if [ ! -f "bin" ]; then
+        echo -e "${RED}解压失败或文件不完整，请检查上方日志！${RESET}"
+        return 1
     fi
 
-    # 3. 组装安全的 MongoDB 连接 URL
-    local mongo_url="mongodb://${db_user}:${db_pass}@${db_host}:${db_port}/?authSource=${db_auth_source}"
+    echo -e "${GREEN}设置程序权限...${RESET}"
+    chmod 777 "bin" "console.sh"
+    chmod +x "bin"
 
-    # 4. 备份保留凭证文件 survey.env (全部通过双引号死锁防特殊字符截断)
-    cat << EOF > "$ENV_FILE"
-HOST_PORT="${custom_port}"
-MONGO_USER="${db_user}"
-MONGO_PASS="${db_pass}"
-MONGO_URL="${mongo_url}"
-EOF
+    echo -e "${GREEN}进入安装程序目录...${RESET}"
+    cd "$INSTALL_DIR" || return 1
 
-    # 5. 生成规整的 docker-compose.yml (针对双模彻底分流)
-    echo -e "${YELLOW}正在生成规范化 Docker Compose 配置文件...${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        # 模式 1：包含本地内置 Mongo 拓扑及桥接网络
-        mkdir -p "$BASE_DIR/data/mongo"
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  mongo:
-    image: mongo:4
-    container_name: xiaoju-survey-mongo
-    restart: always
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: "${db_user}"
-      MONGO_INITDB_ROOT_PASSWORD: "${db_pass}"
-    volumes:
-      - ./data/mongo:/data/db
-    networks:
-      - xiaoju-survey
+    echo -e "${YELLOW}==================================================${RESET}"
+    echo -e "${YELLOW} 🚀 正在前台启动安装程序...${RESET}"
+    echo -e "${YELLOW} 请保持此 SSH 窗口打开！${RESET}"
+    echo -e "${YELLOW} 请立即用浏览器访问：http://服务器IP:端口 完成网页端安装。${RESET}"
+    echo -e "${YELLOW} 安装完成后，若程序未自动退出，可按 Ctrl + C 结束并返回菜单。${RESET}"
+    echo -e "${YELLOW}==================================================${RESET}"
+    sleep 2
 
-  xiaoju-survey:
-    image: ${DEFAULT_IMAGE}
-    container_name: xiaoju-survey
-    restart: always
-    ports:
-      - "127.0.0.1:${custom_port}:8080"
-    environment:
-      XIAOJU_SURVEY_MONGO_URL: "${mongo_url}"
-    depends_on:
-      - mongo
-    networks:
-      - xiaoju-survey
+    # 执行前台安装，脚本会在此处阻塞停止
+    ./bin index.php
 
-networks:
-  xiaoju-survey:
-    driver: bridge
-EOF
-    else
-        # 模式 2：纯净外部远程对接，无本地 mongo 节点，无 networks 隔离
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  xiaoju-survey:
-    image: ${DEFAULT_IMAGE}
-    container_name: xiaoju-survey
-    restart: always
-    ports:
-      - "127.0.0.1:${custom_port}:8080"
-    environment:
-      XIAOJU_SURVEY_MONGO_URL: "${mongo_url}"
-EOF
-    fi
-
-    # 6. 清理残余并重新拉起新集群
-    echo -e "${YELLOW}正在通过 Docker Compose 部署应用状态...${RESET}"
-    cd "$BASE_DIR"
-    docker compose down -v 2>/dev/null
-    docker compose up -d --force-recreate
-
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}错误: 服务拉起失败，请检查端口 ${custom_port} 是否被占用。${RESET}"
-        return
-    fi
-
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             小桔问卷系统部署成功！                   ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}内部提取端口   : ${custom_port} (绑定在 127.0.0.1)${RESET}"
-    echo -e "${YELLOW}本地 Nginx 反代: http://127.0.0.1:${custom_port}${RESET}"
-    echo -e "----------------------------------------------------"
-    echo -e "${CYAN}[MongoDB 凭据回显]${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}Mongo 运行模式 : ${GREEN}全新内置容器 (Mongo 4)${RESET}"
-        echo -e "${YELLOW}安全随机密码   : ${GREEN}${db_pass}${RESET}"
-    else
-        echo -e "${YELLOW}Mongo 运行模式 : ${CYAN}外部远程连接${RESET}"
-        echo -e "${YELLOW}远程目标主机   : ${db_host}:${db_port}${RESET}"
-        echo -e "${YELLOW}认证库名称     : ${db_auth_source}${RESET}"
-    fi
-    echo -e "----------------------------------------------------"
-    echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    # 当网页端安装完程序退出，或用户 Ctrl+C 后，才会继续向下走
+    echo -e "\n${GREEN}✔ 前台安装程序已关闭。${RESET}"
 }
 
-# 更新镜像
-update_survey() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
-        return
+# ================== 环境检查中间件 ==================
+ensure_installed() {
+    if [ ! -f "bin" ]; then
+        echo -e "${RED}错误: 检测到程序尚未安装，请先选择选项 1 进行安装！${RESET}"
+        return 1
     fi
-    echo -e "${YELLOW}正在拉取最新小桔问卷镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}升级完成！${RESET}"
+    return 0
 }
 
-# 卸载小桔问卷
-uninstall_survey() {
-    echo -ne "${RED}确定要完全卸载并删除小桔问卷服务吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down -v
-            rm -rf "$BASE_DIR"
-        else
-            docker rm -f xiaoju-survey xiaoju-survey-mongo 2>/dev/null
-        fi
-        echo -e "${GREEN}完全卸载成功，数据已彻底清理。${RESET}"
-    fi
-}
-
-start_survey() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
-stop_survey() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
-restart_survey() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
-logs_survey() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
-
-show_info() {
-    get_status_info
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}当前运行状态   : $status"
-    echo -e "${YELLOW}外部提取端口   : ${web_port}${RESET}"
-    echo -e "${YELLOW}安装绝对路径   : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-
-# 主菜单管理
-menu() {
+# ================== 菜单函数 ==================
+show_menu() {
     clear
-    get_status_info
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}     ◈  小桔问卷 管理面板  ◈        ${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 当前状态 :${RESET} $status"
-    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 1. 部署启动${RESET}"
-    echo -e "${GREEN} 2. 更新服务${RESET}"
-    echo -e "${GREEN} 3. 卸载服务${RESET}"
-    echo -e "${GREEN} 4. 启动服务${RESET}"
-    echo -e "${GREEN} 5. 停止服务${RESET}"
-    echo -e "${GREEN} 6. 重启服务${RESET}"
-    echo -e "${GREEN} 7. 查看日志${RESET}"
-    echo -e "${GREEN} 8. 查看配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_survey ;;
-        2) update_survey ;;
-        3) uninstall_survey ;;
-        4) start_survey ;;
-        5) stop_survey ;;
-        6) restart_survey ;;
-        7) logs_survey ;;
-        8) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入无效${RESET}" ;;
-    esac
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}         MCY 管理菜单         ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    check_status
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${YELLOW}1.  安装服务${RESET}"
+    echo -e "${GREEN}2.  启动服务${RESET}"
+    echo -e "${GREEN}3.  停止服务${RESET}"
+    echo -e "${GREEN}4.  重启服务${RESET}"
+    echo -e "${GREEN}5.  卸载服务${RESET}"
+    echo -e "${GREEN}6.  更新系统${RESET}"
+    echo -e "${GREEN}7.  生成数据库模型${RESET}"
+    echo -e "${GREEN}8.  创建语言包${RESET}"
+    echo -e "${GREEN}9.  删除语言包${RESET}"
+    echo -e "${GREEN}10. 批量删除语言包${RESET}"
+    echo -e "${GREEN}11. 查看语言代码${RESET}"
+    echo -e "${GREEN}12. 压缩 JS${RESET}"
+    echo -e "${GREEN}13. 压缩 CSS${RESET}"
+    echo -e "${GREEN}14. 压缩 JS+CSS${RESET}"
+    echo -e "${GREEN}15. 停止插件${RESET}"
+    echo -e "${GREEN}16. 查看运行插件${RESET}"
+    echo -e "${GREEN}17. 重置超级管理员密码${RESET}"
+    echo -e "${GREEN}18. 添加 Composer依赖${RESET}"
+    echo -e "${GREEN}19. 删除 Composer依赖${RESET}"
+    echo -e "${GREEN}20. 导入异次元 V3用户数据${RESET}"
+    echo -e "${GREEN}0.  退出${RESET}"
+    echo "--------------------------------"
+    echo -ne "${GREEN}请选择操作: ${RESET}"
 }
 
+# ================== 主循环 ==================
 while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    show_menu
+    read -r choice
+    case $choice in
+        1)
+            mcy_install
+            ;;
+        2)
+            ensure_installed && cd "$INSTALL_DIR" && ./mcy service.start
+            ;;
+        3)
+            ensure_installed && cd "$INSTALL_DIR" && ./mcy service.stop
+            ;;
+        4)
+            ensure_installed && cd "$INSTALL_DIR" && ./mcy service.restart
+            ;;
+        5)
+            ensure_installed && cd "$INSTALL_DIR" && ./mcy service.uninstall
+            ;;
+        6)
+            ensure_installed && cd "$INSTALL_DIR" && ./mcy kit.update
+            ;;
+        7)
+            ensure_installed && {
+                echo -ne "请输入表名（空格隔开）: "
+                read -r tables
+                cd "$INSTALL_DIR" && ./mcy database.model.create $tables
+            }
+            ;;
+        8)
+            ensure_installed && {
+                echo -ne "请输入原文: "
+                read -r original
+                echo -ne "请输入译文: "
+                read -r translation
+                echo -ne "请输入语言代码: "
+                read -r lang
+                cd "$INSTALL_DIR" && ./mcy language.create "$original" "$translation" "$lang"
+            }
+            ;;
+        9)
+            ensure_installed && {
+                echo -ne "请输入原文: "
+                read -r original
+                echo -ne "请输入语言代码: "
+                read -r lang
+                cd "$INSTALL_DIR" && ./mcy language.del "$original" "$lang"
+            }
+            ;;
+        10)
+            ensure_installed && {
+                echo -ne "请输入要删除的原文（空格隔开，如有空格请用双引号包裹）: "
+                read -r originals
+                cd "$INSTALL_DIR" && ./mcy language.all.del "$originals"
+            }
+            ;;
+        11)
+            ensure_installed && cd "$INSTALL_DIR" && ./mcy language.code
+            ;;
+        12)
+            ensure_installed && cd "$INSTALL_DIR" && ./mcy compress.js.merge
+            ;;
+        13)
+            ensure_installed && cd "$INSTALL_DIR" && ./mcy compress.css.merge
+            ;;
+        14)
+            ensure_installed && cd "$INSTALL_DIR" && ./mcy compress.all
+            ;;
+        15)
+            ensure_installed && {
+                echo -ne "请输入插件标识: "
+                read -r plugin
+                echo -ne "请输入用户ID（可留空代表主站插件）: "
+                read -r userid
+                cd "$INSTALL_DIR" && ./mcy plugin.stop "$plugin" "$userid"
+            }
+            ;;
+        16)
+            ensure_installed && {
+                echo -ne "请输入用户ID（可留空代表主站插件）: "
+                read -r userid
+                cd "$INSTALL_DIR" && ./mcy plugin.startups "$userid"
+            }
+            ;;
+        17)
+            ensure_installed && {
+                echo -ne "请输入新密码: "
+                read -r newpass
+                cd "$INSTALL_DIR" && ./mcy kit.reset "$newpass"
+            }
+            ;;
+        18)
+            ensure_installed && {
+                echo -ne "请输入 Composer 包名: "
+                read -r package
+                cd "$INSTALL_DIR" && ./mcy composer.require "$package"
+            }
+            ;;
+        19)
+            ensure_installed && {
+                echo -ne "请输入要删除的 Composer 包名: "
+                read -r package
+                cd "$INSTALL_DIR" && ./mcy composer.remove "$package"
+            }
+            ;;
+        20)
+            ensure_installed && {
+                echo -ne "请输入 .sql 文件名（放在根目录下）: "
+                read -r sqlfile
+                cd "$INSTALL_DIR" && ./mcy migration.v3.user "$sqlfile"
+            }
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效选项，请重新输入${RESET}"
+            ;;
+    esac
+    echo -e "\n${GREEN}操作完成，按回车键返回菜单...${RESET}"
     read -r
 done

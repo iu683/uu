@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# OpenFlare Docker Compose 管理面板 
+# WordPress Docker Compose 管理面板 (多库/多Redis远程切换 + 凭据回显版)
 # =================================================================
 
 # 颜色定义
@@ -10,9 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/openflare"
+BASE_DIR="/opt/wordpress"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-DEFAULT_IMAGE="ghcr.io/rain-kl/openflare:latest"
+DEFAULT_IMAGE="wordpress:latest"
 
 # 检测依赖环境
 check_dependencies() {
@@ -51,234 +51,289 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器整体状态和端口 (高精度精准匹配算法)
+# 动态获取容器整体状态和端口
 get_status_info() {
     if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=openflare-app)" ]; then
+        if [ "$(docker ps -q -f name=wordpress-server)" ]; then
             status="${GREEN}运行中${RESET}"
-        elif [ "$(docker ps -aq -f name=openflare-app)" ]; then
+            web_port=$(docker ps -f name=wordpress-server --format "{{.Ports}}" | sed -E 's/.*0.0.0.0:([0-9]+)->.*/\1/' | head -n 1)
+            if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
+                web_port=$(sed -n '/wordpress:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+            fi
+        elif [ "$(docker ps -aq -f name=wordpress-server)" ]; then
             status="${YELLOW}已停止${RESET}"
+            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' wordpress-server 2>/dev/null)
         else
             status="${RED}未部署${RESET}"
         fi
-        
-        # 【核心修复】高精鲁棒性提取：精准截取 openflare 块下 ports 映射的宿主机端口
-        # 能够完美兼容: - "5788:3000" | - '5788:3000' | - 5788:3000 
-        web_port=$(sed -n '/openflare:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:3000' | head -n 1 | grep -oE '[0-9]+:3000' | cut -d':' -f1)
-        
-        # 如果上面精准匹配失败，启动兜底模糊抓取
-        [[ -z "$web_port" ]] && web_port=$(grep -A 6 "openflare:" "$COMPOSE_FILE" 2>/dev/null | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | sed -E 's/[^0-9:]//g' | cut -d':' -f1)
-        
-        # 最终无解时回落默认值
-        [[ -z "$web_port" ]] && web_port="3000"
+        [[ -z "$web_port" ]] && web_port="80"
     else
         status="${RED}未初始化${RESET}"
         web_port="N/A"
     fi
 }
 
-# 部署 OpenFlare
-install_openflare() {
+# 部署 WordPress
+install_wordpress() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 数据库运行模式选择 ======${RESET}"
-    echo -e " 1. 直接部署全新完整环境 (包含全新本地 PostgreSQL 17 容器)"
-    echo -e " 2. 连接外部/远程已有的 PostgreSQL 数据库 (需提前手动创建好数据库)"
-    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
-    read -r db_mode
-    [[ -z "$db_mode" ]] && db_mode="1"
-
+    # 1. 基础映射端口配置
     echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 OpenFlare Web 访问端口 [默认: 3000]: ${RESET}"
+    echo -ne "${YELLOW}请输入 WordPress 宿主机映射访问端口 [默认: 8080]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
+    [[ -z "$custom_port" ]] && custom_port="8080"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 自动计算高强度的密钥
-    local rand_jwt=$(openssl rand -hex 24)
-    
-    # ------------------ 模式 1：全套本地内置容器化 ------------------
+    # 2. 数据库运行模式选择
+    echo -e "\n${CYAN}====== 1. MySQL 数据库运行模式选择 ======${RESET}"
+    echo -e " 1) 直接部署全新的 MySQL 8.0 容器 (包含本地持久化卷)"
+    echo -e " 2) 使用已有的外部/远程 MySQL 数据库 (需提前手动建好空库)"
+    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
+
+    local db_host="db"
+    local db_user="wordpress"
+    local db_pass=""
+    local db_name="wordpress"
+    local root_pass=""
+
     if [[ "$db_mode" == "1" ]]; then
         echo -e "${YELLOW}正在自动计算生成数据库高强度防破解随机密码...${RESET}"
-        local rand_db_pass=$(openssl rand -hex 16)
-        local db_user="openflare"
-        local db_name="openflare"
+        root_pass=$(openssl rand -hex 12)
+        db_pass=$(openssl rand -hex 12)
+    else
+        echo -ne "${YELLOW}请输入外部 MySQL 的 IP 或域名 [默认: 172.17.0.1]: ${RESET}"
+        read -r ext_db_ip
+        [[ -z "$ext_db_ip" ]] && ext_db_ip="172.17.0.1"
+        echo -ne "${YELLOW}请输入外部 MySQL 端口 [默认: 3306]: ${RESET}"
+        read -r ext_db_port
+        [[ -z "$ext_db_port" ]] && ext_db_port="3306"
+        db_host="${ext_db_ip}:${ext_db_port}"
+        echo -ne "${YELLOW}请输入外部 MySQL 用户名 [默认: wordpress]: ${RESET}"
+        read -r db_user
+        [[ -z "$db_user" ]] && db_user="wordpress"
+        echo -ne "${YELLOW}请输入外部 MySQL 密码: ${RESET}"
+        read -r db_pass
+        echo -ne "${YELLOW}请输入外部已存在的数据库名 [默认: wordpress]: ${RESET}"
+        read -r db_name
+        [[ -z "$db_name" ]] && db_name="wordpress"
+        
+        # 破壁 Docker 宿主机回环地址限制
+        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
+            db_host="172.17.0.1:${ext_db_port}"
+        fi
+        echo -e "${YELLOW}提示: 请确保远程 MySQL (${db_host}) 中已提前手动创建好名为 '${db_name}' 的数据库！${RESET}"
+    fi
 
-        cat << EOF > "$COMPOSE_FILE"
+    # 3. Redis 运行模式选择
+    echo -e "\n${CYAN}====== 2. Redis 缓存运行模式选择 ======${RESET}"
+    echo -e " 1) 直接部署全新的 Redis 容器 (免密本地内部网络访问)"
+    echo -e " 2) 使用已有的外部/远程 Redis 缓存服务 (支持密码验证)"
+    echo -ne "${YELLOW}请选择 Redis 模式 [默认: 1]: ${RESET}"
+    read -r redis_mode
+    [[ -z "$redis_mode" ]] && redis_mode="1"
+
+    local wp_redis_host="redis"
+    local wp_redis_password=""
+
+    if [[ "$redis_mode" == "2" ]]; then
+        echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 172.17.0.1]: ${RESET}"
+        read -r ext_redis_ip
+        [[ -z "$ext_redis_ip" ]] && ext_redis_ip="172.17.0.1"
+        echo -ne "${YELLOW}请输入外部 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r ext_redis_port
+        [[ -z "$ext_redis_port" ]] && ext_redis_port="6379"
+        wp_redis_host="${ext_redis_ip}:${ext_redis_port}"
+        echo -ne "${YELLOW}请输入外部 Redis 密码 (若无密码请直接留空回车): ${RESET}"
+        read -r wp_redis_password
+        
+        # 破壁 Docker 宿主机回环地址限制
+        if [[ "$ext_redis_ip" == "127.0.0.1" || "$ext_redis_ip" == "localhost" ]]; then
+            wp_redis_host="172.17.0.1:${ext_redis_port}"
+        fi
+    fi
+
+    # 4. 精准分割 Redis 主机与端口并处理字符串机制
+    local redis_pure_host="${wp_redis_host%%:*}"
+    local redis_pure_port="${wp_redis_host##*:}"
+    if [[ "$redis_pure_host" == "$redis_pure_port" ]]; then
+        redis_pure_port="6379"
+    fi
+
+    # 5. 生成 docker-compose.yml 文本
+    echo -e "\n${YELLOW}正在生成持久化 Docker Compose 配置文件...${RESET}"
+    mkdir -p "$BASE_DIR/data"
+
+    cat << EOF > "$COMPOSE_FILE"
 services:
-  postgres:
-    image: postgres:17-alpine
-    container_name: openflare-db
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${db_name}
-      POSTGRES_USER: ${db_user}
-      POSTGRES_PASSWORD: ${rand_db_pass}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${db_user} -d ${db_name}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  openflare:
+  wordpress:
     image: ${DEFAULT_IMAGE}
-    container_name: openflare-app
+    container_name: wordpress-server
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
     ports:
-      - "${custom_port}:3000"
-    environment:
-      JWT_SECRET: ${rand_jwt}
-      DSN: postgres://${db_user}:${rand_db_pass}@postgres:5432/${db_name}?sslmode=disable
-      GIN_MODE: release
-      LOG_LEVEL: info
+      - "${custom_port}:80"
     volumes:
-      - openflare-data:/data
-
-volumes:
-  postgres-data:
-  openflare-data:
+      - ${BASE_DIR}/data:/var/www/html
+    environment:
+      WORDPRESS_DB_HOST: ${db_host}
+      WORDPRESS_DB_NAME: ${db_name}
+      WORDPRESS_DB_USER: ${db_user}
+      WORDPRESS_DB_PASSWORD: ${db_pass}
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_REDIS_HOST', '${redis_pure_host}');
+        define('WP_REDIS_PORT', ${redis_pure_port});
 EOF
 
-    # ------------------ 模式 2：连接外部/远程已有的 PostgreSQL（纯写入，免建库） ------------------
-    else
-        echo -e "${CYAN}====== 远程/外部 PostgreSQL 信息输入 ======${RESET}"
-        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r ext_host
-        [[ -z "$ext_host" ]] && ext_host="127.0.0.1"
-        
-        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
-        read -r ext_port
-        [[ -z "$ext_port" ]] && ext_port="5432"
-        
-        echo -ne "${YELLOW}请输入数据库用户名 [默认: openflare]: ${RESET}"
-        read -r ext_user
-        [[ -z "$ext_user" ]] && ext_user="openflare"
-        
-        echo -ne "${YELLOW}请输入数据库密码: ${RESET}"
-        read -r ext_pass
-        
-        echo -ne "${YELLOW}请输入目标数据库名 [默认: openflare]: ${RESET}"
-        read -r ext_dbname
-        [[ -z "$ext_dbname" ]] && ext_dbname="openflare"
-
-        # 突破 Docker 宿主机回环地址限制
-        if [[ "$ext_host" == "127.0.0.1" || "$ext_host" == "localhost" ]]; then
-            ext_host="172.17.0.1"
-        fi
-
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  openflare:
-    image: ${DEFAULT_IMAGE}
-    container_name: openflare-app
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:3000"
-    environment:
-      JWT_SECRET: ${rand_jwt}
-      DSN: postgres://${ext_user}:${ext_pass}@${ext_host}:${ext_port}/${ext_dbname}?sslmode=disable
-      GIN_MODE: release
-      LOG_LEVEL: info
-    volumes:
-      - openflare-data:/data
-
-volumes:
-  openflare-data:
+    # 如果外部 Redis 有密码，将密码采用单引号安全闭合注入
+    if [[ -n "$wp_redis_password" ]]; then
+        cat << EOF >> "$COMPOSE_FILE"
+        define('WP_REDIS_PASSWORD', '${wp_redis_password}');
 EOF
     fi
 
-    # ------------------ 启动集群 ------------------
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 OpenFlare 服务中...${RESET}"
+    # 处理 depends_on 依赖节点
+    cat << EOF >> "$COMPOSE_FILE"
+    depends_on:
+EOF
+    [[ "$db_mode" == "1" ]] && echo "      - db" >> "$COMPOSE_FILE"
+    [[ "$redis_mode" == "1" ]] && echo "      - redis" >> "$COMPOSE_FILE"
+    if [[ "$db_mode" == "2" && "$redis_mode" == "2" ]]; then
+        sed -i '/depends_on:/d' "$COMPOSE_FILE"
+    fi
+
+    # 动态追加本地内置 MySQL 服务
+    if [[ "$db_mode" == "1" ]]; then
+        mkdir -p "$BASE_DIR/db"
+        cat << EOF >> "$COMPOSE_FILE"
+
+  db:
+    image: mysql:8.0
+    container_name: wordpress-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${root_pass}
+      MYSQL_DATABASE: ${db_name}
+      MYSQL_USER: ${db_user}
+      MYSQL_PASSWORD: ${db_pass}
+    volumes:
+      - ${BASE_DIR}/db:/var/lib/mysql
+EOF
+    fi
+
+    # 动态追加本地内置 Redis 服务
+    if [[ "$redis_mode" == "1" ]]; then
+        mkdir -p "$BASE_DIR/redis"
+        cat << EOF >> "$COMPOSE_FILE"
+
+  redis:
+    image: redis:alpine
+    container_name: wordpress-redis
+    restart: unless-stopped
+    volumes:
+      - ${BASE_DIR}/redis:/data
+EOF
+    fi
+
+    # 6. 执行一键拉起
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 WordPress 容器集群...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}部署失败，请检查 Docker 日志。${RESET}"
+        echo -e "${RED}错误: 架构拉起失败，请检查端口是否被占用。${RESET}"
         return
     fi
 
     DETECT_IP=$(get_public_ip)
-
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             OpenFlare 部署成功！                   ${RESET}"
+    echo -e "${GREEN}             WordPress 部署成功！                    ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}访问端点(URL) : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}映射宿主机端口 : ${custom_port}${RESET}"
-    echo -e "${YELLOW}安全 JWT 密钥  : ${rand_jwt}${RESET}"
+    echo -e "${YELLOW}外部访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}宿主机映射端口 : ${custom_port}${RESET}"
+    echo -e "----------------------------------------------------"
+    echo -e "${CYAN}[数据库凭据回显]${RESET}"
     if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}内置库密码凭证 : 用户:${db_user} | 密码:${rand_db_pass} | 库名:${db_name}${RESET}"
+        echo -e "${YELLOW}MySQL 运行模式 : ${GREEN}全新内置容器 (MySQL 8.0)${RESET}"
+        echo -e "${YELLOW}内置实例库名   : ${db_name}${RESET}"
+        echo -e "${YELLOW}MySQL root密码 : ${RED}${root_pass}${RESET}"
+        echo -e "${YELLOW}WP专账用户名   : ${GREEN}${db_user}${RESET}"
+        echo -e "${YELLOW}WP专账访问密码 : ${GREEN}${db_pass}${RESET}"
     else
-        echo -e "${YELLOW}连接外部数据库 : ${ext_host}:${ext_port} -> 库名:${ext_dbname}${RESET}"
+        echo -e "${YELLOW}MySQL 运行模式 : ${CYAN}外部远程连接${RESET}"
+        echo -e "${YELLOW}远程目标主机   : ${db_host}${RESET}"
+        echo -e "${YELLOW}指定连接库名   : ${db_name}${RESET}"
+        echo -e "${YELLOW}连接用户名     : ${db_user}${RESET}"
+        echo -e "${YELLOW}连接密码       : ****** (您输入的外部密码)${RESET}"
     fi
-    echo -e "${YELLOW}默认账号密码   : root/123456${RESET}"
-    echo -e "${YELLOW}部署工作路径   : ${BASE_DIR}${RESET}"
+    echo -e "----------------------------------------------------"
+    echo -e "${CYAN}[Redis 凭据回显]${RESET}"
+    if [[ "$redis_mode" == "1" ]]; then
+        echo -e "${YELLOW}Redis 运行模式 : ${GREEN}全新内置容器 (免密隔离网络)${RESET}"
+    else
+        echo -e "${YELLOW}Redis 运行模式 : ${CYAN}外部远程缓存${RESET}"
+        echo -e "${YELLOW}Redis目标主机  : ${wp_redis_host}${RESET}"
+        if [[ -n "$wp_redis_password" ]]; then
+            echo -e "${YELLOW}Redis验证状态  : ${GREEN}带密码认证 (已成功注入环境)${RESET}"
+        else
+            echo -e "${YELLOW}Redis验证状态  : ${YELLOW}免密开放模式${RESET}"
+        fi
+    fi
+    echo -e "----------------------------------------------------"
+    echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新服务
-update_openflare() {
+# 更新镜像
+update_wp() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取 OpenFlare 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}服务已升级并拉升至最新状态！${RESET}"
+    echo -e "${GREEN}升级完成！${RESET}"
 }
 
-# 卸载集群
-uninstall_openflare() {
-    echo -ne "${RED} 确定要注销并删除 OpenFlare 服务集群吗？(y/n): ${RESET}"
+# 卸载 WordPress
+uninstall_wp() {
+    echo -ne "${RED}确定要完全卸载并删除 WordPress 服务吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已全部终止并移除。${RESET}"
-            echo -ne "${RED}是否同步清理掉本地所有挂载的数据卷和数据？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                cd "$BASE_DIR" && docker compose down -v
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}工作目录及 Docker 命名数据卷已被彻底净化清除。${RESET}"
-            fi
+            cd "$BASE_DIR" && docker compose down -v
+            rm -rf "$BASE_DIR"
         else
-            docker rm -f openflare-app openflare-db 2>/dev/null
+            docker rm -f wordpress-server wordpress-db wordpress-redis 2>/dev/null
         fi
-        echo -e "${GREEN}完全卸载完毕！${RESET}"
+        echo -e "${GREEN}完全卸载成功，数据已彻底清理。${RESET}"
     fi
 }
 
-# 周期控制
-start_of() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已正常启动${RESET}"; }
-stop_of() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已安全暂停${RESET}"; }
-restart_of() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已完成软重启${RESET}"; }
-logs_of() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+start_wp() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
+stop_wp() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
+restart_wp() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
+logs_wp() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
-# 配置显示
 show_info() {
     get_status_info
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}当前运行状态   : $status"
-    echo -e "${YELLOW}实际映射端口   : ${web_port}${RESET}"
-    echo -e "${YELLOW}本地项目路径   : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}外部提取端口   : ${web_port}${RESET}"
+    echo -e "${YELLOW}安装绝对路径   : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 主菜单
+# 主菜单管理
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}      ◈  OpenFlare 管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}      ◈  WordPress 管理面板  ◈        ${RESET}"
     echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 当前状态 :${RESET} $status"
     echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
@@ -296,16 +351,16 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_openflare ;;
-        2) update_openflare ;;
-        3) uninstall_openflare ;;
-        4) start_of ;;
-        5) stop_of ;;
-        6) restart_of ;;
-        7) logs_of ;;
+        1) install_wordpress ;;
+        2) update_wp ;;
+        3) uninstall_wp ;;
+        4) start_wp ;;
+        5) stop_wp ;;
+        6) restart_wp ;;
+        7) logs_wp ;;
         8) show_info ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
+        *) echo -e "${RED}输入无效${RESET}" ;;
     esac
 }
 

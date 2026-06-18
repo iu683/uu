@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Halo 2.x Docker Compose 管理面板 (远程多库支持 + 自动建库版)
+# MetaTube Docker Compose 管理面板 
 # =================================================================
 
 # 颜色定义
@@ -10,9 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/halo"
+BASE_DIR="/opt/metatube"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-DEFAULT_IMAGE="registry.fit2cloud.com/halo/halo-pro:2.25"
+DEFAULT_IMAGE="ghcr.io/metatube-community/metatube-server:latest"
 
 # 检测依赖环境
 check_dependencies() {
@@ -21,7 +21,6 @@ check_dependencies() {
         exit 1
     fi
 }
-
 
 get_public_ip() {
     local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
@@ -52,303 +51,205 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器整体状态和端口 (高精度精准匹配)
+# 动态获取容器整体状态和端口 (采用原生 Docker Inspect 终极技术)
 get_status_info() {
     if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=halo-app)" ]; then
+        if [ "$(docker ps -q -f name=metatube)" ]; then
             status="${GREEN}运行中${RESET}"
-        elif [ "$(docker ps -aq -f name=halo-app)" ]; then
+            # 直接向 Docker 引擎索要 metatube 容器内部 8080 端口映射到宿主机的真实端口
+            web_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' metatube 2>/dev/null)
+        elif [ "$(docker ps -aq -f name=metatube)" ]; then
             status="${YELLOW}已停止${RESET}"
+            web_port=""
         else
             status="${RED}未部署${RESET}"
+            web_port=""
         fi
         
-        # 严格提取 halo 服务下 ports 块中冒号左侧的宿主机映射端口
-        web_port=$(sed -n '/halo:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
-        [[ -z "$web_port" ]] && web_port="8090"
+        # 兜底逻辑：如果容器没启动，退回静态解析 YAML 文件
+        if [ -z "$web_port" ]; then
+            web_port=$(grep -A 5 "metatube:" "$COMPOSE_FILE" 2>/dev/null | grep -E '\-[[:space:]]*["'\'']?.*:8080' | head -n 1 | grep -oE '[0-9]+:8080' | cut -d':' -f1)
+            [[ -z "$web_port" ]] && web_port="8080"
+        fi
     else
         status="${RED}未初始化${RESET}"
         web_port="N/A"
     fi
 }
 
-# 部署 Halo
-install_halo() {
+# 部署 MetaTube
+install_metatube() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 数据库运行模式选择 ======${RESET}"
-    echo -e " 1. 直接部署全新环境 (包含全新 PostgreSQL 15 容器)"
-    echo -e " 2. 使用已有的外部/远程数据库 (支持外部 MySQL 或 PostgreSQL)"
-    echo -e " 3. 使用轻量级嵌入式 H2 数据库 (无需额外数据库，适合低配服务器)"
+    echo -e " 1. 直接部署全新完整环境 (包含全新本地 PostgreSQL 15 容器)"
+    echo -e " 2. 连接外部/远程已有的 PostgreSQL 数据库 (需提前手动创建好数据库)"
     echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
     read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
     echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Halo 宿主机映射访问端口 [默认: 8090]: ${RESET}"
+    echo -ne "${YELLOW}请输入 MetaTube 宿主机访问端口 [默认: 8080]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8090"
+    [[ -z "$custom_port" ]] && custom_port="8080"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -ne "${YELLOW}请输入站点外部访问域名或公网IP (形如 http://12.34.56.78:${custom_port}/): ${RESET}"
-    read -r ext_url
-    [[ -z "$ext_url" ]] && ext_url="http://localhost:${custom_port}/"
-    [[ "${ext_url}" != */ ]] && ext_url="${ext_url}/"
-
-    mkdir -p "$BASE_DIR/halo2"
-
-    # ------------------ 模式 1：全套本地内置容器化 PostgreSQL ------------------
+    # ------------------ 模式 1：全套本地内置容器化 ------------------
     if [[ "$db_mode" == "1" ]]; then
         echo -e "${YELLOW}正在自动计算生成数据库高强度防破解随机密码...${RESET}"
-        local rand_pass=$(openssl rand -hex 12)
-        mkdir -p "$BASE_DIR/db"
+        local rand_db_pass=$(openssl rand -hex 16)
+        local db_user="metatube"
+        local db_name="metatube"
 
         cat << EOF > "$COMPOSE_FILE"
 services:
-  halo:
-    image: ${DEFAULT_IMAGE}
-    container_name: halo-app
-    restart: on-failure:3
-    depends_on:
-      halodb:
-        condition: service_healthy
-    networks:
-      - halo_network
-    volumes:
-      - ${BASE_DIR}/halo2:/root/.halo2
-    ports:
-      - "${custom_port}:8090"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8090/actuator/health/readiness"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
+  postgres:
+    image: postgres:15-alpine
+    container_name: metatube-postgres
+    restart: unless-stopped
     environment:
-      - JVM_OPTS=-Xmx256m -Xms256m
-    command:
-      - --spring.r2dbc.url=r2dbc:pool:postgresql://halodb/halo
-      - --spring.r2dbc.username=halo
-      - --spring.r2dbc.password=${rand_pass}
-      - --spring.sql.init.platform=postgresql
-      - --halo.external-url=${ext_url}
-
-  halodb:
-    image: postgres:15.4
-    container_name: halo-db
-    restart: on-failure:3
-    networks:
-      - halo_network
+      - POSTGRES_USER=${db_user}
+      - POSTGRES_PASSWORD=${rand_db_pass}
+      - POSTGRES_DB=${db_name}
     volumes:
       - ${BASE_DIR}/db:/var/lib/postgresql/data
-    healthcheck:
-      test: [ "CMD", "pg_isready" ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    environment:
-      - POSTGRES_PASSWORD=${rand_pass}
-      - POSTGRES_USER=halo
-      - POSTGRES_DB=halo
-      - PGUSER=halo
 
-networks:
-  halo_network:
-    driver: bridge
+  metatube:
+    image: ${DEFAULT_IMAGE}
+    container_name: metatube
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "${custom_port}:8080"
+    volumes:
+      - ${BASE_DIR}/config:/config
+    command: >
+      -dsn "postgres://${db_user}:${rand_db_pass}@postgres:5432/${db_name}?sslmode=disable"
+      -port 8080
+      -db-auto-migrate
 EOF
 
-    # ------------------ 模式 2：连接外部/远程已有的 MySQL / PostgreSQL ------------------
-    elif [[ "$db_mode" == "2" ]]; then
-        echo -e "${CYAN}====== 远程/外部数据库类型选择 ======${RESET}"
-        echo -e " 1) MySQL (5.7 或 8.0+)"
-        echo -e " 2) PostgreSQL"
-        echo -ne "${YELLOW}请选择远程数据库类型 [默认: 1]: ${RESET}"
-        read -r ext_db_type
-        [[ -z "$ext_db_type" ]] && ext_db_type="1"
-
-        echo -e "${CYAN}====== 远程/外部数据库信息输入 ======${RESET}"
-        echo -ne "${YELLOW}请输入外部数据库的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+    # ------------------ 模式 2：连接外部/远程已有的 PostgreSQL（免建库） ------------------
+    else
+        echo -e "${CYAN}====== 远程/外部 PostgreSQL 信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
         read -r ext_host
         [[ -z "$ext_host" ]] && ext_host="127.0.0.1"
         
-        # 根据数据库类型设定默认端口和驱动名称
-        local default_port="3306"
-        local r2dbc_proto="mysql"
-        local sql_platform="mysql"
-        if [[ "$ext_db_type" == "2" ]]; then
-            default_port="5432"
-            r2dbc_proto="postgresql"
-            sql_platform="postgresql"
-        fi
-
-        echo -ne "${YELLOW}请输入数据库端口 [默认: ${default_port}]: ${RESET}"
+        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
         read -r ext_port
-        [[ -z "$ext_port" ]] && ext_port="$default_port"
+        [[ -z "$ext_port" ]] && ext_port="5432"
         
-        echo -ne "${YELLOW}请输入数据库用户名 [默认: root/halo]: ${RESET}"
+        echo -ne "${YELLOW}请输入数据库用户名 [默认: metatube]: ${RESET}"
         read -r ext_user
-        if [[ -z "$ext_user" ]]; then
-            [[ "$ext_db_type" == "1" ]] && ext_user="root" || ext_user="halo"
-        fi
+        [[ -z "$ext_user" ]] && ext_user="metatube"
         
         echo -ne "${YELLOW}请输入数据库密码: ${RESET}"
         read -r ext_pass
         
-        echo -ne "${YELLOW}请输入要自动创建的数据库名 [默认: halo]: ${RESET}"
+        echo -ne "${YELLOW}请输入目标数据库名 [默认: metatube]: ${RESET}"
         read -r ext_dbname
-        [[ -z "$ext_dbname" ]] && ext_dbname="halo"
+        [[ -z "$ext_dbname" ]] && ext_dbname="metatube"
 
-        local connect_host="$ext_host"
-        # 破壁 Docker 宿主机回环地址限制
+        # 突破 Docker 宿主机回环地址限制
         if [[ "$ext_host" == "127.0.0.1" || "$ext_host" == "localhost" ]]; then
             ext_host="172.17.0.1"
         fi
 
-        # 核心：根据不同类型执行临时的容器化自动建库
-        if [[ "$ext_db_type" == "1" ]]; then
-            echo -e "${YELLOW}正在连接外部 MySQL (${connect_host}) 并自动创建 '${ext_dbname}' 库...${RESET}"
-            docker run --rm mysql:5.7 mysql -h"${connect_host}" -P"${ext_port}" -u"${ext_user}" -p"${ext_pass}" -e "CREATE DATABASE IF NOT EXISTS \`${ext_dbname}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null
-        else
-            echo -e "${YELLOW}正在连接外部 PostgreSQL (${connect_host}) 并自动创建 '${ext_dbname}' 库...${RESET}"
-            docker run --rm -e PGPASSWORD="${ext_pass}" postgres:15.4 psql -h "${connect_host}" -p "${ext_port}" -U "${ext_user}" -d "postgres" -c "CREATE DATABASE ${ext_dbname};" 2>/dev/null
-        fi
-
         cat << EOF > "$COMPOSE_FILE"
 services:
-  halo:
+  metatube:
     image: ${DEFAULT_IMAGE}
-    container_name: halo-app
-    restart: on-failure:3
+    container_name: metatube
+    restart: unless-stopped
     ports:
-      - "${custom_port}:8090"
+      - "${custom_port}:8080"
     volumes:
-      - ${BASE_DIR}/halo2:/root/.halo2
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8090/actuator/health/readiness"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    environment:
-      - JVM_OPTS=-Xmx256m -Xms256m
-    command:
-      - --spring.r2dbc.url=r2dbc:pool:${r2dbc_proto}://${ext_host}:${ext_port}/${ext_dbname}
-      - --spring.r2dbc.username=${ext_user}
-      - --spring.r2dbc.password=${ext_pass}
-      - --spring.sql.init.platform=${sql_platform}
-      - --halo.external-url=${ext_url}
-EOF
-
-    # ------------------ 模式 3：使用本地轻量级嵌入式 H2 数据库 ------------------
-    else
-        echo -e "${YELLOW}正在配置嵌入式 H2 数据库环境（无需外部独立关系型数据库）...${RESET}"
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  halo:
-    image: ${DEFAULT_IMAGE}
-    container_name: halo-app
-    restart: on-failure:3
-    ports:
-      - "${custom_port}:8090"
-    volumes:
-      - ${BASE_DIR}/halo2:/root/.halo2
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8090/actuator/health/readiness"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    environment:
-      - JVM_OPTS=-Xmx256m -Xms256m
-    command:
-      - --halo.external-url=${ext_url}
+      - ${BASE_DIR}/config:/config
+    command: >
+      -dsn "postgres://${ext_user}:${ext_pass}@${ext_host}:${ext_port}/${ext_dbname}?sslmode=disable"
+      -port 8080
+      -db-auto-migrate
 EOF
     fi
 
     # ------------------ 启动集群 ------------------
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Halo 服务中...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 MetaTube 服务中...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}====================================================${RESET}"
-        echo -e "${RED} 错误: 容器启动失败，请排查端口占用或日志报错。   ${RESET}"
-        echo -e "${RED}====================================================${RESET}"
+        echo -e "${RED}部署失败，请检查 Docker 日志。${RESET}"
         return
     fi
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             Halo 部署成功！                        ${RESET}"
+    echo -e "${GREEN}             MetaTube 部署成功！                    ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}后台初始Url   : http://${DETECT_IP}:${custom_port}/console${RESET}"
-    echo -e "${YELLOW}绑定的外部Url : ${ext_url}${RESET}"
-    echo -e "${YELLOW}宿主机映射端口: ${custom_port}${RESET}"
-    echo -ne "${YELLOW}数据库运行模式: ${RESET}"
-    if [[ "$db_mode" == "1" ]]; then 
-        echo -e "${GREEN}全新内置容器 (PostgreSQL 15)${RESET}"
-        echo -e "${YELLOW}内置库高强密码: ${rand_pass}${RESET}"
-    elif [[ "$db_mode" == "2" ]]; then 
-        echo -e "${GREEN}外部连接模式 (目标数据库平台: ${sql_platform^^})${RESET}"
-        echo -e "${YELLOW}自动连通库名  : ${ext_dbname}${RESET}"
-    else 
-        echo -e "${GREEN}超轻量级本地嵌入式 H2 数据库${RESET}"
+    echo -e "${YELLOW}访问端点(URL) : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}映射宿主机端口 : ${custom_port}${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}内置库密码凭证 : 用户:${db_user} | 密码:${rand_db_pass} | 库名:${db_name}${RESET}"
+    else
+        echo -e "${YELLOW}连接外部数据库 : ${ext_host}:${ext_port} -> 库名:${ext_dbname}${RESET}"
     fi
-    echo -e "${YELLOW}部署工作路径  : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}部署工作路径   : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新镜像
-update_halo() {
+# 更新服务
+update_metatube() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取 Halo 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取 MetaTube 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}服务更新完成！${RESET}"
+    echo -e "${GREEN}服务已升级并拉升至最新状态！${RESET}"
 }
 
-# 卸载 Halo
-uninstall_halo() {
-    echo -ne "${RED}确定要卸载并删除 Halo 服务吗？(y/n): ${RESET}"
+# 卸载集群
+uninstall_metatube() {
+    echo -ne "${RED}确定要注销并删除 MetaTube 服务集群吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}是否同时删除所有建站源码、主题插件及数据库文件？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已全部终止并移除。${RESET}"
+            echo -ne "${RED}是否同步清理掉本地所有挂载的数据卷和数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 cd "$BASE_DIR" && docker compose down -v
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}所有持久化数据及工作目录已彻底清理。${RESET}"
+                echo -e "${GREEN}工作目录及数据已被彻底清除。${RESET}"
             fi
         else
-            docker rm -f halo-app halo-db 2>/dev/null
+            docker rm -f metatube metatube-postgres 2>/dev/null
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        echo -e "${GREEN}完全卸载完毕！${RESET}"
     fi
 }
 
-# 基础生命周期控制
-start_hl() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}Halo 服务已启动${RESET}"; }
-stop_hl() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}Halo 服务已停止${RESET}"; }
-restart_hl() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}Halo 服务已重启${RESET}"; }
-logs_hl() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+# 周期控制
+start_mt() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已正常启动${RESET}"; }
+stop_mt() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已安全暂停${RESET}"; }
+restart_mt() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已完成软重启${RESET}"; }
+logs_mt() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
-# 显示配置面板
+# 配置显示
 show_info() {
     get_status_info
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}当前运行状态   : $status"
     echo -e "${YELLOW}实际映射端口   : ${web_port}${RESET}"
-    echo -e "${YELLOW}工作路径       : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}本地项目路径   : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
@@ -357,7 +258,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}        ◈  Halo 管理面板  ◈          ${RESET}"
+    echo -e "${GREEN}      ◈  MetaTube 管理面板  ◈      ${RESET}"
     echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 当前状态 :${RESET} $status"
     echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
@@ -375,13 +276,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_halo ;;
-        2) update_halo ;;
-        3) uninstall_halo ;;
-        4) start_hl ;;
-        5) stop_hl ;;
-        6) restart_hl ;;
-        7) logs_hl ;;
+        1) install_metatube ;;
+        2) update_metatube ;;
+        3) uninstall_metatube ;;
+        4) start_mt ;;
+        5) stop_mt ;;
+        6) restart_mt ;;
+        7) logs_mt ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

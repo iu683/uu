@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# WordPress Docker Compose 管理面板 (多库/多Redis远程切换 + 实时状态版)
+# Moments Blog Docker Compose 管理面板 (带远程自动同步数据表版)
 # =================================================================
 
 # 颜色定义
@@ -10,9 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/wordpress"
+BASE_DIR="/opt/moments"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-DEFAULT_IMAGE="wordpress:latest"
+ENV_FILE="$BASE_DIR/moments.env"
+DEFAULT_IMAGE="koalalove/moments-blog:latest"
 
 # 检测依赖环境
 check_dependencies() {
@@ -51,18 +52,18 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器整体状态和端口 (实时从运行状态提取)
+# 动态获取容器整体状态和端口
 get_status_info() {
     if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=wordpress-server)" ]; then
+        if [ "$(docker ps -q -f name=moments-blog)" ]; then
             status="${GREEN}运行中${RESET}"
-            web_port=$(docker ps -f name=wordpress-server --format "{{.Ports}}" | sed -E 's/.*0.0.0.0:([0-9]+)->.*/\1/' | head -n 1)
+            web_port=$(docker ps -f name=moments-blog --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
             if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
-                web_port=$(sed -n '/wordpress:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+                web_port=$(sed -n '/moments-blog:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
             fi
-        elif [ "$(docker ps -aq -f name=wordpress-server)" ]; then
+        elif [ "$(docker ps -aq -f name=moments-blog)" ]; then
             status="${YELLOW}已停止${RESET}"
-            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' wordpress-server 2>/dev/null)
+            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' moments-blog 2>/dev/null)
         else
             status="${RED}未部署${RESET}"
         fi
@@ -73,212 +74,226 @@ get_status_info() {
     fi
 }
 
-# 部署 WordPress
-install_wordpress() {
+# 部署 Moments
+install_moments() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    # 1. 基础映射端口配置
+    # 1. 基础参数配置
     echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 WordPress 宿主机映射访问端口 [默认: 8080]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Moments 宿主机映射访问端口 [默认: 80]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
+    [[ -z "$custom_port" ]] && custom_port="80"
+    
+    echo -ne "${YELLOW}请输入反向代理跳数 TRUST_PROXY (直接公网暴露填 1，前面有宿主机Nginx填 2) [默认: 1]: ${RESET}"
+    read -r trust_proxy
+    [[ -z "$trust_proxy" ]] && trust_proxy="1"
+
+    # 自动生成 64 位强安全 JWT 密钥
+    local jwt_secret=$(openssl rand -hex 64)
 
     # 2. 数据库运行模式选择
-    echo -e "\n${CYAN}====== 1. MySQL 数据库运行模式选择 ======${RESET}"
-    echo -e " 1) 直接部署全新的 MySQL 8.0 容器 (包含本地持久化卷)"
-    echo -e " 2) 使用已有的外部/远程 MySQL 数据库 (需提前手动建好空库)"
+    echo -e "\n${CYAN}====== PostgreSQL 数据库运行模式选择 ======${RESET}"
+    echo -e " 1) 启动单容器内嵌自带的 PostgreSQL 15 (全自动一体化，推荐)"
+    echo -e " 2) 使用已有的外部/远程外部 PostgreSQL 数据库 (跳过容器自带PG)"
     echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
     read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
-    local db_host="db"
-    local db_user="wordpress"
-    local db_pass=""
-    local db_name="wordpress"
+    local db_host_ip="127.0.0.1"
+    local db_port="5432"
+    local db_user="moments"
+    local db_pass="moments_password"
+    local db_name="moments"
 
     if [[ "$db_mode" == "1" ]]; then
-        echo -ne "${YELLOW}请为全新内置 MySQL 设置 root 密码 [默认: root123]: ${RESET}"
-        read -r root_pass
-        [[ -z "$root_pass" ]] && root_pass="root123"
-        echo -ne "${YELLOW}请为全新内置 MySQL 设置应用专账密码 [默认: wp123]: ${RESET}"
-        read -r db_pass
-        [[ -z "$db_pass" ]] && db_pass="wp123"
+        echo -e "${YELLOW}使用容器内嵌自启数据库，正在生成安全随机密码...${RESET}"
+        db_pass=$(openssl rand -hex 12)
     else
-        echo -ne "${YELLOW}请输入外部 MySQL 的 IP 或域名 [默认: 172.17.0.1]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 的 IP 或域名 [例如: 47.79.88.134]: ${RESET}"
         read -r ext_db_ip
-        [[ -z "$ext_db_ip" ]] && ext_db_ip="172.17.0.1"
-        echo -ne "${YELLOW}请输入外部 MySQL 端口 [默认: 3306]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 端口 [默认: 5432]: ${RESET}"
         read -r ext_db_port
-        [[ -z "$ext_db_port" ]] && ext_db_port="3306"
-        db_host="${ext_db_ip}:${ext_db_port}"
-        echo -ne "${YELLOW}请输入外部 MySQL 用户名 [默认: wordpress]: ${RESET}"
+        [[ -z "$ext_db_port" ]] && ext_db_port="5432"
+        db_host_ip="$ext_db_ip"
+        db_port="$ext_db_port"
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 用户名 [默认: moments]: ${RESET}"
         read -r db_user
-        [[ -z "$db_user" ]] && db_user="wordpress"
-        echo -ne "${YELLOW}请输入外部 MySQL 密码: ${RESET}"
+        [[ -z "$db_user" ]] && db_user="moments"
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 密码: ${RESET}"
         read -r db_pass
-        echo -ne "${YELLOW}请输入外部已存在的数据库名 [默认: wordpress]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: moments]: ${RESET}"
         read -r db_name
-        [[ -z "$db_name" ]] && db_name="wordpress"
+        [[ -z "$db_name" ]] && db_name="moments"
         
-        echo -e "${YELLOW}提示: 请确保远程 MySQL (${db_host}) 中已提前手动创建好名为 '${db_name}' 的数据库！${RESET}"
+        # 兼容宿主机回环地址
+        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
+            db_host_ip="172.17.0.1"
+        fi
     fi
 
-    # 3. Redis 运行模式选择
-    echo -e "\n${CYAN}====== 2. Redis 缓存运行模式选择 ======${RESET}"
-    echo -e " 1) 直接部署全新的 Redis 容器 (免密本地内部网络访问)"
-    echo -e " 2) 使用已有的外部/远程 Redis 缓存服务 (支持密码验证)"
-    echo -ne "${YELLOW}请选择 Redis 模式 [默认: 1]: ${RESET}"
-    read -r redis_mode
-    [[ -z "$redis_mode" ]] && redis_mode="1"
+    # 3. 创建基础持久化数据目录
+    mkdir -p "$BASE_DIR/data/uploads" "$BASE_DIR/data/logs"
 
-    local wp_redis_host="redis"
-    local wp_redis_password=""
+    # 4. 组装最终的连接串
+    local database_url="postgresql://${db_user}:${db_pass}@${db_host_ip}:${db_port}/${db_name}"
 
-    if [[ "$redis_mode" == "2" ]]; then
-        echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 172.17.0.1]: ${RESET}"
-        read -r ext_redis_ip
-        [[ -z "$ext_redis_ip" ]] && ext_redis_ip="172.17.0.1"
-        echo -ne "${YELLOW}请输入外部 Redis 端口 [默认: 6307]: ${RESET}"
-        read -r ext_redis_port
-        [[ -z "$ext_redis_port" ]] && ext_redis_port="6379"
-        wp_redis_host="${ext_redis_ip}:${ext_redis_port}"
-        echo -ne "${YELLOW}请输入外部 Redis 密码 (若无密码请直接留空回车): ${RESET}"
-        read -r wp_redis_password
+    # 5. 生成备份供日常查阅的 moments.env
+    cat << EOF > "$ENV_FILE"
+HOST_PORT=${custom_port}
+TRUST_PROXY=${trust_proxy}
+JWT_SECRET=${jwt_secret}
+DB_NAME=${db_name}
+DB_USER=${db_user}
+DB_PASSWORD=${db_pass}
+DATABASE_URL=${database_url}
+EOF
+
+    # 6. 核心自动化【方案 A 落地】：如果用户选了远程数据库，提前借道初始化结构
+    if [[ "$db_mode" == "2" ]]; then
+        echo -e "\n${YELLOW}🔄 检测到配置为远程外部数据库，正在拉取临时环境初始化表结构...${RESET}"
+        docker run --rm \
+          -e DATABASE_URL="${database_url}" \
+          ${DEFAULT_IMAGE} \
+          sh -c "cd /app && npx prisma db push"
+          
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✅ 远程数据库结构 (User, Config 等) 同步成功！${RESET}"
+        else
+            echo -e "${RED}❌ 远程数据库同步失败！请确认输入的账号密码是否正确，且远程数据库已创建空库。${RESET}"
+            echo -ne "${YELLOW}是否强行继续拉起应用服务？(y/n): ${RESET}"
+            read -r force_continue
+            if [[ "$force_continue" != "y" && "$force_continue" != "Y" ]]; then
+                return
+            fi
+        fi
     fi
 
-    # 4. 生成 docker-compose.yml 文本
-    echo -e "\n${YELLOW}正在生成持久化 Docker Compose 配置文件...${RESET}"
-    mkdir -p "$BASE_DIR/data"
-
-    # 初始化 YML 头部
-    cat << EOF > "$COMPOSE_FILE"
+    # 7. 生成规范化 Docker Compose 配置文件
+    echo -e "${YELLOW}正在生成规范化 Docker Compose 配置文件...${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        mkdir -p "$BASE_DIR/data/postgres"
+        cat << EOF > "$COMPOSE_FILE"
 services:
-  wordpress:
+  moments-blog:
     image: ${DEFAULT_IMAGE}
-    container_name: wordpress-server
+    container_name: moments-blog
     restart: unless-stopped
     ports:
       - "${custom_port}:80"
     volumes:
-      - ${BASE_DIR}/data:/var/www/html
+      - ./data/uploads:/data/uploads
+      - ./data/logs:/data/logs
+      - ./data/postgres:/var/lib/postgresql/data
     environment:
-      WORDPRESS_DB_HOST: ${db_host}
-      WORDPRESS_DB_NAME: ${db_name}
-      WORDPRESS_DB_USER: ${db_user}
-      WORDPRESS_DB_PASSWORD: ${db_pass}
-      WORDPRESS_CONFIG_EXTRA: |
-        define('WP_REDIS_HOST', '${wp_redis_host%%:*}');
-        define('WP_REDIS_PORT', ${wp_redis_host##*:});
+      - JWT_SECRET=${jwt_secret}
+      - DATABASE_URL=${database_url}
+      - NODE_ENV=production
+      - PORT=3001
+      - UPLOAD_DIR=/data/uploads
+      - INTERNAL_API_URL=http://localhost:3001
+      - TRUST_PROXY=${trust_proxy}
+      - PGDATA=/var/lib/postgresql/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 EOF
-
-    # 如果外部 Redis 有密码，将密码注入 WordPress 的额外配置中
-    if [[ -n "$wp_redis_password" ]]; then
-        cat << EOF >> "$COMPOSE_FILE"
-        define('WP_REDIS_PASSWORD', '${wp_redis_password}');
-EOF
-    fi
-
-    # 处理 depends_on 依赖节点
-    cat << EOF >> "$COMPOSE_FILE"
-    depends_on:
-EOF
-    [[ "$db_mode" == "1" ]] && echo "      - db" >> "$COMPOSE_FILE"
-    [[ "$redis_mode" == "1" ]] && echo "      - redis" >> "$COMPOSE_FILE"
-    # 如果都是外部的，则干掉整个 empty depends_on
-    if [[ "$db_mode" == "2" && "$redis_mode" == "2" ]]; then
-        sed -i '/depends_on:/d' "$COMPOSE_FILE"
-    fi
-
-    # 动态追加本地内置 MySQL 服务
-    if [[ "$db_mode" == "1" ]]; then
-        mkdir -p "$BASE_DIR/db"
-        cat << EOF >> "$COMPOSE_FILE"
-
-  db:
-    image: mysql:8.0
-    container_name: wordpress-db
+    else
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  moments-blog:
+    image: ${DEFAULT_IMAGE}
+    container_name: moments-blog
     restart: unless-stopped
+    ports:
+      - "${custom_port}:80"
+    volumes:
+      - ./data/uploads:/data/uploads
+      - ./data/logs:/data/logs
     environment:
-      MYSQL_ROOT_PASSWORD: ${root_pass}
-      MYSQL_DATABASE: ${db_name}
-      MYSQL_USER: ${db_user}
-      MYSQL_PASSWORD: ${db_pass}
-    volumes:
-      - ${BASE_DIR}/db:/var/lib/mysql
+      - JWT_SECRET=${jwt_secret}
+      - DATABASE_URL=${database_url}
+      - NODE_ENV=production
+      - PORT=3001
+      - UPLOAD_DIR=/data/uploads
+      - INTERNAL_API_URL=http://localhost:3001
+      - TRUST_PROXY=${trust_proxy}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 EOF
     fi
 
-    # 动态追加本地内置 Redis 服务
-    if [[ "$redis_mode" == "1" ]]; then
-        mkdir -p "$BASE_DIR/redis"
-        cat << EOF >> "$COMPOSE_FILE"
-
-  redis:
-    image: redis:alpine
-    container_name: wordpress-redis
-    restart: unless-stopped
-    volumes:
-      - ${BASE_DIR}/redis:/data
-EOF
-    fi
-
-    # 5. 执行一键拉起
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 WordPress 容器集群...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    # 8. 清理旧容器并启动新集群
+    echo -e "${YELLOW}正在拉起 Moments 容器架构...${RESET}"
+    cd "$BASE_DIR"
+    docker compose down -v 2>/dev/null
+    docker compose up -d --force-recreate
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}错误: 架构拉起失败，请检查端口是否被占用。${RESET}"
+        echo -e "${RED}错误: 服务拉起失败，请检查端口 ${custom_port} 是否被占用。${RESET}"
         return
     fi
 
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             WordPress 部署成功！                    ${RESET}"
+    echo -e "${GREEN}             Moments 博客系统部署成功！               ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}外部访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}宿主机映射端口 : ${custom_port}${RESET}"
-    echo -e "${YELLOW}MySQL 运行模式 : $([[ "$db_mode" == "1" ]] && echo -e "${GREEN}内置本地容器" || echo -e "${CYAN}连接外部远程: ${db_host}")${RESET}"
-    echo -e "${YELLOW}Redis 运行模式 : $([[ "$redis_mode" == "1" ]] && echo -e "${GREEN}内置本地容器 (免密)" || echo -e "${CYAN}连接外部远程: ${wp_redis_host} (带密认证)")${RESET}"
+    echo -e "${YELLOW}初始管理账号   : admin${RESET}"
+    echo -e "${YELLOW}初始默认密码   : Strong1passwd! (登录后请立即前往后台修改)${RESET}"
+    echo -e "----------------------------------------------------"
+    echo -e "${CYAN}[数据库拓扑连接回显]${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}数据库运行状态 : ${GREEN}容器内嵌自带自启 (PostgreSQL 15)${RESET}"
+        echo -e "${YELLOW}分配实例库名   : ${db_name}${RESET}"
+        echo -e "${YELLOW}随机高强密码   : ${GREEN}${db_pass}${RESET}"
+    else
+        echo -e "${YELLOW}数据库运行状态 : ${CYAN}外部远程对接${RESET}"
+        echo -e "${YELLOW}远程目标节点   : ${db_host_ip}:${db_port}${RESET}"
+        echo -e "${YELLOW}指定连接库名   : ${db_name}${RESET}"
+        echo -e "${YELLOW}连接用户名     : ${db_user}${RESET}"
+    fi
+    echo -e "----------------------------------------------------"
     echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 # 更新镜像
-update_wp() {
+update_moments() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新 Moments 镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}升级完成！${RESET}"
 }
 
-# 卸载 WordPress
-uninstall_wp() {
-    echo -ne "${RED}确定要完全卸载并删除 WordPress 服务吗？(y/n): ${RESET}"
+# 卸载 Moments
+uninstall_moments() {
+    echo -ne "${RED}确定要完全卸载并删除 Moments 服务吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down -v
             rm -rf "$BASE_DIR"
         else
-            docker rm -f wordpress-server wordpress-db wordpress-redis 2>/dev/null
+            docker rm -f moments-blog 2>/dev/null
         fi
         echo -e "${GREEN}完全卸载成功，数据已彻底清理。${RESET}"
     fi
 }
 
-start_wp() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
-stop_wp() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
-restart_wp() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
-logs_wp() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+start_moments() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
+stop_moments() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
+restart_moments() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
+logs_moments() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
 show_info() {
     get_status_info
@@ -294,7 +309,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}      ◈  WordPress 管理面板  ◈        ${RESET}"
+    echo -e "${GREEN}       ◈  Moments 管理面板  ◈        ${RESET}"
     echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 当前状态 :${RESET} $status"
     echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
@@ -312,13 +327,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_wordpress ;;
-        2) update_wp ;;
-        3) uninstall_wp ;;
-        4) start_wp ;;
-        5) stop_wp ;;
-        6) restart_wp ;;
-        7) logs_wp ;;
+        1) install_moments ;;
+        2) update_moments ;;
+        3) uninstall_moments ;;
+        4) start_moments ;;
+        5) stop_moments ;;
+        6) restart_moments ;;
+        7) logs_moments ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效${RESET}" ;;

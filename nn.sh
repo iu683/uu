@@ -10,62 +10,67 @@ RESET='\033[0m'
 # 设置目标目录
 TARGET_DIR="/app/oci-helper"
 KEYS_DIR="$TARGET_DIR/keys"
+COMPOSE_FILE="$TARGET_DIR/docker-compose.yml"
+APP_YML="$TARGET_DIR/application.yml"
 
 # ======================
-# 获取服务器IP
+# 获取服务器IP与展示面板信息
 # ======================
-get_server_ip() {
-    local ip=$(curl -s https://apiip.net/api/check?accessKey= 2>/dev/null | grep -oE '"ip":"[^"]+"' | cut -d'"' -f4)
-    if [[ -z "$ip" ]]; then
-        ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7}')
-    fi
-    [[ -z "$ip" ]] && echo "your_server_ip" || echo "$ip"
-}
-
-# ======================
-# 卸载逻辑
-# ======================
-uninstall() {
-    echo -e "\n🛑 开始卸载 oci-helper ..."
-
-    # 停止并删除容器
-    echo "🔍 停止并删除相关容器..."
-    for name in "oci-helper-watcher" "websockify" "oci-helper"; do
-        if docker ps -a --filter "name=$name" -q | grep -q .; then
-            docker rm -f "$name"
-            echo "✅ 已删除容器 $name"
-        else
-            echo "ℹ️ 未找到容器 $name"
-        fi
-    done
-
-    # 删除相关镜像
-    echo "🧹 删除相关镜像..."
-    docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep "oci-helper" | awk '{print $2}' | sort -u | xargs -r docker rmi -f
-    echo "✅ 镜像清理完成"
-
-    # 询问是否删除目录
-    read -p "是否清空所有数据并删除 $TARGET_DIR 目录？(y/N): " DEL_DIR
-    if [[ "$DEL_DIR" =~ ^[Yy]$ ]]; then
-        rm -rf "$TARGET_DIR"
-        echo "✅ 已删除目录 $TARGET_DIR"
+get_public_ip() {
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
     else
-        echo "ℹ️ 保留目录 $TARGET_DIR"
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
 
-    echo "😢 oci-helper 卸载完成~"
-    exit 0
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    echo "127.0.0.1" && return 0
+}
+
+
+show_success_info() {
+    local acc=$(grep "account:" "$APP_YML" 2>/dev/null | awk '{print $2}')
+    local pass=$(grep "password:" "$APP_YML" 2>/dev/null | awk '{print $2}')
+    local ip=$(get_public_ip)
+    local port=$(grep -A 2 "ports:" "$COMPOSE_FILE" 2>/dev/null | grep -oE '[0-9]+:8818' | cut -d':' -f1)
+    [[ -z "$port" ]] && port="8818"
+
+    echo -e "\n${GREEN}==================================================${RESET}"
+    echo -e "${GREEN}🎉 oci-helper 服务运行成功！${RESET}"
+    echo -e "${GREEN}==================================================${RESET}"
+    echo -e "${YELLOW}🌐 访问地址:${RESET} ${YELLOW}http://${ip}:${port}${RESET}"
+    echo -e "${YELLOW}👤 登录账号:${RESET} ${YELLOW}${acc:-未知}${RESET}"
+    echo -e "${YELLOW}🔑 登录密码:${RESET} ${YELLOW}${pass:-未知}${RESET}"
+    echo -e "${YELLOW}📂 安装目录: $TARGET_DIR${RESET}"
+    echo -e "${GREEN}==================================================${RESET}"
 }
 
 # ======================
-# 部署/更新逻辑
+# 1. 部署启动逻辑 (初次安装/重置)
 # ======================
 deploy() {
     echo -e "\n⏳ 开始准备环境并下载核心文件..."
     mkdir -p "$KEYS_DIR" && cd "$TARGET_DIR" || { echo "❌ 无法进入目录：$TARGET_DIR"; return; }
 
-    rm -rf update_version_trigger.flag
-    : > update_version_trigger.flag
+    rm -rf update_version_trigger.flag && : > update_version_trigger.flag
 
     BASE_URL="https://github.com/Yohann0617/oci-helper/releases/download/deploy"
     FILES=("application.yml" "oci-helper.db" "docker-compose.yml")
@@ -79,98 +84,88 @@ deploy() {
         fi
     done
 
-    # 路径纠正
-    COMPOSE_FILE="$TARGET_DIR/docker-compose.yml"
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        sed -i 's|/opt/oci-helper|/app/oci-helper|g' "$COMPOSE_FILE"
-    fi
+    # 路径纠正与移除不兼容挂载
+    [[ -f "$COMPOSE_FILE" ]] && sed -i 's|/opt/oci-helper|/app/oci-helper|g' "$COMPOSE_FILE"
+    sed -i "\|/usr/bin/docker:/usr/bin/docker|d" "$COMPOSE_FILE" 2>/dev/null
 
-    BAD_MOUNT="/usr/bin/docker:/usr/bin/docker"
-    if grep -- "$BAD_MOUNT" "$COMPOSE_FILE" > /dev/null 2>&1; then
-        sed -i "\|$BAD_MOUNT|d" "$COMPOSE_FILE"
-    fi
-
-    # Docker 环境检查
+    # 环境依赖检查
     if ! command -v docker &> /dev/null; then
-        echo "⚠️ Docker 未安装，开始安装中..."
-        curl -fsSL https://get.docker.com | sh
-        systemctl start docker && systemctl enable docker
+        echo "Docker 未安装，开始安装中..."
+        curl -fsSL https://get.docker.com | sh && systemctl start docker && systemctl enable docker
     fi
-
     if ! command -v docker-compose &> /dev/null; then
         curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
         chmod +x /usr/local/bin/docker-compose
     fi
 
-    DOCKER_BIN=$(command -v docker)
-    DOCKER_COMPOSE_BIN=$(command -v docker-compose)
-    [[ "$DOCKER_BIN" != "/usr/bin/docker" && ! -d /usr/bin/docker ]] && ln -sf "$DOCKER_BIN" /usr/bin/docker
-    [[ "$DOCKER_COMPOSE_BIN" != "/usr/local/bin/docker-compose" && ! -d /usr/local/bin/docker-compose ]] && ln -sf "$DOCKER_COMPOSE_BIN" /usr/local/bin/docker-compose
-
-    # 提前给高权限防锁死
     chmod 777 "$TARGET_DIR/oci-helper.db"
 
-    # 同步版本号
-    LATEST_TAG=$(curl -s https://api.github.com/repos/Yohann0617/oci-helper/releases/latest | grep '"tag_name":' | awk -F '"' '{print $4}')
-    DB_FILE="$TARGET_DIR/oci-helper.db"
-    if [[ -n "$LATEST_TAG" && -f "$DB_FILE" ]]; then
-        if ! command -v sqlite3 &> /dev/null; then
-            if [ -f /etc/os-release ]; then
-                . /etc/os-release
-                [[ "$ID" =~ ^(ubuntu|debian)$ ]] && apt update && apt install -y sqlite3 &>/dev/null
-                [[ "$ID" =~ ^(centos|rhel|rocky|almalinux)$ ]] && yum install -y sqlite &>/dev/null
-            fi
-        fi
-        if command -v sqlite3 &> /dev/null; then
-            sqlite3 "$DB_FILE" "UPDATE oci_kv SET value = '$LATEST_TAG' WHERE code = 'Y106' AND type = 'Y003';" 2>/dev/null
-        fi
-    fi
-
     # 凭据配置
-    APP_YML="$TARGET_DIR/application.yml"
     echo -e "\n${YELLOW}请选择账号密码设置方式：${RESET}"
     echo "1) 自动生成随机账号和密码"
     echo "2) 手动输入账号和密码"
-    echo "3) 保留当前账号和密码，不作修改"
-    read -p "输入选项 (1/2/3): " ACC_MODE
+    read -p "输入选项: " ACC_MODE
 
     if [[ "$ACC_MODE" == "1" ]]; then
-        NEW_ACC="user_$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
-        NEW_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)
-        sed -i "s|^.*account:.*|  account: $NEW_ACC|" "$APP_YML"
-        sed -i "s|^.*password:.*|  password: $NEW_PASS|" "$APP_YML"
+        local new_acc="user_$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
+        local new_pass=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)
+        sed -i "s|^.*account:.*|  account: $new_acc|" "$APP_YML"
+        sed -i "s|^.*password:.*|  password: $new_pass|" "$APP_YML"
     elif [[ "$ACC_MODE" == "2" ]]; then
-        read -p "请输入账号: " NEW_ACC
-        read -p "请输入密码: " NEW_PASS
-        if [[ -n "$NEW_ACC" && -n "$NEW_PASS" ]]; then
-            sed -i "s|^.*account:.*|  account: $NEW_ACC|" "$APP_YML"
-            sed -i "s|^.*password:.*|  password: $NEW_PASS|" "$APP_YML"
+        read -p "请输入账号: " new_acc
+        read -p "请输入密码: " new_pass
+        if [[ -n "$new_acc" && -n "$new_pass" ]]; then
+            sed -i "s|^.*account:.*|  account: $new_acc|" "$APP_YML"
+            sed -i "s|^.*password:.*|  password: $new_pass|" "$APP_YML"
         fi
     fi
 
-    # 拉取并上载
     echo -e "\n🚀 正在拉取镜像并部署容器服务..."
-    cd "$TARGET_DIR" || return
     docker-compose pull && docker-compose up -d
-
-    # 获取部署后的账号密码用于显式通知
-    FINAL_ACC=$(grep "account:" "$APP_YML" | awk '{print $2}')
-    FINAL_PASS=$(grep "password:" "$APP_YML" | awk '{print $2}')
-    SERVER_IP=$(get_server_ip)
-    WEB_PORT=$(grep -A 2 "ports:" "$COMPOSE_FILE" | grep -oE '[0-9]+:8818' | cut -d':' -f1)
-    [[ -z "$WEB_PORT" ]] && WEB_PORT="8818"
-
-    echo -e "\n${GREEN}==================================================${RESET}"
-    echo -e "${GREEN}🎉 oci-helper 容器服务部署/更新成功！${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
-    echo -e "${BLUE}🌐 访问地址:${RESET} http://${SERVER_IP}:${WEB_PORT}"
-    echo -e "${BLUE}👤 登录账号:${RESET} ${YELLOW}${FINAL_ACC}${RESET}"
-    echo -e "${BLUE}🔑 登录密码:${RESET} ${YELLOW}${FINAL_PASS}${RESET}"
-    echo -e "${GREEN}==================================================${RESET}"
+    show_success_info
 }
 
 # ======================
-# 控制逻辑
+# 2. 纯净更新逻辑
+# ======================
+update_containers() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "\n❌ 未检测到 $COMPOSE_FILE ，请先选择选项 1 进行部署启动。"
+        return
+    fi
+    echo -e "\n🔄 正在执行更新..."
+    cd "$TARGET_DIR" || return
+    
+    # 纯净的两行更新核心命令
+    docker-compose pull && docker-compose up -d
+    
+    show_success_info
+}
+
+# ======================
+# 3. 卸载逻辑
+# ======================
+uninstall() {
+    echo -e "开始卸载 oci-helper ..."
+    cd "$TARGET_DIR" 2>/dev/null && docker-compose down 2>/dev/null
+    
+    for name in "oci-helper-watcher" "websockify" "oci-helper"; do
+        docker rm -f "$name" &>/dev/null
+    done
+
+    docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep "oci-helper" | awk '{print $2}' | sort -u | xargs -r docker rmi -f &>/dev/null
+    echo "✅ 容器与镜像清理完成"
+
+    read -p "是否清空所有数据并删除 $TARGET_DIR 目录？(y/N): " DEL_DIR
+    if [[ "$DEL_DIR" =~ ^[Yy]$ ]]; then
+        rm -rf "$TARGET_DIR"
+        echo "✅ 已删除目录 $TARGET_DIR"
+    fi
+    echo "oci-helper 卸载完成~"
+}
+
+# ======================
+# 其它控制命令
 # ======================
 start_containers() {
     echo -e "\n▶️ 正在启动容器..."
@@ -187,9 +182,6 @@ restart_containers() {
     docker restart oci-helper-watcher oci-helper websockify && echo "✅ 容器已成功重启"
 }
 
-# ======================
-# 状态与配置获取
-# ======================
 get_status_info() {
     local active_count=0
     for name in "oci-helper-watcher" "oci-helper" "websockify"; do
@@ -207,16 +199,15 @@ get_status_info() {
     fi
 
     webui_port="8818"
-    if [[ -f "$TARGET_DIR/docker-compose.yml" ]]; then
-        local port_extract=$(grep -A 2 "ports:" "$TARGET_DIR/docker-compose.yml" | grep -oE '[0-9]+:8818' | cut -d':' -f1)
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        local port_extract=$(grep -A 2 "ports:" "$COMPOSE_FILE" | grep -oE '[0-9]+:8818' | cut -d':' -f1)
         [[ -n "$port_extract" ]] && webui_port="$port_extract"
     fi
 }
 
 show_config() {
-    APP_YML="$TARGET_DIR/application.yml"
     if [[ -f "$APP_YML" ]]; then
-        echo -e "\n${BLUE}📋 当前网页配置凭据：${RESET}"
+        echo -e "\n${YELLOW}📋 当前网页配置凭据：${RESET}"
         grep -E "account:|password:" "$APP_YML"
     else
         echo -e "\n❌ 未找到配置文件 $APP_YML"
@@ -231,7 +222,7 @@ while true; do
     get_status_info
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  Y探长 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}     ◈   Y探长 管理面板   ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -250,34 +241,19 @@ while true; do
     read -r choice
 
     case "$choice" in
-        1|2)
-            deploy
-            ;;
-        3)
-            uninstall
-            ;;
-        4)
-            start_containers
-            ;;
-        5)
-            stop_containers
-            ;;
-        6)
-            restart_containers
-            ;;
+        1)  deploy ;;
+        2)  update_containers ;;
+        3)  uninstall ;;
+        4)  start_containers ;;
+        5)  stop_containers ;;
+        6)  restart_containers ;;
         7)
             echo -e "\n📋 正在追踪实时日志 (按 Ctrl+C 退出日志流)..."
             docker logs -f oci-helper
             ;;
-        8)
-            show_config
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "\n❌ 无效的选项，请重新选择。"
-            ;;
+        8)  show_config ;;
+        0)  exit 0 ;;
+        *)  echo -e "\n❌ 无效的选项，请重新选择。" ;;
     esac
 
     echo -ne "\n${YELLOW}按回车键返回主菜单...${RESET}"

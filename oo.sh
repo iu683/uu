@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Moments Blog Docker Compose 管理面板 (单容器内嵌+远程切换版)
+# Umami 网站统计系统 Docker Compose 管理面板 (特殊字符字符隔离版)
 # =================================================================
 
 # 颜色定义
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/moments"
+BASE_DIR="/opt/umami"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/moments.env"
-DEFAULT_IMAGE="koalalove/moments-blog:latest"
+ENV_FILE="$BASE_DIR/umami.env"
 
 # 检测依赖环境
 check_dependencies() {
@@ -24,91 +23,66 @@ check_dependencies() {
 }
 
 get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    for url in "https://api.ipify.org" "https://4.ip.sb"; do
+        ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+    done
     echo "127.0.0.1" && return 0
 }
 
 # 动态获取容器整体状态和端口
 get_status_info() {
     if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=moments-blog)" ]; then
+        if [ "$(docker ps -q -f name=umami)" ]; then
             status="${GREEN}运行中${RESET}"
-            web_port=$(docker ps -f name=moments-blog --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
+            web_port=$(docker ps -f name=umami --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
             if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
-                web_port=$(sed -n '/moments-blog:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+                web_port=$(sed -n '/umami:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
             fi
-        elif [ "$(docker ps -aq -f name=moments-blog)" ]; then
+        elif [ "$(docker ps -aq -f name=umami)" ]; then
             status="${YELLOW}已停止${RESET}"
-            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' moments-blog 2>/dev/null)
+            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' umami 2>/dev/null)
         else
             status="${RED}未部署${RESET}"
         fi
-        [[ -z "$web_port" ]] && web_port="80"
+        [[ -z "$web_port" ]] && web_port="3000"
     else
         status="${RED}未初始化${RESET}"
         web_port="N/A"
     fi
 }
 
-# 部署 Moments
-install_moments() {
+# 部署 Umami
+install_umami() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
     # 1. 基础参数配置
     echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Moments 宿主机映射访问端口 [默认: 80]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Umami 宿主机映射访问端口 [默认: 3000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="80"
-    
-    echo -ne "${YELLOW}请输入反向代理跳数 TRUST_PROXY (直接公网暴露填 1，前面有宿主机Nginx填 2) [默认: 1]: ${RESET}"
-    read -r trust_proxy
-    [[ -z "$trust_proxy" ]] && trust_proxy="1"
+    [[ -z "$custom_port" ]] && custom_port="3000"
 
-    # 自动生成 64 位强安全 JWT 密钥
-    local jwt_secret=$(openssl rand -hex 64)
+    # 自动生成 Umami 的哈希加盐密钥 (排除特殊字符干扰)
+    local app_secret=$(openssl rand -hex 32)
 
     # 2. 数据库运行模式选择
     echo -e "\n${CYAN}====== PostgreSQL 数据库运行模式选择 ======${RESET}"
-    echo -e " 1) 启动单容器内嵌自带的 PostgreSQL 15 (全自动一体化，推荐)"
-    echo -e " 2) 使用已有的外部/远程外部 PostgreSQL 数据库 (跳过容器自带PG)"
+    echo -e " 1) 直接部署全新的 PostgreSQL 15 容器 (包含本地持久化卷)"
+    echo -e " 2) 使用已有的外部/远程 PostgreSQL 数据库 (需提前手动建好空库)"
     echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
     read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
-    local db_host_ip="127.0.0.1"
+    local db_host_ip="db"
     local db_port="5432"
-    local db_user="moments"
-    local db_pass="moments_password"
-    local db_name="moments"
+    local db_user="umami"
+    local db_pass=""
+    local db_name="umami"
 
     if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}使用容器内嵌自启数据库，正在生成安全随机密码...${RESET}"
-        db_pass=$(openssl rand -hex 12)
+        echo -e "${YELLOW}使用全新内置数据库容器，正在生成高强度随机密码...${RESET}"
+        db_pass=$(openssl rand -hex 16)
     else
         echo -ne "${YELLOW}请输入远程 PostgreSQL 的 IP 或域名 [例如: 47.79.88.134]: ${RESET}"
         read -r ext_db_ip
@@ -117,84 +91,92 @@ install_moments() {
         [[ -z "$ext_db_port" ]] && ext_db_port="5432"
         db_host_ip="$ext_db_ip"
         db_port="$ext_db_port"
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 用户名 [默认: moments]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 用户名 [默认: umami]: ${RESET}"
         read -r db_user
-        [[ -z "$db_user" ]] && db_user="moments"
+        [[ -z "$db_user" ]] && db_user="umami"
         echo -ne "${YELLOW}请输入远程 PostgreSQL 密码: ${RESET}"
         read -r db_pass
-        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: moments]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: umami]: ${RESET}"
         read -r db_name
-        [[ -z "$db_name" ]] && db_name="moments"
+        [[ -z "$db_name" ]] && db_name="umami"
         
-        # 兼容宿主机回环地址
+        # 兼容本地宿主机回环网关
         if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
             db_host_ip="172.17.0.1"
         fi
     fi
 
-    # 3. 创建持久化数据目录
-    mkdir -p "$BASE_DIR/data/uploads" "$BASE_DIR/data/logs"
-
-    # 4. 组装最终的连接串
+    # 3. 动态拼接生成强连接串
     local database_url="postgresql://${db_user}:${db_pass}@${db_host_ip}:${db_port}/${db_name}"
 
-    # 5. 生成备份供查阅的 moments.env
+    # 4. 备份保留凭证文件 umami.env (值全部外加双引号)
     cat << EOF > "$ENV_FILE"
-HOST_PORT=${custom_port}
-TRUST_PROXY=${trust_proxy}
-JWT_SECRET=${jwt_secret}
-DB_NAME=${db_name}
-DB_USER=${db_user}
-DB_PASSWORD=${db_pass}
-DATABASE_URL=${database_url}
+HOST_PORT="${custom_port}"
+APP_SECRET="${app_secret}"
+DB_NAME="${db_name}"
+DB_USER="${db_user}"
+DB_PASSWORD="${db_pass}"
+DATABASE_URL="${database_url}"
 EOF
 
-    # 6. 生成核心 docker-compose.yml 文本
+    # 5. 完全分流式生成 docker-compose.yml 文本
     echo -e "${YELLOW}正在生成规范化 Docker Compose 配置文件...${RESET}"
-    cat << EOF > "$COMPOSE_FILE"
-services:
-  moments-blog:
-    image: ${DEFAULT_IMAGE}
-    container_name: moments-blog
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:80"
-    volumes:
-      - ./data/uploads:/data/uploads
-      - ./data/logs:/data/logs
-    environment:
-      - JWT_SECRET=${jwt_secret}
-      - DATABASE_URL=${database_url}
-      - NODE_ENV=production
-      - PORT=3001
-      - UPLOAD_DIR=/data/uploads
-      - INTERNAL_API_URL=http://localhost:3001
-      - TRUST_PROXY=${trust_proxy}
-EOF
-
-    # 处理内嵌数据库卷映射挂载（只有模式1也就是本地自启才需要挂载内置存储卷）
     if [[ "$db_mode" == "1" ]]; then
-        mkdir -p "$BASE_DIR/data/postgres"
-        cat << EOF >> "$COMPOSE_FILE"
-      - PGDATA=/var/lib/postgresql/data
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: umami-db
+    environment:
+      POSTGRES_DB: "${db_name}"
+      POSTGRES_USER: "${db_user}"
+      POSTGRES_PASSWORD: "${db_pass}"
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - umami-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${db_user} -d ${db_name}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  umami:
+    image: ghcr.io/umami-software/umami:latest
+    container_name: umami
+    ports:
+      - "127.0.0.1:${custom_port}:3000"
+    environment:
+      DATABASE_URL: "${database_url}"
+      APP_SECRET: "${app_secret}"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+    init: true
+
+volumes:
+  umami-db-data:
+EOF
+    else
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  umami:
+    image: ghcr.io/umami-software/umami:latest
+    container_name: umami
+    ports:
+      - "127.0.0.1:${custom_port}:3000"
+    environment:
+      DATABASE_URL: "${database_url}"
+      APP_SECRET: "${app_secret}"
+    restart: always
+    init: true
 EOF
     fi
 
-    # 追加标准的全局日志控制
-    cat << EOF >> "$COMPOSE_FILE"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "5"
-EOF
-
-    # 7. 清理旧容器并启动新集群
-    echo -e "${YELLOW}正在拉起 Moments 容器架构...${RESET}"
+    # 6. 清理残余并重新拉起新集群
+    echo -e "${YELLOW}正在通过 Docker Compose 部署应用状态...${RESET}"
     cd "$BASE_DIR"
-    docker compose down 2>/dev/null
+    docker compose down -v 2>/dev/null
     docker compose up -d --force-recreate
 
     if [ $? -ne 0 ]; then
@@ -204,22 +186,21 @@ EOF
 
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             Moments 博客系统部署成功！               ${RESET}"
+    echo -e "${GREEN}             Umami 统计系统部署成功！                 ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}外部访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}初始管理账号   : admin${RESET}"
-    echo -e "${YELLOW}初始默认密码   : Strong1passwd! (登录后请立即前往后台修改)${RESET}"
+    echo -e "${YELLOW}内部提取端口   : ${custom_port} (绑定在 127.0.0.1)${RESET}"
+    echo -e "${YELLOW}本地 Nginx 反代: http://127.0.0.1:${custom_port}${RESET}"
+    echo -e "${YELLOW}默认初始账号   : admin${RESET}"
+    echo -e "${YELLOW}默认初始密码   : umami (登录后请前往设置及时修改)${RESET}"
     echo -e "----------------------------------------------------"
-    echo -e "${CYAN}[数据库拓扑连接回显]${RESET}"
+    echo -e "${CYAN}[数据库凭据回显]${RESET}"
     if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}数据库运行状态 : ${GREEN}容器内嵌自带自启 (PostgreSQL 15)${RESET}"
-        echo -e "${YELLOW}分配实例库名   : ${db_name}${RESET}"
-        echo -e "${YELLOW}随机高强密码   : ${GREEN}${db_pass}${RESET}"
+        echo -e "${YELLOW}PGSQL 运行模式 : ${GREEN}全新内置容器 (PostgreSQL 15)${RESET}"
+        echo -e "${YELLOW}安全随机密码   : ${GREEN}${db_pass}${RESET}"
     else
-        echo -e "${YELLOW}数据库运行状态 : ${CYAN}外部远程对接${RESET}"
-        echo -e "${YELLOW}远程目标节点   : ${db_host_ip}:${db_port}${RESET}"
-        echo -e "${YELLOW}指定连接库名   : ${db_name}${RESET}"
-        echo -e "${YELLOW}连接用户名     : ${db_user}${RESET}"
+        echo -e "${YELLOW}PGSQL 运行模式 : ${CYAN}外部远程连接${RESET}"
+        echo -e "${YELLOW}远程目标主机   : ${db_host_ip}:${db_port}${RESET}"
+        echo -e "${YELLOW}连接指定库名   : ${db_name}${RESET}"
     fi
     echo -e "----------------------------------------------------"
     echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
@@ -227,36 +208,36 @@ EOF
 }
 
 # 更新镜像
-update_moments() {
+update_umami() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新 Moments 镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新 Umami 镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}升级完成！${RESET}"
 }
 
-# 卸载 Moments
-uninstall_moments() {
-    echo -ne "${RED}确定要完全卸载并删除 Moments 服务吗？(y/n): ${RESET}"
+# 卸载 Umami
+uninstall_umami() {
+    echo -ne "${RED}确定要完全卸载并删除 Umami 服务吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down -v
             rm -rf "$BASE_DIR"
         else
-            docker rm -f moments-blog 2>/dev/null
+            docker rm -f umami umami-db 2>/dev/null
         fi
         echo -e "${GREEN}完全卸载成功，数据已彻底清理。${RESET}"
     fi
 }
 
-start_moments() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
-stop_moments() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
-restart_moments() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
-logs_moments() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+start_umami() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
+stop_umami() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
+restart_umami() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
+logs_umami() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
 show_info() {
     get_status_info
@@ -272,7 +253,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}       ◈  Moments 管理面板  ◈        ${RESET}"
+    echo -e "${GREEN}       ◈  Umami 管理面板  ◈        ${RESET}"
     echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 当前状态 :${RESET} $status"
     echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
@@ -290,13 +271,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_moments ;;
-        2) update_moments ;;
-        3) uninstall_moments ;;
-        4) start_moments ;;
-        5) stop_moments ;;
-        6) restart_moments ;;
-        7) logs_moments ;;
+        1) install_umami ;;
+        2) update_umami ;;
+        3) uninstall_umami ;;
+        4) start_umami ;;
+        5) stop_umami ;;
+        6) restart_umami ;;
+        7) logs_umami ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效${RESET}" ;;

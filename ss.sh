@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Cloudreve Docker Compose 管理面板 (本地/远程双模 + 高精端口版)
+# Halo 2.x Docker Compose 管理面板 (远程多库支持 + 状态端口双模版)
 # =================================================================
 
 # 颜色定义
@@ -10,9 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/cloudreve"
+BASE_DIR="/opt/halo"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-DEFAULT_IMAGE="cloudreve/cloudreve:latest"
+DEFAULT_IMAGE="registry.fit2cloud.com/halo/halo-pro:2.25"
 
 # 检测依赖环境
 check_dependencies() {
@@ -51,256 +51,304 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器整体状态和端口 (采用原生 Docker Inspect 终极技术)
+# 动态获取容器整体状态和端口 (实时从运行状态提取)
 get_status_info() {
     if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=cloudreve-backend)" ]; then
+        if [ "$(docker ps -q -f name=halo-app)" ]; then
             status="${GREEN}运行中${RESET}"
-            # 直接向 Docker 引擎索要容器内部 5212 端口映射到宿主机的真实端口
-            web_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5212/tcp") 0).HostPort}}' cloudreve-backend 2>/dev/null)
-        elif [ "$(docker ps -aq -f name=cloudreve-backend)" ]; then
+            # 实时从正在运行的容器中提取宿主机映射的端口
+            web_port=$(docker ps -f name=halo-app --format "{{.Ports}}" | sed -E 's/.*0.0.0.0:([0-9]+)->.*/\1/' | head -n 1)
+            # 如果提取失败（例如网络模式特殊），再尝试 fallback 到配置文件
+            if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
+                web_port=$(sed -n '/halo:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+            fi
+        elif [ "$(docker ps -aq -f name=halo-app)" ]; then
             status="${YELLOW}已停止${RESET}"
-            web_port=""
+            # 容器停止时，通过 inspect 获取原本绑定的宿主机端口
+            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' halo-app 2>/dev/null)
         else
             status="${RED}未部署${RESET}"
-            web_port=""
         fi
         
-        # 兜底逻辑：如果容器没启动，退回静态解析 YAML 文件
-        if [ -z "$web_port" ]; then
-            web_port=$(grep -A 5 "cloudreve:" "$COMPOSE_FILE" 2>/dev/null | grep -E '\-[[:space:]]*["'\'']?.*:5212' | head -n 1 | grep -oE '[0-9]+:5212' | cut -d':' -f1)
-            [[ -z "$web_port" ]] && web_port="5212"
-        fi
+        # 兜底：如果以上方法都没拿到端口，默认显示 8090
+        [[ -z "$web_port" ]] && web_port="8090"
     else
         status="${RED}未初始化${RESET}"
         web_port="N/A"
     fi
 }
 
-# 部署 Cloudreve
-install_cloudreve() {
+# 部署 Halo
+install_halo() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 数据库/缓存运行模式选择 ======${RESET}"
-    echo -e " 1. 直接部署全新完整环境 (包含全新的本地 PostgreSQL 和 Redis 容器)"
-    echo -e " 2. 连接外部/远程已有的数据库与 Redis (需提前手动创建好 PostgreSQL 数据库)"
-    echo -ne "${YELLOW}请选择运行模式 [默认: 1]: ${RESET}"
+    echo -e "${CYAN}====== 数据库运行模式选择 ======${RESET}"
+    echo -e " 1. 直接部署全新环境 (包含全新 PostgreSQL 15 容器)"
+    echo -e " 2. 使用已有的外部/远程数据库 (支持外部 MySQL 或 PostgreSQL - 需提前建库)"
+    echo -e " 3. 使用轻量级嵌入式 H2 数据库 (无需额外数据库，适合低配服务器)"
+    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
     read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
     echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Cloudreve Web 访问端口 [默认: 5212]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Halo 宿主机映射访问端口 [默认: 8090]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="5212"
+    [[ -z "$custom_port" ]] && custom_port="8090"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # ------------------ 模式 1：全套本地内置容器化 ------------------
+    echo -ne "${YELLOW}请输入站点外部访问域名或公网IP (形如 http://12.34.56.78:${custom_port}/): ${RESET}"
+    read -r ext_url
+    [[ -z "$ext_url" ]] && ext_url="http://localhost:${custom_port}/"
+    [[ "${ext_url}" != */ ]] && ext_url="${ext_url}/"
+
+    mkdir -p "$BASE_DIR/halo2"
+
+    # ------------------ 模式 1：全套本地内置容器化 PostgreSQL ------------------
     if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}正在配置全套本地内置容器环境...${RESET}"
-        local rand_db_pass=$(openssl rand -hex 16)
-        local db_user="cloudreve"
-        local db_name="cloudreve"
+        echo -e "${YELLOW}正在自动计算生成数据库高强度防破解随机密码...${RESET}"
+        local rand_pass=$(openssl rand -hex 12)
+        mkdir -p "$BASE_DIR/db"
 
         cat << EOF > "$COMPOSE_FILE"
 services:
-  cloudreve:
-    container_name: cloudreve-backend
+  halo:
     image: ${DEFAULT_IMAGE}
+    container_name: halo-app
+    restart: on-failure:3
     depends_on:
-      - postgresql
-      - redis
-    restart: unless-stopped
+      halodb:
+        condition: service_healthy
+    networks:
+      - halo_network
+    volumes:
+      - ${BASE_DIR}/halo2:/root/.halo2
     ports:
-      - "${custom_port}:5212"
-      - "6888:6888"
-      - "6888:6888/udp"
+      - "${custom_port}:8090"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/actuator/health/readiness"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     environment:
-      - CR_CONF_Database.Type=postgres
-      - CR_CONF_Database.Host=postgresql
-      - CR_CONF_Database.User=${db_user}
-      - CR_CONF_Database.Password=${rand_db_pass}
-      - CR_CONF_Database.Name=${db_name}
-      - CR_CONF_Database.Port=5432
-      - CR_CONF_Redis.Server=redis:6379
-    volumes:
-      - backend_data:/cloudreve/data
+      - JVM_OPTS=-Xmx256m -Xms256m
+    command:
+      - --spring.r2dbc.url=r2dbc:pool:postgresql://halodb/halo
+      - --spring.r2dbc.username=halo
+      - --spring.r2dbc.password=${rand_pass}
+      - --spring.sql.init.platform=postgresql
+      - --halo.external-url=${ext_url}
 
-  postgresql:
-    container_name: postgresql
-    image: postgres:17-alpine
-    restart: unless-stopped
+  halodb:
+    image: postgres:15.4
+    container_name: halo-db
+    restart: on-failure:3
+    networks:
+      - halo_network
+    volumes:
+      - ${BASE_DIR}/db:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD", "pg_isready" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     environment:
-      - POSTGRES_USER=${db_user}
-      - POSTGRES_PASSWORD=${rand_db_pass}
-      - POSTGRES_DB=${db_name}
-    volumes:
-      - database_postgres:/var/lib/postgresql/data
+      - POSTGRES_PASSWORD=${rand_pass}
+      - POSTGRES_USER=halo
+      - POSTGRES_DB=halo
+      - PGUSER=halo
 
-  redis:
-    container_name: redis
-    image: redis:alpine
-    restart: unless-stopped
-    volumes:
-      - redis_data:/data
-
-volumes:
-  backend_data:
-  database_postgres:
-  redis_data:
+networks:
+  halo_network:
+    driver: bridge
 EOF
 
-    # ------------------ 模式 2：连接外部/远程已有的 PostgreSQL + Redis ------------------
-    else
-        echo -e "${CYAN}====== 远程/外部 PostgreSQL 信息输入 ======${RESET}"
-        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r ext_db_host
-        [[ -z "$ext_db_host" ]] && ext_db_host="127.0.0.1"
-        
-        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
-        read -r ext_db_port
-        [[ -z "$ext_db_port" ]] && ext_db_port="5432"
-        
-        echo -ne "${YELLOW}请输入数据库用户名 [默认: cloudreve]: ${RESET}"
-        read -r ext_db_user
-        [[ -z "$ext_db_user" ]] && ext_db_user="cloudreve"
-        
-        echo -ne "${YELLOW}请输入数据库密码: ${RESET}"
-        read -r ext_db_pass
-        
-        echo -ne "${YELLOW}请输入目标数据库名 [默认: cloudreve]: ${RESET}"
-        read -r ext_db_name
-        [[ -z "$ext_db_name" ]] && ext_db_name="cloudreve"
+    # ------------------ 模式 2：连接外部/远程已有的 MySQL / PostgreSQL ------------------
+    elif [[ "$db_mode" == "2" ]]; then
+        echo -e "${CYAN}====== 远程/外部数据库类型选择 ======${RESET}"
+        echo -e " 1) MySQL (5.7 或 8.0+)"
+        echo -e " 2) PostgreSQL"
+        echo -ne "${YELLOW}请选择远程数据库类型 [默认: 1]: ${RESET}"
+        read -r ext_db_type
+        [[ -z "$ext_db_type" ]] && ext_db_type="1"
 
-        echo -e "${CYAN}====== 远程/外部 Redis 信息输入 ======${RESET}"
-        echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r ext_rd_host
-        [[ -z "$ext_rd_host" ]] && ext_rd_host="127.0.0.1"
+        echo -e "${CYAN}====== 远程/外部数据库信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部数据库的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_host
+        [[ -z "$ext_host" ]] && ext_host="127.0.0.1"
         
-        echo -ne "${YELLOW}请输入 Redis 端口 [默认: 6379]: ${RESET}"
-        read -r ext_rd_port
-        [[ -z "$ext_rd_port" ]] && ext_rd_port="6379"
-
-        echo -ne "${YELLOW}请输入 Redis 密码 (若无密码请直接回车): ${RESET}"
-        read -r ext_rd_pass
-
-        # 突破 Docker 宿主机回环地址限制
-        [[ "$ext_db_host" == "127.0.0.1" || "$ext_db_host" == "localhost" ]] && ext_db_host="172.17.0.1"
-        [[ "$ext_rd_host" == "127.0.0.1" || "$ext_rd_host" == "localhost" ]] && ext_rd_host="172.17.0.1"
-
-        # 【核心重构修复】地址只保留纯粹的 IP:Port，密码作为独立字段注入
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  cloudreve:
-    container_name: cloudreve-backend
-    image: ${DEFAULT_IMAGE}
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:5212"
-      - "6888:6888"
-      - "6888:6888/udp"
-    environment:
-      - CR_CONF_Database.Type=postgres
-      - CR_CONF_Database.Host=${ext_db_host}
-      - CR_CONF_Database.User=${ext_db_user}
-      - CR_CONF_Database.Password=${ext_db_pass}
-      - CR_CONF_Database.Name=${ext_db_name}
-      - CR_CONF_Database.Port=${ext_db_port}
-      - CR_CONF_Redis.Server=${ext_rd_host}:${ext_rd_port}
-EOF
-
-        # 仅当外部 Redis 设置了密码时，才追加独立密码环境变量
-        if [[ -n "$ext_rd_pass" ]]; then
-            echo "      - CR_CONF_Redis.Password=${ext_rd_pass}" >> "$COMPOSE_FILE"
+        # 根据数据库类型设定默认端口和驱动名称
+        local default_port="3306"
+        local r2dbc_proto="mysql"
+        local sql_platform="mysql"
+        if [[ "$ext_db_type" == "2" ]]; then
+            default_port="5432"
+            r2dbc_proto="postgresql"
+            sql_platform="postgresql"
         fi
 
-        # 追加数据卷配置闭合
-        cat << EOF >> "$COMPOSE_FILE"
-    volumes:
-      - backend_data:/cloudreve/data
+        echo -ne "${YELLOW}请输入数据库端口 [默认: ${default_port}]: ${RESET}"
+        read -r ext_port
+        [[ -z "$ext_port" ]] && ext_port="$default_port"
+        
+        echo -ne "${YELLOW}请输入数据库用户名 [默认: root/halo]: ${RESET}"
+        read -r ext_user
+        if [[ -z "$ext_user" ]]; then
+            [[ "$ext_db_type" == "1" ]] && ext_user="root" || ext_user="halo"
+        fi
+        
+        echo -ne "${YELLOW}请输入数据库密码: ${RESET}"
+        read -r ext_pass
+        
+        echo -ne "${YELLOW}请输入已存在的远程数据库名 [默认: halo]: ${RESET}"
+        read -r ext_dbname
+        [[ -z "$ext_dbname" ]] && ext_dbname="halo"
 
-volumes:
-  backend_data:
+        # 破壁 Docker 宿主机回环地址限制
+        if [[ "$ext_host" == "127.0.0.1" || "$ext_host" == "localhost" ]]; then
+            ext_host="172.17.0.1"
+            echo -e "${YELLOW}提示: 检测到本地回环地址，内部网络配置已自动适配宿主机网关 IP: 172.17.0.1${RESET}"
+        fi
+
+        echo -e "${YELLOW}提示: 请确保远程数据库 (${ext_host}:${ext_port}) 中已手动创建好名为 '${ext_dbname}' 的空白库。${RESET}"
+
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  halo:
+    image: ${DEFAULT_IMAGE}
+    container_name: halo-app
+    restart: on-failure:3
+    ports:
+      - "${custom_port}:8090"
+    volumes:
+      - ${BASE_DIR}/halo2:/root/.halo2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/actuator/health/readiness"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    environment:
+      - JVM_OPTS=-Xmx256m -Xms256m
+    command:
+      - --spring.r2dbc.url=r2dbc:pool:${r2dbc_proto}://${ext_host}:${ext_port}/${ext_dbname}
+      - --spring.r2dbc.username=${ext_user}
+      - --spring.r2dbc.password=${ext_pass}
+      - --spring.sql.init.platform=${sql_platform}
+      - --halo.external-url=${ext_url}
+EOF
+
+    # ------------------ 模式 3：使用本地轻量级嵌入式 H2 数据库 ------------------
+    else
+        echo -e "${YELLOW}正在配置嵌入式 H2 数据库环境（无需外部独立关系型数据库）...${RESET}"
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  halo:
+    image: ${DEFAULT_IMAGE}
+    container_name: halo-app
+    restart: on-failure:3
+    ports:
+      - "${custom_port}:8090"
+    volumes:
+      - ${BASE_DIR}/halo2:/root/.halo2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/actuator/health/readiness"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    environment:
+      - JVM_OPTS=-Xmx256m -Xms256m
+    command:
+      - --halo.external-url=${ext_url}
 EOF
     fi
 
     # ------------------ 启动集群 ------------------
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Cloudreve 服务中...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Halo 服务中...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}部署失败，请检查 Docker 日志。${RESET}"
+        echo -e "${RED}====================================================${RESET}"
+        echo -e "${RED} 错误: 容器启动失败，请排查端口占用或日志报错。   ${RESET}"
+        echo -e "${RED}====================================================${RESET}"
         return
     fi
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             Cloudreve 部署成功！                    ${RESET}"
+    echo -e "${GREEN}             Halo 部署成功！                        ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}访问端点(URL) : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}映射宿主机端口 : ${custom_port}${RESET}"
-    echo -e "${YELLOW}离线下载端口   : 6888 (TCP/UDP已开启)${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}内置库密码凭证 : 用户:${db_user} | 密码:${rand_db_pass} | 库名:${db_name}${RESET}"
-    else
-        echo -e "${YELLOW}连接外部数据库 : ${ext_db_host}:${ext_db_port} -> 库名:${ext_db_name}${RESET}"
-        echo -e "${YELLOW}连接外部缓存库 : Redis -> ${ext_rd_host}:${ext_rd_port}${RESET}"
+    echo -e "${YELLOW}后台初始Url   : http://${DETECT_IP}:${custom_port}/console${RESET}"
+    echo -e "${YELLOW}绑定的外部Url : ${ext_url}${RESET}"
+    echo -e "${YELLOW}宿主机映射端口: ${custom_port}${RESET}"
+    echo -ne "${YELLOW}数据库运行模式: ${RESET}"
+    if [[ "$db_mode" == "1" ]]; then 
+        echo -e "${GREEN}全新内置容器 (PostgreSQL 15)${RESET}"
+        echo -e "${YELLOW}内置库高强密码: ${rand_pass}${RESET}"
+    elif [[ "$db_mode" == "2" ]]; then 
+        echo -e "${GREEN}外部连接模式 (目标数据库平台: ${sql_platform^^})${RESET}"
+        echo -e "${YELLOW}连通目标地址  : ${ext_host}:${ext_port}${RESET}"
+        echo -e "${YELLOW}指定目标库名  : ${ext_dbname}${RESET}"
+    else 
+        echo -e "${GREEN}超轻量级本地嵌入式 H2 数据库${RESET}"
     fi
-    echo -e "${YELLOW}部署工作路径   : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}部署工作路径  : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新服务
-update_cloudreve() {
+# 更新镜像
+update_halo() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取 Cloudreve 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取 Halo 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}服务已升级并拉升至最新状态！${RESET}"
+    echo -e "${GREEN}服务更新完成！${RESET}"
 }
 
-# 卸载集群
-uninstall_cloudreve() {
-    echo -ne "${RED}确定要注销并删除 Cloudreve 服务集群吗？(y/n): ${RESET}"
+# 卸载 Halo
+uninstall_halo() {
+    echo -ne "${RED}确定要卸载并删除 Halo 服务吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已全部终止并移除。${RESET}"
-            echo -ne "${RED}是否同步清理掉本地所有挂载的数据卷和数据？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${RED}是否同时删除所有建站源码、主题插件及数据库文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 cd "$BASE_DIR" && docker compose down -v
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}工作目录及数据已被彻底清除。${RESET}"
+                echo -e "${GREEN}所有持久化数据及工作目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f cloudreve-backend postgresql redis 2>/dev/null
+            docker rm -f halo-app halo-db 2>/dev/null
         fi
-        echo -e "${GREEN}完全卸载完毕！${RESET}"
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 周期控制
-start_cr() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已正常启动${RESET}"; }
-stop_cr() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已安全暂停${RESET}"; }
-restart_cr() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已完成软重启${RESET}"; }
-logs_cr() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+# 基础生命周期控制
+start_hl() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}Halo 服务已启动${RESET}"; }
+stop_hl() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}Halo 服务已停止${RESET}"; }
+restart_hl() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}Halo 服务已重启${RESET}"; }
+logs_hl() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
-# 配置显示
+# 显示配置面板
 show_info() {
     get_status_info
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}当前运行状态   : $status"
     echo -e "${YELLOW}实际映射端口   : ${web_port}${RESET}"
-    echo -e "${YELLOW}本地项目路径   : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}工作路径       : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
@@ -309,7 +357,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}      ◈  Cloudreve 管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}        ◈  Halo 管理面板  ◈          ${RESET}"
     echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 当前状态 :${RESET} $status"
     echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
@@ -327,13 +375,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_cloudreve ;;
-        2) update_cloudreve ;;
-        3) uninstall_cloudreve ;;
-        4) start_cr ;;
-        5) stop_cr ;;
-        6) restart_cr ;;
-        7) logs_cr ;;
+        1) install_halo ;;
+        2) update_halo ;;
+        3) uninstall_halo ;;
+        4) start_hl ;;
+        5) stop_hl ;;
+        6) restart_hl ;;
+        7) logs_hl ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

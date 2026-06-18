@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Subboost Docker Compose 管理面板 
+# Nodeget Docker Compose 管理面板
 # =================================================================
 
 # 颜色定义
@@ -10,9 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/subboost"
+BASE_DIR="/opt/nodeget"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
+DEFAULT_IMAGE="genshinmc/nodeget:latest"
 
 # 检测依赖环境
 check_dependencies() {
@@ -22,217 +22,289 @@ check_dependencies() {
     fi
 }
 
+get_public_ip() {
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    echo "127.0.0.1" && return 0
+}
+
 # 动态获取容器整体状态和端口
 get_status_info() {
     if [ -f "$COMPOSE_FILE" ]; then
-        # 检查核心 app 容器状态
-        if [ "$(docker ps -q -f name=subboost-app)" ]; then
+        if [ "$(docker ps -q -f name=nodeget-app)" ]; then
             status="${GREEN}运行中${RESET}"
-        elif [ "$(docker ps -aq -f name=subboost-app)" ]; then
+        elif [ "$(docker ps -aq -f name=nodeget-app)" ]; then
             status="${YELLOW}已停止${RESET}"
         else
             status="${RED}未部署${RESET}"
         fi
         
-        # 从 .env 或 compose 中抓取端口
-        if [ -f "$ENV_FILE" ]; then
-            web_port=$(grep -E "^SUBBOOST_PORT=" "$ENV_FILE" | cut -d'=' -f2 | tr -d '[:space:]')
-        fi
-        [[ -z "$web_port" ]] && web_port="3000"
+        # 精准提取 Nodeget 宿主机映射端口
+        web_port=$(grep -E "\-[[:space:]]*[\"']?([0-9.]+:)?[0-9]+" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $2 ? $2 : $1}' | tr -d '[:space:]"''-/tcp')
+        [[ -z "$web_port" ]] && web_port="2211"
     else
         status="${RED}未初始化${RESET}"
         web_port="N/A"
     fi
 }
 
-# 获取公网 IP (双栈自适应)
-get_public_ip() {
-    local ip=""
-    for url in "https://api.ipify.org" "https://4.ip.sb"; do
-        ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-    done
-    echo "127.0.0.1" && return 0
-}
-
-# 部署 Subboost
-install_subboost() {
+# 部署 Nodeget
+install_nodeget() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入 Subboost 访问端口 [默认: 3000]: ${RESET}"
+    echo -e "${CYAN}====== 数据库模式选择 ======${RESET}"
+    echo -e " 1. 直接部署全新的 PostgreSQL 17 (Docker 容器化)"
+    echo -e " 2. 使用已有的外部/远程 PostgreSQL (自建/云数据库)"
+    echo -e " 3. 使用超轻量级本地 SQLite 数据库"
+    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
+
+    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Nodeget 访问端口 [默认: 2211]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
+    [[ -z "$custom_port" ]] && custom_port="2211"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -ne "${YELLOW}请输入外部访问域名或公网IP (例如 http://1.2.3.4:${custom_port}) [回车自动探测]: ${RESET}"
-    read -r custom_url
-    if [[ -z "$custom_url" ]]; then
-        DETECT_IP=$(get_public_ip)
-        custom_url="http://${DETECT_IP}:${custom_port}"
+    # ------------------ 模式 1：全新 Docker 部署 PostgreSQL 17 ------------------
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}正在配置全新容器化 PostgreSQL 数据库环境...${RESET}"
+        
+        cat << EOF > "$COMPOSE_FILE"
+name: nodeget-postgres
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: nodeget-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nodeget
+      POSTGRES_USER: nodeget
+      POSTGRES_PASSWORD: nodeget
+    volumes:
+      - ${BASE_DIR}/data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U nodeget -d nodeget" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  nodeget:
+    image: ${DEFAULT_IMAGE}
+    container_name: nodeget-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODEGET_DATABASE_URL: postgres://nodeget:nodeget@postgres:5432/nodeget
+    ports:
+      - "${custom_port}:2211"
+    volumes:
+      - ${BASE_DIR}/data/nodeget:/nodeget
+EOF
+
+    # ------------------ 模式 2：连接外部/远程已有 PostgreSQL ------------------
+    elif [[ "$db_mode" == "2" ]]; then
+        echo -e "${CYAN}====== 远程/外部数据库信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_host
+        [[ -z "$ext_host" ]] && ext_host="127.0.0.1"
+        
+        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
+        read -r ext_port
+        [[ -z "$ext_port" ]] && ext_port="5432"
+        
+        echo -ne "${YELLOW}请输入数据库用户名 [默认: nodeget]: ${RESET}"
+        read -r ext_user
+        [[ -z "$ext_user" ]] && ext_user="nodeget"
+        
+        echo -ne "${YELLOW}请输入数据库密码 [默认: nodeget]: ${RESET}"
+        read -r ext_pass
+        [[ -z "$ext_pass" ]] && ext_pass="nodeget"
+        
+        echo -ne "${YELLOW}请输入数据库名 [默认: nodeget]: ${RESET}"
+        read -r ext_dbname
+        [[ -z "$ext_dbname" ]] && ext_dbname="nodeget"
+
+        # 处理本地回环外连突破
+        if [[ "$ext_host" == "127.0.0.1" || "$ext_host" == "localhost" ]]; then
+            ext_host="172.17.0.1"
+            echo -e "${YELLOW}提示: 检测到本地回环地址，已自动桥接至宿主机网卡 IP: 172.17.0.1${RESET}"
+        fi
+
+        cat << EOF > "$COMPOSE_FILE"
+name: nodeget-postgres
+
+services:
+  nodeget:
+    image: ${DEFAULT_IMAGE}
+    container_name: nodeget-app
+    restart: unless-stopped
+    environment:
+      NODEGET_DATABASE_URL: postgres://${ext_user}:${ext_pass}@${ext_host}:${ext_port}/${ext_dbname}
+    ports:
+      - "${custom_port}:2211"
+    volumes:
+      - ${BASE_DIR}/data/nodeget:/nodeget
+EOF
+
+    # ------------------ 模式 3：使用本地轻量级 SQLite 数据库 ------------------
+    else
+        echo -e "${YELLOW}正在配置轻量级本地 SQLite 数据库环境...${RESET}"
+        mkdir -p "${BASE_DIR}/data"
+        
+        cat << EOF > "$COMPOSE_FILE"
+name: nodeget-sqlite
+
+services:
+  nodeget:
+    image: ${DEFAULT_IMAGE}
+    container_name: nodeget-app
+    restart: unless-stopped
+    environment:
+      NODEGET_DATABASE_URL: sqlite:///nodeget/nodeget.db?mode=rwc
+    ports:
+      - "${custom_port}:2211"
+    volumes:
+      - ${BASE_DIR}/data:/nodeget
+EOF
     fi
 
-    # 1. 自动生成高强度安全密钥与密码
-    echo -e "${YELLOW}正在自动生成高强度加密密钥与环境配置...${RESET}"
-    DB_PASS=$(openssl rand -hex 16)
-    ENC_KEY=$(openssl rand -hex 32)
-    JWT_SEC=$(openssl rand -hex 32)
-    CRON_SEC=$(openssl rand -hex 16)
-
-    # 2. 写入 .env 文件
-    cat <<EOF > "$ENV_FILE"
-POSTGRES_DB=subboost
-POSTGRES_USER=subboost
-POSTGRES_PASSWORD=${DB_PASS}
-DATABASE_URL=postgresql://subboost:${DB_PASS}@db:5432/subboost?schema=public
-
-ENCRYPTION_KEY=${ENC_KEY}
-JWT_SECRET=${JWT_SEC}
-CRON_SECRET=${CRON_SEC}
-
-APP_URL=${custom_url}
-SUBBOOST_PORT=${custom_port}
-SUBBOOST_IMAGE=subboost/subboost:latest
-EOF
-
-    # 3. 生成优化的 docker-compose.yml (内含优化的 cron 任务流控制)
-    echo -e "${YELLOW}正在生成规范化 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  db:
-    image: postgres:16-alpine
-    container_name: subboost-db
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: \${POSTGRES_DB:-subboost}
-      POSTGRES_USER: \${POSTGRES_USER:-subboost}
-      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
-    volumes:
-      - subboost-local-db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \$\${POSTGRES_USER} -d \$\${POSTGRES_DB}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  app:
-    image: \${SUBBOOST_IMAGE:?set SUBBOOST_IMAGE}
-    container_name: subboost-app
-    restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-    ports:
-      - "\${SUBBOOST_PORT:-3000}:3000"
-    environment:
-      DATABASE_URL: \${DATABASE_URL:?set DATABASE_URL}
-      ENCRYPTION_KEY: \${ENCRYPTION_KEY:?set ENCRYPTION_KEY}
-      JWT_SECRET: \${JWT_SECRET:?set JWT_SECRET}
-      CRON_SECRET: \${CRON_SECRET:?set CRON_SECRET}
-      APP_URL: \${APP_URL:-http://localhost:3000}
-
-  cron:
-    image: curlimages/curl:8.11.1
-    container_name: subboost-cron
-    restart: unless-stopped
-    depends_on:
-      app:
-        condition: service_started
-    environment:
-      CRON_SECRET: \${CRON_SECRET:?set CRON_SECRET}
-    command: >
-      sh -c '
-      counter=0;
-      while true; do
-        echo "[local-cron] \$(date -Iseconds) POST /api/cron/update-subscriptions"
-        curl -fsS -X POST -H "Authorization: Bearer \${CRON_SECRET}" http://app:3000/api/cron/update-subscriptions || true
-        
-        if [ \$((\$counter % 10)) -eq 0 ]; then
-          echo "[local-cron] \$(date -Iseconds) POST /api/cron/update-rule-index"
-          curl -fsS -X POST -H "Authorization: Bearer \${CRON_SECRET}" http://app:3000/api/cron/update-rule-index || true
-        fi
-        
-        counter=\$((\$counter + 1))
-        sleep 360
-      done
-      '
-
-volumes:
-  subboost-local-db:
-EOF
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Subboost 服务集群...${RESET}"
+    # ------------------ 启动集群 ------------------
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Nodeget 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}====================================================${RESET}"
+        echo -e "${RED} 错误: 容器启动失败。请检查网络环境或数据库配置。   ${RESET}"
+        echo -e "${RED}====================================================${RESET}"
+        return
+    fi
+
+    # ------------------ 自动化获取 Super Token 逻辑 ------------------
+    echo -e "${YELLOW}正在等待容器初始化并提取 Super Token (最多等待 30 秒)...${RESET}"
+    local token=""
+    for i in {1..30}; do
+        sleep 1
+        token=$(docker logs nodeget-app 2>&1 | grep -E 'Super Token')
+        if [[ -n "$token" ]]; then
+            break
+        fi
+        echo -n "."
+    done
+    echo "" # 换行
+
+    DETECT_IP=$(get_public_ip)
+
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             Subboost 部署成功！                    ${RESET}"
+    echo -e "${GREEN}             Nodeget 部署成功！                     ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}应用访问地址   : ${custom_url}${RESET}"
+    echo -e "${YELLOW}应用访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
     echo -e "${YELLOW}宿主机映射端口 : ${custom_port}${RESET}"
-    echo -e "${YELLOW}CRON 鉴权密钥  : ${CRON_SEC}${RESET}"
+    echo -ne "${YELLOW}数据库运行模式 : ${RESET}"
+    if [[ "$db_mode" == "1" ]]; then echo -e "${GREEN}全新内置容器 (PostgreSQL 17)${RESET}"
+    elif [[ "$db_mode" == "2" ]]; then echo -e "${GREEN}外部/远程 PostgreSQL 数据库${RESET}"
+    else echo -e "${GREEN}超轻量级本地 SQLite 数据库${RESET}"; fi
     echo -e "${YELLOW}部署工作目录   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    if [[ -n "$token" ]]; then
+        echo -e "${CYAN}🔑 成功捕获系统凭证：${RESET}"
+        echo -e "${GREEN}${token}${RESET}"
+    else
+        echo -e "${RED}⚠️  捕获超时：未能在 30 秒内自日志中检索到 Super Token。${RESET}"
+        echo -e "${YELLOW}提示: 请稍后在主菜单使用选项 7 (查看运行日志) 手动确认。${RESET}"
+    fi
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新 Subboost 镜像
-update_subboost() {
+# 更新镜像
+update_nodeget() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取 Subboost 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取 Nodeget 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}集群更新完成！${RESET}"
+    echo -e "${GREEN}服务更新完成！${RESET}"
 }
 
-# 卸载 Subboost
-uninstall_subboost() {
-    echo -ne "${RED}确定要卸载并删除 Subboost 容器集群吗？(y/n): ${RESET}"
+# 卸载 Nodeget
+uninstall_nodeget() {
+    echo -ne "${RED}确定要卸载并删除 Nodeget 服务吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}是否同时删除所有数据库数据、密钥和配置文件？(y/n): ${RESET}"
+            echo -ne "${RED}是否同时删除所有持久化本地数据及数据库文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 cd "$BASE_DIR" && docker compose down -v
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}工作目录及 Docker 卷已彻底清理。${RESET}"
+                echo -e "${GREEN}所有数据文件及工作目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f subboost-app subboost-db subboost-cron 2>/dev/null
+            docker rm -f nodeget-app nodeget-db 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 集群基础控制命令
-start_sb() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}Subboost 服务集群已启动${RESET}"; }
-stop_sb() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}Subboost 服务集群已停止${RESET}"; }
-restart_sb() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}Subboost 服务集群已重启${RESET}"; }
-logs_sb() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+# 基础生命周期控制
+start_ng() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}Nodeget 服务已启动${RESET}"; }
+stop_ng() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}Nodeget 服务已停止${RESET}"; }
+restart_ng() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}Nodeget 服务已重启${RESET}"; }
+logs_ng() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
-# 显示核心配置信息面板
+# 显示配置面板与检索当前 Token
 show_info() {
     get_status_info
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}当前运行状态   : $status"
-    if [ -f "$ENV_FILE" ]; then
-        local app_url=$(grep -E "^APP_URL=" "$ENV_FILE" | cut -d'=' -f2)
-        local cron_sec=$(grep -E "^CRON_SECRET=" "$ENV_FILE" | cut -d'=' -f2)
-        echo -e "${YELLOW}外部访问地址   : ${app_url}${RESET}"
+    if [ -f "$COMPOSE_FILE" ]; then
+        local db_url=$(grep -E "NODEGET_DATABASE_URL:" "$COMPOSE_FILE" | awk -F ' ' '{print $2}' || echo "未找到")
         echo -e "${YELLOW}宿主机映射端口 : ${web_port}${RESET}"
-        echo -e "${YELLOW}CRON 鉴权密钥  : ${cron_sec}${RESET}"
-    else
-        echo -e "${RED}未检测到环境配置文件 (.env)${RESET}"
+        echo -e "${YELLOW}连接数据库地址 : ${db_url}${RESET}"
+        echo -e "${GREEN}----------------------------------------------------${RESET}"
+        echo -e "${YELLOW}实时检索系统凭证 :${RESET}"
+        local current_token=$(docker logs nodeget-app 2>&1 | grep -E 'Super Token' | tail -n 1)
+        if [[ -n "$current_token" ]]; then
+            echo -e "${GREEN}${current_token}${RESET}"
+        else
+            echo -e "${RED}未在当前容器运行日志中匹配到 Super Token 记录。${RESET}"
+        fi
     fi
-    echo -e "${YELLOW}部署工作路径   : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}工作路径       : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
@@ -241,7 +313,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}      ◈  Subboost 管理面板  ◈       ${RESET}"
+    echo -e "${GREEN}       ◈  Nodeget 管理面板  ◈        ${RESET}"
     echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 当前状态 :${RESET} $status"
     echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
@@ -259,20 +331,19 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_subboost ;;
-        2) update_subboost ;;
-        3) uninstall_subboost ;;
-        4) start_sb ;;
-        5) stop_sb ;;
-        6) restart_sb ;;
-        7) logs_sb ;;
+        1) install_nodeget ;;
+        2) update_nodeget ;;
+        3) uninstall_nodeget ;;
+        4) start_ng ;;
+        5) stop_ng ;;
+        6) restart_ng ;;
+        7) logs_ng ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 
-# 保持循环交互
 while true; do
     menu
     echo -ne "${YELLOW}按回车键继续...${RESET}"

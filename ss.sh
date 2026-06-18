@@ -1,372 +1,344 @@
 #!/bin/bash
 # =================================================================
-# Transmission Docker Compose 管理面板
+# Dnsmgr Docker Compose 管理面板 (内置库/远程库双模 + 自动建库版)
 # =================================================================
 
-# 颜色
+# 颜色定义
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="transmission"
-BASE_DIR="/opt/transmission"
+BASE_DIR="/opt/dnsmgr"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-WEB_SRC_DIR="$BASE_DIR/web/src"
+DEFAULT_IMAGE="netcccyun/dnsmgr"
 
-# GitHub 仓库信息
-REPO_API="https://api.github.com/repos/hisproc/transmission-next-ui/releases/latest"
-
-# 代理前缀列表（第一个留空代表直连尝试）
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
-
-# 检测依赖
+# 检测依赖环境
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    
-    local missing_deps=()
-    ! command -v unzip &> /dev/null && missing_deps+=("unzip")
-    ! command -v wget &> /dev/null && missing_deps+=("wget")
-    ! command -v curl &> /dev/null && missing_deps+=("curl")
-    
-    if [ ${#missing_deps[@]} -ne 0 ]; then
-        echo -e "${YELLOW}提示: 正在安装缺失的工具 (${missing_deps[*]})...${RESET}"
-        if command -v apt-get &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y wget unzip curl
-        elif command -v yum &> /dev/null; then
-            sudo yum install -y wget unzip curl
-        fi
-    fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
+
+get_public_ip() {
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
+    echo "127.0.0.1" && return 0
+}
+
+# 动态获取容器整体状态和端口
+
 get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
+    if [ -f "$COMPOSE_FILE" ]; then
+        if [ "$(docker ps -q -f name=dnsmgr-web)" ]; then
+            status="${GREEN}运行中${RESET}"
+        elif [ "$(docker ps -aq -f name=dnsmgr-web)" ]; then
+            status="${YELLOW}已停止${RESET}"
+        else
+            status="${RED}未部署${RESET}"
+        fi
+        
+        # 精准定位 dnsmgr-web 服务下的 ports 映射行，提取冒号前的宿主机端口
+        web_port=$(sed -n '/dnsmgr-web:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+        [[ -z "$web_port" ]] && web_port="8081"
     else
-        status="${RED}未部署${RESET}"
-    fi
-
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-    else
-        img_version="${RED}未安装${RESET}"
-    fi
-
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        webui_port=$(grep -E "\-[[:space:]]*[\"']?[0-9]+:9091" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"-')
-        [[ -z "$webui_port" ]] && webui_port="9091"
-
-        download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | tr -d '"' | xargs)
-        [[ -z "$download_dir" ]] && download_dir="$BASE_DIR/downloads"
-    else
-        webui_port="N/A"
-        download_dir="N/A"
+        status="${RED}未初始化${RESET}"
+        web_port="N/A"
     fi
 }
 
-# 提取 Web UI 账号密码
-get_transmission_creds() {
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        local username=$(grep -E "USER=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-        local password=$(grep -E "PASS=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-        echo -e "${GREEN}用户名: ${username} | 密码: ${password}${RESET}"
-    else
-        echo -e "${RED}未部署${RESET}"
-    fi
-}
 
-# 核心下载函数：带代理轮询及重试机制
-download_with_proxy_pool() {
-    local raw_url="$1"
-    local output_path="$2"
-    local download_success=false
 
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        # 拼接代理前缀
-        local final_url="${proxy}${raw_url}"
-        
-        if [[ -z "$proxy" ]]; then
-            echo -e "${YELLOW}正在尝试直连下载...${RESET}"
-        else
-            echo -e "${YELLOW}直连失败或不可用，正在通过代理 [ ${proxy} ] 尝试下载...${RESET}"
-        fi
-        
-        # 使用 wget 下载，设置5秒超时，1次重试
-        if wget --no-check-certificate --timeout=5 --tries=1 -O "$output_path" "$final_url"; then
-            echo -e "${GREEN}下载成功！${RESET}"
-            download_success=true
-            break
-        else
-            echo -e "${RED}当前下载通道失败，正在切换下一个通道...${RESET}"
-        fi
-    done
-
-    if [ "$download_success" = true ]; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# 智能动态在线获取最新版 Web UI
-setup_custom_webui() {
-    echo -ne "${YELLOW}是否自动获取并安装最新版 Next-UI 界面？(y/n) [默认: y]: ${RESET}"
-    read -r enable_ui
-    [[ -z "$enable_ui" ]] && enable_ui="y"
-
-    if [[ "$enable_ui" == "y" || "$enable_ui" == "Y" ]]; then
-        echo -e "${CYAN}--- 正在通过 GitHub API 获取最新版本 ---${RESET}"
-        
-        # 1. 动态获取最新 Release 信息（带代理兜底，防止 API 本身被墙）
-        local api_response=""
-        # 尝试通过代理或者直连获取 API 信息 (API 一般不走普通 GH 代理，通过增加超时重试防挂)
-        api_response=$(curl -s --connect-timeout 5 "$REPO_API")
-        
-        local raw_download_url=""
-        local version_tag=""
-
-        if [[ -z "$api_response" || "$api_response" == *"message"* ]]; then
-            echo -e "${RED}⚠️ 警告: 无法连接到 GitHub API 或触发限制。将启用本地备用静态解析方案。${RESET}"
-            raw_download_url="https://github.com/hisproc/transmission-next-ui/releases/download/v0.3.1/release.zip"
-            version_tag="v0.3.1 (备用)"
-        else
-            raw_download_url=$(echo "$api_response" | grep -E '"browser_download_url":' | grep -i '\.zip' | head -n 1 | awk -F '"' '{print $4}')
-            version_tag=$(echo "$api_response" | grep -E '"tag_name":' | head -n 1 | awk -F '"' '{print $4}')
-        fi
-
-        if [[ -z "$raw_download_url" ]]; then
-            echo -e "${RED}❌ 错误: 无法解析到 zip 压缩包下载地址！将回滚使用原生界面。${RESET}"
-            return 1
-        fi
-
-        echo -e "${GREEN}发现最新版本: ${version_tag}${RESET}"
-        
-        # 2. 清理并创建本地目录
-        echo -e "${YELLOW}正在清理旧的 Web 目录...${RESET}"
-        rm -rf "$WEB_SRC_DIR"
-        mkdir -p "$WEB_SRC_DIR"
-
-        # 3. 调用带代理轮询的下载函数
-        if download_with_proxy_pool "$raw_download_url" "$BASE_DIR/web_ui.zip"; then
-            echo -e "${YELLOW}正在智能解压...${RESET}"
-            mkdir -p "$BASE_DIR/web_tmp"
-            unzip -q "$BASE_DIR/web_ui.zip" -d "$BASE_DIR/web_tmp"
-            
-            # 兼容性处理：判断解压后是直接含 index.html 还是包裹了一层目录
-            if [ $(ls -A "$BASE_DIR/web_tmp" | wc -l) -eq 1 ] && [ -d "$BASE_DIR/web_tmp/$(ls -A $BASE_DIR/web_tmp)" ]; then
-                mv "$BASE_DIR/web_tmp/$(ls -A $BASE_DIR/web_tmp)"/* "$WEB_SRC_DIR/"
-            else
-                mv "$BASE_DIR/web_tmp"/* "$WEB_SRC_DIR/"
-            fi
-
-            # 清理临时文件
-            rm -rf "$BASE_DIR/web_ui.zip" "$BASE_DIR/web_tmp"
-            echo -e "${GREEN}✨ Next-UI (${version_tag}) 静态文件已成功部署！${RESET}"
-            return 0
-        else
-            echo -e "${RED}❌ 严重错误: 所有下载代理通道全部沦陷！将自动回滚为 Transmission 原生界面。${RESET}"
-            return 1
-        fi
-    fi
-    return 1
-}
-
-install_transmission() {
+# 部署 Dnsmgr
+install_dnsmgr() {
     check_dependencies
-    
-    mkdir -p "$BASE_DIR/config" "$BASE_DIR/watch"
+    mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入 Transmission WebUI 访问端口 [默认: 9091]: ${RESET}"
+    echo -e "${CYAN}====== 数据库模式选择 ======${RESET}"
+    echo -e " 1. 直接部署全新的 MySQL 5.7 (Docker 容器化)"
+    echo -e " 2. 使用已有的外部/远程 MySQL (自建/云数据库 RDS)"
+    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
+
+    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Dnsmgr Web 访问端口 [默认: 8081]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="9091"
+    [[ -z "$custom_port" ]] && custom_port="8081"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -ne "${YELLOW}请输入 Transmission Peer 传入端口 [默认: 51413]: ${RESET}"
-    read -r peer_port
-    [[ -z "$peer_port" ]] && peer_port="51413"
+    # ------------------ 模式 1：全新 Docker 部署 MySQL 5.7 ------------------
+    if [[ "$db_mode" == "1" ]]; then
+        echo -ne "${YELLOW}请为全新 MySQL 设置 root 密码 [默认: 123456]: ${RESET}"
+        read -r db_pass
+        [[ -z "$db_pass" ]] && db_pass="123456"
 
-    echo -ne "${YELLOW}请输入宿主机下载文件存储绝对路径 [默认: $BASE_DIR/downloads]: ${RESET}"
-    read -r custom_download
-    [[ -z "$custom_download" ]] && custom_download="$BASE_DIR/downloads"
+        echo -e "${YELLOW}正在配置全新容器化 MySQL 5.7 数据库环境...${RESET}"
+        
+        mkdir -p "$BASE_DIR/mysql/conf" "$BASE_DIR/mysql/logs" "$BASE_DIR/mysql/data" "$BASE_DIR/web"
+        
+        if [ ! -f "$BASE_DIR/mysql/conf/my.cnf" ]; then
+            cat << EOF > "$BASE_DIR/mysql/conf/my.cnf"
+[mysqld]
+user=mysql
+default-storage-engine=INNODB
+character-set-server=utf8mb4
+collation-server=utf8mb4_unicode_ci
+EOF
+        fi
 
-    echo -ne "${YELLOW}请设置 WebUI 登录用户名 [默认: transmission]: ${RESET}"
-    read -r ui_user
-    [[ -z "$ui_user" ]] && ui_user="transmission"
-
-    echo -ne "${YELLOW}请设置 WebUI 登录密码 [默认: transmission]: ${RESET}"
-    read -r ui_pass
-    [[ -z "$ui_pass" ]] && ui_pass="transmission"
-
-    # 执行智能化 UI 部署
-    setup_custom_webui
-    has_custom_ui=$?
-
-    # 获取执行脚本用户的 UID/GID 并创建存储目录
-    CURRENT_UID=$(id -u)
-    CURRENT_GID=$(id -g)
-    mkdir -p "$custom_download"
-    
-    # 生成标准的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
-    
-    local env_web_home=""
-    local volume_web_src=""
-    
-    if [ $has_custom_ui -eq 0 ]; then
-        env_web_home="- TRANSMISSION_WEB_HOME=/src"
-        volume_web_src="- ${WEB_SRC_DIR}:/src"
-    fi
-
-    cat <<EOF > "$COMPOSE_FILE"
+        cat << EOF > "$COMPOSE_FILE"
 services:
-  transmission:
-    image: linuxserver/transmission:4.0.0
-    container_name: ${CONTAINER_NAME}
-    environment:
-      - PUID=${CURRENT_UID}
-      - PGID=${CURRENT_GID}
-      - UMASK=022
-      ${env_web_home}
-      - TZ=Asia/Shanghai
-      - USER=${ui_user}
-      - PASS=${ui_pass}
-    volumes:
-      ${volume_web_src}
-      - ${BASE_DIR}/config:/config
-      - ${custom_download}:/downloads
-      - ${BASE_DIR}/watch:/watch
-    ports:
-      - "${custom_port}:9091"
-      - "${peer_port}:51413"
-      - "${peer_port}:51413/udp"
+  dnsmgr-web:
+    container_name: dnsmgr-web
+    image: ${DEFAULT_IMAGE}
     restart: unless-stopped
+    stdin_open: true
+    tty: true
+    ports:
+      - "${custom_port}:80"
+    volumes:
+      - ${BASE_DIR}/web:/app/www
+    depends_on:
+      dnsmgr-mysql:
+        condition: service_healthy
+    networks:
+      - dnsmgr-network
+
+  dnsmgr-mysql:
+    container_name: dnsmgr-mysql
+    image: mysql:5.7
+    restart: always
+    ports:
+      - "3306:3306"
+    volumes:
+      - ${BASE_DIR}/mysql/conf/my.cnf:/etc/mysql/my.cnf
+      - ${BASE_DIR}/mysql/logs:/logs
+      - ${BASE_DIR}/mysql/data:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${db_pass}
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p${db_pass}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - dnsmgr-network
+
+networks:
+  dnsmgr-network:
+    driver: bridge
 EOF
 
-    chmod -R 777 "$BASE_DIR" "$custom_download"
+        echo -e "${YELLOW}正在通过 Docker Compose 启动 Dnsmgr 容器集群...${RESET}"
+        cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Transmission...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}错误: 容器集群启动失败。${RESET}"
+            return
+        fi
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+        # 核心：利用刚刚健康的本地 mysql 容器一键自动创建 dnsmgr 数据库
+        echo -e "${YELLOW}正在内置 MySQL 容器中自动创建 'dnsmgr' 数据库...${RESET}"
+        docker exec -i dnsmgr-mysql mysql -uroot -p"${db_pass}" -e "CREATE DATABASE IF NOT EXISTS dnsmgr CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null
+        echo -e "${GREEN}数据库 dnsmgr 创建/检查成功！${RESET}"
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Transmission 部署成功！    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://127.0.0.1:${custom_port}${RESET}"
-    get_transmission_creds
-    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR/config${RESET}"
-    echo -e "${YELLOW}宿主机下载路径 : $custom_download${RESET}"
-    echo -e "${YELLOW}Peer 传入端口  : $peer_port (请记得在路由器做端口映射)${RESET}"
-    if [ $has_custom_ui -eq 0 ]; then
-        echo -e "${GREEN}自定义 Web UI  : 已成功启用并自动挂载最新版${RESET}"
+    # ------------------ 模式 2：连接外部/远程已有 MySQL ------------------
+    else
+        echo -e "${CYAN}====== 远程/外部 MySQL 信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 MySQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_host
+        [[ -z "$ext_host" ]] && ext_host="127.0.0.1"
+        
+        echo -ne "${YELLOW}请输入 MySQL 端口 [默认: 3306]: ${RESET}"
+        read -r ext_port
+        [[ -z "$ext_port" ]] && ext_port="3306"
+
+        echo -ne "${YELLOW}请输入 MySQL 用户名 [默认: root]: ${RESET}"
+        read -r ext_user
+        [[ -z "$ext_user" ]] && ext_user="root"
+
+        echo -ne "${YELLOW}请输入 MySQL 密码: ${RESET}"
+        read -r ext_pass
+
+        # 临时存储外连地址，用于稍后创建数据库
+        local db_connect_host="$ext_host"
+
+        # 处理本地回环外连突破
+        if [[ "$ext_host" == "127.0.0.1" || "$ext_host" == "localhost" ]]; then
+            ext_host="172.17.0.1"
+            echo -e "${YELLOW}提示: 检测到本地回环地址，网页配置时请填写宿主机网关 IP: 172.17.0.1${RESET}"
+        fi
+
+        # 核心：使用独立的临时容器去执行远程创建数据库逻辑
+        echo -e "${YELLOW}正在尝试远程连接到 ${db_connect_host}:${ext_port} 并自动创建 'dnsmgr' 数据库...${RESET}"
+        docker run --rm mysql:5.7 mysql -h"${db_connect_host}" -P"${ext_port}" -u"${ext_user}" -p"${ext_pass}" -e "CREATE DATABASE IF NOT EXISTS dnsmgr CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null
+        
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}远程数据库 dnsmgr 创建/检查成功！${RESET}"
+        else
+            echo -e "${RED}⚠️  注意: 自动连接远程库失败，可能是账号无远程建库权限或防火墙拦截。${RESET}"
+            echo -e "${YELLOW}提示: 如果建库失败，请确保目标 MySQL 上已手动存在名为 'dnsmgr' 的数据库，否则网页安装会报错。${RESET}"
+        fi
+
+        mkdir -p "$BASE_DIR/web"
+
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  dnsmgr-web:
+    container_name: dnsmgr-web
+    image: ${DEFAULT_IMAGE}
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    ports:
+      - "${custom_port}:80"
+    volumes:
+      - ${BASE_DIR}/web:/app/www
+EOF
+
+        echo -e "${YELLOW}正在通过 Docker Compose 启动 Dnsmgr Web 服务...${RESET}"
+        cd "$BASE_DIR" && docker compose up -d --force-recreate
     fi
-    echo -e "${GREEN}================================${RESET}"
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}====================================================${RESET}"
+        echo -e "${RED} 错误: 容器启动失败。请检查网络环境。               ${RESET}"
+        echo -e "${RED}====================================================${RESET}"
+        return
+    fi
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}             Dnsmgr 部署成功！                      ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}应用访问地址   : http://${DETECT_IP}:${custom_port}/install${RESET}"
+    echo -e "${YELLOW}宿主机映射端口 : ${custom_port}${RESET}"
+    echo -e "${YELLOW}自动配置数据库 : dnsmgr${RESET}"
+    echo -ne "${YELLOW}数据库运行模式 : ${RESET}"
+    if [[ "$db_mode" == "1" ]]; then 
+        echo -e "${GREEN}全新内置容器 (MySQL 5.7)${RESET}"
+        echo -e "${YELLOW}数据库内部地址 : dnsmgr-mysql:3306${RESET}"
+        echo -e "${YELLOW}数据库初始凭证 : root / ${db_pass}${RESET}"
+    else 
+        echo -e "${GREEN}连接外部/远程已有的 MySQL 数据库${RESET}"
+        echo -e "${YELLOW}网页安装建议目标 : ${ext_host}:${ext_port}${RESET}"
+    fi
+    echo -e "${YELLOW}部署工作目录   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-update_transmission() {
+# 更新镜像
+update_dnsmgr() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    
-    # 更新时同时检测是否有更高级的 WebUI
-    echo -e "${YELLOW}正在检查并更新 WebUI 与核心镜像...${RESET}"
-    if grep -q "TRANSMISSION_WEB_HOME" "$COMPOSE_FILE"; then
-        setup_custom_webui
-    fi
-
+    echo -e "${YELLOW}正在拉取 Dnsmgr 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器与组件已处于最新状态。${RESET}"
+    echo -e "${GREEN}服务更新完成！${RESET}"
 }
 
-uninstall_transmission() {
-    echo -ne "${YELLOW}确定要卸载并删除 Transmission 容器吗？(y/n): ${RESET}"
+# 卸载 Dnsmgr
+uninstall_dnsmgr() {
+    echo -ne "${RED}确定要卸载并删除 Dnsmgr 服务吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和下载的种子文件？(y/n): ${RESET}"
+            echo -ne "${RED}是否同时删除所有网站程序源码、日志及数据库文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                cd "$BASE_DIR" && docker compose down -v
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}所有相关数据文件及工作目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            docker rm -f dnsmgr-web dnsmgr-mysql 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_trans() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_trans() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_trans() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_trans() { docker logs -f "$CONTAINER_NAME"; }
+# 基础生命周期控制
+start_dm() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}Dnsmgr 服务已启动${RESET}"; }
+stop_dm() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}Dnsmgr 服务已停止${RESET}"; }
+restart_dm() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}Dnsmgr 服务已重启${RESET}"; }
+logs_dm() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
+# 显示配置面板
 show_info() {
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://127.0.0.1:${webui_port}${RESET}"
-    echo -ne "${YELLOW}当前认证凭据   : ${RESET}"
-    get_transmission_creds
-    echo -e "${YELLOW}宿主机下载路径 : ${download_dir}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}当前运行状态   : $status"
+    echo -e "${YELLOW}宿主机映射端口 : ${web_port}${RESET}"
+    echo -e "${YELLOW}工作路径       : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
+# 主菜单
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Transmission 管理面板  ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}       ◈  Dnsmgr 管理面板  ◈        ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 当前状态 :${RESET} $status"
+    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 1. 部署启动${RESET}"
+    echo -e "${GREEN} 2. 更新服务${RESET}"
+    echo -e "${GREEN} 3. 卸载服务${RESET}"
+    echo -e "${GREEN} 4. 启动服务${RESET}"
+    echo -e "${GREEN} 5. 停止服务${RESET}"
+    echo -e "${GREEN} 6. 重启服务${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_transmission ;;
-        2) update_transmission ;;
-        3) uninstall_transmission ;;
-        4) start_trans ;;
-        5) stop_trans ;;
-        6) restart_trans ;;
-        7) logs_trans ;;
+        1) install_dnsmgr ;;
+        2) update_dnsmgr ;;
+        3) uninstall_dnsmgr ;;
+        4) start_dm ;;
+        5) stop_dm ;;
+        6) restart_dm ;;
+        7) logs_dm ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

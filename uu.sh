@@ -1,25 +1,82 @@
 #!/bin/bash
 # =================================================================
-# Moments Blog Docker Compose 管理面板 (带远程自动同步数据表版)
+# Filebrowser Docker Compose 管理面板 
 # =================================================================
 
-# 颜色定义
+# 颜色
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/moments"
+CONTAINER_NAME="filebrowser"
+BASE_DIR="/opt/filebrowser"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/moments.env"
-DEFAULT_IMAGE="koalalove/moments-blog:latest"
+JSON_FILE="$BASE_DIR/config/.filebrowser.json"
 
-# 检测依赖环境
+# 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
+    fi
+}
+
+# 动态获取容器状态、映射端口和数据目录
+get_status_info() {
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    # 2. 如果容器存在（不论运行还是停止），从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        # 【优化：从容器状态提取 WebUI 端口】
+        # 优先获取容器绑定的宿主机端口（假设容器内监听的是 80 端口，请根据实际情况修改，比如 Filebrowser 默认通常是 80）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 如果上面指定内部端口没获取到，则兜底获取容器暴露出来的第一个宿主机端口
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 如果容器停止了或没映射端口，则给个默认值
+        [[ -z "$webui_port" ]] && webui_port="8089"
+
+        # 【优化：从容器状态提取下载目录（挂载路径）】
+        # 精准查找容器内挂载到 /srv 的宿主机绝对路径
+        download_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/srv"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 如果没挂载到 /srv，查找包含 filebrowser 的挂载，或者任意第一个挂载作为兜底
+        [[ -z "$download_dir" ]] && download_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 终极兜底默认值
+        [[ -z "$download_dir" ]] && download_dir="/opt/filebrowser/file"
+    else
+        # 容器未安装/未部署时的返回值
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        download_dir="N/A"
+    fi
+}
+
+# 提取 Filebrowser 容器内的初始临时密码
+get_fb_password() {
+    if [ ! "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        echo -e "${RED}容器未部署${RESET}"
+        return
+    fi
+    
+    local log_pass
+    log_pass=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -i "randomly generated password:" | tail -n 1 | awk -F 'randomly generated password:' '{print $2}' | tr -d '[:space:].')
+    
+    if [[ -n "$log_pass" ]]; then
+        echo -e "${GREEN}${log_pass}${RESET}"
+    else
+        echo -e "${YELLOW}未探测到初始密码（可能已被你修改，或日志已被冲刷）${RESET}"
     fi
 }
 
@@ -52,291 +109,172 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器整体状态和端口
-get_status_info() {
-    if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=moments-blog)" ]; then
-            status="${GREEN}运行中${RESET}"
-            web_port=$(docker ps -f name=moments-blog --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
-            if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
-                web_port=$(sed -n '/moments-blog:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
-            fi
-        elif [ "$(docker ps -aq -f name=moments-blog)" ]; then
-            status="${YELLOW}已停止${RESET}"
-            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' moments-blog 2>/dev/null)
-        else
-            status="${RED}未部署${RESET}"
-        fi
-        [[ -z "$web_port" ]] && web_port="80"
-    else
-        status="${RED}未初始化${RESET}"
-        web_port="N/A"
-    fi
-}
-
-# 部署 Moments
-install_moments() {
+install_filebrowser() {
     check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    # 1. 基础参数配置
-    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Moments 宿主机映射访问端口 [默认: 80]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="80"
     
-    echo -ne "${YELLOW}请输入反向代理跳数 TRUST_PROXY (直接公网暴露填 1，前面有宿主机Nginx填 2) [默认: 1]: ${RESET}"
-    read -r trust_proxy
-    [[ -z "$trust_proxy" ]] && trust_proxy="1"
-
-    # 自动生成 64 位强安全 JWT 密钥
-    local jwt_secret=$(openssl rand -hex 64)
-
-    # 2. 数据库运行模式选择
-    echo -e "\n${CYAN}====== PostgreSQL 数据库运行模式选择 ======${RESET}"
-    echo -e " 1) 启动单容器内嵌自带的 PostgreSQL 15 (全自动一体化，推荐)"
-    echo -e " 2) 使用已有的外部/远程外部 PostgreSQL 数据库 (跳过容器自带PG)"
-    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
-    read -r db_mode
-    [[ -z "$db_mode" ]] && db_mode="1"
-
-    local db_host_ip="127.0.0.1"
-    local db_port="5432"
-    local db_user="moments"
-    local db_pass="moments_password"
-    local db_name="moments"
-
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}使用容器内嵌自启数据库，正在生成安全随机密码...${RESET}"
-        db_pass=$(openssl rand -hex 12)
-    else
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 的 IP 或域名 [例如: 47.79.88.134]: ${RESET}"
-        read -r ext_db_ip
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 端口 [默认: 5432]: ${RESET}"
-        read -r ext_db_port
-        [[ -z "$ext_db_port" ]] && ext_db_port="5432"
-        db_host_ip="$ext_db_ip"
-        db_port="$ext_db_port"
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 用户名 [默认: moments]: ${RESET}"
-        read -r db_user
-        [[ -z "$db_user" ]] && db_user="moments"
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 密码: ${RESET}"
-        read -r db_pass
-        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: moments]: ${RESET}"
-        read -r db_name
-        [[ -z "$db_name" ]] && db_name="moments"
-        
-        # 兼容宿主机回环地址
-        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
-            db_host_ip="172.17.0.1"
-        fi
+    # 彻底清理之前由于报错导致 Docker 自动生成的错误“文件夹”
+    if [[ -d "$JSON_FILE" ]]; then
+        rm -rf "$JSON_FILE"
     fi
+    mkdir -p "$BASE_DIR/config"
 
-    # 3. 创建基础持久化数据目录
-    mkdir -p "$BASE_DIR/data/uploads" "$BASE_DIR/data/logs"
-
-    # 4. 组装最终的连接串
-    local database_url="postgresql://${db_user}:${db_pass}@${db_host_ip}:${db_port}/${db_name}"
-
-    # 5. 生成备份供日常查阅的 moments.env
-    cat << EOF > "$ENV_FILE"
-HOST_PORT=${custom_port}
-TRUST_PROXY=${trust_proxy}
-JWT_SECRET=${jwt_secret}
-DB_NAME=${db_name}
-DB_USER=${db_user}
-DB_PASSWORD=${db_pass}
-DATABASE_URL=${database_url}
-EOF
-
-    # 6. 核心自动化【方案 A 落地】：如果用户选了远程数据库，提前借道初始化结构
-    if [[ "$db_mode" == "2" ]]; then
-        echo -e "\n${YELLOW}🔄 检测到配置为远程外部数据库，正在拉取临时环境初始化表结构...${RESET}"
-        docker run --rm \
-          -e DATABASE_URL="${database_url}" \
-          ${DEFAULT_IMAGE} \
-          sh -c "cd /app && npx prisma db push"
-          
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✅ 远程数据库结构 (User, Config 等) 同步成功！${RESET}"
-        else
-            echo -e "${RED}❌ 远程数据库同步失败！请确认输入的账号密码是否正确，且远程数据库已创建空库。${RESET}"
-            echo -ne "${YELLOW}是否强行继续拉起应用服务？(y/n): ${RESET}"
-            read -r force_continue
-            if [[ "$force_continue" != "y" && "$force_continue" != "Y" ]]; then
-                return
-            fi
-        fi
-    fi
-
-    # 7. 生成规范化 Docker Compose 配置文件
-    echo -e "${YELLOW}正在生成规范化 Docker Compose 配置文件...${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        mkdir -p "$BASE_DIR/data/postgres"
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  moments-blog:
-    image: ${DEFAULT_IMAGE}
-    container_name: moments-blog
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:80"
-    volumes:
-      - ./data/uploads:/data/uploads
-      - ./data/logs:/data/logs
-      - ./data/postgres:/var/lib/postgresql/data
-    environment:
-      - JWT_SECRET=${jwt_secret}
-      - DATABASE_URL=${database_url}
-      - NODE_ENV=production
-      - PORT=3001
-      - UPLOAD_DIR=/data/uploads
-      - INTERNAL_API_URL=http://localhost:3001
-      - TRUST_PROXY=${trust_proxy}
-      - PGDATA=/var/lib/postgresql/data
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "5"
-EOF
-    else
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  moments-blog:
-    image: ${DEFAULT_IMAGE}
-    container_name: moments-blog
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:80"
-    volumes:
-      - ./data/uploads:/data/uploads
-      - ./data/logs:/data/logs
-    environment:
-      - JWT_SECRET=${jwt_secret}
-      - DATABASE_URL=${database_url}
-      - NODE_ENV=production
-      - PORT=3001
-      - UPLOAD_DIR=/data/uploads
-      - INTERNAL_API_URL=http://localhost:3001
-      - TRUST_PROXY=${trust_proxy}
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "5"
-EOF
-    fi
-
-    # 8. 清理旧容器并启动新集群
-    echo -e "${YELLOW}正在拉起 Moments 容器架构...${RESET}"
-    cd "$BASE_DIR"
-    docker compose down -v 2>/dev/null
-    docker compose up -d --force-recreate
-
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}错误: 服务拉起失败，请检查端口 ${custom_port} 是否被占用。${RESET}"
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    echo -ne "${YELLOW}请输入 Filebrowser 访问端口 (宿主机端口) [默认: 8089]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8089"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             Moments 博客系统部署成功！               ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}外部访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}初始管理账号   : admin${RESET}"
-    echo -e "${YELLOW}初始默认密码   : Strong1passwd! (登录后请立即前往后台修改)${RESET}"
-    echo -e "----------------------------------------------------"
-    echo -e "${CYAN}[数据库拓扑连接回显]${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}数据库运行状态 : ${GREEN}容器内嵌自带自启 (PostgreSQL 15)${RESET}"
-        echo -e "${YELLOW}分配实例库名   : ${db_name}${RESET}"
-        echo -e "${YELLOW}随机高强密码   : ${GREEN}${db_pass}${RESET}"
-    else
-        echo -e "${YELLOW}数据库运行状态 : ${CYAN}外部远程对接${RESET}"
-        echo -e "${YELLOW}远程目标节点   : ${db_host_ip}:${db_port}${RESET}"
-        echo -e "${YELLOW}指定连接库名   : ${db_name}${RESET}"
-        echo -e "${YELLOW}连接用户名     : ${db_user}${RESET}"
-    fi
-    echo -e "----------------------------------------------------"
-    echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -ne "${YELLOW}请输入宿主机网盘文件存储绝对路径 [默认: /opt/filebrowser/file]: ${RESET}"
+    read -r custom_download
+    [[ -z "$custom_download" ]] && custom_download="/opt/filebrowser/file"
+
+    # 1. 动态创建所需的宿主机目录与空数据库文件
+    mkdir -p "$custom_download"
+    touch "$BASE_DIR/config/filebrowser.db"
+
+    # 2. 核心联动：动态生成对应的 .filebrowser.json 配置文件
+    echo -e "${YELLOW}正在生成对应的 .filebrowser.json 配置文件...${RESET}"
+    cat <<EOF > "$JSON_FILE"
+{
+  "port": 80,
+  "baseURL": "",
+  "address": "",
+  "log": "stdout",
+  "database": "/database.db",
+  "root": "/srv"
+}
+EOF
+    chmod -R 777 "$BASE_DIR" "$custom_download"
+
+    # 3. 移除过时的 version 声明，修正 JSON_FILE 路径挂载 Bug
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    container_name: ${CONTAINER_NAME}
+    restart: always
+    user: "$(id -u):$(id -g)"
+    ports:
+      - "127.0.0.1:${custom_port}:80/tcp"
+    networks:
+      - net
+    volumes:
+      - ${custom_download}:/srv
+      - ${BASE_DIR}/config/filebrowser.db:/database.db
+      - ${JSON_FILE}:/.filebrowser.json
+      - /etc/localtime:/etc/localtime:ro
+
+networks:
+  net:
+    driver: bridge
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Filebrowser...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器初始化并同步密码日志 (约5秒)...${RESET}"
+    sleep 5
+
+    SHOW_IP=$(get_public_ip)
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    Filebrowser 部署成功！    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}网盘访问地址   : http://127.0.0.1:${custom_port}${RESET}"
+    echo -e "${YELLOW}默认用户名     : admin${RESET}"
+    echo -ne "${YELLOW}初始随机密码   : ${RESET}"
+    get_fb_password
+    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR/config${RESET}"
+    echo -e "${YELLOW}宿主机网盘路径 : $custom_download${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新镜像
-update_moments() {
+update_filebrowser() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新 Moments 镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Filebrowser 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}升级完成！${RESET}"
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Moments
-uninstall_moments() {
-    echo -ne "${RED}确定要完全卸载并删除 Moments 服务吗？(y/n): ${RESET}"
+uninstall_filebrowser() {
+    echo -ne "${YELLOW}确定要卸载并删除 Filebrowser 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down -v
-            rm -rf "$BASE_DIR"
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和网盘内的数据？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+            fi
         else
-            docker rm -f moments-blog 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
-        echo -e "${GREEN}完全卸载成功，数据已彻底清理。${RESET}"
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_moments() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
-stop_moments() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
-restart_moments() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
-logs_moments() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+start_fb() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_fb() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_fb() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_fb() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}当前运行状态   : $status"
-    echo -e "${YELLOW}外部提取端口   : ${web_port}${RESET}"
-    echo -e "${YELLOW}安装绝对路径   : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    SHOW_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}网盘访问地址   : http://127.0.0.1:${webui_port}${RESET}"
+    echo -e "${YELLOW}宿主机网盘路径 : ${download_dir}${RESET}"
+    echo -ne "${YELLOW}初始密码探测   : ${RESET}"
+    get_fb_password
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 主菜单管理
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}       ◈  Moments 管理面板  ◈        ${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 当前状态 :${RESET} $status"
-    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 1. 部署启动${RESET}"
-    echo -e "${GREEN} 2. 更新服务${RESET}"
-    echo -e "${GREEN} 3. 卸载服务${RESET}"
-    echo -e "${GREEN} 4. 启动服务${RESET}"
-    echo -e "${GREEN} 5. 停止服务${RESET}"
-    echo -e "${GREEN} 6. 重启服务${RESET}"
-    echo -e "${GREEN} 7. 查看日志${RESET}"
-    echo -e "${GREEN} 8. 查看配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈  Filebrowser 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_moments ;;
-        2) update_moments ;;
-        3) uninstall_moments ;;
-        4) start_moments ;;
-        5) stop_moments ;;
-        6) restart_moments ;;
-        7) logs_moments ;;
+        1) install_filebrowser ;;
+        2) update_filebrowser ;;
+        3) uninstall_filebrowser ;;
+        4) start_fb ;;
+        5) stop_fb ;;
+        6) restart_fb ;;
+        7) logs_fb ;;
         8) show_info ;;
         0) exit 0 ;;
-        *) echo -e "${RED}输入无效${RESET}" ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 

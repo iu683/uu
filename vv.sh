@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Moments Blog Docker Compose 管理面板 (环境全变量注入同步版)
+# Lsky Pro 兰空图床 Docker Compose 管理面板
 # =================================================================
 
 # 颜色定义
@@ -10,10 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/moments"
+BASE_DIR="/opt/lsky-pro"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/moments.env"
-DEFAULT_IMAGE="koalalove/moments-blog:latest"
+CONFIG_FILE="$BASE_DIR/lsky.env"
+DEFAULT_IMAGE="dko0/lsky-pro:latest"
 
 # 检测依赖环境
 check_dependencies() {
@@ -24,193 +24,190 @@ check_dependencies() {
 }
 
 get_public_ip() {
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
-    for url in "https://api.ipify.org" "https://4.ip.sb"; do
-        ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-    done
+    
+    if [[ "$mode" == "v4" ]]; then
+        # 强制获取 IPv4
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        # 强制获取 IPv6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+
+    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
     echo "127.0.0.1" && return 0
 }
 
 # 动态获取容器整体状态和端口
 get_status_info() {
     if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=moments-blog)" ]; then
+        if [ "$(docker ps -q -f name=lsky-pro)" ]; then
             status="${GREEN}运行中${RESET}"
-            web_port=$(docker ps -f name=moments-blog --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
+            web_port=$(docker ps -f name=lsky-pro --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
             if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
-                web_port=$(sed -n '/moments-blog:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+                web_port=$(sed -n '/lsky-pro:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
             fi
-        elif [ "$(docker ps -aq -f name=moments-blog)" ]; then
+        elif [ "$(docker ps -aq -f name=lsky-pro)" ]; then
             status="${YELLOW}已停止${RESET}"
-            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' moments-blog 2>/dev/null)
+            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' lsky-pro 2>/dev/null)
         else
             status="${RED}未部署${RESET}"
         fi
-        [[ -z "$web_port" ]] && web_port="80"
+        [[ -z "$web_port" ]] && web_port="8080"
     else
         status="${RED}未初始化${RESET}"
         web_port="N/A"
     fi
 }
 
-# 部署 Moments
-install_moments() {
+# 部署 Lsky Pro
+install_lsky() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
     # 1. 基础参数配置
     echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Moments 宿主机映射访问端口 [默认: 80]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Lsky Pro 宿主机映射访问端口 [默认: 8089]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="80"
-    
-    echo -ne "${YELLOW}请输入反向代理跳数 TRUST_PROXY (直接公网暴露填 1，前面有宿主机Nginx填 2) [默认: 1]: ${RESET}"
-    read -r trust_proxy
-    [[ -z "$trust_proxy" ]] && trust_proxy="1"
-
-    # 自动生成 64 位强安全 JWT 密钥
-    local jwt_secret=$(openssl rand -hex 64)
+    [[ -z "$custom_port" ]] && custom_port="8089"
 
     # 2. 数据库运行模式选择
-    echo -e "\n${CYAN}====== PostgreSQL 数据库运行模式选择 ======${RESET}"
-    echo -e " 1) 启动单容器内嵌自带的 PostgreSQL 15 (全自动一体化，推荐)"
-    echo -e " 2) 使用已有的外部/远程外部 PostgreSQL 数据库 (跳过容器自带PG)"
+    echo -e "\n${CYAN}====== MySQL 数据库运行模式选择 ======${RESET}"
+    echo -e " 1) 直接部署全新的 MySQL 8.0 容器 (包含本地持久化卷)"
+    echo -e " 2) 使用已有的外部/远程外部 MySQL 数据库 (需提前手动建好空库)"
     echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
     read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
-    local db_host_ip="127.0.0.1"
-    local db_port="5432"
-    local db_user="moments"
-    local db_pass="moments_password"
-    local db_name="moments"
+    local db_host="mysql"
+    local db_port="3306"
+    local db_name="lsky"
+    local db_user="lsky"
+    local db_pass=""
+    local db_root_pass=""
 
     if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}使用容器内嵌自启数据库，正在生成安全随机密码...${RESET}"
+        echo -e "${YELLOW}使用全新内置 MySQL 容器，正在生成高强度随机密码...${RESET}"
         db_pass=$(openssl rand -hex 12)
+        db_root_pass=$(openssl rand -hex 16)
     else
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 的 IP 或域名 [例如: 47.79.88.134]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程 MySQL 的 IP 或域名: ${RESET}"
         read -r ext_db_ip
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 端口 [默认: 5432]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程 MySQL 端口 [默认: 3306]: ${RESET}"
         read -r ext_db_port
-        [[ -z "$ext_db_port" ]] && ext_db_port="5432"
-        db_host_ip="$ext_db_ip"
+        [[ -z "$ext_db_port" ]] && ext_db_port="3306"
+        db_host="$ext_db_ip"
         db_port="$ext_db_port"
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 用户名 [默认: moments]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程 MySQL 用户名 [默认: lsky]: ${RESET}"
         read -r db_user
-        [[ -z "$db_user" ]] && db_user="moments"
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 密码: ${RESET}"
+        [[ -z "$db_user" ]] && db_user="lsky"
+        echo -ne "${YELLOW}请输入远程 MySQL 密码: ${RESET}"
         read -r db_pass
-        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: moments]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: lsky]: ${RESET}"
         read -r db_name
-        [[ -z "$db_name" ]] && db_name="moments"
+        [[ -z "$db_name" ]] && db_name="lsky"
         
-        # 兼容宿主机回环地址
+        # 兼容本地宿主机回环网关
         if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
-            db_host_ip="172.17.0.1"
+            db_host="172.17.0.1"
         fi
     fi
 
-    # 3. 创建基础持久化数据目录
-    mkdir -p "$BASE_DIR/data/uploads" "$BASE_DIR/data/logs"
-
-    # 4. 组装最终的连接串
-    local database_url="postgresql://${db_user}:${db_pass}@${db_host_ip}:${db_port}/${db_name}"
-
-    # 5. 生成备份供日常查阅的 moments.env
-    cat << EOF > "$ENV_FILE"
-HOST_PORT=${custom_port}
-TRUST_PROXY=${trust_proxy}
-JWT_SECRET=${jwt_secret}
-DB_NAME=${db_name}
-DB_USER=${db_user}
-DB_PASSWORD=${db_pass}
-DATABASE_URL=${database_url}
+    # 3. 备份保留凭证配置文件 lsky.env (值全部外加双引号防截断)
+    cat << EOF > "$CONFIG_FILE"
+PORT="${custom_port}"
+DB_HOST="${db_host}"
+DB_PORT="${db_port}"
+MYSQL_DATABASE="${db_name}"
+MYSQL_USER="${db_user}"
+MYSQL_PASSWORD="${db_pass}"
+MYSQL_ROOT_PASSWORD="${db_root_pass}"
 EOF
 
-    # 6. 【核心修复点】：注入 JWT_SECRET 与 NODE_ENV 绕过镜像的入口强校验锁
-    if [[ "$db_mode" == "2" ]]; then
-        echo -e "\n${YELLOW}🔄 检测到配置为远程外部数据库，正在拉取临时环境初始化表结构...${RESET}"
-        docker run --rm \
-          -e DATABASE_URL="${database_url}" \
-          -e JWT_SECRET="${jwt_secret}" \
-          -e NODE_ENV="production" \
-          ${DEFAULT_IMAGE} \
-          sh -c "cd /app && npx prisma db push"
-          
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✅ 远程数据库结构 (User, Config 等) 同步成功！${RESET}"
-        else
-            echo -e "${RED}❌ 远程数据库同步失败！请确认输入的账号密码是否正确，且远程数据库已创建空库。${RESET}"
-            echo -ne "${YELLOW}是否强行继续拉起应用服务？(y/n): ${RESET}"
-            read -r force_continue
-            if [[ "$force_continue" != "y" && "$force_continue" != "Y" ]]; then
-                return
-            fi
-        fi
-    fi
+    # 4. 创建持久化数据目录
+    mkdir -p "$BASE_DIR/data/html"
 
-    # 7. 生成规范化 Docker Compose 配置文件
+    # 5. 生成规范化 Docker Compose 配置文件 (双模彻底分流)
     echo -e "${YELLOW}正在生成规范化 Docker Compose 配置文件...${RESET}"
     if [[ "$db_mode" == "1" ]]; then
-        mkdir -p "$BASE_DIR/data/postgres"
+        # 模式 1：包含本地内置 MySQL 容器及专属桥接网络
+        mkdir -p "$BASE_DIR/data/db"
         cat << EOF > "$COMPOSE_FILE"
+networks:
+  lsky-net:
+
 services:
-  moments-blog:
+  lsky-pro:
     image: ${DEFAULT_IMAGE}
-    container_name: moments-blog
-    restart: unless-stopped
+    container_name: lsky-pro
+    restart: always
     ports:
-      - "${custom_port}:80"
+      - "127.0.0.1:${custom_port}:80"
     volumes:
-      - ./data/uploads:/data/uploads
-      - ./data/logs:/data/logs
-      - ./data/postgres:/var/lib/postgresql/data
+      - ./data/html:/var/www/html
     environment:
-      - JWT_SECRET=${jwt_secret}
-      - DATABASE_URL=${database_url}
-      - NODE_ENV=production
-      - PORT=3001
-      - UPLOAD_DIR=/data/uploads
-      - INTERNAL_API_URL=http://localhost:3001
-      - TRUST_PROXY=${trust_proxy}
-      - PGDATA=/var/lib/postgresql/data
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "5"
+      - DB_HOST=${db_host}
+      - DB_PORT=${db_port}
+      - DB_DATABASE=${db_name}
+      - DB_USERNAME=${db_user}
+      - DB_PASSWORD=${db_pass}
+    depends_on:
+      - mysql
+    networks:
+      - lsky-net
+
+  mysql:
+    image: mysql:8.0
+    container_name: lsky-pro-db
+    restart: always
+    environment:
+      - MYSQL_DATABASE=${db_name}
+      - MYSQL_USER=${db_user}
+      - MYSQL_PASSWORD=${db_pass}
+      - MYSQL_ROOT_PASSWORD=${db_root_pass}
+    command: --default-authentication-plugin=mysql_native_password
+    volumes:
+      - ./data/db:/var/lib/mysql
+    networks:
+      - lsky-net
 EOF
     else
+        # 模式 2：纯净外部远程对接，无本地 mysql 节点，无 lsky-net 网络限制
         cat << EOF > "$COMPOSE_FILE"
 services:
-  moments-blog:
+  lsky-pro:
     image: ${DEFAULT_IMAGE}
-    container_name: moments-blog
-    restart: unless-stopped
+    container_name: lsky-pro
+    restart: always
     ports:
-      - "${custom_port}:80"
+      - "127.0.0.1:${custom_port}:80"
     volumes:
-      - ./data/uploads:/data/uploads
-      - ./data/logs:/data/logs
+      - ./data/html:/var/www/html
     environment:
-      - JWT_SECRET=${jwt_secret}
-      - DATABASE_URL=${database_url}
-      - NODE_ENV=production
-      - PORT=3001
-      - UPLOAD_DIR=/data/uploads
-      - INTERNAL_API_URL=http://localhost:3001
-      - TRUST_PROXY=${trust_proxy}
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "5"
+      - DB_HOST=${db_host}
+      - DB_PORT=${db_port}
+      - DB_DATABASE=${db_name}
+      - DB_USERNAME=${db_user}
+      - DB_PASSWORD=${db_pass}
 EOF
     fi
 
-    # 8. 清理旧容器并启动新集群
-    echo -e "${YELLOW}正在拉起 Moments 容器架构...${RESET}"
+    # 6. 清理残余并拉起容器集群
+    echo -e "${YELLOW}正在通过 Docker Compose 部署图床环境...${RESET}"
     cd "$BASE_DIR"
     docker compose down -v 2>/dev/null
     docker compose up -d --force-recreate
@@ -222,59 +219,60 @@ EOF
 
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             Moments 博客系统部署成功！               ${RESET}"
+    echo -e "${GREEN}             Lsky Pro 图床系统部署成功！              ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}外部访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}初始管理账号   : admin${RESET}"
-    echo -e "${YELLOW}初始默认密码   : Strong1passwd! (登录后请立即前往后台修改)${RESET}"
+    echo -e "${YELLOW}内部提取端口   : ${custom_port} (绑定在 127.0.0.1)${RESET}"
+    echo -e "${YELLOW}本地 Nginx 反代: http://127.0.0.1:${custom_port}${RESET}"
     echo -e "----------------------------------------------------"
-    echo -e "${CYAN}[数据库拓扑连接回显]${RESET}"
+    echo -e "${CYAN}[数据库凭据回显]${RESET}"
     if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}数据库运行状态 : ${GREEN}容器内嵌自带自启 (PostgreSQL 15)${RESET}"
-        echo -e "${YELLOW}分配实例库名   : ${db_name}${RESET}"
-        echo -e "${YELLOW}随机高强密码   : ${GREEN}${db_pass}${RESET}"
+        echo -e "${YELLOW}MySQL 运行模式 : ${GREEN}全新内置容器 (MySQL 8.0)${RESET}"
+        echo -e "${YELLOW}MySQL 地址 : ${GREEN}mysql${RESET}"
+        echo -e "${YELLOW}MySQL 数据库名 : ${GREEN}${db_name}${RESET}"
+        echo -e "${YELLOW}MySQL 用户名 : ${GREEN}${db_user}${RESET}"
+        echo -e "${YELLOW}常规用户密码   : ${GREEN}${db_pass}${RESET}"
+        echo -e "${YELLOW}ROOT 超管密码  : ${GREEN}${db_root_pass}${RESET}"
     else
-        echo -e "${YELLOW}数据库运行状态 : ${CYAN}外部远程对接${RESET}"
-        echo -e "${YELLOW}远程目标节点   : ${db_host_ip}:${db_port}${RESET}"
-        echo -e "${YELLOW}指定连接库名   : ${db_name}${RESET}"
-        echo -e "${YELLOW}连接用户名     : ${db_user}${RESET}"
+        echo -e "${YELLOW}MySQL 运行模式 : ${CYAN}外部远程连接${RESET}"
+        echo -e "${YELLOW}远程目标主机   : ${db_host}:${db_port}${RESET}"
+        echo -e "${YELLOW}连接指定库名   : ${db_name}${RESET}"
     fi
     echo -e "----------------------------------------------------"
     echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新镜像
-update_moments() {
+# 更新图床
+update_lsky() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新 Moments 镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新 Lsky Pro 镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}升级完成！${RESET}"
 }
 
-# 卸载 Moments
-uninstall_moments() {
-    echo -ne "${RED}确定要完全卸载并删除 Moments 服务吗？(y/n): ${RESET}"
+# 卸载图床
+uninstall_lsky() {
+    echo -ne "${RED}确定要完全卸载并删除 Lsky Pro 服务吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down -v
             rm -rf "$BASE_DIR"
         else
-            docker rm -f moments-blog 2>/dev/null
+            docker rm -f lsky-pro lsky-pro-db 2>/dev/null
         fi
         echo -e "${GREEN}完全卸载成功，数据已彻底清理。${RESET}"
     fi
 }
 
-start_moments() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
-stop_moments() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
-restart_moments() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
-logs_moments() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+start_lsky() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
+stop_lsky() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
+restart_lsky() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
+logs_lsky() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
 show_info() {
     get_status_info
@@ -290,7 +288,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}       ◈  Moments 管理面板  ◈        ${RESET}"
+    echo -e "${GREEN}     ◈  Lsky Pro 管理面板  ◈        ${RESET}"
     echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 当前状态 :${RESET} $status"
     echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
@@ -308,13 +306,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_moments ;;
-        2) update_moments ;;
-        3) uninstall_moments ;;
-        4) start_moments ;;
-        5) stop_moments ;;
-        6) restart_moments ;;
-        7) logs_moments ;;
+        1) install_lsky ;;
+        2) update_lsky ;;
+        3) uninstall_lsky ;;
+        4) start_lsky ;;
+        5) stop_lsky ;;
+        6) restart_lsky ;;
+        7) logs_lsky ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效${RESET}" ;;

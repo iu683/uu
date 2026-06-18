@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Moments Blog Docker Compose 管理面板 (PostgreSQL 远程切换版)
+# Moments Blog Docker Compose 管理面板
 # =================================================================
 
 # 颜色定义
@@ -81,86 +81,110 @@ install_moments() {
 
     # 1. 基础参数配置
     echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Moments 宿主机映射访问端口 [默认: 8080]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Moments 宿主机映射访问端口 [默认: 80]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
+    [[ -z "$custom_port" ]] && custom_port="80"
     
-    echo -ne "${YELLOW}请输入管理员用户名 [默认: admin]: ${RESET}"
-    read -r admin_username
-    [[ -z "$admin_username" ]] && admin_username="admin"
+    echo -ne "${YELLOW}请输入反向代理跳数 TRUST_PROXY (直接公网暴露填 1，前面有宿主机Nginx填 2) [默认: 1]: ${RESET}"
+    read -r trust_proxy
+    [[ -z "$trust_proxy" ]] && trust_proxy="1"
 
-    # 自动生成 32 位强 JWT 密钥和高强度数据库密码
-    local jwt_secret=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 32)
+    # 自动生成 64 位强安全 JWT 密钥
+    local jwt_secret=$(openssl rand -hex 64)
 
     # 2. 数据库运行模式选择
     echo -e "\n${CYAN}====== PostgreSQL 数据库运行模式选择 ======${RESET}"
-    echo -e " 1) 直接部署全新的 PostgreSQL 15 容器 (包含本地持久化卷)"
-    echo -e " 2) 使用已有的外部/远程 PostgreSQL 数据库 (需提前手动建好空库)"
+    echo -e " 1) 启动单容器内嵌自带的 PostgreSQL 15 (全自动一体化，推荐)"
+    echo -e " 2) 使用已有的外部/远程外部 PostgreSQL 数据库 (跳过容器自带PG)"
     echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
     read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
-    local db_host_ip="db"
+    local db_host_ip="127.0.0.1"
     local db_port="5432"
     local db_user="moments"
-    local db_pass=""
+    local db_pass="moments_password"
     local db_name="moments"
-    local admin_password=""
 
     if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}正在自动计算生成高强度随机密码...${RESET}"
+        echo -e "${YELLOW}使用容器内嵌自启数据库，正在生成安全随机密码...${RESET}"
         db_pass=$(openssl rand -hex 12)
-        admin_password=$(openssl rand -hex 10)
     else
-        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [例如: 47.79.88.134]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 的 IP 或域名 [例如: 47.79.88.134]: ${RESET}"
         read -r ext_db_ip
-        echo -ne "${YELLOW}请输入外部 PostgreSQL 端口 [默认: 5432]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 端口 [默认: 5432]: ${RESET}"
         read -r ext_db_port
         [[ -z "$ext_db_port" ]] && ext_db_port="5432"
         db_host_ip="$ext_db_ip"
         db_port="$ext_db_port"
-        echo -ne "${YELLOW}请输入外部 PostgreSQL 用户名 [默认: moments]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 用户名 [默认: moments]: ${RESET}"
         read -r db_user
         [[ -z "$db_user" ]] && db_user="moments"
-        echo -ne "${YELLOW}请输入外部 PostgreSQL 密码: ${RESET}"
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 密码: ${RESET}"
         read -r db_pass
-        echo -ne "${YELLOW}请输入外部已存在的数据库名 [默认: moments]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: moments]: ${RESET}"
         read -r db_name
         [[ -z "$db_name" ]] && db_name="moments"
-        echo -ne "${YELLOW}请设置您的管理员登录密码 (至少6位): ${RESET}"
-        read -r admin_password
         
-        # 兼容本地宿主机回环网关
+        # 兼容宿主机回环地址
         if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
             db_host_ip="172.17.0.1"
         fi
     fi
 
-    # 3. 创建持久化数据目录
+    # 3. 创建基础持久化数据目录
     mkdir -p "$BASE_DIR/data/uploads" "$BASE_DIR/data/logs"
 
-    # 4. 生成 100% 格式对齐的 moments.env 配置文件
-    echo -e "\n${YELLOW}正在生成环境变量配置文件 (moments.env)...${RESET}"
+    # 4. 组装最终的连接串
+    local database_url="postgresql://${db_user}:${db_pass}@${db_host_ip}:${db_port}/${db_name}"
+
+    # 5. 生成备份供日常查阅的 moments.env
     cat << EOF > "$ENV_FILE"
 HOST_PORT=${custom_port}
+TRUST_PROXY=${trust_proxy}
+JWT_SECRET=${jwt_secret}
 DB_NAME=${db_name}
 DB_USER=${db_user}
 DB_PASSWORD=${db_pass}
-
-ADMIN_USERNAME=${admin_username}
-ADMIN_PASSWORD=${admin_password}
-
-JWT_SECRET=${jwt_secret}
+DATABASE_URL=${database_url}
 EOF
 
-    # 5. 动态拼接生成复合型的数据库全局连接串 (DATABASE_URL)
-    local database_url="postgresql://${db_user}:${db_pass}@${db_host_ip}:${db_port}/${db_name}"
-
-    # 6. 生成核心 docker-compose.yml 文本
-    echo -e "${YELLOW}正在生成 Docker Compose 配置文件...${RESET}"
-    cat << EOF > "$COMPOSE_FILE"
+    # 6. 【核心修复点】采用完全独立的 if-else 分流生成 YML，绝不交叉追加导致 Key 重复
+    echo -e "${YELLOW}正在生成规范化 Docker Compose 配置文件...${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        # 模式 1：包含 PGDATA 变量以及数据库卷挂载
+        mkdir -p "$BASE_DIR/data/postgres"
+        cat << EOF > "$COMPOSE_FILE"
 services:
-
+  moments-blog:
+    image: ${DEFAULT_IMAGE}
+    container_name: moments-blog
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:80"
+    volumes:
+      - ./data/uploads:/data/uploads
+      - ./data/logs:/data/logs
+      - ./data/postgres:/var/lib/postgresql/data
+    environment:
+      - JWT_SECRET=${jwt_secret}
+      - DATABASE_URL=${database_url}
+      - NODE_ENV=production
+      - PORT=3001
+      - UPLOAD_DIR=/data/uploads
+      - INTERNAL_API_URL=http://localhost:3001
+      - TRUST_PROXY=${trust_proxy}
+      - PGDATA=/var/lib/postgresql/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+EOF
+    else
+        # 模式 2：纯净远程对接，移除本地数据库存储卷以及 PGDATA 声明
+        cat << EOF > "$COMPOSE_FILE"
+services:
   moments-blog:
     image: ${DEFAULT_IMAGE}
     container_name: moments-blog
@@ -171,61 +195,29 @@ services:
       - ./data/uploads:/data/uploads
       - ./data/logs:/data/logs
     environment:
-      JWT_SECRET: "\${JWT_SECRET}"
-      ADMIN_USERNAME: "\${ADMIN_USERNAME}"
-      ADMIN_PASSWORD: "\${ADMIN_PASSWORD}"
-      DATABASE_URL: "${database_url}"
-      NODE_ENV: production
-      PORT: 3001
-      UPLOAD_DIR: /data/uploads
-      INTERNAL_API_URL: http://localhost:3001
-    networks:
-      - moments-net
-EOF
-
-    # 动态追加依赖与内置本地 PG 数据库节点
-    if [[ "$db_mode" == "1" ]]; then
-        # 为应用容器追加 depends_on 约束
-        sed -i '/    networks:/i \    depends_on:\n      db:\n        condition: service_healthy' "$COMPOSE_FILE"
-        
-        mkdir -p "$BASE_DIR/data/postgres"
-        cat << EOF >> "$COMPOSE_FILE"
-
-  db:
-    image: postgres:15-alpine
-    container_name: moments-db
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: \${DB_NAME}
-      POSTGRES_USER: \${DB_USER}
-      POSTGRES_PASSWORD: \${DB_PASSWORD}
-      PGDATA: /var/lib/postgresql/data/pgdata
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data/pgdata
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \${DB_USER} -d \${DB_NAME}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - moments-net
+      - JWT_SECRET=${jwt_secret}
+      - DATABASE_URL=${database_url}
+      - NODE_ENV=production
+      - PORT=3001
+      - UPLOAD_DIR=/data/uploads
+      - INTERNAL_API_URL=http://localhost:3001
+      - TRUST_PROXY=${trust_proxy}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 EOF
     fi
 
-    # 追加底层网络拓扑结构
-    cat << EOF >> "$COMPOSE_FILE"
-
-networks:
-  moments-net:
-    driver: bridge
-EOF
-
-    # 7. 执行一键拉起
-    echo -e "${YELLOW}正在启动 Moments 容器集群...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    # 7. 清理旧容器并启动新集群
+    echo -e "${YELLOW}正在拉起 Moments 容器架构...${RESET}"
+    cd "$BASE_DIR"
+    docker compose down -v 2>/dev/null
+    docker compose up -d --force-recreate
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}错误: 架构拉起失败，请检查端口是否被占用。${RESET}"
+        echo -e "${RED}错误: 服务拉起失败，请检查端口 ${custom_port} 是否被占用。${RESET}"
         return
     fi
 
@@ -234,26 +226,19 @@ EOF
     echo -e "${GREEN}             Moments 博客系统部署成功！               ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}外部访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}管理员账号     : ${GREEN}${admin_username}${RESET}"
-    echo -e "${YELLOW}管理员密码     : ${GREEN}${admin_password}${RESET}"
+    echo -e "${YELLOW}初始管理账号   : admin${RESET}"
+    echo -e "${YELLOW}初始默认密码   : Strong1passwd! (登录后请立即前往后台修改)${RESET}"
     echo -e "----------------------------------------------------"
-    echo -e "${CYAN}[数据库凭据回显]${RESET}"
+    echo -e "${CYAN}[数据库拓扑连接回显]${RESET}"
     if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}PGSQL 运行模式 : ${GREEN}全新内置容器 (PostgreSQL 15)${RESET}"
-        echo -e "${YELLOW}内置连接地址   : db${RESET}"
-        echo -e "${YELLOW}内置实例库名   : ${db_name}${RESET}"
-        echo -e "${YELLOW}连接用户名     : ${db_user}${RESET}"
-        echo -e "${YELLOW}内置访问密码   : ${GREEN}${db_pass}${RESET}"
+        echo -e "${YELLOW}数据库运行状态 : ${GREEN}容器内嵌自带自启 (PostgreSQL 15)${RESET}"
+        echo -e "${YELLOW}分配实例库名   : ${db_name}${RESET}"
+        echo -e "${YELLOW}随机高强密码   : ${GREEN}${db_pass}${RESET}"
     else
-        echo -e "${YELLOW}PGSQL 运行模式 : ${CYAN}外部远程连接${RESET}"
-        echo -e "${YELLOW}远程目标主机   : ${db_host_ip}:${db_port}${RESET}"
-        echo -e "${YELLOW}连接指定库名   : ${db_name}${RESET}"
+        echo -e "${YELLOW}数据库运行状态 : ${CYAN}外部远程对接${RESET}"
+        echo -e "${YELLOW}远程目标节点   : ${db_host_ip}:${db_port}${RESET}"
+        echo -e "${YELLOW}指定连接库名   : ${db_name}${RESET}"
         echo -e "${YELLOW}连接用户名     : ${db_user}${RESET}"
-        echo -e "${YELLOW}连接密码       : ****** (您输入的外部密码)${RESET}"
-        echo -e "----------------------------------------------------"
-        echo -e "${RED}【重要提醒】${RESET}"
-        echo -e "${YELLOW}请确保远程 PostgreSQL 放行了容器主机的访问，且执行过：${RESET}"
-        echo -e "${GREEN}GRANT ALL PRIVILEGES ON DATABASE ${db_name} TO ${db_user};${RESET}"
     fi
     echo -e "----------------------------------------------------"
     echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
@@ -281,7 +266,7 @@ uninstall_moments() {
             cd "$BASE_DIR" && docker compose down -v
             rm -rf "$BASE_DIR"
         else
-            docker rm -f moments-blog moments-db 2>/dev/null
+            docker rm -f moments-blog 2>/dev/null
         fi
         echo -e "${GREEN}完全卸载成功，数据已彻底清理。${RESET}"
     fi
@@ -319,7 +304,7 @@ menu() {
     echo -e "${GREEN} 6. 重启服务${RESET}"
     echo -e "${GREEN} 7. 查看日志${RESET}"
     echo -e "${GREEN} 8. 查看配置${RESET}"
-    echo -e "${{GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}====================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice

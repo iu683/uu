@@ -1,291 +1,252 @@
 #!/bin/bash
-# =================================================================
-# Umami 网站统计系统 Docker Compose 管理面板 (特殊字符字符隔离版)
-# =================================================================
 
-# 颜色定义
-RED="\033[31m"
+# ================== 颜色定义 ==================
 GREEN="\033[32m"
+RED="\033[31m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/umami"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/umami.env"
+# ================== 检查是否 root ==================
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请使用 root 用户运行此脚本！${RESET}"
+    exit 1
+fi
 
-# 检测依赖环境
+# ================== 配置信息 ==================
+INSTALL_DIR="/www/wwwroot/mcy-shop"
+DOWNLOAD_URL="https://wiki.mcy.im/download.php?q=27"
+
+# ================== 依赖环境检测与安装 ==================
 check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
-    fi
-}
-
-get_public_ip() {
-    local ip=""
-    for url in "https://api.ipify.org" "https://4.ip.sb"; do
-        ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-    done
-    echo "127.0.0.1" && return 0
-}
-
-# 动态获取容器整体状态和端口
-get_status_info() {
-    if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=umami)" ]; then
-            status="${GREEN}运行中${RESET}"
-            web_port=$(docker ps -f name=umami --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
-            if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
-                web_port=$(sed -n '/umami:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
-            fi
-        elif [ "$(docker ps -aq -f name=umami)" ]; then
-            status="${YELLOW}已停止${RESET}"
-            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' umami 2>/dev/null)
+    if ! command -v unzip &> /dev/null; then
+        echo -e "${YELLOW}检测到系统缺少 unzip 工具，正在尝试自动安装...${RESET}"
+        if command -v apt-get &> /dev/null; then
+            apt-get update && apt-get install -y unzip
+        elif command -v yum &> /dev/null; then
+            yum install -y unzip
+        elif command -v dnf &> /dev/null; then
+            dnf install -y unzip
         else
-            status="${RED}未部署${RESET}"
+            echo -e "${RED}未找到包管理器，请手动安装 unzip 后重试！${RESET}"
+            exit 1
         fi
-        [[ -z "$web_port" ]] && web_port="3000"
-    else
-        status="${RED}未初始化${RESET}"
-        web_port="N/A"
+    fi
+
+    if ! command -v wget &> /dev/null; then
+        echo -e "${YELLOW}检测到系统缺少 wget 工具，正在尝试自动安装...${RESET}"
+        if command -v apt-get &> /dev/null; then
+            apt-get install -y wget
+        elif command -v yum &> /dev/null; then
+            yum install -y wget
+        fi
     fi
 }
 
-# 部署 Umami
-install_umami() {
+# ================== 检查服务状态 ==================
+check_status() {
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "$INSTALL_DIR/bin" ]; then
+        echo -e "${RED}服务状态: 未安装 (请选择 5 进行系统安装)${RESET}"
+        return
+    fi
+    cd "$INSTALL_DIR"
+    STATUS=$(mcy service.start 2>&1 | grep -i "already running")
+    if [ -n "$STATUS" ]; then
+        echo -e "${GREEN}服务状态: 运行中${RESET}"
+    else
+        echo -e "${YELLOW}服务状态: 未启动${RESET}"
+    fi
+}
+
+# ================== 核心安装函数 ==================
+mcy_install() {
+    echo -e "${GREEN}开始执行全新安装流程...${RESET}"
     check_dependencies
-    mkdir -p "$BASE_DIR"
+    
+    echo -e "${GREEN}开始下载最新版安装包...${RESET}"
+    mkdir -p "$INSTALL_DIR"
+    wget -O /tmp/mcy-latest.zip "$DOWNLOAD_URL"
 
-    # 1. 基础参数配置
-    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Umami 宿主机映射访问端口 [默认: 3000]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
+    echo -e "${GREEN}解压安装包到 $INSTALL_DIR ...${RESET}"
+    unzip -o /tmp/mcy-latest.zip -d "$INSTALL_DIR"
 
-    # 自动生成 Umami 的哈希加盐密钥 (排除特殊字符干扰)
-    local app_secret=$(openssl rand -hex 32)
-
-    # 2. 数据库运行模式选择
-    echo -e "\n${CYAN}====== PostgreSQL 数据库运行模式选择 ======${RESET}"
-    echo -e " 1) 直接部署全新的 PostgreSQL 15 容器 (包含本地持久化卷)"
-    echo -e " 2) 使用已有的外部/远程 PostgreSQL 数据库 (需提前手动建好空库)"
-    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
-    read -r db_mode
-    [[ -z "$db_mode" ]] && db_mode="1"
-
-    local db_host_ip="db"
-    local db_port="5432"
-    local db_user="umami"
-    local db_pass=""
-    local db_name="umami"
-
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}使用全新内置数据库容器，正在生成高强度随机密码...${RESET}"
-        db_pass=$(openssl rand -hex 16)
-    else
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 的 IP 或域名 [例如: 47.79.88.134]: ${RESET}"
-        read -r ext_db_ip
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 端口 [默认: 5432]: ${RESET}"
-        read -r ext_db_port
-        [[ -z "$ext_db_port" ]] && ext_db_port="5432"
-        db_host_ip="$ext_db_ip"
-        db_port="$ext_db_port"
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 用户名 [默认: umami]: ${RESET}"
-        read -r db_user
-        [[ -z "$db_user" ]] && db_user="umami"
-        echo -ne "${YELLOW}请输入远程 PostgreSQL 密码: ${RESET}"
-        read -r db_pass
-        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: umami]: ${RESET}"
-        read -r db_name
-        [[ -z "$db_name" ]] && db_name="umami"
-        
-        # 兼容本地宿主机回环网关
-        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
-            db_host_ip="172.17.0.1"
-        fi
+    if [ ! -f "$INSTALL_DIR/bin" ]; then
+        echo -e "${RED}解压失败或文件不完整，请检查上方日志！${RESET}"
+        return 1
     fi
 
-    # 3. 动态拼接生成强连接串
-    local database_url="postgresql://${db_user}:${db_pass}@${db_host_ip}:${db_port}/${db_name}"
+    echo -e "${GREEN}设置程序权限...${RESET}"
+    chmod 777 "$INSTALL_DIR/bin" "$INSTALL_DIR/console.sh"
 
-    # 4. 备份保留凭证文件 umami.env (值全部外加双引号)
-    cat << EOF > "$ENV_FILE"
-HOST_PORT="${custom_port}"
-APP_SECRET="${app_secret}"
-DB_NAME="${db_name}"
-DB_USER="${db_user}"
-DB_PASSWORD="${db_pass}"
-DATABASE_URL="${database_url}"
-EOF
+    echo -e "${GREEN}进入安装程序目录...${RESET}"
+    cd "$INSTALL_DIR"
 
-    # 5. 完全分流式生成 docker-compose.yml 文本
-    echo -e "${YELLOW}正在生成规范化 Docker Compose 配置文件...${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  db:
-    image: postgres:15-alpine
-    container_name: umami-db
-    environment:
-      POSTGRES_DB: "${db_name}"
-      POSTGRES_USER: "${db_user}"
-      POSTGRES_PASSWORD: "${db_pass}"
-    volumes:
-      - umami-db-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${db_user} -d ${db_name}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: always
+    echo -e "${YELLOW}启动安装程序，请保持 SSH 窗口打开...${RESET}"
+    ./bin index.php
 
-  umami:
-    image: ghcr.io/umami-software/umami:latest
-    container_name: umami
-    ports:
-      - "127.0.0.1:${custom_port}:3000"
-    environment:
-      DATABASE_URL: "${database_url}"
-      APP_SECRET: "${app_secret}"
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: always
-    init: true
-
-volumes:
-  umami-db-data:
-EOF
-    else
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  umami:
-    image: ghcr.io/umami-software/umami:latest
-    container_name: umami
-    ports:
-      - "127.0.0.1:${custom_port}:3000"
-    environment:
-      DATABASE_URL: "${database_url}"
-      APP_SECRET: "${app_secret}"
-    restart: always
-    init: true
-EOF
-    fi
-
-    # 6. 清理残余并重新拉起新集群
-    echo -e "${YELLOW}正在通过 Docker Compose 部署应用状态...${RESET}"
-    cd "$BASE_DIR"
-    docker compose down -v 2>/dev/null
-    docker compose up -d --force-recreate
-
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}错误: 服务拉起失败，请检查端口 ${custom_port} 是否被占用。${RESET}"
-        return
-    fi
-
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             Umami 统计系统部署成功！                 ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}内部提取端口   : ${custom_port} (绑定在 127.0.0.1)${RESET}"
-    echo -e "${YELLOW}本地 Nginx 反代: http://127.0.0.1:${custom_port}${RESET}"
-    echo -e "${YELLOW}默认初始账号   : admin${RESET}"
-    echo -e "${YELLOW}默认初始密码   : umami (登录后请前往设置及时修改)${RESET}"
-    echo -e "----------------------------------------------------"
-    echo -e "${CYAN}[数据库凭据回显]${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}PGSQL 运行模式 : ${GREEN}全新内置容器 (PostgreSQL 15)${RESET}"
-        echo -e "${YELLOW}安全随机密码   : ${GREEN}${db_pass}${RESET}"
-    else
-        echo -e "${YELLOW}PGSQL 运行模式 : ${CYAN}外部远程连接${RESET}"
-        echo -e "${YELLOW}远程目标主机   : ${db_host_ip}:${db_port}${RESET}"
-        echo -e "${YELLOW}连接指定库名   : ${db_name}${RESET}"
-    fi
-    echo -e "----------------------------------------------------"
-    echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}后台基础安装完成！${RESET}"
+    echo -e "${YELLOW}请使用浏览器访问：http://服务器IP:端口 完成网页端的后续安装${RESET}"
 }
 
-# 更新镜像
-update_umami() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
-        return
+# ================== 环境检查中间件 ==================
+ensure_installed() {
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "$INSTALL_DIR/bin" ]; then
+        echo -e "${RED}错误: 检测到程序尚未安装，请先选择选项 5 进行安装！${RESET}"
+        return 1
     fi
-    echo -e "${YELLOW}正在拉取最新 Umami 镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}升级完成！${RESET}"
+    return 0
 }
 
-# 卸载 Umami
-uninstall_umami() {
-    echo -ne "${RED}确定要完全卸载并删除 Umami 服务吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down -v
-            rm -rf "$BASE_DIR"
-        else
-            docker rm -f umami umami-db 2>/dev/null
-        fi
-        echo -e "${GREEN}完全卸载成功，数据已彻底清理。${RESET}"
-    fi
-}
-
-start_umami() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
-stop_umami() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
-restart_umami() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
-logs_umami() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
-
-show_info() {
-    get_status_info
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}当前运行状态   : $status"
-    echo -e "${YELLOW}外部提取端口   : ${web_port}${RESET}"
-    echo -e "${YELLOW}安装绝对路径   : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-
-# 主菜单管理
-menu() {
+# ================== 菜单函数 ==================
+show_menu() {
     clear
-    get_status_info
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}       ◈  Umami 管理面板  ◈        ${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 当前状态 :${RESET} $status"
-    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 1. 部署启动${RESET}"
-    echo -e "${GREEN} 2. 更新服务${RESET}"
-    echo -e "${GREEN} 3. 卸载服务${RESET}"
-    echo -e "${GREEN} 4. 启动服务${RESET}"
-    echo -e "${GREEN} 5. 停止服务${RESET}"
-    echo -e "${GREEN} 6. 重启服务${RESET}"
-    echo -e "${GREEN} 7. 查看日志${RESET}"
-    echo -e "${GREEN} 8. 查看配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_umami ;;
-        2) update_umami ;;
-        3) uninstall_umami ;;
-        4) start_umami ;;
-        5) stop_umami ;;
-        6) restart_umami ;;
-        7) logs_umami ;;
-        8) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入无效${RESET}" ;;
-    esac
+    echo -e "${GREEN}=== MCY 全功能一键管理菜单 =======${RESET}"
+    check_status
+    echo "--------------------------------"
+    echo -e "${YELLOW}1.  安装服务${RESET}"
+    echo -e "${GREEN}2.  启动服务${RESET}"
+    echo -e "${GREEN}3.  停止服务${RESET}"
+    echo -e "${GREEN}4.  重启服务${RESET}"
+    echo -e "${GREEN}5.  卸载服务${RESET}"
+    echo -e "${GREEN}6.  更新系统${RESET}"
+    echo -e "${GREEN}7.  生成数据库模型${RESET}"
+    echo -e "${GREEN}8.  创建语言包${RESET}"
+    echo -e "${GREEN}9.  删除语言包${RESET}"
+    echo -e "${GREEN}10. 批量删除语言包${RESET}"
+    echo -e "${GREEN}11. 查看语言代码${RESET}"
+    echo -e "${GREEN}12. 压缩 JS${RESET}"
+    echo -e "${GREEN}13. 压缩 CSS${RESET}"
+    echo -e "${GREEN}14. 压缩 JS+CSS${RESET}"
+    echo -e "${GREEN}15. 停止插件${RESET}"
+    echo -e "${GREEN}16. 查看运行插件${RESET}"
+    echo -e "${GREEN}17. 重置超级管理员密码${RESET}"
+    echo -e "${GREEN}18. 添加 Composer依赖${RESET}"
+    echo -e "${GREEN}19. 删除 Composer依赖${RESET}"
+    echo -e "${GREEN}20. 导入异次元 V3用户数据${RESET}"
+    echo -e "${GREEN}0.  退出"
+    echo "--------------------------------"
+    echo -ne "${GREEN}请选择操作: ${RESET}"
 }
 
+# ================== 主循环 ==================
 while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
+    show_menu
+    read choice
+    case $choice in
+        1)
+            mcy_install
+            ;;
+        2)
+            ensure_installed && cd "$INSTALL_DIR" && mcy service.start
+            ;;
+        3)
+            ensure_installed && cd "$INSTALL_DIR" && mcy service.stop
+            ;;
+        4)
+            ensure_installed && cd "$INSTALL_DIR" && mcy service.restart
+            ;;
+        5)
+            ensure_installed && cd "$INSTALL_DIR" && mcy service.uninstall
+            ;;
+        6)
+            ensure_installed && cd "$INSTALL_DIR" && mcy kit.update
+            ;;
+        7)
+            ensure_installed && {
+                echo -ne "请输入表名（空格隔开）: "
+                read tables
+                cd "$INSTALL_DIR" && mcy database.model.create $tables
+            }
+            ;;
+        8)
+            ensure_installed && {
+                echo -ne "请输入原文: "
+                read original
+                echo -ne "请输入译文: "
+                read translation
+                echo -ne "请输入语言代码: "
+                read lang
+                cd "$INSTALL_DIR" && mcy language.create "$original" "$translation" "$lang"
+            }
+            ;;
+        9)
+            ensure_installed && {
+                echo -ne "请输入原文: "
+                read original
+                echo -ne "请输入语言代码: "
+                read lang
+                cd "$INSTALL_DIR" && mcy language.del "$original" "$lang"
+            }
+            ;;
+        10)
+            ensure_installed && {
+                echo -ne "请输入要删除的原文（空格隔开，如有空格请用双引号包裹）: "
+                read originals
+                cd "$INSTALL_DIR" && mcy language.all.del $originals
+            }
+            ;;
+        11)
+            ensure_installed && cd "$INSTALL_DIR" && mcy language.code
+            ;;
+        12)
+            ensure_installed && cd "$INSTALL_DIR" && mcy compress.js.merge
+            ;;
+        13)
+            ensure_installed && cd "$INSTALL_DIR" && mcy compress.css.merge
+            ;;
+        14)
+            ensure_installed && cd "$INSTALL_DIR" && mcy compress.all
+            ;;
+        15)
+            ensure_installed && {
+                echo -ne "请输入插件标识: "
+                read plugin
+                echo -ne "请输入用户ID（可留空代表主站插件）: "
+                read userid
+                cd "$INSTALL_DIR" && mcy plugin.stop "$plugin" "$userid"
+            }
+            ;;
+        16)
+            ensure_installed && {
+                echo -ne "请输入用户ID（可留空代表主站插件）: "
+                read userid
+                cd "$INSTALL_DIR" && mcy plugin.startups "$userid"
+            }
+            ;;
+        17)
+            ensure_installed && {
+                echo -ne "请输入新密码: "
+                read newpass
+                cd "$INSTALL_DIR" && mcy kit.reset "$newpass"
+            }
+            ;;
+        18)
+            ensure_installed && {
+                echo -ne "请输入 Composer 包名: "
+                read package
+                cd "$INSTALL_DIR" && mcy composer.require "$package"
+            }
+            ;;
+        19)
+            ensure_installed && {
+                echo -ne "请输入要删除的 Composer 包名: "
+                read package
+                cd "$INSTALL_DIR" && mcy composer.remove "$package"
+            }
+            ;;
+        20)
+            ensure_installed && {
+                echo -ne "请输入 .sql 文件名（放在根目录下）: "
+                read sqlfile
+                cd "$INSTALL_DIR" && mcy migration.v3.user "$sqlfile"
+            }
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效选项，请重新输入${RESET}"
+            ;;
+    esac
+    echo -e "\n${GREEN}操作完成，按回车键返回菜单...${RESET}"
+    read
 done

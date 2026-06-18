@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Dnsmgr Docker Compose 管理面板 (内置自动建库 / 远程手动建库双模版)
+# Flarum 论坛 Docker Compose 管理面板 (多库远程切换 + 完美凭据回显版)
 # =================================================================
 
 # 颜色定义
@@ -10,9 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/dnsmgr"
+BASE_DIR="/opt/flarum"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-DEFAULT_IMAGE="netcccyun/dnsmgr"
+ENV_FILE="$BASE_DIR/flarum.env"
+DEFAULT_IMAGE="mondedie/flarum:stable"
 
 # 检测依赖环境
 check_dependencies() {
@@ -51,256 +52,256 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-
-# 动态获取容器整体状态和端口（改为从实际运行状态提取）
+# 动态获取容器整体状态和端口
 get_status_info() {
     if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=dnsmgr-web)" ]; then
+        if [ "$(docker ps -q -f name=flarum)" ]; then
             status="${GREEN}运行中${RESET}"
-            # 实时从正在运行的容器中提取宿主机映射的端口
-            web_port=$(docker ps -f name=dnsmgr-web --format "{{.Ports}}" | sed -E 's/.*0.0.0.0:([0-9]+)->.*/\1/' | head -n 1)
-            # 如果提取失败（例如网络模式特殊），再尝试 fallback 到配置文件
+            web_port=$(docker ps -f name=flarum --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
             if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
-                web_port=$(sed -n '/dnsmgr-web:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+                web_port=$(sed -n '/flarum:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
             fi
-        elif [ "$(docker ps -aq -f name=dnsmgr-web)" ]; then
+        elif [ "$(docker ps -aq -f name=flarum)" ]; then
             status="${YELLOW}已停止${RESET}"
-            # 容器停止时，通过 inspect 获取原本绑定的宿主机端口
-            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' dnsmgr-web 2>/dev/null)
+            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' flarum 2>/dev/null)
         else
             status="${RED}未部署${RESET}"
         fi
-        
-        # 兜底：如果以上方法都没拿到端口，默认显示 8081
-        [[ -z "$web_port" ]] && web_port="8081"
+        [[ -z "$web_port" ]] && web_port="80"
     else
         status="${RED}未初始化${RESET}"
         web_port="N/A"
     fi
 }
 
-# 部署 Dnsmgr
-install_dnsmgr() {
+# 部署 Flarum
+install_flarum() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 数据库模式选择 ======${RESET}"
-    echo -e " 1. 直接部署全新的 MySQL 5.7 (Docker 容器化 + 自动建库)"
-    echo -e " 2. 使用已有的外部/远程 MySQL (自建/云数据库 RDS - 需提前建库)"
+    # 1. 基础参数配置
+    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Flarum 宿主机映射访问端口 [默认: 8080]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8080"
+    
+    DETECT_IP=$(get_public_ip)
+    echo -ne "${YELLOW}请输入 Flarum 论坛域名/URL [默认: http://${DETECT_IP}:${custom_port}]: ${RESET}"
+    read -r forum_domain
+    [[ -z "$forum_domain" ]] && forum_domain="http://${DETECT_IP}:${custom_port}"
+
+    echo -ne "${YELLOW}请输入论坛管理员用户名 [默认: admin]: ${RESET}"
+    read -r admin_user
+    [[ -z "$admin_user" ]] && admin_user="admin"
+
+    echo -ne "${YELLOW}请输入论坛管理员邮箱 [默认: admin@example.com]: ${RESET}"
+    read -r admin_mail
+    [[ -z "$admin_mail" ]] && admin_mail="admin@example.com"
+
+    echo -ne "${YELLOW}请输入论坛标题 [默认: Flarum Forum]: ${RESET}"
+    read -r forum_title
+    [[ -z "$forum_title" ]] && forum_title="Flarum Forum"
+
+    # 2. 数据库运行模式选择
+    echo -e "\n${CYAN}====== MySQL 数据库运行模式选择 ======${RESET}"
+    echo -e " 1) 直接部署全新的 MySQL 8.0 容器 (包含本地持久化卷)"
+    echo -e " 2) 使用已有的外部/远程 MySQL 数据库 (需提前手动建好空库并授权)"
     echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
     read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
-    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Dnsmgr Web 访问端口 [默认: 8081]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8081"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
+    local db_host="mysql-db"
+    local db_port="3306"
+    local db_user="flarum"
+    local db_pass=""
+    local db_name="flarum"
+    local root_pass=""
 
-    # ------------------ 模式 1：全新 Docker 部署 MySQL 5.7 ------------------
     if [[ "$db_mode" == "1" ]]; then
-        echo -ne "${YELLOW}请为全新 MySQL 设置 root 密码 [默认: 123456]: ${RESET}"
-        read -r db_pass
-        [[ -z "$db_pass" ]] && db_pass="123456"
-
-        echo -e "${YELLOW}正在配置全新容器化 MySQL 5.7 数据库环境...${RESET}"
-        
-        mkdir -p "$BASE_DIR/mysql/conf" "$BASE_DIR/mysql/logs" "$BASE_DIR/mysql/data" "$BASE_DIR/web"
-        
-        if [ ! -f "$BASE_DIR/mysql/conf/my.cnf" ]; then
-            cat << EOF > "$BASE_DIR/mysql/conf/my.cnf"
-[mysqld]
-user=mysql
-default-storage-engine=INNODB
-character-set-server=utf8mb4
-collation-server=utf8mb4_unicode_ci
-EOF
-        fi
-
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  dnsmgr-web:
-    container_name: dnsmgr-web
-    image: ${DEFAULT_IMAGE}
-    restart: unless-stopped
-    stdin_open: true
-    tty: true
-    ports:
-      - "${custom_port}:80"
-    volumes:
-      - ${BASE_DIR}/web:/app/www
-    depends_on:
-      dnsmgr-mysql:
-        condition: service_healthy
-    networks:
-      - dnsmgr-network
-
-  dnsmgr-mysql:
-    container_name: dnsmgr-mysql
-    image: mysql:5.7
-    restart: always
-    ports:
-      - "3306:3306"
-    volumes:
-      - ${BASE_DIR}/mysql/conf/my.cnf:/etc/mysql/my.cnf
-      - ${BASE_DIR}/mysql/logs:/logs
-      - ${BASE_DIR}/mysql/data:/var/lib/mysql
-    environment:
-      - MYSQL_ROOT_PASSWORD=${db_pass}
-      - TZ=Asia/Shanghai
-    healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p${db_pass}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    networks:
-      - dnsmgr-network
-
-networks:
-  dnsmgr-network:
-    driver: bridge
-EOF
-
-        echo -e "${YELLOW}正在通过 Docker Compose 启动 Dnsmgr 容器集群...${RESET}"
-        cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}错误: 容器集群启动失败。${RESET}"
-            return
-        fi
-
-        # 利用健康的本地 mysql 容器一键自动创建 dnsmgr 数据库
-        echo -e "${YELLOW}正在内置 MySQL 容器中自动创建 'dnsmgr' 数据库...${RESET}"
-        docker exec -i dnsmgr-mysql mysql -uroot -p"${db_pass}" -e "CREATE DATABASE IF NOT EXISTS dnsmgr CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null
-        echo -e "${GREEN}数据库 dnsmgr 创建/检查成功！${RESET}"
-
-    # ------------------ 模式 2：连接外部/远程已有 MySQL ------------------
+        echo -e "${YELLOW}正在自动计算生成数据库高强度随机密码...${RESET}"
+        root_pass=$(openssl rand -hex 12)
+        db_pass=$(openssl rand -hex 12)
+        admin_pass=$(openssl rand -hex 10)
     else
-        echo -e "${CYAN}====== 远程/外部 MySQL 信息确认 ======${RESET}"
-        echo -ne "${YELLOW}请输入外部 MySQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r ext_host
-        [[ -z "$ext_host" ]] && ext_host="127.0.0.1"
+        echo -ne "${YELLOW}请输入外部 MySQL 的 IP 或域名 [例如: 47.79.88.134]: ${RESET}"
+        read -r ext_db_ip
+        echo -ne "${YELLOW}请输入外部 MySQL 端口 [默认: 3306]: ${RESET}"
+        read -r ext_db_port
+        [[ -z "$ext_db_port" ]] && ext_db_port="3306"
+        db_host="$ext_db_ip"
+        db_port="$ext_db_port"
+        echo -ne "${YELLOW}请输入外部 MySQL 用户名 [默认: flarum]: ${RESET}"
+        read -r db_user
+        [[ -z "$db_user" ]] && db_user="flarum"
+        echo -ne "${YELLOW}请输入外部 MySQL 密码: ${RESET}"
+        read -r db_pass
+        echo -ne "${YELLOW}请输入外部已存在的数据库名 [默认: flarum]: ${RESET}"
+        read -r db_name
+        [[ -z "$db_name" ]] && db_name="flarum"
+        echo -ne "${YELLOW}请设置您论坛管理员的初始化密码 (至少8位): ${RESET}"
+        read -r admin_pass
         
-        echo -ne "${YELLOW}请输入 MySQL 端口 [默认: 3306]: ${RESET}"
-        read -r ext_port
-        [[ -z "$ext_port" ]] && ext_port="3306"
-
-        # 处理本地回环外连突破提示
-        if [[ "$ext_host" == "127.0.0.1" || "$ext_host" == "localhost" ]]; then
-            ext_host="172.17.0.1"
-            echo -e "${YELLOW}提示: 检测到本地回环地址，网页配置时请填写宿主机网关 IP: 172.17.0.1${RESET}"
+        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
+            db_host="172.17.0.1"
         fi
+    fi
 
-        echo -e "${YELLOW}提示: 请确保远程 MySQL (${ext_host}:${ext_port}) 中已手动创建好名为 'dnsmgr' 的数据库，且字符集为 utf8mb4。${RESET}"
+    # 3. 创建核心持久化数据目录
+    mkdir -p "$BASE_DIR/assets" "$BASE_DIR/extensions" "$BASE_DIR/logs" "$BASE_DIR/nginx"
 
-        mkdir -p "$BASE_DIR/web"
+    # 4. 生成 flarum.env 配置文件
+    echo -e "\n${YELLOW}正在生成 Flarum 环境变量配置文件 (.env)...${RESET}"
+    cat << EOF > "$ENV_FILE"
+DEBUG=false
+FORUM_URL=${forum_domain}
 
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  dnsmgr-web:
-    container_name: dnsmgr-web
-    image: ${DEFAULT_IMAGE}
-    restart: unless-stopped
-    stdin_open: true
-    tty: true
-    ports:
-      - "${custom_port}:80"
-    volumes:
-      - ${BASE_DIR}/web:/app/www
+DB_HOST=${db_host}
+DB_NAME=${db_name}
+DB_USER=${db_user}
+DB_PASS=${db_pass}
+DB_PREF=flarum_
+DB_PORT=${db_port}
+
+FLARUM_ADMIN_USER=${admin_user}
+FLARUM_ADMIN_PASS=${admin_pass}
+FLARUM_ADMIN_MAIL=${admin_mail}
+FLARUM_TITLE=${forum_title}
 EOF
 
-        echo -e "${YELLOW}正在通过 Docker Compose 启动 Dnsmgr Web 服务...${RESET}"
-        cd "$BASE_DIR" && docker compose up -d --force-recreate
+    # 5. 生成 docker-compose.yml 文本
+    echo -e "${YELLOW}正在生成 Docker Compose 配置文件...${RESET}"
+    cat << EOF > "$COMPOSE_FILE"
+services:
+  flarum:
+    image: ${DEFAULT_IMAGE}
+    container_name: flarum
+    restart: unless-stopped
+    env_file:
+      - ./flarum.env
+    volumes:
+      - ./assets:/flarum/app/public/assets
+      - ./extensions:/flarum/app/extensions
+      - ./logs:/flarum/app/storage/logs
+      - ./nginx:/etc/nginx/flarum
+    ports:
+      - "${custom_port}:8888"
+EOF
+
+    # 动态追加依赖节点
+    if [[ "$db_mode" == "1" ]]; then
+        cat << EOF >> "$COMPOSE_FILE"
+    depends_on:
+      - mysql-db
+EOF
     fi
+
+    # 动态追加本地内置纯正 MySQL 8.0 服务 (替代原本的 MariaDB)
+    if [[ "$db_mode" == "1" ]]; then
+        mkdir -p "$BASE_DIR/mysql"
+        cat << EOF >> "$COMPOSE_FILE"
+
+  mysql-db:
+    image: mysql:8.0
+    container_name: flarum-db
+    restart: unless-stopped
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${root_pass}
+      MYSQL_DATABASE: ${db_name}
+      MYSQL_USER: ${db_user}
+      MYSQL_PASSWORD: ${db_pass}
+    volumes:
+      - ./mysql:/var/lib/mysql
+EOF
+    fi
+
+    # 6. 执行一键拉起
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Flarum 论坛系统...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}====================================================${RESET}"
-        echo -e "${RED} 错误: 容器启动失败。请检查网络环境。               ${RESET}"
-        echo -e "${RED}====================================================${RESET}"
+        echo -e "${RED}错误: 架构拉起失败，请检查端口是否被占用。${RESET}"
         return
     fi
 
-    DETECT_IP=$(get_public_ip)
-
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             Dnsmgr 部署成功！                      ${RESET}"
+    echo -e "${GREEN}             Flarum 论坛部署成功！                   ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}应用访问地址   : http://${DETECT_IP}:${custom_port}/install${RESET}"
-    echo -e "${YELLOW}宿主机映射端口 : ${custom_port}${RESET}"
-    echo -ne "${YELLOW}数据库运行模式 : ${RESET}"
-    if [[ "$db_mode" == "1" ]]; then 
-        echo -e "${GREEN}全新内置容器 (MySQL 5.7)${RESET}"
-        echo -e "${YELLOW}自动配置数据库 : dnsmgr${RESET}"
-        echo -e "${YELLOW}数据库内部地址 : dnsmgr-mysql:3306${RESET}"
-        echo -e "${YELLOW}数据库初始凭证 : root / ${db_pass}${RESET}"
-    else 
-        echo -e "${GREEN}连接外部/远程已有的 MySQL 数据库${RESET}"
-        echo -e "${YELLOW}网页安装建议目标 : ${ext_host}:${ext_port}${RESET}"
-        echo -e "${YELLOW}请在下一步网页安装时，手动填写您的远程库账号和密码${RESET}"
+    echo -e "${YELLOW}论坛访问地址   : ${forum_domain}${RESET}"
+    echo -e "${YELLOW}管理员账号     : ${GREEN}${admin_user}${RESET}"
+    echo -e "${YELLOW}管理员密码     : ${GREEN}${admin_pass}${RESET}"
+    echo -e "${YELLOW}管理员邮箱     : ${admin_mail}${RESET}"
+    echo -e "----------------------------------------------------"
+    echo -e "${CYAN}[数据库凭据回显]${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}MySQL 运行模式 : ${GREEN}全新内置容器 (MySQL 8.0)${RESET}"
+        echo -e "${YELLOW}内置实例库名   : ${db_name}${RESET}"
+        echo -e "${YELLOW}MySQL root密码 : ${RED}${root_pass}${RESET}"
+        echo -e "${YELLOW}应用专账用户名 : ${GREEN}${db_user}${RESET}"
+        echo -e "${YELLOW}应用专账访问密码 : ${GREEN}${db_pass}${RESET}"
+    else
+        echo -e "${YELLOW}MySQL 运行模式 : ${CYAN}外部远程连接${RESET}"
+        echo -e "${YELLOW}远程目标主机   : ${db_host}:${db_port}${RESET}"
+        echo -e "${YELLOW}指定连接库名   : ${db_name}${RESET}"
+        echo -e "${YELLOW}连接用户名     : ${db_user}${RESET}"
+        echo -e "${YELLOW}连接密码       : ****** (您输入的外部密码)${RESET}"
+        echo -e "----------------------------------------------------"
+        echo -e "${RED}⚠️【重要提醒】${RESET}"
+        echo -e "${YELLOW}由于属于跨网段容器请求，请确保您远程 MySQL 服务器执行过：${RESET}"
+        echo -e "${GREEN}GRANT ALL PRIVILEGES ON ${db_name}.* TO '${db_user}'@'%'; FLUSH PRIVILEGES;${RESET}"
     fi
-    echo -e "${YELLOW}部署工作目录   : ${BASE_DIR}${RESET}"
+    echo -e "----------------------------------------------------"
+    echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 # 更新镜像
-update_dnsmgr() {
+update_flarum() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取 Dnsmgr 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新 Flarum 镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}服务更新完成！${RESET}"
+    echo -e "${GREEN}升级完成！${RESET}"
 }
 
-# 卸载 Dnsmgr
-uninstall_dnsmgr() {
-    echo -ne "${RED}确定要卸载并删除 Dnsmgr 服务吗？(y/n): ${RESET}"
+# 卸载 Flarum
+uninstall_flarum() {
+    echo -ne "${RED}确定要完全卸载并删除 Flarum 服务吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}是否同时删除所有网站程序源码、日志及数据库文件？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                cd "$BASE_DIR" && docker compose down -v
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}所有相关数据文件及工作目录已彻底清理。${RESET}"
-            fi
+            cd "$BASE_DIR" && docker compose down -v
+            rm -rf "$BASE_DIR"
         else
-            docker rm -f dnsmgr-web dnsmgr-mysql 2>/dev/null
+            docker rm -f flarum flarum-db 2>/dev/null
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        echo -e "${GREEN}完全卸载成功，数据已彻底清理。${RESET}"
     fi
 }
 
-# 基础生命周期控制
-start_dm() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}Dnsmgr 服务已启动${RESET}"; }
-stop_dm() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}Dnsmgr 服务已停止${RESET}"; }
-restart_dm() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}Dnsmgr 服务已重启${RESET}"; }
-logs_dm() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+start_flarum() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
+stop_flarum() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
+restart_flarum() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
+logs_flarum() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
-# 显示配置面板
 show_info() {
     get_status_info
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}当前运行状态   : $status"
-    echo -e "${YELLOW}宿主机映射端口 : ${web_port}${RESET}"
-    echo -e "${YELLOW}工作路径       : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}外部提取端口   : ${web_port}${RESET}"
+    echo -e "${YELLOW}安装绝对路径   : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 主菜单
+# 主菜单管理
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}       ◈  Dnsmgr 管理面板  ◈        ${RESET}"
+    echo -e "${GREEN}       ◈  Flarum 管理面板  ◈        ${RESET}"
     echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 当前状态 :${RESET} $status"
     echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
@@ -318,16 +319,16 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_dnsmgr ;;
-        2) update_dnsmgr ;;
-        3) uninstall_dnsmgr ;;
-        4) start_dm ;;
-        5) stop_dm ;;
-        6) restart_dm ;;
-        7) logs_dm ;;
+        1) install_flarum ;;
+        2) update_flarum ;;
+        3) uninstall_flarum ;;
+        4) start_flarum ;;
+        5) stop_flarum ;;
+        6) restart_flarum ;;
+        7) logs_flarum ;;
         8) show_info ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
+        *) echo -e "${RED}输入无效${RESET}" ;;
     esac
 }
 

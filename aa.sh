@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Komari 管理脚本 (统一文件夹 + 智能端口锁固 + 彻底解决 set -e 静默退出版)
+# Komari 管理脚本 
 # =================================================================
 
 # 颜色定义
@@ -152,7 +152,7 @@ uninstall_komari() {
 # 查看日志
 view_logs() {
     echo -e "\n${CYAN}=== 正在追踪 Komari 实时运行日志 (Ctrl+C 退出追踪) ===${RESET}"
-    docker logs -f $CONTAINER_NAME || echo -e "${RED}未找到容器运行日志${RESET}"
+    docker logs -f $CONTAINER_NAME || echo -e "${YELLOW}返回菜单${RESET}"
 }
 
 # =================================================================
@@ -168,7 +168,7 @@ while true; do
     echo -e "${GREEN} 当前状态 :${RESET} $status"
     echo -e "${GREEN} 内部映射 :${RESET} ${YELLOW}127.0.0.1:${PORT}${RESET}"
     if [[ "$KOMARI_ENABLE_CLOUDFLARED" == "true" ]]; then
-        echo -e "${GREEN} 穿透状态 :${RESET} ${CYAN}已启用 Cloudflared 隧道 (端口已锁定)${RESET}"
+        echo -e "${GREEN} 穿透状态 :${RESET} ${YELLOW}已启用 Cloudflared 隧道${RESET}"
     else
         echo -e "${GREEN} 穿透状态 :${RESET} ${YELLOW}未启用通道${RESET}"
     fi

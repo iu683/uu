@@ -16,6 +16,17 @@ fi
 INSTALL_DIR="/www/wwwroot/mcy-shop"
 DOWNLOAD_URL="https://wiki.mcy.im/download.php?q=27"
 
+# ================== 目录限制守卫 ==================
+CURRENT_DIR=$(pwd)
+
+if [ "$CURRENT_DIR" != "$INSTALL_DIR" ]; then
+    echo -e "${RED}❌ 拒绝访问！此管理脚本必须进入程序根目录才能使用！${RESET}"
+    echo -e "${YELLOW}请先执行以下命令进入目录：${RESET}"
+    echo -e "${GREEN}cd $INSTALL_DIR${RESET}"
+    echo ""
+    exit 1
+fi
+
 # ================== 依赖环境检测与安装 ==================
 check_dependencies() {
     if ! command -v unzip &> /dev/null; then
@@ -44,11 +55,10 @@ check_dependencies() {
 
 # ================== 检查服务状态 ==================
 check_status() {
-    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "$INSTALL_DIR/bin" ]; then
-        echo -e "${RED}服务状态: 未安装 (请选择 5 进行系统安装)${RESET}"
+    if [ ! -f "bin" ]; then
+        echo -e "${RED}服务状态: 未安装 (请选择 1 进行系统安装)${RESET}"
         return
     fi
-    cd "$INSTALL_DIR"
     STATUS=$(mcy service.start 2>&1 | grep -i "already running")
     if [ -n "$STATUS" ]; then
         echo -e "${GREEN}服务状态: 运行中${RESET}"
@@ -69,19 +79,16 @@ mcy_install() {
     echo -e "${GREEN}解压安装包到 $INSTALL_DIR ...${RESET}"
     unzip -o /tmp/mcy-latest.zip -d "$INSTALL_DIR"
 
-    if [ ! -f "$INSTALL_DIR/bin" ]; then
+    if [ ! -f "bin" ]; then
         echo -e "${RED}解压失败或文件不完整，请检查上方日志！${RESET}"
         return 1
     fi
 
     echo -e "${GREEN}设置程序权限...${RESET}"
-    chmod 777 "$INSTALL_DIR/bin" "$INSTALL_DIR/console.sh"
+    chmod 777 "bin" "console.sh"
 
-    echo -e "${GREEN}进入安装程序目录...${RESET}"
-    cd "$INSTALL_DIR"
-
-    echo -e "${YELLOW}启动安装程序，请保持 SSH 窗口打开...${RESET}"
-    ./bin index.php
+    echo -e "${YELLOW}启动安装程序...${RESET}"
+    cd "$INSTALL_DIR" && mcy service.start
 
     echo -e "${GREEN}后台基础安装完成！${RESET}"
     echo -e "${YELLOW}请使用浏览器访问：http://服务器IP:端口 完成网页端的后续安装${RESET}"
@@ -89,8 +96,8 @@ mcy_install() {
 
 # ================== 环境检查中间件 ==================
 ensure_installed() {
-    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "$INSTALL_DIR/bin" ]; then
-        echo -e "${RED}错误: 检测到程序尚未安装，请先选择选项 5 进行安装！${RESET}"
+    if [ ! -f "bin" ]; then
+        echo -e "${RED}错误: 检测到程序尚未安装，请先选择选项 1 进行安装！${RESET}"
         return 1
     fi
     return 0
@@ -99,14 +106,16 @@ ensure_installed() {
 # ================== 菜单函数 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== MCY 全功能一键管理菜单 =======${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}     ◈   MCY 管理菜单  ◈     ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
     check_status
-    echo "--------------------------------"
-    echo -e "${YELLOW}5. 安装服务${RESET}"
-    echo -e "${GREEN}1.  启动服务${RESET}"
-    echo -e "${GREEN}2.  停止服务${RESET}"
-    echo -e "${GREEN}3.  重启服务${RESET}"
-    echo -e "${GREEN}4.  卸载服务${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${YELLOW}1. 安装服务${RESET}"
+    echo -e "${GREEN}2.  启动服务${RESET}"
+    echo -e "${GREEN}3.  停止服务${RESET}"
+    echo -e "${GREEN}4.  重启服务${RESET}"
+    echo -e "${GREEN}5.  卸载服务${RESET}"
     echo -e "${GREEN}6.  更新系统${RESET}"
     echo -e "${GREEN}7.  生成数据库模型${RESET}"
     echo -e "${GREEN}8.  创建语言包${RESET}"

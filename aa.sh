@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# 长亭雷池 WAF (SafeLine) Docker Compose 管理面板 
+# 小雅 TVBox / AList-TVBox 三合一 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,7 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="safeline-mgt"
-BASE_DIR="/data/safeline"
+BASE_DIR="/opt/alist-tvbox"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,166 +21,243 @@ check_dependencies() {
     fi
 }
 
+# 获取公网 IP (兼容双栈环境)
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
+}
+
+DETECT_IP=$(get_public_ip)
+
+
 # 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    # 1. 检查核心管理容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+    # 尝试捕获可能存在的两个容器名
+    if [ "$(docker ps -q -f name=^/xiaoya-tvbox$)" ] || [ "$(docker ps -q -f name=^/alist-tvbox$)" ]; then
         status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+    elif [ "$(docker ps -aq -f name=^/xiaoya-tvbox$)" ] || [ "$(docker ps -aq -f name=^/alist-tvbox$)" ]; then
         status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从环境或容器中提取控制台端口
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取控制台管理端口（雷池 mgt 内部默认是 9443）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9443/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="9443"
+    # 动态抓取当前运行的容器名
+    current_container="xiaoya-tvbox"
+    if [ "$(docker ps -aq -f name=^/alist-tvbox$)" ]; then
+        current_container="alist-tvbox"
+    fi
+
+    # 从容器状态提取端口
+    if [ "$(docker ps -aq -f name=^/${current_container}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$current_container" 2>/dev/null)
+        
+        # 检查是否为 Host 模式
+        local net_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$current_container" 2>/dev/null)
+        if [[ "$net_mode" == "host" ]]; then
+            mgt_port="4567 (Host模式)"
+            alist_port="5234 (Host模式)"
+        else
+            # 桥接模式下动态提取管理后台端口 (4567)
+            mgt_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "4567/tcp") 0).HostPort}}' "$current_container" 2>/dev/null)
+            [[ -z "$mgt_port" ]] && mgt_port="4567"
+            
+            # 提取 AList 端口
+            alist_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{if eq $p "80/tcp"}}{{(index $conf 0).HostPort}}{{end}}{{end}}{{end}}' "$current_container" 2>/dev/null)
+            [[ -z "$alist_port" ]] && alist_port="5344"
+        fi
     else
-        webui_port="N/A"
+        img_version="${RED}未安装${RESET}"
+        mgt_port="N/A"
+        alist_port="N/A"
     fi
 }
 
-# 随机生成纯英数密码（雷池 WAF 数据库要求勿使用特殊字符）
-generate_password() {
-    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1
-}
-
-# 部署长亭雷池
-install_safeline() {
+# 部署选择与安装流程
+install_xiaoya() {
     check_dependencies
     
+    clear
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    请选择要部署的 小雅/TVBox 版本: ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${CYAN}1. 小雅集成版 (标准网桥模式，默认端口 4567 / 5344)${RESET}"
+    echo -e "${CYAN}2. 小雅集成版 (Host 网络模式，性能更佳，固定端口 4567 / 5234)${RESET}"
+    echo -e "${CYAN}3. 纯净版 AList-TVBox (无自带小雅，默认端口 4567)${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${YELLOW}请输入版本编号 [1-3]: ${RESET}"
+    read -r version_choice
+
+    if [[ "$version_choice" != "1" && "$version_choice" != "2" && "$version_choice" != "3" ]]; then
+        echo -e "${RED}输入错误，取消部署。${RESET}"
+        return
+    fi
+
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入雷池安装绝对路径 [默认: /data/safeline]: ${RESET}"
+    echo -ne "${YELLOW}请输入安装绝对路径 [默认: /opt/alist-tvbox]: ${RESET}"
     read -r custom_dir
-    [[ -z "$custom_dir" ]] && custom_dir="/data/safeline"
+    [[ -z "$custom_dir" ]] && custom_dir="/opt/alist-tvbox"
     BASE_DIR="$custom_dir"
     COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
-    echo -ne "${YELLOW}请输入雷池控制台 (MGT) 访问端口 [默认: 9443]: ${RESET}"
-    read -r mgt_port
-    [[ -z "$mgt_port" ]] && mgt_port="9443"
-
-    echo -ne "${YELLOW}是否使用 LTS (长期支持) 版本通道？(y/n) [默认: n]: ${RESET}"
-    read -r is_lts
-    local release_channel=""
-    [[ "$is_lts" == "y" || "$is_lts" == "Y" ]] && release_channel="-lts"
-
-    echo -ne "${YELLOW}您的服务器在 [1. 中国大陆] 还是 [2. 海外/中国香港]？输入数字 [默认: 1]: ${RESET}"
-    read -r geo_choice
-    local img_prefix="swr.cn-east-3.myhuaweicloud.com/chaitin-safeline"
-    [[ "$geo_choice" == "2" ]] && img_prefix="chaitin"
-
-    # 自动识别系统架构 (x86_64 vs arm64)
-    local arch_suffix=""
-    local sys_arch=$(uname -m)
-    if [[ "$sys_arch" == "arm*" || "$sys_arch" == "aarch64" ]]; then
-        arch_suffix="-arm"
-        echo -e "${YELLOW}检测到当前服务器为 ARM 架构，已自动启用架构适配。${RESET}"
-    fi
-
-    # 1. 创建目录并下载编排脚本
-    mkdir -p "$BASE_DIR"
-    echo -e "${YELLOW}正在从官方源下载最新 Compose 编排脚本...${RESET}"
-    if ! wget -qO "$COMPOSE_FILE" "https://waf-ce.chaitin.cn/release/latest/compose.yaml"; then
-        echo -e "${RED}错误: 下载编排脚本失败，请检查网络或链接是否有效！${RESET}"
-        return
-    fi
-
-    # 2. 生成随机高强度数据库密码
-    local pg_pwd=$(generate_password)
-
-    # 3. 写入 .env 配置文件
-    echo -e "${YELLOW}正在写入环境变量配置文件 (.env)...${RESET}"
-    cat <<EOF > "$BASE_DIR/.env"
-SAFELINE_DIR=${BASE_DIR}
-IMAGE_TAG=latest
-MGT_PORT=${mgt_port}
-POSTGRES_PASSWORD=${pg_pwd}
-SUBNET_PREFIX=172.22.222
-IMAGE_PREFIX=${img_prefix}
-ARCH_SUFFIX=${arch_suffix}
-RELEASE=${release_channel}
-REGION=
-MGT_PROXY=0
-EOF
-
+    mkdir -p "$BASE_DIR" "$BASE_DIR/www-static"
     chmod -R 777 "$BASE_DIR"
 
-    # 4. 启动服务
-    echo -e "${YELLOW}正在启动雷池服务集群 (首次拉取镜像时间可能较长)...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d
+    # 根据版本渲染不同的 YAML 配置
+    case "$version_choice" in
+        1)
+            echo -ne "${YELLOW}请输入管理网页访问端口 [默认: 4567]: ${RESET}"
+            read -r custom_mgt
+            [[ -z "$custom_mgt" ]] && custom_mgt="4567"
+            
+            echo -ne "${YELLOW}请输入 AList 访问端口 [默认: 5344]: ${RESET}"
+            read -r custom_alist
+            [[ -z "$custom_alist" ]] && custom_alist="5344"
 
-    echo -e "${YELLOW}等待雷池各微服务初始化完成 (约8秒)...${RESET}"
-    sleep 8
+            echo -e "${YELLOW}正在生成 [小雅集成版] 配置文件...${RESET}"
+            cat <<EOF > "$COMPOSE_FILE"
+services:
+  xiaoya-tvbox:
+    image: haroldli/xiaoya-tvbox:latest
+    container_name: xiaoya-tvbox
+    restart: always
+    ports:
+      - "${custom_mgt}:4567"
+      - "${custom_alist}:80"
+    environment:
+      - ALIST_PORT=${custom_alist}
+    volumes:
+      - ${BASE_DIR}:/data
+      - ${BASE_DIR}/www-static:/www/static
+EOF
+            local show_msg="${YELLOW}管理后台地址 : http://${DETECT_IP}:${custom_mgt}\nAList 访问地址: http://${DETECT_IP}:${custom_alist}${RESET}"
+            ;;
+        2)
+            echo -e "${YELLOW}正在生成 [小雅 Host网络版] 配置文件 (注意：Host模式下端口由容器本身决定)...${RESET}"
+            cat <<EOF > "$COMPOSE_FILE"
+services:
+  xiaoya-tvbox:
+    image: haroldli/xiaoya-tvbox:hostmode
+    container_name: xiaoya-tvbox
+    restart: always
+    network_mode: host
+    volumes:
+      - ${BASE_DIR}:/data
+      - ${BASE_DIR}/www-static:/www/static
+EOF
+            local show_msg="${YELLOW}管理后台地址 : http://${DETECT_IP}:4567\nAList 访问地址: http://${DETECT_IP}:5234${RESET}"
+            ;;
+        3)
+            echo -ne "${YELLOW}请输入管理网页访问端口 [默认: 4567]: ${RESET}"
+            read -r custom_mgt
+            [[ -z "$custom_mgt" ]] && custom_mgt="4567"
+
+            echo -e "${YELLOW}正在生成 [纯净版 AList-TVBox] 配置文件...${RESET}"
+            cat <<EOF > "$COMPOSE_FILE"
+services:
+  alist-tvbox:
+    image: haroldli/alist-tvbox:latest
+    container_name: alist-tvbox
+    restart: always
+    ports:
+      - "${custom_mgt}:4567"
+    volumes:
+      - ${BASE_DIR}:/data
+      - ${BASE_DIR}/www-static:/www/static
+EOF
+            local show_msg="${YELLOW}管理后台地址 : http://${DETECT_IP}:${custom_mgt}\n纯净版进AList后台用户名：atv (密码在高级设置中查看)${RESET}"
+            ;;
+    esac
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待服务初始化并生成密码凭据 (约5秒)...${RESET}"
+    sleep 5
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       雷池 WAF 部署命令提交！   ${RESET}"
+    echo -e "${GREEN}          部署命令提交成功！      ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}控制台访问地址 : https://127.0.0.1:${mgt_port}${RESET} (请使用 https 访问)"
-    echo -e "${YELLOW}安装绝对路径   : $BASE_DIR${RESET}"
-    echo -e "${CYAN}提示: 如果首次登录需要初始密码，请在主菜单选择 [9] 初始化管理员账户。${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-# 重置/初始化雷池管理员账户
-reset_admin_pwd() {
-    get_status_info
-    if [[ "$status" != *"运行中"* ]]; then
-        echo -e "${RED}错误: 雷池管理服务未运行，无法执行重置！${RESET}"
-        return
+    echo -e "$show_msg"
+    echo -e "${YELLOW}持久化目录   : $BASE_DIR${RESET}"
+    
+    # 动态判断并打印安装后的密码
+    if [ -f "$BASE_DIR/initial_admin_credentials.txt" ]; then
+        echo -e "${GREEN}====== 检测到系统自动生成的安全凭据 ======${RESET}"
+        cat "$BASE_DIR/initial_admin_credentials.txt"
+    else
+        echo -e "${YELLOW}默认用户名   : admin${RESET}"
+        echo -e "${YELLOW}默认初始密码 : admin${RESET}"
     fi
-    echo -e "${YELLOW}正在请求雷池内部模块安全重置管理员账户...${RESET}"
-    docker exec "$CONTAINER_NAME" resetadmin
+    echo -e "${GREEN}================================${RESET}"
+    
 }
 
-# 更新雷池
-update_safeline() {
+# 更新镜像
+update_xiaoya() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取雷池 WAF 最新容器镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！雷池集群已升至最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！容器组件已处于最新状态。${RESET}"
 }
 
-# 卸载雷池
-uninstall_safeline() {
-    echo -ne "${RED}确定要完全卸载长亭雷池 WAF 吗？(y/n): ${RESET}"
+# 卸载服务
+uninstall_xiaoya() {
+    echo -ne "${YELLOW}确定要卸载并删除 TVBox 相关容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}所有雷池防火墙容器已停止并清除。${RESET}"
-            echo -ne "${YELLOW}是否同时彻底清除所有防护拦截日志、站点配置和数据库数据？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时彻底删除本地缓存数据、小雅配置及静态文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}雷池数据目录已完全清理。${RESET}"
+                echo -e "${GREEN}持久化数据目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f safeline-mgt safeline-pg safeline-detector safeline-tengine safeline-farter 2>/dev/null
+            docker rm -f xiaoya-tvbox alist-tvbox 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_safeline() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}雷池集群已启动${RESET}"; }
-stop_safeline() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}雷池集群已停止${RESET}"; }
-restart_safeline() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}雷池集群已重启${RESET}"; }
-logs_safeline() { cd "$BASE_DIR" && docker compose logs -f; }
+start_xiaoya() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_xiaoya() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_xiaoya() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_xiaoya() { cd "$BASE_DIR" && docker compose logs -f; }
 
 show_info() {
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}核心状态       : $status"
-    echo -e "${YELLOW}控制台访问地址 : https://127.0.0.1:${webui_port}${RESET}"
-    echo -e "${YELLOW}数据存储路径   : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}配置管理端口   : ${mgt_port}${RESET}"
+    if [[ "$alist_port" != "N/A" ]]; then
+        echo -e "${YELLOW}AList 端口     : ${alist_port}${RESET}"
+    fi
+    echo -e "${YELLOW}数据存储目录   : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -189,34 +265,33 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  长亭雷池 WAF 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}◈  小雅/AList-TVBox  管理面板 ◈ ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}状态     :${RESET} $status"
+    echo -e "${GREEN}管理端口 :${RESET} ${YELLOW}${mgt_port}${RESET}"  
+    echo -e "${GREEN}AList端口:${RESET} ${YELLOW}${alist_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新雷池${RESET}"
-    echo -e "${GREEN}3. 卸载雷池${RESET}"
-    echo -e "${GREEN}4. 启动集群${RESET}"
-    echo -e "${GREEN}5. 停止集群${RESET}"
-    echo -e "${GREEN}6. 重启集群${RESET}"
+    echo -e "${GREEN}2. 更新服务${RESET}"
+    echo -e "${GREEN}3. 卸载服务${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}9. 初始化/重置管理员账户密码${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_safeline ;;
-        2) update_safeline ;;
-        3) uninstall_safeline ;;
-        4) start_safeline ;;
-        5) stop_safeline ;;
-        6) restart_safeline ;;
-        7) logs_safeline ;;
+        1) install_xiaoya ;;
+        2) update_xiaoya ;;
+        3) uninstall_xiaoya ;;
+        4) start_xiaoya ;;
+        5) stop_xiaoya ;;
+        6) restart_xiaoya ;;
+        7) logs_xiaoya ;;
         8) show_info ;;
-        9) reset_admin_pwd ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

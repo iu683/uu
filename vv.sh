@@ -98,12 +98,17 @@ check_and_install() {
         inetspeed)
             echo -e "${YELLOW}📦 正在安装 iNetSpeed-CLI (Apple CDN 测速)...${RESET}"
             # 使用 echo "inetspeed" 管道输入，自动回应安装器的命令名询问
-            echo "inetspeed" | curl -fsSL https://raw.githubusercontent.com/tsosunchia/iNetSpeed-CLI/main/scripts/install.sh | bash || true
+            echo "2" | curl -fsSL https://raw.githubusercontent.com/tsosunchia/iNetSpeed-CLI/main/scripts/install.sh | bash || true
             ;;
         speed-cloudflare-cli)
+            # CRITICAL AT ALL: 如果是 Alpine 系统，必须安装 gcompat 补齐 glibc 运行环境缺失的 __res_init 符号
+            if [ -f /etc/alpine-release ]; then
+                echo -e "${YELLOW}📦 检测到 Alpine 系统，正在补充安装 gcompat 运行环境支持...${RESET}"
+                apk add --no-cache gcompat libc6-compat
+            fi
+
             echo -e "${YELLOW}🔍 正在通过 GitHub API 获取 Cloudflare-CLI Rust 最新版本信息...${RESET}"
             
-            # 1. 抓取 API 数据
             local api_response=$(curl -fsSL "https://api.github.com/repos/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/latest" 2>/dev/null)
             if [ -z "$api_response" ]; then
                 echo -e "${RED}❌ 无法获取 GitHub 最新发布版本信息，请检查网络或 API 速率限制。${RESET}"
@@ -114,17 +119,14 @@ check_and_install() {
             local latest_tag=$(echo "$api_response" | jq -r '.tag_name')
             echo -e "${GREEN}✨ 发现最新版本: ${latest_tag}${RESET}"
 
-            # 2. 识别架构并检索对应的下载 URL
             local cpu_arch=$(uname -m)
             local cf_url=""
             
             case "$cpu_arch" in
                 x86_64) 
-                    # 在最新的 Release 资源列表中搜索匹配含 'ubuntu' 且不含 'arm' 且不含 '.deb' 的裸文件下载链接
                     cf_url=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("ubuntu") and (contains("arm") | not) and (contains(".deb") | not)) | .browser_download_url' | head -n 1)
                     ;;
                 aarch64|arm64) 
-                    # 匹配含 'ubuntu' 且含 'arm' 且不含 '.deb' 的链接
                     cf_url=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("ubuntu") and contains("arm") and (contains(".deb") | not)) | .browser_download_url' | head -n 1)
                     ;;
                 *) 
@@ -133,7 +135,6 @@ check_and_install() {
                     ;;
             esac
 
-            # 3. 容错拦截：若未能提取到 URL，使用固定的稳妥降级方案
             if [ -z "$cf_url" ] || [ "$cf_url" = "null" ]; then
                 echo -e "${YELLOW}⚠️ 提取最新下载链接失败，启用稳定版规则匹配下载...${RESET}"
                 if [ "$cpu_arch" = "x86_64" ]; then
@@ -143,7 +144,6 @@ check_and_install() {
                 fi
             fi
 
-            # 4. 下载裸文件并赋权
             echo -e "${YELLOW}📥 正在下载二进制资产...${RESET}"
             wget -q "$cf_url" -O /usr/local/bin/speed-cloudflare-cli
             if [ $? -eq 0 ]; then
@@ -376,12 +376,12 @@ while true; do
     echo -e "${GREEN}iperf3    :${RESET} $(get_status iperf3)"
     echo -e "${GREEN}MTR       :${RESET} $(get_status mtr)"
     echo -e "${GREEN}================================${RESET}"
-    echo -e " ${GREEN}1) 运行 Speedtest 网速测试${RESET}"
-    echo -e " ${GREEN}2) 运行 NextTrace 路由追踪${RESET}"
+    echo -e " ${GREEN}1) 运行 Speedtest  网速测试${RESET}"
+    echo -e " ${GREEN}2) 运行 NextTrace  路由追踪${RESET}"
+    echo -e " ${GREEN}3) 运行 iperf3     测速${RESET}"
+    echo -e " ${GREEN}4) 运行 MTR        链路诊断${RESET}"
     echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}3) 运行 iperf3 测速${RESET}"
-    echo -e " ${GREEN}4) 运行 MTR 链路诊断${RESET}"
-    echo -e " ${GREEN}5) 运行 iNetSpeed 测速 (Apple CDN)${RESET}"
+    echo -e " ${GREEN}5) 运行 iNetSpeed  测速 (Apple CDN)${RESET}"
     echo -e " ${GREEN}6) 运行 Cloudflare 测速${RESET}"
     echo -e "${GREEN}--------------------------------${RESET}"
     echo -e " ${GREEN}0) 退出${RESET}"

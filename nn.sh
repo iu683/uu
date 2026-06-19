@@ -1,220 +1,257 @@
 #!/bin/bash
-# ========================================
-# VaultFleet 一键管理脚本
-# ========================================
+# =================================================================
+# LookBusy 服务器资源动态保活挂件 (防回收) Docker Compose 管理面板
+# =================================================================
 
+# 颜色定义
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="vaultfleet"
-APP_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+BASE_DIR="/opt/lookbusy"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+CONTAINER_NAME="lookbusy"
 
-check_docker() {
-
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        curl -fsSL https://get.docker.com | bash
-    fi
-
-    if ! docker compose version &>/dev/null; then
-        echo -e "${RED}未检测到 Docker Compose v2，请升级 Docker${RESET}"
+# 检查依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
 }
 
-check_port() {
+# 动态获取当前运行状态和实时配置参数 (修复无错版)
+get_runtime_status() {
+    if [ -f "$COMPOSE_FILE" ] && [ "$(cd "$BASE_DIR" && docker compose ps -q 2>/dev/null)" ]; then
+        status="${GREEN}运行中 (正在动态模拟负载)${RESET}"
+        
+        # 彻底修复：改用纯 shell 处理 inspect 的原始 env 输出，不再依赖 Go 内部函数
+        local raw_env=$(docker inspect --format='{{range .Config.Env}}{{ . }}{{"\n"}}{{end}}' $CONTAINER_NAME 2>/dev/null)
+        
+        cpu_util=$(echo "$raw_env" | grep "^CPU_UTIL=" | cut -d'=' -f2)
+        cpu_core=$(echo "$raw_env" | grep "^CPU_CORE=" | cut -d'=' -f2)
+        mem_util=$(echo "$raw_env" | grep "^MEM_UTIL=" | cut -d'=' -f2)
+        speed_int=$(echo "$raw_env" | grep "^SPEEDTEST_INTERVAL=" | cut -d'=' -f2)
 
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
+        # 兜底保障：如果动态抓取失败，则从 docker-compose.yml 静态文件提取
+        [[ -z "$cpu_util" ]] && cpu_util=$(grep "CPU_UTIL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
+        [[ -z "$cpu_core" ]] && cpu_core=$(grep "CPU_CORE=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
+        [[ -z "$mem_util" ]] && mem_util=$(grep "MEM_UTIL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
+        [[ -z "$speed_int" ]] && speed_int=$(grep "SPEEDTEST_INTERVAL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
+    else
+        if [ -f "$COMPOSE_FILE" ]; then 
+            status="${YELLOW}已受控停止${RESET}"
+            cpu_util=$(grep "CPU_UTIL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
+            cpu_core=$(grep "CPU_CORE=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
+            mem_util=$(grep "MEM_UTIL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
+            speed_int=$(grep "SPEEDTEST_INTERVAL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
+        else 
+            status="${RED}未部署 / 未运行${RESET}"
+            cpu_util="N/A"; cpu_core="N/A"; mem_util="N/A"; speed_int="N/A"
+        fi
     fi
+    
+    [[ -z "$mem_util" ]] && mem_util="0"
+    [[ -z "$speed_int" ]] && speed_int="0"
 }
 
-menu() {
+# 生成 Docker Compose 配置文件核心逻辑
+generate_compose_file() {
+    local cpu_ut=$1
+    local cpu_co=$2
+    local mem_ut=$3
+    local speed_in=$4
 
-    while true; do
-
-        clear
-
-        echo -e "${GREEN}==============================${RESET}"
-        echo -e "${GREEN}  ◈  VaultFleet 管理菜单  ◈${RESET}"
-        echo -e "${GREEN}==============================${RESET}"
-        echo -e "${GREEN}1) 安装启动${RESET}"
-        echo -e "${GREEN}2) 更新${RESET}"
-        echo -e "${GREEN}3) 重启${RESET}"
-        echo -e "${GREEN}4) 查看日志${RESET}"
-        echo -e "${GREEN}5) 查看状态${RESET}"
-        echo -e "${GREEN}6) 卸载(含数据)${RESET}"
-        echo -e "${GREEN}7)${RESET} ${YELLOW}卸载 Agent${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        echo -e "${GREEN}==============================${RESET}"
-
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-
-        case $choice in
-            1) install_app ;;
-            2) update_app ;;
-            3) restart_app ;;
-            4) view_logs ;;
-            5) check_status ;;
-            6) uninstall_app ;;
-            7) run_node ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ; sleep 1 ;;
-        esac 
-    done
-}
-
-install_app() {
-
-    check_docker
-
-    mkdir -p "$APP_DIR/data"
-
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${YELLOW}检测到已安装，是否覆盖安装？(y/n)${RESET}"
-        read confirm
-        [[ "$confirm" != "y" ]] && return
-    fi
-
-    read -p "请输入访问端口 [默认:8080]: " input_port
-    PORT=${input_port:-8080}
-
-    check_port "$PORT" || return
-
-    cat > "$COMPOSE_FILE" <<EOF
+    mkdir -p "$BASE_DIR"
+    
+    cat <<EOF > "$COMPOSE_FILE"
 services:
-  vaultfleet:
-    image: ghcr.io/momo-z/vaultfleet:latest
-
-    container_name: vaultfleet
-
-    restart: unless-stopped
-
-    ports:
-      - "127.0.0.1:${PORT}:8080"
-
-    volumes:
-      - ./data:/data
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+  lookbusy:
+    image: fogforest/lookbusy:latest
+    container_name: lookbusy
+    hostname: lookbusy
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+      - CPU_UTIL=$cpu_ut
+      - CPU_CORE=$cpu_co
 EOF
 
-    cd "$APP_DIR" || exit
-
-    docker compose up -d
-
-    echo
-    echo -e "${GREEN}✅ VaultFleet 已启动${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://127.0.0.1:${PORT}${RESET}"
-    echo -e "${YELLOW}📂 数据目录: $APP_DIR/data${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-update_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose pull
-    docker compose up -d
-
-    echo -e "${GREEN}✅ 更新完成${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-restart_app() {
-
-    docker restart vaultfleet
-
-    echo -e "${GREEN}✅ 已重启${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-view_logs() {
-
-    docker logs -f vaultfleet
-}
-
-check_status() {
-
-    docker ps | grep vaultfleet
-
-    read -p "按回车返回菜单..."
-}
-
-uninstall_app() {
-
-    cd "$APP_DIR" || return
-
-    docker compose down -v
-    rm -rf "$APP_DIR"
-
-    echo -e "${RED}✅ 已彻底卸载${RESET}"
-
-    read -p "按回车返回菜单..."
-}
-
-
-# ============================================================
-# 新增：GitHub 代理下载核心函数
-# ============================================================
-run_node() {
-    clear
-    # 用户提供的代理前缀列表
-    local GITHUB_PROXY=(
-        ''
-        'https://v6.gh-proxy.org/'
-        'https://gh-proxy.com/'
-        'https://hub.glowp.xyz/'
-        'https://proxy.vvvv.ee/'
-        'https://ghproxy.lvedong.eu.org/'
-    )
-    
-    local RAW_URL="https://raw.githubusercontent.com/momo-z/VaultFleet/main/build/uninstall.sh"
-    local TEMP_SCRIPT="/tmp/nginx_backup_restore_temp.sh"
-    local success=false
-
-
-    # 循环轮询代理列表
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local target_url="${proxy}${RAW_URL}"
-        if [ -n "$proxy" ]; then
-            echo
-        else
-            echo
-        fi
-
-        # 使用 curl 下载，设置 8 秒超时
-        if curl -fsSL --connect-timeout 8 "$target_url" -o "$TEMP_SCRIPT"; then
-            success=true
-            break
-        fi
-        echo -e "${RED}❌ 当前连接失败，正在切换下一个节点...${RESET}"
-    done
-
-    # 判断是否下载成功并执行
-    if [ "$success" = true ] && [ -f "$TEMP_SCRIPT" ]; then
-        echo
-        chmod +x "$TEMP_SCRIPT"
-        
-        # 真正执行备份恢复脚本
-        bash "$TEMP_SCRIPT"
-        
-        # 执行完毕后清理临时文件
-        rm -f "$TEMP_SCRIPT"
-    else
-        echo -e "${RED}❌ 致命错误：所有 GitHub 代理节点均无法连接，请检查您的 VPS 网络！${RESET}"
+    if [ "$mem_ut" != "0" ] && [ -n "$mem_ut" ]; then
+        echo "      - MEM_UTIL=$mem_ut" >> "$COMPOSE_FILE"
+    fi
+    if [ "$speed_in" != "0" ] && [ -n "$speed_in" ]; then
+        echo "      - SPEEDTEST_INTERVAL=$speed_in" >> "$COMPOSE_FILE"
     fi
 }
 
-menu
+# 1. 部署启动
+deploy_lookbusy() {
+    check_dependencies
+    clear
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN}      Docker Compose 部署启动 LookBusy    ${RESET}"
+    echo -e "${GREEN}=========================================${RESET}"
+    
+    echo -ne "${YELLOW}1. 请设置 CPU 期望占用百分比 [默认: 10-20] (支持固定值如15或范围): ${RESET}"
+    read -r input_cpu_util
+    [[ -z "$input_cpu_util" ]] && input_cpu_util="10-20"
+
+    echo -ne "${YELLOW}2. 请设置 参与负载的 CPU 核心数 [默认: 1] (打满请填全部核心数): ${RESET}"
+    read -r input_cpu_core
+    [[ -z "$input_cpu_core" ]] && input_cpu_core="1"
+
+    echo -ne "${YELLOW}3. 请设置 内存占用百分比 [默认: 15] (不跑内存填0): ${RESET}"
+    read -r input_mem_util
+    [[ -z "$input_mem_util" ]] && input_mem_util="15"
+
+    echo -ne "${YELLOW}4. 请设置 网络测速波动的间隔时间 (单位: 分钟) [默认: 120]: ${RESET}"
+    read -r input_speed_int
+    [[ -z "$input_speed_int" ]] && input_speed_int="120"
+
+    echo -e "${GREEN}-----------------------------------------${RESET}"
+    echo -e "${CYAN}正在配置并写入 docker-compose.yml ...${RESET}"
+    generate_compose_file "$input_cpu_util" "$input_cpu_core" "$input_mem_util" "$input_speed_int"
+
+    echo -e "${CYAN}正在通过 Docker Compose 启动容器集群...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✔ LookBusy Compose 部署并启动成功！${RESET}"
+    else
+        echo -e "${RED}❌ 启动失败，请检查 Docker Compose 环境。${RESET}"
+    fi
+}
+
+# 2. 更新容器
+update_lookbusy() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在拉取最新 fogforest/lookbusy 镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    echo -e "${YELLOW}正在无损重启并重建容器...${RESET}"
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}✔ 容器更新完成！${RESET}"
+}
+
+# 3. 卸载容器
+uninstall_lookbusy() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}提示: 未检测到任何部署文件。${RESET}"
+        return
+    fi
+    echo -ne "${RED}危险警告：确定要完全卸载并删除 LookBusy 容器及配置文件吗？(y/n): ${RESET}"
+    read -r confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        cd "$BASE_DIR" && docker compose down
+        rm -rf "$BASE_DIR"
+        echo -e "${GREEN}✔ 容器已销毁，且本地工作目录已彻底抹除。${RESET}"
+    else
+        echo -e "${YELLOW}操作已取消。${RESET}"
+    fi
+}
+
+# 4. 启动容器
+start_lookbusy() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到部署集群，请先部署。${RESET}"
+        return
+    fi
+    cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}✔ 容器集群已恢复启动${RESET}"
+}
+
+# 5. 停止容器
+stop_lookbusy() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到部署集群。${RESET}"
+        return
+    fi
+    cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}✔ 容器集群已受控停止${RESET}"
+}
+
+# 6. 重启容器
+restart_lookbusy() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到部署集群。${RESET}"
+        return
+    fi
+    cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}✔ 容器集群已完成重启${RESET}"
+}
+
+# 7. 查看日志
+view_logs() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到部署集群，无法提取日志。${RESET}"
+        return
+    fi
+    echo -e "${CYAN}正在精准追踪 Docker Compose 实时模拟日志 (按 Ctrl+C 退出追踪):${RESET}"
+    cd "$BASE_DIR" && docker compose logs -f
+}
+
+# 8. 查看配置
+show_config() {
+    get_runtime_status
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}     LookBusy Docker Compose 配置   ${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${YELLOW}本地工作路径 : ${BASE_DIR}"
+    echo -e "${YELLOW}配置实际状态 : $status"
+    echo -e "${YELLOW}分配 CPU 核心 : ${cpu_core} 核"
+    echo -e "${YELLOW}目标 CPU 负载 : ${cpu_util}%"
+    echo -e "${YELLOW}分配内存占用 : ${mem_util}%"
+    echo -e "${YELLOW}网络测速频率 : ${speed_int} 分钟/次${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+}
+
+# 主菜单逻辑
+while true; do
+    clear
+    get_runtime_status
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}◈LookBusy  防回收保活管理面板◈  ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    # 状态栏拆分，严格每行一个指标
+    echo -e "${CYAN}容器状态:${RESET} $status"
+    if [ "$cpu_util" != "N/A" ] && [ -n "$cpu_util" ]; then
+    echo -e "${CYAN}CPU核心 :${RESET} ${YELLOW}${cpu_core}核${RESET}"
+    echo -e "${CYAN}目标负载:${RESET} ${YELLOW}${cpu_util}%${RESET}"
+    echo -e "${CYAN}内存占用:${RESET} ${YELLOW}${mem_util}%${RESET}"
+    echo -e "${CYAN}测速频率:${RESET} ${YELLOW}${speed_int}分钟/次${RESET}"
+    fi
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 修改配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+
+    case "$choice" in
+        1) deploy_lookbusy ;;
+        2) update_lookbusy ;;
+        3) uninstall_lookbusy ;;
+        4) start_lookbusy ;;
+        5) stop_lookbusy ;;
+        6) restart_lookbusy ;;
+        7) view_logs ;;
+        8) show_config ;;
+        9) deploy_lookbusy ;; 
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项，请输入 0-9 之间的数字。${RESET}" ;;
+    esac
+
+    echo ""
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

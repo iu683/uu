@@ -23,21 +23,28 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、映射端口
+# 【核心升级】直接从运行状态中提取最真实的端口映射
 get_status_info() {
     if [ -f "$COMPOSE_FILE" ] && [ "$(cd "$BASE_DIR" && docker compose ps -q 2>/dev/null)" ]; then
-        status="${YELLOW}运行中${RESET}"
+        status="${GREEN}运行中${RESET}"
+        
+        # 实时抓取正在运行的容器端口 (通过 docker inspect 提取本地主机的映射端口)
+        api_p=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' dujiaonext-api 2>/dev/null)
+        user_p=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' dujiaonext-user 2>/dev/null)
+        admin_p=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' dujiaonext-admin 2>/dev/null)
     else
         if [ -f "$ENV_FILE" ]; then status="${RED}已停止${RESET}"; else status="${RED}未部署${RESET}" ; fi
     fi
 
-    # 从 .env 提取端口信息
-    if [ -f "$ENV_FILE" ]; then
-        api_p=$(grep "API_PORT=" "$ENV_FILE" | cut -d'=' -f2)
-        user_p=$(grep "USER_PORT=" "$ENV_FILE" | cut -d'=' -f2)
-        admin_p=$(grep "ADMIN_PORT=" "$ENV_FILE" | cut -d'=' -f2)
-    else
-        api_p="N/A"; user_p="N/A"; admin_p="N/A"
+    # 兜底保障：如果容器没运行或者没抓到，则从 .env 静态文件提取
+    if [ -z "$api_p" ] || [ "$api_p" = "<no value>" ]; then
+        if [ -f "$ENV_FILE" ]; then
+            api_p=$(grep "API_PORT=" "$ENV_FILE" | cut -d'=' -f2)
+            user_p=$(grep "USER_PORT=" "$ENV_FILE" | cut -d'=' -f2)
+            admin_p=$(grep "ADMIN_PORT=" "$ENV_FILE" | cut -d'=' -f2)
+        else
+            api_p="N/A"; user_p="N/A"; admin_p="N/A"
+        fi
     fi
 }
 
@@ -318,7 +325,7 @@ networks:
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}用户前台 (本机) : http://127.0.0.1:${user_port}${RESET}"
     echo -e "${YELLOW}管理后台 (本机) : http://127.0.0.1:${admin_port}${RESET}"
-    echo -e "${YELLOW}API 服务 (本机)  : http://127.0.0.1:${api_port}${RESET}"
+    echo -e "${YELLOW}API 服务 (本机) : http://127.0.0.1:${api_port}${RESET}"
     echo -e "${RED}🔒 核心安全提示：所有服务绑口仅监听 127.0.0.1。本地中间件无任何公网暴露。${RESET}"
     if [ "$db_choice" = "3" ]; then
         echo -e "${GREEN}当前模式       : 远程独立 PostgreSQL 连接模式${RESET}"
@@ -392,20 +399,26 @@ logs_dujiao() {
     esac
 }
 
-# 智能备份和清理旧配置函数
+# 智能备份并完全【移出】Nginx 监控视线（修复 include 冲突 Bug）
 safe_remove_old_conf() {
     local domain=$1
     local paths=("/etc/nginx/sites-enabled/$domain" "/etc/nginx/sites-available/$domain" "/etc/nginx/conf.d/$domain.conf")
     
+    # 创建位于系统 tmp 目录的绝对隔离备份区
+    sudo mkdir -p /tmp/nginx_bak/ 2>/dev/null
+
     for path in "${paths[@]}"; do
         if [ -f "$path" ] || [ -L "$path" ]; then
-            echo -e "${YELLOW}发现冲突旧配置: $path，正在自动备份为 .bak 并移除...${RESET}"
-            sudo mv "$path" "${path}.bak_dujiao" 2>/dev/null
+            local filename=$(basename "$path")
+            local parent_dir=$(basename "$(dirname "$path")")
+            echo -e "${YELLOW}发现冲突旧配置: $path，正在将其移出 Nginx 并备份至 /tmp/nginx_bak/${parent_dir}_${filename} ...${RESET}"
+            # 使用 mv 直接移走，绝不在原目录留下任何后缀文件，彻底消除 Nginx 扫描
+            sudo mv "$path" "/tmp/nginx_bak/${parent_dir}_${filename}" 2>/dev/null
         fi
     done
 }
 
-# 自动配置 Nginx 反代逻辑 (支持 sites-enabled 路径及自动清理旧配置)
+# 自动配置 Nginx 反代逻辑 
 configure_nginx() {
     get_status_info
     if [ "$user_p" = "N/A" ] || [ "$admin_p" = "N/A" ] || [ "$api_p" = "N/A" ]; then
@@ -419,7 +432,7 @@ configure_nginx() {
     echo -e "${GREEN}=====================================================${RESET}"
     echo -e "${RED}🔔 智能交割提示：${RESET}"
     echo -e "${YELLOW}1. 脚本会自动检测并在 /etc/nginx/sites-enabled/ 下重写域名文件。${RESET}"
-    echo -e "${YELLOW}2. 如果检测到同名的旧域名配置文件，脚本会自动将其备份为 .bak_dujiao 防止冲突。${RESET}"
+    echo -e "${YELLOW}2. 发现同名旧文件会无损移到 /tmp/nginx_bak/ 目录，绝不污染 Nginx 配置链。${RESET}"
     echo -e "${YELLOW}3. 写入前请确认你已提前生成好这两个域名的 SSL 证书文件。${RESET}"
     echo -e "${GREEN}=====================================================${RESET}"
     echo -ne "${CYAN}确认已知晓并继续操作吗？(y/n): ${RESET}"
@@ -440,7 +453,7 @@ configure_nginx() {
         return
     fi
 
-    # 安全检查并清理同名冲突配置
+    # 彻底移开冲突配置文件
     safe_remove_old_conf "$user_domain"
     safe_remove_old_conf "$admin_domain"
 
@@ -454,7 +467,6 @@ configure_nginx() {
     USER_CONF="$TARGET_DIR/$user_domain"
     ADMIN_CONF="$TARGET_DIR/$admin_domain"
 
-    # 如果是 conf.d 模式，补齐后缀
     if [ "$TARGET_DIR" = "/etc/nginx/conf.d" ]; then
         USER_CONF="${USER_CONF}.conf"
         ADMIN_CONF="${ADMIN_CONF}.conf"
@@ -582,13 +594,13 @@ EOF
         if sudo nginx -t; then
             echo -e "${YELLOW}语法检查成功，正在重载 Nginx 服务...${RESET}"
             sudo nginx -s reload
-            echo -e "${GREEN}✔ 成功无缝交接！独角数卡生产反代全线生效！${RESET}"
+            echo -e "${GREEN}✔ 成功无缝交接！旧配置已彻底移开，独角数卡全线生效！${RESET}"
         else
-            echo -e "${RED}❌ Nginx 语法检查失败！已自动回滚，请检查是否已提前申请证书。${RESET}"
+            echo -e "${RED}❌ Nginx 语法检查失败！请检查证书文件是否存在。${RESET}"
         fi
     else
         echo -e "${YELLOW}提示: 未检测到本地 Nginx 物理命令，文件已保存在: $TARGET_DIR${RESET}"
-    fi
+    fi 
 }
 
 
@@ -596,8 +608,8 @@ show_info() {
     get_status_info
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}集群运行状态 : $status"
-    echo -e "${YELLOW}前台映射端点 : 127.0.0.1:${user_port}"
-    echo -e "${YELLOW}后台映射端点 : 127.0.0.1:${admin_port}"
+    echo -e "${YELLOW}前台映射端点 : 127.0.0.1:${user_p}"
+    echo -e "${YELLOW}后台映射端点 : 127.0.0.1:${admin_p}"
     echo -e "${YELLOW}API 核心端点 : 127.0.0.1:${api_p}"
     echo -e "${YELLOW}本地安装路径 : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}================================${RESET}"
@@ -610,9 +622,9 @@ menu() {
     echo -e "${GREEN} ◈ DuJiaoNext (独角数卡) 面板 ◈  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}核心状态 :${RESET} $status"
-    echo -e "${GREEN}前台端口 :${RESET}${YELLOW}${user_p}${RESET}"
-    echo -e "${GREEN}后台端口 :${RESET}${YELLOW}${admin_p}${RESET}" 
-    echo -e "${GREEN}API端口  :${RESET}${YELLOW}${api_p}${RESET}"
+    echo -e "${GREEN}前台端口 :${RESET} ${YELLOW}${user_p}${RESET}"
+    echo -e "${GREEN}后台端口 :${RESET} ${YELLOW}${admin_p}${RESET}" 
+    echo -e "${GREEN}API端口  :${RESET} ${YELLOW}${api_p}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新服务${RESET}"
@@ -622,6 +634,7 @@ menu() {
     echo -e "${GREEN}6. 重启集群${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 配置反向代理${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
@@ -635,6 +648,7 @@ menu() {
         6) restart_dujiao ;;
         7) logs_dujiao ;;
         8) show_info ;;
+        9) configure_nginx ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

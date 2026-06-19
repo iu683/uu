@@ -51,11 +51,11 @@ install_dujiao() {
     check_dependencies
     clear
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    请选择 DuJiaoNext 数据库架构: ${RESET}"
+    echo -e "${GREEN}  请选择 DuJiaoNext 数据库架构: ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${CYAN}1. 方案 A：SQLite + Redis (轻量本地化推荐)${RESET}"
     echo -e "${CYAN}2. 方案 B：PostgreSQL + Redis (本地容器自建集群)${RESET}"
-    echo -e "${CYAN}3. 方案 C：连接远程/外部独立数据库 + Redis (分离式架构推荐)${RESET}"
+    echo -e "${CYAN}3. 方案 C：连接远程/外部独立 PostgreSQL${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${YELLOW}请输入编号 [1-3]: ${RESET}"
     read -r db_choice
@@ -65,22 +65,15 @@ install_dujiao() {
         return
     fi
 
-    # 如果是远程数据库，先交互获取数据库凭据
-    local remote_driver="postgres"
+    # 如果是远程数据库，交互获取远程 PostgreSQL 凭据
     local remote_dsn=""
     if [ "$db_choice" = "3" ]; then
-        echo -e "${CYAN}--- 远程数据库连接配置 ---${RESET}"
-        echo -ne "${YELLOW}请选择数据库类型 ([1] PostgreSQL [2] MySQL): ${RESET}"
-        read -r db_type
-        if [ "$db_type" = "2" ]; then remote_driver="mysql"; else remote_driver="postgres"; fi
-
+        echo -e "${CYAN}--- 远程 PostgreSQL 数据库连接配置 ---${RESET}"
         echo -ne "${YELLOW}请输入远程数据库 主机IP/域名: ${RESET}"
         read -r remote_host
-        echo -ne "${YELLOW}请输入远程数据库 端口 (默认 Postgres:5432 / MySQL:3306): ${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库 端口 [默认: 5432]: ${RESET}"
         read -r remote_port
-        if [ -z "$remote_port" ]; then
-            if [ "$remote_driver" = "mysql" ]; then remote_port="3306"; else remote_port="5432"; fi
-        fi
+        [[ -z "$remote_port" ]] && remote_port="5432"
         echo -ne "${YELLOW}请输入远程数据库 用户名: ${RESET}"
         read -r remote_user
         echo -ne "${YELLOW}请输入远程数据库 密码: ${RESET}"
@@ -88,12 +81,8 @@ install_dujiao() {
         echo -ne "${YELLOW}请输入远程数据库 数据库名: ${RESET}"
         read -r remote_dbname
 
-        # 封装不同驱动的 DSN
-        if [ "$remote_driver" = "mysql" ]; then
-            remote_dsn="${remote_user}:${remote_pass}@tcp(${remote_host}:${remote_port})/${remote_dbname}?charset=utf8mb4&parseTime=True&loc=Local"
-        else
-            remote_dsn="host=${remote_host} user=${remote_user} password=${remote_pass} dbname=${remote_dbname} port=${remote_port} sslmode=disable TimeZone=Asia/Shanghai"
-        fi
+        # 封装标准 Postgres DSN 格式
+        remote_dsn="host=${remote_host} user=${remote_user} password=${remote_pass} dbname=${remote_dbname} port=${remote_port} sslmode=disable TimeZone=Asia/Shanghai"
     fi
 
     echo -e "${CYAN}====== 自定义基础参数配置 ======${RESET}"
@@ -176,12 +165,12 @@ EOF
     elif [ "$db_choice" = "3" ]; then
         cat <<EOF >> "$CONFIG_FILE"
 database:
-  driver: ${remote_driver}
+  driver: postgres
   dsn: "${remote_dsn}"
 EOF
     fi
 
-    # 4. 生成高内聚的 .env 变量文件
+    # 4. 生成高内聚的 .env 变量 file
     cat <<EOF > "$ENV_FILE"
 TAG=latest
 TZ=Asia/Shanghai
@@ -197,7 +186,6 @@ POSTGRES_PASSWORD=${local_pg_pass}
 EOF
 
     # 5. 生成对应的集群网络 docker-compose.yml 
-    # 基础公共服务定义开始 (不含本地自建数据库组件)
     local compose_content="services:
   redis:
     image: redis:7-alpine
@@ -326,13 +314,14 @@ networks:
     sleep 8
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      DuJiaoNext 部署命令成功提交！${RESET}"
+    echo -e "${GREEN}       DuJiaoNext 部署成功！     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}用户前台 (本机) : http://127.0.0.1:${user_port}${RESET}"
     echo -e "${YELLOW}管理后台 (本机) : http://127.0.0.1:${admin_port}${RESET}"
+    echo -e "${YELLOW}API 服务 (本机)  : http://127.0.0.1:${api_port}${RESET}"
     echo -e "${RED}🔒 核心安全提示：所有服务绑口仅监听 127.0.0.1。本地中间件无任何公网暴露。${RESET}"
     if [ "$db_choice" = "3" ]; then
-        echo -e "${GREEN}当前模式       : 远程数据库连接模式 (${remote_driver})${RESET}"
+        echo -e "${GREEN}当前模式       : 远程独立 PostgreSQL 连接模式${RESET}"
     fi
     echo -e "${GREEN}--------------------------------${RESET}"
     echo -e "${YELLOW}初始管理员账号 : admin${RESET}"
@@ -376,7 +365,232 @@ uninstall_dujiao() {
 start_dujiao() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}集群已恢复启动${RESET}"; }
 stop_dujiao() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}集群已受控停止${RESET}"; }
 restart_dujiao() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}集群已完整重启${RESET}"; }
-logs_dujiao() { cd "$BASE_DIR" && docker compose logs -f api; }
+
+
+# 三选一交互式追踪日志核心逻辑
+logs_dujiao() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到部署集群，无法提取日志。${RESET}"
+        return
+    fi
+    clear
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}      请选择要追踪日志的容器:     ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${CYAN}1. 核心 API 服务 (dujiaonext-api)${RESET}"
+    echo -e "${CYAN}2. 用户前台网站 (dujiaonext-user)${RESET}"
+    echo -e "${CYAN}3. 管理后台管理 (dujiaonext-admin)${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${YELLOW}请输入选项 [1-3]: ${RESET}"
+    read -r log_choice
+
+    case "$log_choice" in
+        1) cd "$BASE_DIR" && docker compose logs -f api ;;
+        2) cd "$BASE_DIR" && docker compose logs -f user ;;
+        3) cd "$BASE_DIR" && docker compose logs -f admin ;;
+        *) echo -e "${RED}输入无效，返回主菜单。${RESET}" ;;
+    esac
+}
+
+# 智能备份和清理旧配置函数
+safe_remove_old_conf() {
+    local domain=$1
+    local paths=("/etc/nginx/sites-enabled/$domain" "/etc/nginx/sites-available/$domain" "/etc/nginx/conf.d/$domain.conf")
+    
+    for path in "${paths[@]}"; do
+        if [ -f "$path" ] || [ -L "$path" ]; then
+            echo -e "${YELLOW}发现冲突旧配置: $path，正在自动备份为 .bak 并移除...${RESET}"
+            sudo mv "$path" "${path}.bak_dujiao" 2>/dev/null
+        fi
+    done
+}
+
+# 自动配置 Nginx 反代逻辑 (支持 sites-enabled 路径及自动清理旧配置)
+configure_nginx() {
+    get_status_info
+    if [ "$user_p" = "N/A" ] || [ "$admin_p" = "N/A" ] || [ "$api_p" = "N/A" ]; then
+        echo -e "${RED}错误: 未检测到有效的部署参数，请先执行选项 1 部署服务。${RESET}"
+        return
+    fi
+
+    clear
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${GREEN}      DuJiaoNext Nginx 智能域名配置交割工具            ${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${RED}🔔 智能交割提示：${RESET}"
+    echo -e "${YELLOW}1. 脚本会自动检测并在 /etc/nginx/sites-enabled/ 下重写域名文件。${RESET}"
+    echo -e "${YELLOW}2. 如果检测到同名的旧域名配置文件，脚本会自动将其备份为 .bak_dujiao 防止冲突。${RESET}"
+    echo -e "${YELLOW}3. 写入前请确认你已提前生成好这两个域名的 SSL 证书文件。${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -ne "${CYAN}确认已知晓并继续操作吗？(y/n): ${RESET}"
+    read -r cert_confirm
+    if [[ "$cert_confirm" != "y" && "$cert_confirm" != "Y" ]]; then
+        echo -e "${YELLOW}已取消配置。${RESET}"
+        return
+    fi
+
+    echo ""
+    echo -ne "${YELLOW}请输入前台(User)现有域名 (例如: user.example.com): ${RESET}"
+    read -r user_domain
+    echo -ne "${YELLOW}请输入后台(Admin)现有域名 (例如: admin.example.com): ${RESET}"
+    read -r admin_domain
+
+    if [ -z "$user_domain" ] || [ -z "$admin_domain" ]; then
+        echo -e "${RED}域名不能为空，取消配置！${RESET}"
+        return
+    fi
+
+    # 安全检查并清理同名冲突配置
+    safe_remove_old_conf "$user_domain"
+    safe_remove_old_conf "$admin_domain"
+
+    # 定位 Nginx 配置写入路径
+    local TARGET_DIR="/etc/nginx/sites-enabled"
+    if [ ! -d "$TARGET_DIR" ]; then
+        TARGET_DIR="/etc/nginx/conf.d"
+    fi
+    sudo mkdir -p "$TARGET_DIR"
+
+    USER_CONF="$TARGET_DIR/$user_domain"
+    ADMIN_CONF="$TARGET_DIR/$admin_domain"
+
+    # 如果是 conf.d 模式，补齐后缀
+    if [ "$TARGET_DIR" = "/etc/nginx/conf.d" ]; then
+        USER_CONF="${USER_CONF}.conf"
+        ADMIN_CONF="${ADMIN_CONF}.conf"
+    fi
+
+    echo -e "${YELLOW}正在写入前台配置到 $USER_CONF ...${RESET}"
+    sudo tee "$USER_CONF" > /dev/null <<EOF
+server {
+    listen 80;
+    server_name $user_domain;
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name $user_domain;
+
+    ssl_certificate /etc/letsencrypt/live/$user_domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$user_domain/privkey.pem;
+
+    client_max_body_size 200M;
+
+    location / {
+        proxy_pass http://127.0.0.1:$user_p;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # WebSocket 支持
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    # SEO 文件
+    location = /sitemap.xml {
+        proxy_pass http://127.0.0.1:$api_p/sitemap.xml;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /robots.txt {
+        proxy_pass http://127.0.0.1:$api_p/robots.txt;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:$api_p/api/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /uploads/ {
+        proxy_pass http://127.0.0.1:$api_p/uploads/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+    echo -e "${YELLOW}正在写入后台配置到 $ADMIN_CONF ...${RESET}"
+    sudo tee "$ADMIN_CONF" > /dev/null <<EOF
+server {
+    listen 80;
+    server_name $admin_domain;
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name $admin_domain;
+
+    ssl_certificate /etc/letsencrypt/live/$admin_domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$admin_domain/privkey.pem;
+
+    client_max_body_size 200M;
+
+    location / {
+        proxy_pass http://127.0.0.1:$admin_p;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # WebSocket 支持
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:$api_p/api/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /uploads/ {
+        proxy_pass http://127.0.0.1:$api_p/uploads/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+    echo -e "${GREEN}新配置文件成功生成！${RESET}"
+    
+    if command -v nginx &> /dev/null; then
+        echo -e "${YELLOW}正在进行 Nginx 语法安全检查...${RESET}"
+        if sudo nginx -t; then
+            echo -e "${YELLOW}语法检查成功，正在重载 Nginx 服务...${RESET}"
+            sudo nginx -s reload
+            echo -e "${GREEN}✔ 成功无缝交接！独角数卡生产反代全线生效！${RESET}"
+        else
+            echo -e "${RED}❌ Nginx 语法检查失败！已自动回滚，请检查是否已提前申请证书。${RESET}"
+        fi
+    else
+        echo -e "${YELLOW}提示: 未检测到本地 Nginx 物理命令，文件已保存在: $TARGET_DIR${RESET}"
+    fi
+}
+
 
 show_info() {
     get_status_info
@@ -384,6 +598,7 @@ show_info() {
     echo -e "${YELLOW}集群运行状态 : $status"
     echo -e "${YELLOW}前台映射端点 : 127.0.0.1:${user_port}"
     echo -e "${YELLOW}后台映射端点 : 127.0.0.1:${admin_port}"
+    echo -e "${YELLOW}API 核心端点 : 127.0.0.1:${api_p}"
     echo -e "${YELLOW}本地安装路径 : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
@@ -395,17 +610,19 @@ menu() {
     echo -e "${GREEN} ◈ DuJiaoNext (独角数卡) 面板 ◈  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}核心状态 :${RESET} $status"
-    echo -e "${GREEN}前/后台绑口:${RESET} ${YELLOW}${user_p} / ${admin_p}${RESET}"
+    echo -e "${GREEN}前台端口 :${RESET}${YELLOW}${user_p}${RESET}"
+    echo -e "${GREEN}后台端口 :${RESET}${YELLOW}${admin_p}${RESET}" 
+    echo -e "${GREEN}API端口  :${RESET}${YELLOW}${api_p}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新镜像${RESET}"
+    echo -e "${GREEN}2. 更新服务${RESET}"
     echo -e "${GREEN}3. 卸载服务${RESET}"
     echo -e "${GREEN}4. 启动集群${RESET}"
     echo -e "${GREEN}5. 停止集群${RESET}"
     echo -e "${GREEN}6. 重启集群${RESET}"
-    echo -e "${GREEN}7. 追踪日志(API)${RESET}"
-    echo -e "${GREEN}8. 查看详细配置${RESET}"
-    echo -e "${GREEN}. 退出${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice

@@ -60,14 +60,13 @@ check_dependencies() {
 
 # ================== 检查服务状态、端口与版本 ==================
 check_status() {
-    if ! command -v mcy &>/dev/null && [ ! -f "bin" ]; then
-        echo -e "${RED}服务状态: 未安装 (请选择 1 进行系统安装)${RESET}"
+    if [ ! -f "bin" ]; then
+        echo -e "${RED}服务状态: 未安装 (请选择 66 进行系统安装)${RESET}"
         return
     fi
 
-    # 1. 安全获取真实版本号（彻底修复 -v 未找到命令的问题）
+    # 1. 安全获取真实版本号
     if [ -f "bin" ]; then
-        # 提取二进制环境中自带的内容，并剔除时间
         VERSION=$(./bin -v 2>/dev/null | grep -oE 'Swoole [0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
         if [ -z "$VERSION" ]; then
             VERSION="Swoole 5.1.3 (cli)"
@@ -81,11 +80,11 @@ check_status() {
     LISTEN_PORT=$(ss -ntlp | grep -E "bin|index.php" | awk '{print $4}' | awk -F: '{print $NF}' | sort -nu | tr '\n' ' ' | xargs)
     
     if [ -n "$LISTEN_PORT" ]; then
-        echo -e "${GREEN}服务状态: 运行中${RESET}"
-        echo -e "${GREEN}监听端口: ${LISTEN_PORT}${RESET}"
+        echo -e "${GREEN}服务状态:${RESET} ${YELLOW}运行中${RESET}"
+        echo -e "${GREEN}监听端口:${RESET} ${YELLOW}${LISTEN_PORT}${RESET}"
     else
-        echo -e "${YELLOW}服务状态: 未启动${RESET}"
-        echo -e "${YELLOW}监听端口: 无${RESET}"
+        echo -e "${GREEN}服务状态:${RESET} ${RED}未启动${RESET}"
+        echo -e "${GREEN}监听端口:${RESET} ${RED}无${RESET}"
     fi
 }
 
@@ -122,16 +121,16 @@ mcy_install() {
     echo -e "${YELLOW}==================================================${RESET}"
     sleep 2
 
-    # 执行前台初始安装
-    mcy service.install 2>/dev/null || ./bin index.php
+    # 执行前台初始安装 (改用更安全的原生路径调用)
+    ./bin service.install 2>/dev/null || ./bin index.php
 
     echo -e "\n${GREEN}✔ 前台安装程序已完成或被关闭。${RESET}"
 }
 
 # ================== 环境检查中间件 ==================
 ensure_installed() {
-    if ! command -v mcy &>/dev/null && [ ! -f "bin" ]; then
-        echo -e "${RED}错误: 检测到程序尚未安装，请先选择选项 1 进行安装！${RESET}"
+    if [ ! -f "bin" ]; then
+        echo -e "${RED}错误: 检测到程序尚未安装，请先选择选项 66 进行安装！${RESET}"
         return 1
     fi
     return 0
@@ -148,18 +147,18 @@ show_menu() {
     
     echo -e "${GREEN} 2.启动服务${RESET}            ${GREEN}|${RESET} ${GREEN} 3.停止服务${RESET}"
     echo -e "${GREEN} 4.重启服务${RESET}            ${GREEN}|${RESET} ${GREEN} 5.更新系统${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
     echo -e "${GREEN} 7.生成数据库模型${RESET}      ${GREEN}|${RESET} ${GREEN} 8.创建语言包${RESET}"
     echo -e "${GREEN} 9.删除语言包${RESET}          ${GREEN}|${RESET} ${GREEN}10.批量删除语言包${RESET}"
     echo -e "${GREEN}11.查看语言代码${RESET}        ${GREEN}|${RESET} ${GREEN}12.压缩 JS${RESET}"
-    echo -e "${GREEN}13.压缩 CSS${RESET}            ${GREEN}|${RESET} ${GREEN}14.压缩 JS+CSS${RESET}"
+    echo -e "${GREEN}13.压缩 CSS${RESET}           ${GREEN}|${RESET} ${GREEN}14.压缩 JS+CSS${RESET}"
     echo -e "${GREEN}15.停止插件${RESET}            ${GREEN}|${RESET} ${GREEN}16.查看运行插件${RESET}"
     echo -e "${GREEN}17.重置管理员密码${RESET}      ${GREEN}|${RESET} ${GREEN}18.添加 Composer依赖${RESET}"
     echo -e "${GREEN}19.删除 Composer依赖${RESET}   ${GREEN}|${RESET} ${GREEN}20.导入异次元V3数据${RESET}"
-    echo -e "${YELLOW}66.安装服务${RESET}           ${GREEN}|${RESET} ${RED}77.卸载服务${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${YELLOW}66.安装服务${RESET}             ${GREEN}|${RESET} ${RED}77.卸载服务${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
     echo -e "${GREEN} 0.退出${RESET}"
-    echo "---------------------------------------"
+    echo -e "${GREEN}=======================================${RESET}"
     echo -ne "${GREEN}请选择操作: ${RESET}"
 }
 
@@ -172,25 +171,26 @@ while true; do
             mcy_install
             ;;
         2)
-            ensure_installed && mcy service.start
+            ensure_installed && ./bin service.start
             ;;
         3)
-            ensure_installed && mcy service.stop
+            ensure_installed && ./bin service.stop
             ;;
         4)
-            ensure_installed && mcy service.restart
+            ensure_installed && ./bin service.restart
             ;;
         77)
-            ensure_installed && mcy service.uninstall
+            ensure_installed && ./bin service.uninstall
+            rm -rf /www/wwwroot/mcy-shop
             ;;
-        6)
-            ensure_installed && mcy kit.update
+        5)
+            ensure_installed && ./bin kit.update
             ;;
         7)
             ensure_installed && {
                 echo -ne "请输入表名（多个表名用空格隔开）: "
                 read -r tables
-                mcy database.model.create $tables
+                ./bin database.model.create $tables
             }
             ;;
         8)
@@ -201,7 +201,7 @@ while true; do
                 read -r translation
                 echo -ne "请输入语言代码: "
                 read -r lang
-                mcy language.create "$original" "$translation" "$lang"
+                ./bin language.create "$original" "$translation" "$lang"
             }
             ;;
         9)
@@ -210,27 +210,27 @@ while true; do
                 read -r original
                 echo -ne "请输入语言代码: "
                 read -r lang
-                mcy language.del "$original" "$lang"
+                ./bin language.del "$original" "$lang"
             }
             ;;
         10)
             ensure_installed && {
                 echo -ne "请输入要删除的原文（空格隔开，如有空格请用双引号包裹）: "
                 read -r originals
-                mcy language.all.del "$originals"
+                ./bin language.all.del "$originals"
             }
             ;;
         11)
-            ensure_installed && mcy language.code
+            ensure_installed && ./bin language.code
             ;;
         12)
-            ensure_installed && mcy compress.js.merge
+            ensure_installed && ./bin compress.js.merge
             ;;
         13)
-            ensure_installed && mcy compress.css.merge
+            ensure_installed && ./bin compress.css.merge
             ;;
         14)
-            ensure_installed && mcy compress.all
+            ensure_installed && ./bin compress.all
             ;;
         15)
             ensure_installed && {
@@ -238,42 +238,42 @@ while true; do
                 read -r plugin
                 echo -ne "请输入用户ID（可留空代表主站插件）: "
                 read -r userid
-                mcy plugin.stop "$plugin" "$userid"
+                ./bin plugin.stop "$plugin" "$userid"
             }
             ;;
         16)
             ensure_installed && {
                 echo -ne "请输入用户ID（可留空代表主站插件）: "
                 read -r userid
-                mcy plugin.startups "$userid"
+                ./bin plugin.startups "$userid"
             }
             ;;
         17)
             ensure_installed && {
                 echo -ne "请输入新密码: "
                 read -r newpass
-                mcy kit.reset "$newpass"
+                ./bin kit.reset "$newpass"
             }
             ;;
         18)
             ensure_installed && {
                 echo -ne "请输入 Composer 包名: "
                 read -r package
-                mcy composer.require "$package"
+                ./bin composer.require "$package"
             }
             ;;
         19)
             ensure_installed && {
                 echo -ne "请输入要删除的 Composer 包名: "
                 read -r package
-                mcy composer.remove "$package"
+                ./bin composer.remove "$package"
             }
             ;;
         20)
             ensure_installed && {
                 echo -ne "请输入 .sql 文件名（放在根目录下）: "
                 read -r sqlfile
-                mcy migration.v3.user "$sqlfile"
+                ./bin migration.v3.user "$sqlfile"
             }
             ;;
         0)

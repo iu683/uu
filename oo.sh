@@ -169,6 +169,10 @@ EOF
             read -r custom_mgt
             [[ -z "$custom_mgt" ]] && custom_mgt="4567"
 
+            echo -ne "${YELLOW}请输入内置 AList 访问端口 [默认: 5244]: ${RESET}"
+            read -r custom_alist
+            [[ -z "$custom_alist" ]] && custom_alist="5244"
+
             echo -e "${YELLOW}正在生成 [纯净版 AList-TVBox] 配置文件...${RESET}"
             cat <<EOF > "$COMPOSE_FILE"
 services:
@@ -178,28 +182,38 @@ services:
     restart: always
     ports:
       - "${custom_mgt}:4567"
+      - "${custom_alist}:5244"
+    environment:
+      - ALIST_PORT=${custom_alist}
     volumes:
       - ${BASE_DIR}:/data
       - ${BASE_DIR}/www-static:/www/static
 EOF
-            local show_msg="${YELLOW}管理后台地址 : http://${DETECT_IP}:${custom_mgt}\n纯净版进AList后台用户名：atv (密码在高级设置中查看)${RESET}"
+            local show_msg="${YELLOW}管理后台地址 : http://${DETECT_IP}:${custom_mgt}\nAList 访问地址: http://${DETECT_IP}:${custom_alist}${RESET}"
             ;;
     esac
 
     echo -e "${YELLOW}正在通过 Docker Compose 启动服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}等待服务初始化并生成密码凭据 (约5秒)...${RESET}"
+    sleep 5
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}          部署命令提交成功！      ${RESET}"
+    echo -e "${GREEN}     AList-TvBox  部署成功！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "$show_msg"
-    echo -e "${YELLOW}默认用户名   : admin${RESET}"
-    echo -e "${YELLOW}默认初始密码 : admin${RESET}"
     echo -e "${YELLOW}持久化目录   : $BASE_DIR${RESET}"
+    
+    # 动态判断并打印安装后的密码
+    if [ -f "$BASE_DIR/initial_admin_credentials.txt" ]; then
+        echo -e "${GREEN}====== 检测到系统自动生成的安全凭据 ======${RESET}"
+        cat "$BASE_DIR/initial_admin_credentials.txt"
+    else
+        echo -e "${YELLOW}默认用户名   : admin${RESET}"
+        cat "$BASE_DIR/initial_admin_credentials.txt"
     echo -e "${GREEN}================================${RESET}"
+
 }
 
 # 更新镜像
@@ -259,7 +273,7 @@ menu() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}◈  小雅/AList-TVBox  管理面板 ◈ ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}状态     :${RESET} $status"
     echo -e "${GREEN}管理端口 :${RESET} ${YELLOW}${mgt_port}${RESET}"  
     echo -e "${GREEN}AList端口:${RESET} ${YELLOW}${alist_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"

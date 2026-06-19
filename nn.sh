@@ -1,6 +1,6 @@
-#!/bin/bash
+ #!/bin/bash
 # =================================================================
-# Translate 翻译服务 Docker Compose 管理面板 
+# SamWAF 防火墙 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="poixe-translate"
-BASE_DIR="/opt/translate"
+CONTAINER_NAME="samwaf-instance"
+BASE_DIR="/opt/samwaf"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -39,20 +39,15 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 80 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 从容器状态提取管理后台端口（容器内部默认监听的是 26666 端口）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "26666/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
         # 兜底获取第一个绑定的端口
         [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8080"
-
-        # 从容器状态提取数据目录（挂载路径）
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="/opt/translate/data"
+        [[ -z "$webui_port" ]] && webui_port="26666"
     else
         # 容器未安装/未部署时的返回值
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        data_dir="N/A"
     fi
 }
 
@@ -80,86 +75,99 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Translate
-install_translate() {
+# 部署 SamWAF
+install_samwaf() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -ne "${YELLOW}请输入 Translate 访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
+    echo -ne "${YELLOW}请输入 SamWAF 管理后台访问端口 (宿主机端口) [默认: 26666]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
+    [[ -z "$custom_port" ]] && custom_port="26666"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -ne "${YELLOW}请输入宿主机缓存数据存储绝对路径 [默认: /opt/translate/data]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="/opt/translate/data"
+    echo -ne "${YELLOW}是否需要同时映射宿主机 80/443 端口提供解密防护服务？(y/n) [默认: y]: ${RESET}"
+    read -r map_http
+    [[ -z "$map_http" ]] && map_http="y"
 
-    # 1. 创建所需的宿主机目录
-    mkdir -p "$custom_data"
-    chmod -R 777 "$BASE_DIR" "$custom_data"
+    # 1. 自动在基础目录下建立规范的子数据目录
+    echo -e "${YELLOW}正在初始化持久化目录 (conf, data, logs, ssl)...${RESET}"
+    mkdir -p "$BASE_DIR/conf" "$BASE_DIR/data" "$BASE_DIR/logs" "$BASE_DIR/ssl"
+    chmod -R 777 "$BASE_DIR"
 
     # 2. 动态生成符合要求的 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    
+    # 基础端口映射
+    local ports_config="      - \"${custom_port}:26666\""
+    # 如果需要保护80/443，追加映射
+    if [[ "$map_http" == "y" || "$map_http" == "Y" ]]; then
+        ports_config="${ports_config}\n      - \"80:80\"\n      - \"443:443\""
+    fi
+
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  translate:
+  samwaf:
     container_name: ${CONTAINER_NAME}
-    image: terobox/translate:latest
+    image: samwaf/samwaf:latest
     restart: always
+    platform: linux/amd64
     ports:
-      - "${custom_port}:80"
+$(echo -e "$ports_config")
     volumes:
-      - ${custom_data}:/app/data
+      - ${BASE_DIR}/conf:/app/conf
+      - ${BASE_DIR}/data:/app/data
+      - ${BASE_DIR}/logs:/app/logs
+      - ${BASE_DIR}/ssl:/app/ssl
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Translate 翻译服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 SamWAF...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
-    
+
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Translate 部署成功！      ${RESET}"
+    echo -e "${GREEN}       SamWAF 部署成功！        ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
-    echo -e "${YELLOW}提示: 你可以直接访问网页进行翻译，或调用其 API 接口。${RESET}"
+    echo -e "${YELLOW}管理后台地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}初始登录密码   : 请查看官方文档或日志提示（通常首次访问会引导创建）${RESET}"
+    echo -e "${YELLOW}持久化数据路径 : $BASE_DIR${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Translate 镜像
-update_translate() {
+# 更新 SamWAF 镜像
+update_samwaf() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Translate 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 SamWAF 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Translate
-uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 Translate 容器吗？(y/n): ${RESET}"
+# 卸载 SamWAF
+uninstall_samwaf() {
+    echo -ne "${YELLOW}确定要卸载并删除 SamWAF 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和缓存数据？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置、证书以及拦截日志数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}所有数据目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -168,18 +176,18 @@ uninstall_translate() {
     fi
 }
 
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_translate() { docker logs -f "$CONTAINER_NAME"; }
+start_samwaf() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_samwaf() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_samwaf() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_samwaf() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
+    echo -e "${YELLOW}管理后台地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}核心配置路径   : ${BASE_DIR}/conf${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -187,7 +195,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  Translate 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}     ◈  SamWAF 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -200,18 +208,18 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
+        1) install_samwaf ;;
+        2) update_samwaf ;;
+        3) uninstall_samwaf ;;
+        4) start_samwaf ;;
+        5) stop_samwaf ;;
+        6) restart_samwaf ;;
+        7) logs_samwaf ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

@@ -1,257 +1,401 @@
 #!/bin/bash
 # =================================================================
-# LookBusy 服务器资源动态保活挂件 (防回收) Docker Compose 管理面板
+# 名称: 全能网络工具箱 
+# 适配: Debian / Ubuntu / CentOS / Rocky Linux / Alpine Linux
 # =================================================================
 
-# 颜色定义
-RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
+RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
+ORANGE='\033[38;5;208m'
 
-BASE_DIR="/opt/lookbusy"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONTAINER_NAME="lookbusy"
+# 默认配置参数
+IPERF_PORT=5201
+IPERF_TIME=30
+IPERF_PARALLEL=1
+IPERF_UDP_BW="1G"
+MTR_PROTO="ICMP"
+MTR_SHOW_AS="true"
 
-# 检查依赖
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
+# 全局安全退出捕获
+trap "echo -e '${RESET}'; exit" INT TERM
+
+# ==========================================
+# 工具状态动态探测
+# ==========================================
+get_status() {
+    if command -v "$1" >/dev/null 2>&1; then
+        echo -e "${YELLOW}已安装${RESET}"
+    else
+        echo -e "${RED}未安装${RESET}"
     fi
 }
 
-# 动态获取当前运行状态和实时配置参数 (修复无错版)
-get_runtime_status() {
-    if [ -f "$COMPOSE_FILE" ] && [ "$(cd "$BASE_DIR" && docker compose ps -q 2>/dev/null)" ]; then
-        status="${GREEN}运行中 (正在动态模拟负载)${RESET}"
-        
-        # 彻底修复：改用纯 shell 处理 inspect 的原始 env 输出，不再依赖 Go 内部函数
-        local raw_env=$(docker inspect --format='{{range .Config.Env}}{{ . }}{{"\n"}}{{end}}' $CONTAINER_NAME 2>/dev/null)
-        
-        cpu_util=$(echo "$raw_env" | grep "^CPU_UTIL=" | cut -d'=' -f2)
-        cpu_core=$(echo "$raw_env" | grep "^CPU_CORE=" | cut -d'=' -f2)
-        mem_util=$(echo "$raw_env" | grep "^MEM_UTIL=" | cut -d'=' -f2)
-        speed_int=$(echo "$raw_env" | grep "^SPEEDTEST_INTERVAL=" | cut -d'=' -f2)
+# ==========================================
+# 自动化安装引擎
+# ==========================================
+check_and_install() {
+    local tool=$1
+    if command -v "$tool" >/dev/null 2>&1; then return; fi
 
-        # 兜底保障：如果动态抓取失败，则从 docker-compose.yml 静态文件提取
-        [[ -z "$cpu_util" ]] && cpu_util=$(grep "CPU_UTIL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
-        [[ -z "$cpu_core" ]] && cpu_core=$(grep "CPU_CORE=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
-        [[ -z "$mem_util" ]] && mem_util=$(grep "MEM_UTIL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
-        [[ -z "$speed_int" ]] && speed_int=$(grep "SPEEDTEST_INTERVAL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
-    else
-        if [ -f "$COMPOSE_FILE" ]; then 
-            status="${YELLOW}已受控停止${RESET}"
-            cpu_util=$(grep "CPU_UTIL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
-            cpu_core=$(grep "CPU_CORE=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
-            mem_util=$(grep "MEM_UTIL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
-            speed_int=$(grep "SPEEDTEST_INTERVAL=" "$COMPOSE_FILE" | cut -d'=' -f2 | tr -d '" ')
-        else 
-            status="${RED}未部署 / 未运行${RESET}"
-            cpu_util="N/A"; cpu_core="N/A"; mem_util="N/A"; speed_int="N/A"
+    echo -e "${YELLOW}📦 正在安装必要依赖与工具: $tool ...${RESET}"
+    
+    # 基础依赖环境前置检查与修复
+    if [ -f /etc/alpine-release ]; then
+        apk add --no-cache curl wget tar bash grep gawk openssl
+    elif ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y curl wget tar grep gawk
+        elif command -v dnf >/dev/null 2>&1; then dnf install -y curl wget tar grep gawk
+        elif command -v yum >/dev/null 2>&1; then yum install -y curl wget tar grep gawk
         fi
     fi
-    
-    [[ -z "$mem_util" ]] && mem_util="0"
-    [[ -z "$speed_int" ]] && speed_int="0"
+
+    case "$tool" in
+        speedtest)
+            if [ -f /etc/alpine-release ]; then
+                echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
+                apk add --no-cache speedtest-cli
+                if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
+                    ln -sf "$(command -v speedtest-cli)" /usr/bin/speedtest
+                fi
+            else
+                echo -e "${YELLOW}📦 正在通过二进制包快速安装 Ookla Speedtest...${RESET}"
+                local cpu_arch=$(uname -m)
+                local download_url=""
+                case "$cpu_arch" in
+                    x86_64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
+                    aarch64|arm64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
+                    *) echo -e "${RED}❌ 错误: 不支持的架构 ${cpu_arch}${RESET}" >&2; exit 1 ;;
+                esac
+                cd /tmp
+                wget -q "$download_url" -O speedtest.tgz && \
+                tar -xzf speedtest.tgz && \
+                mv -f speedtest /usr/local/bin/ && \
+                rm -f speedtest.tgz speedtest.5 speedtest.md LICENSE.md
+            fi
+            mkdir -p "$HOME/.ookla"
+            echo '{"license_accepted": true, "gdpr_accepted": true}' > "$HOME/.ookla/speedtest-cli.json" 2>/dev/null || true
+            ;;
+        nexttrace)
+            curl -fsSL nxtrace.org/nt | bash || true
+            ;;
+        iperf3)
+            if [ -f /etc/alpine-release ]; then apk add --no-cache iperf3
+            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y iperf3
+            elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release 2>/dev/null || true; dnf install -y iperf3
+            elif command -v yum >/dev/null 2>&1; then yum install -y epel-release 2>/dev/null || true; yum install -y iperf3
+            fi
+            ;;
+        mtr)
+            if [ -f /etc/alpine-release ]; then apk add --no-cache mtr
+            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y mtr-tiny || apt-get install -y mtr
+            elif command -v dnf >/dev/null 2>&1; then dnf install -y mtr
+            elif command -v yum >/dev/null 2>&1; then yum install -y mtr
+            fi
+            ;;
+        inetspeed)
+            echo -e "${YELLOW}📦 正在安装 iNetSpeed-CLI (Apple CDN 测速)...${RESET}"
+            # 使用 echo "inetspeed" 管道输入，自动回应安装器的命令名询问
+            echo "2" | curl -fsSL https://raw.githubusercontent.com/tsosunchia/iNetSpeed-CLI/main/scripts/install.sh | bash || true
+            ;;
+        speed-cloudflare-cli)
+            echo -e "${YELLOW}🔍 正在通过 GitHub API 获取 Cloudflare-CLI Rust 最新版本信息...${RESET}"
+            
+            # 1. 抓取 API 数据
+            local api_response=$(curl -fsSL "https://api.github.com/repos/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/latest" 2>/dev/null)
+            if [ -z "$api_response" ]; then
+                echo -e "${RED}❌ 无法获取 GitHub 最新发布版本信息，请检查网络或 API 速率限制。${RESET}"
+                sleep 2
+                return 1
+            fi
+
+            local latest_tag=$(echo "$api_response" | jq -r '.tag_name')
+            echo -e "${GREEN}✨ 发现最新版本: ${latest_tag}${RESET}"
+
+            # 2. 识别架构并检索对应的下载 URL
+            local cpu_arch=$(uname -m)
+            local cf_url=""
+            
+            case "$cpu_arch" in
+                x86_64) 
+                    # 在最新的 Release 资源列表中搜索匹配含 'ubuntu' 且不含 'arm' 且不含 '.deb' 的裸文件下载链接
+                    cf_url=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("ubuntu") and (contains("arm") | not) and (contains(".deb") | not)) | .browser_download_url' | head -n 1)
+                    ;;
+                aarch64|arm64) 
+                    # 匹配含 'ubuntu' 且含 'arm' 且不含 '.deb' 的链接
+                    cf_url=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("ubuntu") and contains("arm") and (contains(".deb") | not)) | .browser_download_url' | head -n 1)
+                    ;;
+                *) 
+                    echo -e "${RED}❌ 错误: 不支持的系统架构 ${cpu_arch}${RESET}" >&2
+                    exit 1 
+                    ;;
+            esac
+
+            # 3. 容错拦截：若未能提取到 URL，使用固定的稳妥降级方案
+            if [ -z "$cf_url" ] || [ "$cf_url" = "null" ]; then
+                echo -e "${YELLOW}⚠️ 提取最新下载链接失败，启用稳定版规则匹配下载...${RESET}"
+                if [ "$cpu_arch" = "x86_64" ]; then
+                    cf_url="https://github.com/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/download/v0.1.0/speed-cloudflare-cli-ubuntu-22.04"
+                else
+                    cf_url="https://github.com/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/download/v0.1.0/speed-cloudflare-cli-ubuntu-22.04-arm"
+                fi
+            fi
+
+            # 4. 下载裸文件并赋权
+            echo -e "${YELLOW}📥 正在下载二进制资产...${RESET}"
+            wget -q "$cf_url" -O /usr/local/bin/speed-cloudflare-cli
+            if [ $? -eq 0 ]; then
+                chmod +x /usr/local/bin/speed-cloudflare-cli
+                echo -e "${GREEN}✅ speed-cloudflare-cli 部署成功！${RESET}"
+                sleep 1
+            else
+                echo -e "${RED}❌ 下载失败，请检查网络或 GitHub 连通性。${RESET}"
+                sleep 2
+            fi
+            ;;
+    esac
+    hash -r 2>/dev/null
 }
 
-# 生成 Docker Compose 配置文件核心逻辑
-generate_compose_file() {
-    local cpu_ut=$1
-    local cpu_co=$2
-    local mem_ut=$3
-    local speed_in=$4
-
-    mkdir -p "$BASE_DIR"
-    
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  lookbusy:
-    image: fogforest/lookbusy:latest
-    container_name: lookbusy
-    hostname: lookbusy
-    restart: always
-    environment:
-      - TZ=Asia/Shanghai
-      - CPU_UTIL=$cpu_ut
-      - CPU_CORE=$cpu_co
-EOF
-
-    if [ "$mem_ut" != "0" ] && [ -n "$mem_ut" ]; then
-        echo "      - MEM_UTIL=$mem_ut" >> "$COMPOSE_FILE"
-    fi
-    if [ "$speed_in" != "0" ] && [ -n "$speed_in" ]; then
-        echo "      - SPEEDTEST_INTERVAL=$speed_in" >> "$COMPOSE_FILE"
-    fi
-}
-
-# 1. 部署启动
-deploy_lookbusy() {
-    check_dependencies
+# ==========================================
+# 1) Speedtest 模块 (双保险免提示版)
+# ==========================================
+run_speedtest() {
     clear
-    echo -e "${GREEN}=========================================${RESET}"
-    echo -e "${GREEN}      Docker Compose 部署启动 LookBusy    ${RESET}"
-    echo -e "${GREEN}=========================================${RESET}"
-    
-    echo -ne "${YELLOW}1. 请设置 CPU 期望占用百分比 [默认: 10-20] (支持固定值如15或范围): ${RESET}"
-    read -r input_cpu_util
-    [[ -z "$input_cpu_util" ]] && input_cpu_util="10-20"
-
-    echo -ne "${YELLOW}2. 请设置 参与负载的 CPU 核心数 [默认: 1] (打满请填全部核心数): ${RESET}"
-    read -r input_cpu_core
-    [[ -z "$input_cpu_core" ]] && input_cpu_core="1"
-
-    echo -ne "${YELLOW}3. 请设置 内存占用百分比 [默认: 15] (不跑内存填0): ${RESET}"
-    read -r input_mem_util
-    [[ -z "$input_mem_util" ]] && input_mem_util="15"
-
-    echo -ne "${YELLOW}4. 请设置 网络测速波动的间隔时间 (单位: 分钟) [默认: 120]: ${RESET}"
-    read -r input_speed_int
-    [[ -z "$input_speed_int" ]] && input_speed_int="120"
-
-    echo -e "${GREEN}-----------------------------------------${RESET}"
-    echo -e "${CYAN}正在配置并写入 docker-compose.yml ...${RESET}"
-    generate_compose_file "$input_cpu_util" "$input_cpu_core" "$input_mem_util" "$input_speed_int"
-
-    echo -e "${CYAN}正在通过 Docker Compose 启动容器集群...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✔ LookBusy Compose 部署并启动成功！${RESET}"
+    check_and_install speedtest
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈   Speedtest 网速测试   ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}🚀 开始测速...${RESET}"
+    echo "-------------------------------------"
+    if speedtest --help 2>&1 | grep -q "accept-license"; then
+        echo "YES" | speedtest --accept-license --accept-gdpr --force || true
     else
-        echo -e "${RED}❌ 启动失败，请检查 Docker Compose 环境。${RESET}"
+        speedtest || speedtest-cli || true
     fi
+    echo "-------------------------------------"
+    read -p "测试完成，按回车返回面板..." dummy
 }
 
-# 2. 更新容器
-update_lookbusy() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return
-    fi
-    echo -e "${YELLOW}正在拉取最新 fogforest/lookbusy 镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    echo -e "${YELLOW}正在无损重启并重建容器...${RESET}"
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}✔ 容器更新完成！${RESET}"
+# ==========================================
+# 2) NextTrace 模块
+# ==========================================
+run_nexttrace() {
+    clear
+    check_and_install nexttrace
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈   NextTrace 路由追踪   ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    read -p "请输入目标IP或域名: " target
+    if [ -z "$target" ]; then return; fi
+    echo -e "--------------------------------"
+    nexttrace "$target" || true
+    echo -e "${GREEN}================================${RESET}"
+    read -p "追踪完成，按回车返回面板..." dummy
 }
 
-# 3. 卸载容器
-uninstall_lookbusy() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}提示: 未检测到任何部署文件。${RESET}"
-        return
+# ==========================================
+# 3) iperf3 
+# ==========================================
+get_iperf_ip() {
+    read -p "请输入远端服务器 IP/域名: " SERVER_IP
+    if [ -z "$SERVER_IP" ]; then
+        echo -e "${RED}❌ 未输入有效 IP，操作取消。${RESET}"
+        sleep 1.5
+        return 1
     fi
-    echo -ne "${RED}危险警告：确定要完全卸载并删除 LookBusy 容器及配置文件吗？(y/n): ${RESET}"
-    read -r confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        cd "$BASE_DIR" && docker compose down
-        rm -rf "$BASE_DIR"
-        echo -e "${GREEN}✔ 容器已销毁，且本地工作目录已彻底抹除。${RESET}"
-    else
-        echo -e "${YELLOW}操作已取消。${RESET}"
-    fi
+    return 0
 }
 
-# 4. 启动容器
-start_lookbusy() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到部署集群，请先部署。${RESET}"
-        return
-    fi
-    cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}✔ 容器集群已恢复启动${RESET}"
+run_iperf3() {
+    check_and_install iperf3
+    while true; do
+        clear
+        echo -e "${GREEN}===================================${RESET}"
+        echo -e "${GREEN}     ◈   iperf3 测速管理   ◈      ${RESET}"
+        echo -e "${GREEN}===================================${RESET}"
+        echo -e "${YELLOW}端口 = $IPERF_PORT  | 时长    = ${IPERF_TIME}s ${RESET}"
+        echo -e "${YELLOW}线程 = $IPERF_PARALLEL     | UDP带宽 = $IPERF_UDP_BW${RESET}"
+        echo -e "${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}1) 启动 iperf3 本地服务端"
+        echo -e "${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}2) 发起 TCP 下载 (↓) 测试${RESET}"
+        echo -e " ${GREEN}3) 发起 TCP 上传 (↑) 测试${RESET}"
+        echo -e " ${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}4) 发起 UDP 下载 (↓) 测试${RESET}"
+        echo -e " ${GREEN}5) 发起 UDP 上传 (↑) 测试${RESET}"
+        echo -e "${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}6) 修改测试参数${RESET}"
+        echo -e " ${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}===================================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        read -r choice
+        
+        case "$choice" in
+            1)
+                clear
+                echo -e "${ORANGE}===================================${RESET}"
+                echo -e "${GREEN}  iperf3 服务器已启动 (监听端口: $IPERF_PORT)${RESET}"
+                echo -e "${YELLOW}  👉 提示: 测速完毕后，按 Ctrl+C 可安全返回菜单${RESET}"
+                echo -e "${ORANGE}===================================${RESET}\n"
+                (trap 'echo -e "${YELLOW}服务端已安全关闭。${RESET}"; exit 0' INT; iperf3 -s -i 10 -p "$IPERF_PORT")
+                echo "-----------------------------------"
+                read -p "按回车继续..." dummy
+                ;;
+            2)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 TCP 下载 (↓) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -R -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            3)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 TCP 上传 (↑) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            4)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 UDP 下载 (↓) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -R -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            5)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 UDP 上传 (↑) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            6)
+                echo -e "${YELLOW}>>> 修改 iperf3 临时参数 <<<${RESET}"
+                read -p "修改端口 (当前 $IPERF_PORT): " in_p; IPERF_PORT=${in_p:-$IPERF_PORT}
+                read -p "修改时长 (当前 $IPERF_TIME): " in_t; IPERF_TIME=${in_t:-$IPERF_TIME}
+                read -p "修改线程 (当前 $IPERF_PARALLEL): " in_pa; IPERF_PARALLEL=${in_pa:-$IPERF_PARALLEL}
+                read -p "修改UDP带宽 (当前 $IPERF_UDP_BW): " in_b; IPERF_UDP_BW=${in_b:-$IPERF_UDP_BW}
+                ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
-# 5. 停止容器
-stop_lookbusy() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到部署集群。${RESET}"
-        return
-    fi
-    cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}✔ 容器集群已受控停止${RESET}"
+# ==========================================
+# 4) MTR 面板模块
+# ==========================================
+run_mtr() {
+    check_and_install mtr
+    while true; do
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}    ◈   MTR 链路诊断面板   ◈    ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}探测协议 :${RESET} ${YELLOW}$(echo "$MTR_PROTO" | tr 'a-z' 'A-Z')${RESET}"
+        echo -e "${GREEN}AS号展示 :${RESET} ${YELLOW}$([ "$MTR_SHOW_AS" = "true" ] && echo "开启" || echo "关闭")${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1) 实时动态检测${RESET}"
+        echo -e "${GREEN} 2) 静态报告模式${RESET}"
+        echo -e "${GREEN} 0) 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        read -r choice
+        
+        local args=""
+        [ "$MTR_SHOW_AS" = "true" ] && args="$args -z"
+
+        case "$choice" in
+            1)
+                read -p "请输入目标IP/域名: " target
+                if [ -z "$target" ]; then continue; fi
+                echo -e "--------------------------------"
+                mtr $args "$target" || true
+                echo -e "--------------------------------"
+                read -p "检测结束，按回车返回..." dummy
+                ;;
+            2)
+                read -p "请输入目标IP/域名: " target
+                if [ -z "$target" ]; then continue; fi
+                clear
+                echo -e "${GREEN}报告生成中(发送100个包)...${RESET}\n"
+                mtr -r -c 100 $args "$target" || true
+                echo -e "--------------------------------"
+                read -p "分析结束，按回车返回..." dummy
+                ;;
+            0) exit 0 ;;
+        esac
+    done
 }
 
-# 6. 重启容器
-restart_lookbusy() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到部署集群。${RESET}"
-        return
-    fi
-    cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}✔ 容器集群已完成重启${RESET}"
+# ==========================================
+# 5) iNetSpeed-CLI 模块 
+# ==========================================
+run_inetspeed() {
+    clear
+    check_and_install inetspeed
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈  iNetSpeed Apple CDN测速  ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}🚀 开始连接 Apple CDN 节点进行测试...${RESET}"
+    echo "-------------------------------------"
+    inetspeed || true
+    echo "-------------------------------------"
+    read -p "测试完成，按回车返回面板..." dummy
 }
 
-# 7. 查看日志
-view_logs() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到部署集群，无法提取日志。${RESET}"
-        return
-    fi
-    echo -e "${CYAN}正在精准追踪 Docker Compose 实时模拟日志 (按 Ctrl+C 退出追踪):${RESET}"
-    cd "$BASE_DIR" && docker compose logs -f
+# ==========================================
+# 6) Cloudflare Speedtest Rust 模块
+# ==========================================
+run_cloudflare_cli() {
+    clear
+    check_and_install speed-cloudflare-cli
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} ◈ Cloudflare Speedtest (Rust) ◈ ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}🚀 开始连接 Cloudflare Anycast 边缘网络...${RESET}"
+    echo "-------------------------------------"
+    speed-cloudflare-cli || true
+    echo "-------------------------------------"
+    read -p "测试完成，按回车返回面板..." dummy
 }
 
-# 8. 查看配置
-show_config() {
-    get_runtime_status
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}     LookBusy Docker Compose 配置   ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${YELLOW}本地工作路径 : ${BASE_DIR}"
-    echo -e "${YELLOW}配置实际状态 : $status"
-    echo -e "${YELLOW}分配 CPU 核心 : ${cpu_core} 核"
-    echo -e "${YELLOW}目标 CPU 负载 : ${cpu_util}%"
-    echo -e "${YELLOW}分配内存占用 : ${mem_util}%"
-    echo -e "${YELLOW}网络测速频率 : ${speed_int} 分钟/次${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-}
 
-# 主菜单逻辑
+
+# ==========================================
+# 工具箱主面板循环
+# ==========================================
 while true; do
     clear
-    get_runtime_status
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}◈LookBusy  防回收保活管理面板◈  ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    # 状态栏拆分，严格每行一个指标
-    echo -e "${CYAN}容器状态:${RESET} $status"
-    if [ "$cpu_util" != "N/A" ] && [ -n "$cpu_util" ]; then
-    echo -e "${CYAN}CPU核心 :${RESET} ${YELLOW}${cpu_core}核${RESET}"
-    echo -e "${CYAN}目标负载:${RESET} ${YELLOW}${cpu_util}%${RESET}"
-    echo -e "${CYAN}内存占用:${RESET} ${YELLOW}${mem_util}%${RESET}"
-    echo -e "${CYAN}测速频率:${RESET} ${YELLOW}${speed_int}分钟/次${RESET}"
-    fi
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}9. 修改配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈   网络管理 综合面板   ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}Speedtest :${RESET} $(get_status speedtest)"
+    echo -e "${GREEN}iNetSpeed :${RESET} $(get_status inetspeed)"
+    echo -e "${GREEN}Cloudflare:${RESET} $(get_status speed-cloudflare-cli)"
+    echo -e "${GREEN}NextTrace :${RESET} $(get_status nexttrace)"
+    echo -e "${GREEN}iperf3    :${RESET} $(get_status iperf3)"
+    echo -e "${GREEN}MTR       :${RESET} $(get_status mtr)"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e " ${GREEN}1) 运行 Speedtest  网速测试${RESET}"
+    echo -e " ${GREEN}2) 运行 NextTrace  路由追踪${RESET}"
+    echo -e " ${GREEN}3) 运行 iperf3     测速${RESET}"
+    echo -e " ${GREEN}4) 运行 MTR        链路诊断${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e " ${GREEN}5) 运行 iNetSpeed  测速 (Apple CDN)${RESET}"
+    echo -e " ${GREEN}6) 运行 Cloudflare 测速${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e " ${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    read -p $'\033[32m 请选择: \033[0m' choice
 
     case "$choice" in
-        1) deploy_lookbusy ;;
-        2) update_lookbusy ;;
-        3) uninstall_lookbusy ;;
-        4) start_lookbusy ;;
-        5) stop_lookbusy ;;
-        6) restart_lookbusy ;;
-        7) view_logs ;;
-        8) show_config ;;
-        9) deploy_lookbusy ;; 
+        1) run_speedtest ;;
+        2) run_nexttrace ;;
+        3) run_iperf3 ;;
+        4) run_mtr ;;
+        5) run_inetspeed ;;
+        6) run_cloudflare_cli ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项，请输入 0-9 之间的数字。${RESET}" ;;
+        *) echo -e "${RED}输入错误。${RESET}"; sleep 1 ;;
     esac
-
-    echo ""
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
 done

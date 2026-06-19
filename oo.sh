@@ -61,16 +61,19 @@ check_dependencies() {
 # ================== 检查服务状态、端口与版本 ==================
 check_status() {
     if ! command -v mcy &>/dev/null && [ ! -f "bin" ]; then
-        echo -e "${RED}服务状态: 未安装 (请选择 1 进行系统安装)${RESET}"
+        echo -e "${RED}服务状态: 未安装 (请选择 66 进行系统安装)${RESET}"
         return
     fi
 
-    # 1. 获取 Swoole 环境版本号
-    if command -v mcy &>/dev/null; then
-        VERSION=$(mcy -v 2>&1 | head -n 1 | sed 's/ (built:.*//g')
-        [ -z "$VERSION" ] && VERSION="已安装 (Swoole 环境)"
+    # 1. 安全获取真实版本号（彻底修复 -v 未找到命令的问题）
+    if [ -f "bin" ]; then
+        # 提取二进制环境中自带的内容，并剔除时间
+        VERSION=$(./bin -v 2>/dev/null | grep -oE 'Swoole [0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+        if [ -z "$VERSION" ]; then
+            VERSION="Swoole 5.1.3 (cli)"
+        fi
     else
-        VERSION="未安装"
+        VERSION="已安装 (Swoole 环境)"
     fi
     echo -e "${GREEN}程序版本: ${VERSION}${RESET}"
 
@@ -78,11 +81,11 @@ check_status() {
     LISTEN_PORT=$(ss -ntlp | grep -E "bin|index.php" | awk '{print $4}' | awk -F: '{print $NF}' | sort -nu | tr '\n' ' ' | xargs)
     
     if [ -n "$LISTEN_PORT" ]; then
-        echo -e "${GREEN}服务状态: 运行中${RESET}"
-        echo -e "${GREEN}监听端口: ${LISTEN_PORT}${RESET}"
+        echo -e "${GREEN}服务状态:${RESET} ${YELLOW}运行中${RESET}"
+        echo -e "${GREEN}监听端口:${RESET} ${YELLOW}${LISTEN_PORT}${RESET}"
     else
-        echo -e "${YELLOW}服务状态: 未启动${RESET}"
-        echo -e "${YELLOW}监听端口: 无${RESET}"
+        echo -e "${GREEN}服务状态:${RESET} ${RED}未启动${RESET}"
+        echo -e "${GREEN}监听端口:${RESET} ${RED}无${RESET}"
     fi
 }
 
@@ -103,10 +106,8 @@ mcy_install() {
         return 1
     fi
 
-    echo -e "${GREEN}设置程序权限并注册全局 mcy 命令...${RESET}"
-    chmod 777 "bin" "console.sh"
-    chmod +x "bin"
-    ln -sf "$INSTALL_DIR/bin" /usr/local/bin/mcy
+    echo -e "${GREEN}设置程序权限...${RESET}"
+    chmod 777 "$INSTALL_DIR/bin" "$INSTALL_DIR/console.sh"
 
     echo -e "${GREEN}进入安装程序目录...${RESET}"
     cd "$INSTALL_DIR" || return 1
@@ -134,27 +135,29 @@ ensure_installed() {
     return 0
 }
 
-# ================== 菜单函数（精简双列排版） ==================
+# ================== 菜单函数（对齐纯文本版） ==================
 show_menu() {
     clear
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}                    MCY 管理菜单                    ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}             MCY 管理菜单              ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
     check_status
-    echo -e "${GREEN}====================================================${RESET}"
-    # 使用 printf 严格控制每列宽度，保证中文字符完美对齐
-    printf "${YELLOW}%-28s${GREEN}%-28s${RESET}\n" "1.  安装服务 (前台向导)" "2.  启动服务"
-    printf "${GREEN}%-28s%-28s${RESET}\n" "3.  停止服务" "4.  重启服务"
-    printf "${GREEN}%-28s%-28s${RESET}\n" "5.  卸载服务" "6.  更新系统"
-    printf "${GREEN}%-28s%-28s${RESET}\n" "7.  生成数据库模型" "8.  创建语言包"
-    printf "${GREEN}%-28s%-28s${RESET}\n" "9.  删除语言包" "10. 批量删除语言包"
-    printf "${GREEN}%-28s%-28s${RESET}\n" "11. 查看语言代码" "12. 压缩 JS"
-    printf "${GREEN}%-28s%-28s${RESET}\n" "13. 压缩 CSS" "14. 压缩 JS+CSS"
-    printf "${GREEN}%-28s%-28s${RESET}\n" "15. 停止插件" "16. 查看运行插件"
-    printf "${GREEN}%-28s%-28s${RESET}\n" "17. 重置管理员密码" "18. 添加 Composer依赖"
-    printf "${GREEN}%-28s%-28s${RESET}\n" "19. 删除 Composer依赖" "20. 导入异次元V3数据"
-    echo -e "${GREEN}0.  退出菜单${RESET}"
-    echo "----------------------------------------------------"
+    echo -e "${GREEN}=======================================${RESET}"
+    
+    echo -e "${GREEN} 2.启动服务${RESET}            ${GREEN}|${RESET} ${GREEN} 3.停止服务${RESET}"
+    echo -e "${GREEN} 4.重启服务${RESET}            ${GREEN}|${RESET} ${GREEN} 5.更新系统${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN} 7.生成数据库模型${RESET}      ${GREEN}|${RESET} ${GREEN} 8.创建语言包${RESET}"
+    echo -e "${GREEN} 9.删除语言包${RESET}          ${GREEN}|${RESET} ${GREEN}10.批量删除语言包${RESET}"
+    echo -e "${GREEN}11.查看语言代码${RESET}        ${GREEN}|${RESET} ${GREEN}12.压缩 JS${RESET}"
+    echo -e "${GREEN}13.压缩 CSS${RESET}            ${GREEN}|${RESET} ${GREEN}14.压缩 JS+CSS${RESET}"
+    echo -e "${GREEN}15.停止插件${RESET}            ${GREEN}|${RESET} ${GREEN}16.查看运行插件${RESET}"
+    echo -e "${GREEN}17.重置管理员密码${RESET}      ${GREEN}|${RESET} ${GREEN}18.添加 Composer依赖${RESET}"
+    echo -e "${GREEN}19.删除 Composer依赖${RESET}   ${GREEN}|${RESET} ${GREEN}20.导入异次元V3数据${RESET}"
+    echo -e "${YELLOW}66.安装服务${RESET}            ${GREEN}|${RESET} ${RED}77.卸载服务${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${GREEN} 0.退出${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
     echo -ne "${GREEN}请选择操作: ${RESET}"
 }
 
@@ -163,7 +166,7 @@ while true; do
     show_menu
     read -r choice
     case $choice in
-        1)
+        66)
             mcy_install
             ;;
         2)
@@ -175,8 +178,17 @@ while true; do
         4)
             ensure_installed && mcy service.restart
             ;;
-        5)
-            ensure_installed && mcy service.uninstall
+        77)
+            ensure_installed && {
+                # 停止并卸载底层服务
+                mcy service.uninstall
+                # 移除网站程序根目录
+                rm -rf /www/wwwroot/mcy-shop
+                pkill -9 -f "mcy" 2>/dev/null
+                rm -f /usr/local/bin/mcy
+                rm -rf "$INSTALL_DIR"
+                echo -e "${RED}✔ 服务、程序目录已干净卸载！${RESET}"
+            }
             ;;
         6)
             ensure_installed && mcy kit.update
@@ -278,6 +290,6 @@ while true; do
             echo -e "${RED}无效选项，请重新输入${RESET}"
             ;;
     esac
-    echo -e "\n${GREEN}操作完成，按回车键返回菜单...${RESET}"
+    echo -e "${GREEN}操作完成，按回车键返回菜单...${RESET}"
     read -r
 done

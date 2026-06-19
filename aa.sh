@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Subtracker 订阅管理 Docker Compose 管理面板
+# 长亭雷池 WAF (SafeLine) Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,11 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/subtracker"
+CONTAINER_NAME="safeline-mgt"
+BASE_DIR="/data/safeline"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-# 主要检查前端 web 容器的状态
-CONTAINER_NAME="subtracker-web"
-API_CONTAINER="subtracker-api"
 
 # 检测依赖
 check_dependencies() {
@@ -26,7 +24,7 @@ check_dependencies() {
 
 # 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    # 1. 检查前端容器状态
+    # 1. 检查核心管理容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -35,191 +33,155 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从前端容器状态中提取信息
+    # 2. 如果容器存在，从环境或容器中提取控制台端口
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 从容器状态提取 WebUI 端口（前端容器内部默认监听的是 80 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 兜底获取第一个绑定的端口
+        # 提取控制台管理端口（雷池 mgt 内部默认是 9443）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9443/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8080"
-        
-        # 顺便获取当前 API 暴露的宿主机端口作为展示（从 API 容器提取环境参数中的 PORT 映射情况）
-        api_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$API_CONTAINER" 2>/dev/null)
-        [[ -z "$api_port" ]] && api_port="3001"
+        [[ -z "$webui_port" ]] && webui_port="9443"
     else
-        # 容器未安装/未部署时的返回值
-        img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        api_port="N/A"
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
-get_public_ip() {
-    local mode=${1:-"auto"}
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
+# 随机生成纯英数密码（雷池 WAF 数据库要求勿使用特殊字符）
+generate_password() {
+    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1
 }
 
-# 部署 Subtracker
-install_subtracker() {
+# 部署长亭雷池
+install_safeline() {
     check_dependencies
     
-    mkdir -p "$BASE_DIR"
-
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    # 1. 前端端口自定义
-    echo -ne "${YELLOW}请输入 Subtracker 前端 Web 访问端口 [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+    echo -ne "${YELLOW}请输入雷池安装绝对路径 [默认: /data/safeline]: ${RESET}"
+    read -r custom_dir
+    [[ -z "$custom_dir" ]] && custom_dir="/data/safeline"
+    BASE_DIR="$custom_dir"
+    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+
+    echo -ne "${YELLOW}请输入雷池控制台 (MGT) 访问端口 [默认: 9443]: ${RESET}"
+    read -r mgt_port
+    [[ -z "$mgt_port" ]] && mgt_port="9443"
+
+    echo -ne "${YELLOW}是否使用 LTS (长期支持) 版本通道？(y/n) [默认: n]: ${RESET}"
+    read -r is_lts
+    local release_channel=""
+    [[ "$is_lts" == "y" || "$is_lts" == "Y" ]] && release_channel="-lts"
+
+    echo -ne "${YELLOW}您的服务器在 [1. 中国大陆] 还是 [2. 海外/中国香港]？输入数字 [默认: 1]: ${RESET}"
+    read -r geo_choice
+    local img_prefix="swr.cn-east-3.myhuaweicloud.com/chaitin-safeline"
+    [[ "$geo_choice" == "2" ]] && img_prefix="chaitin"
+
+    # 自动识别系统架构 (x86_64 vs arm64)
+    local arch_suffix=""
+    local sys_arch=$(uname -m)
+    if [[ "$sys_arch" == "arm*" || "$sys_arch" == "aarch64" ]]; then
+        arch_suffix="-arm"
+        echo -e "${YELLOW}检测到当前服务器为 ARM 架构，已自动启用架构适配。${RESET}"
+    fi
+
+    # 1. 创建目录并下载编排脚本
+    mkdir -p "$BASE_DIR"
+    echo -e "${YELLOW}正在从官方源下载最新 Compose 编排脚本...${RESET}"
+    if ! wget -qO "$COMPOSE_FILE" "https://waf-ce.chaitin.cn/release/latest/compose.yaml"; then
+        echo -e "${RED}错误: 下载编排脚本失败，请检查网络或链接是否有效！${RESET}"
         return
     fi
 
-    # 2. API 端口自定义
-    echo -ne "${YELLOW}请输入 Subtracker 后端 API 监听端口 [默认: 3001]: ${RESET}"
-    read -r custom_api_port
-    [[ -z "$custom_api_port" ]] && custom_api_port="3001"
-    if ! [[ "$custom_api_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
+    # 2. 生成随机高强度数据库密码
+    local pg_pwd=$(generate_password)
 
-    # 3. 路径与域名
-    echo -ne "${YELLOW}请输入数据持久化存储绝对路径 [默认: /opt/subtracker/data]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="/opt/subtracker/data"
-
-    echo -ne "${YELLOW}请输入该服务计划绑定的公网域名/本地访问地址 (例如: https://subtracker.example.com): ${RESET}"
-    read -r web_origin
-    [[ -z "$web_origin" ]] && web_origin="https://subtracker.example.com"
-
-    # 1. 创建所需的宿主机目录
-    mkdir -p "$custom_data"
-    mkdir -p "$custom_data/logos"
-    chmod -R 777 "$BASE_DIR" "$custom_data"
-
-    # 2. 动态生成符合要求、且 API 端口可自定义的 docker-compose.yml
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  api:
-    image: ghcr.io/smile-qwq/subtracker-api:latest
-    container_name: ${API_CONTAINER}
-    restart: unless-stopped
-    ports:
-      - "${custom_api_port}:${custom_api_port}"
-    environment:
-      PORT: ${custom_api_port}
-      HOST: 0.0.0.0
-      DATABASE_URL: file:/app/data/subtracker.db
-      WEB_ORIGIN: ${web_origin}
-      BASE_CURRENCY: CNY
-      CRON_SCAN: "* * * * *"
-      CRON_REFRESH_RATES: "0 2 * * *"
-      LOG_LEVEL: warn
-      DEFAULT_APP_LOCALE: zh-CN
-      TZ: Asia/Shanghai
-    volumes:
-      - ${custom_data}:/app/data
-      - ${custom_data}/logos:/app/apps/api/storage/logos
-
-  web:
-    image: ghcr.io/smile-qwq/subtracker-web:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    depends_on:
-      - api
-    ports:
-      - "${custom_port}:80"
+    # 3. 写入 .env 配置文件
+    echo -e "${YELLOW}正在写入环境变量配置文件 (.env)...${RESET}"
+    cat <<EOF > "$BASE_DIR/.env"
+SAFELINE_DIR=${BASE_DIR}
+IMAGE_TAG=latest
+MGT_PORT=${mgt_port}
+POSTGRES_PASSWORD=${pg_pwd}
+SUBNET_PREFIX=172.22.222
+IMAGE_PREFIX=${img_prefix}
+ARCH_SUFFIX=${arch_suffix}
+RELEASE=${release_channel}
+REGION=
+MGT_PROXY=0
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Subtracker (API + Web)...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    chmod -R 777 "$BASE_DIR"
 
-    echo -e "${YELLOW}等待前后端服务初始化 (约5秒)...${RESET}"
-    sleep 5
+    # 4. 启动服务
+    echo -e "${YELLOW}正在启动雷池服务集群 (首次拉取镜像时间可能较长)...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d
 
-    DETECT_IP=$(get_public_ip)
+    echo -e "${YELLOW}等待雷池各微服务初始化完成 (约8秒)...${RESET}"
+    sleep 8
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Subtracker 部署成功！     ${RESET}"
+    echo -e "${GREEN}       雷池 WAF 部署命令提交！   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}前端访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}后端 API 端口  : ${custom_api_port}${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
-    echo -e "${YELLOW}配置的前端域名 : $web_origin${RESET}"
+    echo -e "${YELLOW}控制台访问地址 : https://127.0.0.1:${mgt_port}${RESET} (请使用 https 访问)"
+    echo -e "${YELLOW}安装绝对路径   : $BASE_DIR${RESET}"
+    echo -e "${CYAN}提示: 如果首次登录需要初始密码，请在主菜单选择 [9] 初始化管理员账户。${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Subtracker 镜像
-update_subtracker() {
+# 重置/初始化雷池管理员账户
+reset_admin_pwd() {
+    get_status_info
+    if [[ "$status" != *"运行中"* ]]; then
+        echo -e "${RED}错误: 雷池管理服务未运行，无法执行重置！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在请求雷池内部模块安全重置管理员账户...${RESET}"
+    docker exec "$CONTAINER_NAME" resetadmin
+}
+
+# 更新雷池
+update_safeline() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Subtracker (API+Web) 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取雷池 WAF 最新容器镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！所有容器已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！雷池集群已升至最新状态。${RESET}"
 }
 
-# 卸载 Subtracker
-uninstall_subtracker() {
-    echo -ne "${YELLOW}确定要卸载并删除 Subtracker 前后端容器吗？(y/n): ${RESET}"
+# 卸载雷池
+uninstall_safeline() {
+    echo -ne "${RED}确定要完全卸载长亭雷池 WAF 吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}所有相关容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有订阅数据和图标缓存？(y/n): ${RESET}"
+            echo -e "${GREEN}所有雷池防火墙容器已停止并清除。${RESET}"
+            echo -ne "${YELLOW}是否同时彻底清除所有防护拦截日志、站点配置和数据库数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}雷池数据目录已完全清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" "$API_CONTAINER" 2>/dev/null
+            docker rm -f safeline-mgt safeline-pg safeline-detector safeline-tengine safeline-farter 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_subtracker() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
-stop_subtracker() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
-restart_subtracker() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
-logs_subtracker() { cd "$BASE_DIR" && docker compose logs -f; }
+start_safeline() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}雷池集群已启动${RESET}"; }
+stop_safeline() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}雷池集群已停止${RESET}"; }
+restart_safeline() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}雷池集群已重启${RESET}"; }
+logs_safeline() { cd "$BASE_DIR" && docker compose logs -f; }
 
 show_info() {
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称(前端) : ${img_version}${RESET}"
-    echo -e "${YELLOW}前端访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}后端 API 端口  : ${api_port}${RESET}"
+    echo -e "${YELLOW}核心状态       : $status"
+    echo -e "${YELLOW}控制台访问地址 : https://127.0.0.1:${webui_port}${RESET}"
+    echo -e "${YELLOW}数据存储路径   : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -227,33 +189,34 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  Subtracker 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}   ◈  长亭雷池 WAF 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态     :${RESET} $status"
-    echo -e "${GREEN}前端端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}API端口 :${RESET} ${YELLOW}${api_port}${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}2. 更新雷池${RESET}"
+    echo -e "${GREEN}3. 卸载雷池${RESET}"
+    echo -e "${GREEN}4. 启动集群${RESET}"
+    echo -e "${GREEN}5. 停止集群${RESET}"
+    echo -e "${GREEN}6. 重启集群${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 初始化/重置管理员账户密码${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_subtracker ;;
-        2) update_subtracker ;;
-        3) uninstall_subtracker ;;
-        4) start_subtracker ;;
-        5) stop_subtracker ;;
-        6) restart_subtracker ;;
-        7) logs_subtracker ;;
+        1) install_safeline ;;
+        2) update_safeline ;;
+        3) uninstall_safeline ;;
+        4) start_safeline ;;
+        5) stop_safeline ;;
+        6) restart_safeline ;;
+        7) logs_safeline ;;
         8) show_info ;;
+        9) reset_admin_pwd ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

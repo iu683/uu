@@ -69,6 +69,7 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
+
 # 部署核心逻辑
 install_translate() {
     check_dependencies
@@ -164,6 +165,147 @@ show_info() {
     echo -e "${GREEN}====================================================${RESET}"
 }
 
+
+# 9. 独立菜单：直接修改本机 Nginx 配置文件 (支持证书自定义路径)
+setup_host_nginx() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        echo -e "${RED}错误: 请先执行选项 1 部署基础服务以确定本地映射端口！${RESET}"
+        return
+    fi
+
+    # 自动获取当前容器在宿主机映射的实际端口
+    local current_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+    [[ -z "$current_port" ]] && current_port="22567"
+
+    echo -e "${CYAN}====== 宿主机独立 Nginx 自动化配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入您的反代域名 [默认:emby.eu.org]: ${RESET}"
+    read -r custom_domain
+    [[ -z "$custom_domain" ]] && custom_domain="emby.eu.org"
+    echo "$custom_domain" > "$NGINX_CONF_DIR/host_domain.txt"
+
+    # 1. 自动根据域名生成默认证书路径建议
+    local default_cert_path="/etc/letsencrypt/live/${custom_domain}/fullchain.pem"
+    local default_key_path="/etc/letsencrypt/live/${custom_domain}/privkey.pem"
+
+    # 2. 允许用户交互修改或直接回车确认
+    echo -e "\n${CYAN}====== 域名证书自定义路径配置 ======${RESET}"
+    echo -e "${YELLOW}请输入证书 (fullchain.pem) 的宿主机绝对路径${RESET}"
+    echo -ne "[默认: ${CYAN}${default_cert_path}${RESET}]: "
+    read -r cert_path
+    [[ -z "$cert_path" ]] && cert_path="$default_cert_path"
+
+    echo -e "${YELLOW}请输入私钥 (privkey.pem) 的宿主机绝对路径${RESET}"
+    echo -ne "[默认: ${CYAN}${default_key_path}${RESET}]: "
+    read -r key_path
+    [[ -z "$key_path" ]] && key_path="$default_key_path"
+
+    # 定义宿主机 Nginx 网站配置路径
+    local nginx_avail_file="/etc/nginx/sites-available/${custom_domain}"
+    local nginx_enabled_file="/etc/nginx/sites-enabled/${custom_domain}"
+
+    if [ ! -d "/etc/nginx/sites-available" ]; then
+        echo -e "${RED}错误: 未在本机检测到 /etc/nginx/sites-available 目录，请确认本机是否正确安装并运行了 Nginx！${RESET}"
+        return
+    fi
+
+    # 校验自定义输入的证书文件是否存在
+    if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+        echo -e "\n${RED}警告: 宿主机未检测到指定的证书或私钥文件！${RESET}"
+        echo -e "当前路径:\n证书: $cert_path\n私钥: $key_path"
+        echo -ne "${YELLOW}是否强制继续生成 Nginx 站点配置？(y/n): ${RESET}"
+        read -r force_confirm
+        if [[ "$force_confirm" != "y" && "$force_confirm" != "Y" ]]; then
+            return
+        fi
+    fi
+
+    # 生成并写入宿主机的 Nginx 配置文件
+    echo -e "\n${YELLOW}正在直接写入本机 Nginx 配置文件: ${cyan}${nginx_avail_file}${RESET}"
+    
+    # 🛑 请把原本的这行：sudo bash -c "cat << 'EOF' > ${nginx_avail_file}
+    # 🛑 修改为下面这行（去掉 'EOF' 的单引号，改为使用下面的转义规则）：
+    sudo bash -c "cat << EOF > ${nginx_avail_file}
+# =================================================================
+# Emby-Proxy-Go 高性能流媒体代理网关 - 本机 Nginx 自动化配置
+# =================================================================
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${custom_domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://\\\$host\\\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${custom_domain};
+
+    # 自定义指定的证书路径
+    ssl_certificate ${cert_path};
+    ssl_certificate_key ${key_path};
+    
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    client_max_body_size 100M;
+
+    location / {
+        # 自动转发至本地 docker-compose 映射端口
+        proxy_pass http://127.0.0.1:${current_port};
+        
+        proxy_set_header Host \\\$http_host;
+        proxy_set_header X-Real-IP \\\$remote_addr;
+        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \\\$scheme;
+        proxy_set_header X-Forwarded-Host \\\$http_host;
+
+        # 禁用流媒体缓冲防止卡顿
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_max_temp_file_size 0;
+
+        # WebSocket 双向透传支持
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \\\$http_upgrade;
+        proxy_set_header Connection \\"upgrade\\";
+
+        proxy_read_timeout 360s;
+        proxy_send_timeout 360s;
+    }
+}
+EOF"
+
+    # 创建软链接启用配置
+    echo -e "${YELLOW}正在建立 Nginx sites-enabled 启用软链接...${RESET}"
+    sudo ln -sf "$nginx_avail_file" "$nginx_enabled_file"
+
+    # 测试 Nginx 配置并重载
+    echo -e "${YELLOW}正在测试本机 Nginx 配置语法...${RESET}"
+    if sudo nginx -t &>/dev/null; then
+        echo -e "${YELLOW}语法正确，正在让本机 Nginx 平滑重载配置...${RESET}"
+        sudo nginx -s reload
+        echo -e "${GREEN}====================================================${RESET}"
+        echo -e "${GREEN}      本机 Nginx 反向代理配置并重载成功！         ${RESET}"
+        echo -e "${GREEN}====================================================${RESET}"
+        echo -e "${YELLOW}外网 HTTPS 入口地址 : https://${custom_domain}${RESET}"
+        echo -e "${YELLOW}已成功绑定外部证书  : ${cert_path}${RESET}"
+        echo -e "${YELLOW}已成功将流量转发至  : 本地端口 ${current_port}${RESET}"
+        echo -e "${GREEN}====================================================${RESET}"
+    else
+        echo -e "${RED}错误: Nginx 语法测试失败！${RESET}"
+        echo -e "${RED}请检查证书文件是否有效或权限是否正确。站点配置已保存，您可以手动排查后执行 nginx -s reload。${RESET}"
+    fi
+}
+
 menu() {
     clear
     get_status_info
@@ -181,6 +323,7 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 反向代理${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
@@ -194,6 +337,7 @@ menu() {
         6) restart_translate ;;
         7) logs_translate ;;
         8) show_info ;;
+        9) setup_host_nginx ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

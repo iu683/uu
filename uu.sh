@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Vertex 刷流自动化管理工具 Docker Compose 管理面板 
+# Navidrome 私有音乐流媒体服务器 Docker Compose 管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="vertex"
-BASE_DIR="/opt/vertex"
+CONTAINER_NAME="navidrome"
+BASE_DIR="/opt/navidrome"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,7 +22,11 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取当前系统用户的 UID 和 GID 作为默认安全权限
+CURRENT_UID=$(id -u)
+CURRENT_GID=$(id -g)
+
+# 动态获取容器状态、映射端口和各数据目录
 get_status_info() {
     # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -33,30 +37,24 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
+    # 2. 如果容器存在，从容器状态中精准提取挂载信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 提取 WebUI 映射出来的宿主机端口 (内部默认 3000)
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3000"
+        # 提取 Web 映射出来的宿主机端口 (内部默认 4533)
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "4533/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="4533"
 
-        # 提取宿主机配置路径
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/vertex"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/vertex"
-        # 自动读取容器生成的密码文件
-        pwd_file="$data_dir/data/password"
-        if [ -f "$pwd_file" ]; then
-            v_password=$(cat "$pwd_file" | tr -d '\n\r ')
-        else
-            v_password="[ 容器尚未完全初始化，请刷新或稍等片刻 ]"
-        fi
+        # 提取宿主机数据保存目录
+        path_data_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 提取宿主机音乐库目录
+        path_music_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/music"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        data_dir="N/A"
-        v_password="N/A"
+        path_data_show="N/A"
+        path_music_show="N/A"
     fi
 }
 
@@ -89,62 +87,74 @@ install_translate() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== Vertex 参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入后台 WebUI 访问映射端口 (宿主机) [默认: 3000]: ${RESET}"
+    echo -e "${CYAN}====== Navidrome 参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Web 访问映射端口 (宿主机) [默认: 4533]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
+    [[ -z "$custom_port" ]] && custom_port="4533"
 
-    echo -ne "${YELLOW}请输入数据持久化目录 [默认: $BASE_DIR/vertex]: ${RESET}"
-    read -r path_config
-    [[ -z "$path_config" ]] && path_config="$BASE_DIR/vertex"
+    echo -e "\n${CYAN}--- 运行权限配置 (极其重要：需匹配您的音乐文件读写权限) ---${RESET}"
+    echo -ne "${YELLOW}请输入运行用户 UID [默认当前用户: ${CURRENT_UID}]: ${RESET}"
+    read -r custom_uid
+    [[ -z "$custom_uid" ]] && custom_uid="${CURRENT_UID}"
 
-    # 创建宿主机目录并赋权
-    mkdir -p "$path_config"
-    chmod -R 777 "$BASE_DIR" "$path_config"
+    echo -ne "${YELLOW}请输入运行用户组 GID [默认当前用户组: ${CURRENT_GID}]: ${RESET}"
+    read -r custom_gid
+    [[ -z "$custom_gid" ]] && custom_gid="${CURRENT_GID}"
 
-    # 【关键要求】第一步：先拉取一次底包
-    echo -e "\n${YELLOW}=================================================${RESET}"
-    echo -e "${YELLOW}>> 正在拉取 Vertex 底包镜像 (lswl/vertex-base)...${RESET}"
-    echo -e "${YELLOW}=================================================${RESET}"
-    docker pull lswl/vertex-base:latest
+    echo -e "\n${CYAN}--- 宿主机目录自定义 (请尽量填绝对路径) ---${RESET}"
+    echo -ne "${YELLOW}1. 请输入【数据保存(缓存/歌词/数据库)】路径 [默认: $BASE_DIR/data]: ${RESET}"
+    read -r path_data
+    [[ -z "$path_data" ]] && path_data="$BASE_DIR/data"
 
-    # 第二步：生成规范化 docker-compose.yml 配置文件
-    echo -e "\n${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    echo -ne "${YELLOW}2. 请输入【您的音乐库存放文件夹】路径 [默认: $BASE_DIR/music]: ${RESET}"
+    read -r path_music
+    [[ -z "$path_music" ]] && path_music="$BASE_DIR/music"
+
+    # 自动创建所需目录并授权
+    echo -e "\n${YELLOW}正在初始化并检查宿主机目录权限...${RESET}"
+    mkdir -p "$path_data" "$path_music"
+    
+    # 保证数据保存路径对于该 UID 有可写权限
+    chown -R "$custom_uid":"$custom_gid" "$path_data"
+    chmod -R 755 "$BASE_DIR" "$path_data"
+
+    # 生成规范化 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  vertex:
+  navidrome:
+    image: deluan/navidrome:latest
+    user: "${custom_uid}:${custom_gid}"
     container_name: ${CONTAINER_NAME}
-    volumes:
-      - '${path_config}:/vertex'
     ports:
-      - '${custom_port}:3000'
+      - "${custom_port}:4533"
+    restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
-    restart: unless-stopped
-    image: lswl/vertex:stable
+      - ND_LOGLEVEL=info
+      - ND_DEFAULTLANGUAGE=zh-Hans
+      - ND_SCANSCHEDULE=1h
+    volumes:
+      - "${path_data}:/data"
+      - "${path_music}:/music:ro"
 EOF
 
-    # 第三步：启动主容器
-    echo -e "\n${YELLOW}正在启动 Vertex 主服务容器...${RESET}"
+    # 启动容器
+    echo -e "\n${YELLOW}正在通过 Docker Compose 启动 Navidrome 音乐服务器...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务初始化 (约 3 秒)...${RESET}"
+    echo -e "${YELLOW}等待服务容器建构完成 (约 3 秒)...${RESET}"
     sleep 3
-
-    echo -e "${YELLOW}等待服务生成初始密码 (约 5 秒)...${RESET}"
-    sleep 5
-
-    # 重新抓取状态以读取新生成的密码
-    get_status_info
 
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     Vertex 部署成功！     ${RESET}"
+    echo -e "${GREEN}    Navidrome 部署成功！        ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}WEB 访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}默认用户名     : admin${RESET}"
-    echo -e "${YELLOW}系统初始密码   : ${CYAN}${v_password}${RESET}"
-    echo -e "${YELLOW}持久化配置路径 : ${path_config}${RESET}"
+    echo -e "${YELLOW}运行用户权限   : UID:${custom_uid}  GID:${custom_gid}${RESET}"
+    echo -e "${YELLOW}数据保存路径   : ${path_data}${RESET}"
+    echo -e "${YELLOW}音乐媒体路径   : ${path_music} (只读保护)${RESET}"
+    echo -e "${YELLOW}提示: 首次访问请打开网页端注册第一个账号(即为超级管理员)。${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -154,27 +164,27 @@ update_translate() {
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在更新底包镜像...${RESET}"
-    docker pull lswl/vertex-base:latest
-    echo -e "${YELLOW}正在拉取最新 Vertex 主程序镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新 Navidrome 官方镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！主容器已安全重启并保持最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！容器已成功安全重启。${RESET}"
 }
 
-# 卸载 Vertex
+# 卸载服务
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 Vertex 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Navidrome 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地配置和所有刷流数据？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地数据保存目录(歌词缓存和账号数据)？(注意: 绝不会删除你的音乐库文件)(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                get_status_info
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}Vertex 主配置与全部数据目录已彻底清理。${RESET}"
+                [[ "$path_data_show" != "$BASE_DIR"* && -d "$path_data_show" ]] && rm -rf "$path_data_show"
+                echo -e "${GREEN}缓存与元数据目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -195,9 +205,8 @@ show_info() {
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}核心镜像       : ${img_version}${RESET}"
     echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}默认用户名     : admin${RESET}"
-    echo -e "${YELLOW}系统初始密码   : ${CYAN}${v_password}${RESET}"
-    echo -e "${YELLOW}宿主机配置路径 : ${data_dir}${RESET}"
+    echo -e "${YELLOW}数据保存路径   : ${path_data_show}${RESET}"
+    echo -e "${YELLOW}音乐媒体路径   : ${path_music_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -205,10 +214,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}◈  Vertex  自动化刷流管理面板  ◈ ${RESET}"
+    echo -e "${GREEN}◈ Navidrome 私有音乐云管理面板 ◈ ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态    :${RESET} $status"
-    echo -e "${GREEN}Web端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

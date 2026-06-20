@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Kavita (Manga/Comics/Books) 多类目电子书库全自动化管理面板
+# Audiobookshelf 有声书与播客电台 Docker Compose 自动化管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="kavita"
-BASE_DIR="/opt/kavita"
+CONTAINER_NAME="audiobookshelf"
+BASE_DIR="/opt/audiobookshelf"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,7 +22,7 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态及多个独立书架的真实物理挂载路径
+# 动态获取容器状态及多品类书架的真实物理挂载路径
 get_status_info() {
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
@@ -37,26 +37,26 @@ get_status_info() {
         [[ -z "$img_version" ]] && img_version="latest"
 
         # 提取 Web 访问端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="5000"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="43378"
 
         # 提取本地多类别挂载物理路径
-        path_config_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/kavita/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        path_manga_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/manga"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        path_comics_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/comics"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        path_books_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/books"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        path_config_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        path_meta_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/metadata"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        path_audio_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/audiobooks"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        path_podcast_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/podcasts"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
         
         [[ -z "$path_config_show" ]] && path_config_show="$BASE_DIR/config"
-        [[ -z "$path_manga_show" ]] && path_manga_show="$BASE_DIR/manga"
-        [[ -z "$path_comics_show" ]] && path_comics_show="$BASE_DIR/comics"
-        [[ -z "$path_books_show" ]] && path_books_show="$BASE_DIR/books"
+        [[ -z "$path_meta_show" ]] && path_meta_show="$BASE_DIR/metadata"
+        [[ -z "$path_audio_show" ]] && path_audio_show="$BASE_DIR/audiobooks"
+        [[ -z "$path_podcast_show" ]] && path_podcast_show="$BASE_DIR/podcasts"
     else
         img_version="N/A"
         webui_port="N/A"
         path_config_show="N/A"
-        path_manga_show="N/A"
-        path_comics_show="N/A"
-        path_books_show="N/A"
+        path_meta_show="N/A"
+        path_audio_show="N/A"
+        path_podcast_show="N/A"
     fi
 }
 
@@ -90,70 +90,70 @@ install_translate() {
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 1. 网络访问端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Kavita 网页访问映射端口 (宿主机) [默认: 5000]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Audiobookshelf 网页访问端口 (宿主机) [默认: 43378]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="5000"
+    [[ -z "$custom_port" ]] && custom_port="43378"
 
-    echo -e "\n${CYAN}====== 2. 分类书架数据挂载自定义 (绝对路径) ======${RESET}"
+    echo -e "\n${CYAN}====== 2. 分类媒体仓挂载自定义 (绝对路径) ======${RESET}"
     echo -ne "${YELLOW}1. 请输入【程序系统配置 ./config】保存路径 [默认: $BASE_DIR/config]: ${RESET}"
     read -r path_config
     [[ -z "$path_config" ]] && path_config="$BASE_DIR/config"
 
-    echo -ne "${YELLOW}2. 请输入【日漫/韩漫本地仓 ./manga】保存路径 [默认: $BASE_DIR/manga]: ${RESET}"
-    read -r path_manga
-    [[ -z "$path_manga" ]] && path_manga="$BASE_DIR/manga"
+    echo -ne "${YELLOW}2. 请输入【书籍元数据 ./metadata】保存路径 [默认: $BASE_DIR/metadata]: ${RESET}"
+    read -r path_meta
+    [[ -z "$path_meta" ]] && path_meta="$BASE_DIR/metadata"
 
-    echo -ne "${YELLOW}3. 请输入【美漫/港漫本地仓 ./comics】保存路径 [默认: $BASE_DIR/comics]: ${RESET}"
-    read -r path_comics
-    [[ -z "$path_comics" ]] && path_comics="$BASE_DIR/comics"
+    echo -ne "${YELLOW}3. 请输入【有声书音频库 ./audiobooks】本地路径 [默认: $BASE_DIR/audiobooks]: ${RESET}"
+    read -r path_audio
+    [[ -z "$path_audio" ]] && path_audio="$BASE_DIR/audiobooks"
 
-    echo -ne "${YELLOW}4. 请输入【文学电子书本地仓 ./books】保存路径 [默认: $BASE_DIR/books]: ${RESET}"
-    read -r path_books
-    [[ -z "$path_books" ]] && path_books="$BASE_DIR/books"
+    echo -ne "${YELLOW}4. 请输入【网络播客电台 ./podcasts】本地路径 [默认: $BASE_DIR/podcasts]: ${RESET}"
+    read -r path_podcast
+    [[ -z "$path_podcast" ]] && path_podcast="$BASE_DIR/podcasts"
 
     # 批量创建本地分类目录并赋予高兼容读写权限
-    echo -e "\n${YELLOW}正在批量初始化 Kavita 分类物理仓所有权及读写权限...${RESET}"
-    mkdir -p "$path_config" "$path_manga" "$path_comics" "$path_books"
-    chmod -R 777 "$path_config" "$path_manga" "$path_comics" "$path_books"
+    echo -e "\n${YELLOW}正在批量初始化 Audiobookshelf 核心矩阵仓及多维文件读写权限...${RESET}"
+    mkdir -p "$path_config" "$path_meta" "$path_audio" "$path_podcast"
+    chmod -R 777 "$path_config" "$path_meta" "$path_audio" "$path_podcast"
 
     # 生成规范化 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在构建符合 Kavita 图书规范的 docker-compose.yml...${RESET}"
+    echo -e "${YELLOW}正在构建符合规范的 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  kavita:
-    image: jvmilazz0/kavita:latest
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:latest
     container_name: ${CONTAINER_NAME}
+    ports:
+      - "${custom_port}:80"
+    volumes:
+      - "${path_config}:/config"
+      - "${path_meta}:/metadata"
+      - "${path_audio}:/audiobooks"
+      - "${path_podcast}:/podcasts"
     environment:
       - TZ=Asia/Shanghai
-    volumes:
-      - "${path_config}:/kavita/config"
-      - "${path_manga}:/manga"
-      - "${path_comics}:/comics"
-      - "${path_books}:/books"
-    ports:
-      - "${custom_port}:5000"
     restart: unless-stopped
 EOF
 
     # 启动容器
-    echo -e "\n${YELLOW}正在通过 Docker Compose 部署 Kavita 数字化书房...${RESET}"
+    echo -e "\n${YELLOW}正在通过 Docker Compose 编排启动 Audiobookshelf 广播中心...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待 Kavita 核心扫描本地磁盘文件结构 (约 3 秒)...${RESET}"
+    echo -e "${YELLOW}等待音频服务端加载数据库环境 (约 3 秒)...${RESET}"
     sleep 3
 
     get_status_info
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}              Kavita 媒体库部署成功！                ${RESET}"
+    echo -e "${GREEN}           Audiobookshelf 服务端部署成功！              ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}Web 阅读器访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}元数据配置本地路径 : ${path_config}${RESET}"
-    echo -e "${YELLOW}Manga 漫画本地路径 : ${path_manga}${RESET}"
-    echo -e "${YELLOW}Comics美漫本地路径 : ${path_comics}${RESET}"
-    echo -e "${YELLOW}Books 电子书主路径 : ${path_books}${RESET}"
-    echo -e "${CYAN}💡 进阶提示：请将对应种类的电子书分别放入主机的上述物理路径中。${RESET}"
-    echo -e "${CYAN}   在 Kavita 后台新建媒体库时，直接关联容器内的【 /manga 】、【 /comics 】或【 /books 】即可！${RESET}"
+    echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}系统主配置路径   : ${path_config}${RESET}"
+    echo -e "${YELLOW}有声书媒体仓路径 : ${path_audio}${RESET}"
+    echo -e "${YELLOW}播客流媒体路径   : ${path_podcast}${RESET}"
+    echo -e "${CYAN}💡 客户端与初始化提示：首次登录进入 Web 页面请根据提示注册 root 管理员账户。${RESET}"
+    echo -e "${CYAN}   后台关联媒体库时，直接选择容器内对应的【 /audiobooks 】或【 /podcasts 】即可。${RESET}"
+    echo -e "${CYAN}   下载官方手机 App 后，服务器地址填写 http://${DETECT_IP}:${custom_port} 即可多端畅听！${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
@@ -163,27 +163,28 @@ update_translate() {
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新 Kavita 官方发布版镜像...${RESET}"
+    echo -e "${YELLOW}正在同步拉取最新 Audiobookshelf 官方发布版镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！数字化阅读服务已平滑重启。${RESET}"
+    echo -e "${GREEN}更新完成！有声书流媒体网关已平滑重启。${RESET}"
 }
 
 # 卸载服务
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 Kavita 图书容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Audiobookshelf 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地保存的书架刮削海报、阅读记录及索引数据库？(⚠️绝不会动你的书籍漫画原文件)(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地保存的媒体元数据、刮削海报及播放进度数据库？(⚠️绝不会动你的音频、播客原文件)(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 get_status_info
                 rm -rf "$BASE_DIR"
                 [[ "$path_config_show" != "$BASE_DIR"* && -d "$path_config_show" ]] && rm -rf "$path_config_show"
-                echo -e "${GREEN}所有本地的 Kavita 账户信息、页码缓存、元数据已彻底清理。${RESET}"
+                [[ "$path_meta_show" != "$BASE_DIR"* && -d "$path_meta_show" ]] && rm -rf "$path_meta_show"
+                echo -e "${GREEN}所有本地的账户关系、流媒体元数据及缓存已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -204,22 +205,22 @@ show_info() {
     echo -e "${YELLOW}当前运行状态     : $status"
     echo -e "${YELLOW}核心镜像版本     : ${img_version}${RESET}"
     echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}配置存储本地路径 : ${path_config_show}${RESET}"
-    echo -e "${YELLOW}Manga 漫画本地路径 : ${path_manga_show}${RESET}"
-    echo -e "${YELLOW}Comics美漫本地路径 : ${path_comics_show}${RESET}"
-    echo -e "${YELLOW}Books 电子书本地路 : ${path_books_show}${RESET}"
+    echo -e "${YELLOW}系统配置本地路径 : ${path_config_show}${RESET}"
+    echo -e "${YELLOW}元数据缓存路径   : ${path_meta_show}${RESET}"
+    echo -e "${YELLOW}有声书本地物理路径: ${path_audio_show}${RESET}"
+    echo -e "${YELLOW}播客电台本地路径 : ${path_podcast_show}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Kavita  漫画管理面板  ◈  ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}======================================${RESET}"
+    echo -e "${GREEN}◈ Audiobookshelf 有声书/播客管理面板 ◈ ${RESET}"
+    echo -e "${GREEN}======================================${RESET}"
     echo -e "${GREEN}状态    :${RESET} $status"
     echo -e "${GREEN}端口    :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}======================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -229,7 +230,7 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}======================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in

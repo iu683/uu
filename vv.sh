@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Emby Server (官方原版) 架构/硬解/本地数据挂载自适应管理面板
+# IYUUPlus 自动辅种/转种工具 Docker Compose 管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="emby"
-BASE_DIR="/opt/emby-official"
+CONTAINER_NAME="IYUUPlus"
+BASE_DIR="/opt/iyuuplus"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,7 +22,7 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、架构、端口及本地挂载配置
+# 动态获取容器状态、映射端口和各本地挂载目录
 get_status_info() {
     # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -33,48 +33,27 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 自动检测当前宿主机 CPU 架构
-    local arch=$(uname -m)
-    if [[ "$arch" == "x86_64" ]]; then
-        CURRENT_ARCH_TEXT="AMD64 (x86_64)"
-    elif [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
-        CURRENT_ARCH_TEXT="ARM64 (aarch64)"
-    else
-        CURRENT_ARCH_TEXT="未知架构 ($arch)"
-    fi
-
-    # 3. 如果容器存在，精准提取本地挂载路径
+    # 2. 如果容器存在，精准提取实时挂载和端口信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 提取端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8096/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8096"
-        
-        https_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8920/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$https_port" ]] && https_port="8920"
+        # 提取 WebUI 映射出来的宿主机端口 (内部默认 8780)
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8780/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8780"
 
-        # 提取本地挂载路径
-        path_config_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        path_media_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/mnt/share1"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$path_config_show" ]] && path_config_show="未检测到挂载"
-        [[ -z "$path_media_show" ]] && path_media_show="未检测到挂载"
+        # 提取本地 iyuu 配置目录
+        path_iyuu_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/iyuu"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$path_iyuu_show" ]] && path_iyuu_show="$BASE_DIR/iyuu"
 
-        # 检查是否挂载了硬解设备
-        has_dri=$(docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep "/dev/dri")
-        if [[ -n "$has_dri" ]]; then
-            hw_status="${GREEN}已开启 (/dev/dri)${RESET}"
-        else
-            hw_status="${RED}已关闭${RESET}"
-        fi
+        # 提取本地数据/种子目录
+        path_data_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$path_data_show" ]] && path_data_show="$BASE_DIR/data"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        https_port="N/A"
-        path_config_show="N/A"
-        path_media_show="N/A"
-        hw_status="N/A"
+        path_iyuu_show="N/A"
+        path_data_show="N/A"
     fi
 }
 
@@ -107,97 +86,61 @@ install_translate() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 1. 🔍 核心逻辑：自动检测系统架构 ======${RESET}"
-    local arch=$(uname -m)
-    local emby_image=""
-    local arch_title=""
+    echo -e "${CYAN}====== 1. 基础网络端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 IYUU WebUI 访问端口 (宿主机) [默认: 8780]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8780"
 
-    if [[ "$arch" == "x86_64" ]]; then
-        emby_image="emby/embyserver:latest"
-        arch_title="AMD64 (x86_64)"
-    elif [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
-        emby_image="emby/embyserver_arm64v8:latest"
-        arch_title="ARM64 (aarch64)"
-    else
-        echo -e "${RED}❌ 未知或不支持的系统架构: $arch${RESET}"
-        read -p "按回车返回菜单..."
-        return
-    fi
-    echo -e "检测到系统架构为: ${GREEN}${arch_title}${RESET}"
-    echo -e "官方适配镜像标签: ${CYAN}${emby_image}${RESET}"
+    echo -e "\n${CYAN}====== 2. 本地数据挂载自定义 (绝对路径) ======${RESET}"
+    echo -e "${GREEN}提示：建议将数据目录直接指向你各下载器（如 qB/TR）共用的主下载或种子存放路径。${RESET}"
+    
+    echo -ne "${YELLOW}1. 请输入【本地 IYUU 程序配置】保存路径 [默认: $BASE_DIR/iyuu]: ${RESET}"
+    read -r path_iyuu
+    [[ -z "$path_iyuu" ]] && path_iyuu="$BASE_DIR/iyuu"
 
-    echo -e "\n${CYAN}====== 2. 基础网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}1. 请输入 Emby HTTP 访问端口 (宿主机) [默认: 8096]: ${RESET}"
-    read -r custom_http_port
-    [[ -z "$custom_http_port" ]] && custom_http_port="8096"
+    echo -ne "${YELLOW}2. 请输入【本地种子/媒体数据】存放路径 [默认: $BASE_DIR/data]: ${RESET}"
+    read -r path_data
+    [[ -z "$path_data" ]] && path_data="$BASE_DIR/data"
 
-    echo -ne "${YELLOW}2. 请输入 Emby HTTPS 安全端口 (宿主机) [默认: 8920]: ${RESET}"
-    read -r custom_https_port
-    [[ -z "$custom_https_port" ]] && custom_https_port="8920"
+    # 自动创建本地挂载目录并赋予高权限
+    echo -e "\n${YELLOW}正在创建并安全初始化本地独立挂载卷...${RESET}"
+    mkdir -p "$path_iyuu" "$path_data"
+    chmod -R 777 "$path_iyuu" "$path_data"
 
-    echo -e "\n${CYAN}====== 3. 本地数据挂载自定义 (绝对路径) ======${RESET}"
-    echo -ne "${YELLOW}1. 请输入【本地 Emby 配置 ./config】保存路径 [默认: $BASE_DIR/config]: ${RESET}"
-    read -r path_config
-    [[ -z "$path_config" ]] && path_config="$BASE_DIR/config"
-
-    echo -ne "${YELLOW}2. 请输入【本地媒体电影 ./media】存放路径 [默认: $BASE_DIR/media]: ${RESET}"
-    read -r path_media
-    [[ -z "$path_media" ]] && path_media="$BASE_DIR/media"
-
-    echo -e "\n${CYAN}====== 4. 显卡核显硬件解码配置 ======${RESET}"
-    echo -ne "${YELLOW}是否需要启用核显硬解解压（挂载 /dev/dri）？(y/n, 默认 n): ${RESET}"
-    read -r HW_TRANSCODE
-
-    # 自动创建本地挂载目录并赋予最高权限
-    echo -e "\n${YELLOW}正在创建并初始化本地挂载目录权限...${RESET}"
-    mkdir -p "$path_config" "$path_media"
-    chmod -R 777 "$path_config" "$path_media"
-
-    # 生成官方规范化 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合官方原版规范的 docker-compose.yml...${RESET}"
+    # 生成规范化 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合 IYUU 规范的 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  emby:
-    image: ${emby_image}
+  iyuuplus-dev:
+    stdin_open: true
+    tty: true
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
+    restart: always
+    image: iyuucn/iyuuplus-dev:latest
     ports:
-      - "${custom_http_port}:8096"
-      - "${custom_https_port}:8920"
-    environment:
-      - TZ=Asia/Shanghai
+      - "${custom_port}:8780"
     volumes:
-      - "${path_config}:/config"
-      - "${path_media}:/mnt/share1"
+      - "${path_iyuu}:/iyuu"
+      - "${path_data}:/data"
 EOF
 
-    # 动态追加官方硬解设备模块
-    if [[ "$HW_TRANSCODE" == "y" || "$HW_TRANSCODE" == "Y" ]]; then
-        echo -e "${GREEN}正在追加核显驱动硬件映射 (/dev/dri)...${RESET}"
-        cat <<EOF >> "$COMPOSE_FILE"
-    devices:
-      - /dev/dri:/dev/dri
-EOF
-    fi
-
-    # 启动官方版容器
-    echo -e "\n${YELLOW}正在通过 Docker Compose 启动官方原版 Emby Server...${RESET}"
+    # 启动容器
+    echo -e "\n${YELLOW}正在通过 Docker Compose 启动 IYUUPlus 辅种矩阵...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待官方服务构建就绪 (约 3 秒)...${RESET}"
+    echo -e "${YELLOW}等待服务构建并扫描网络环境 (约 3 秒)...${RESET}"
     sleep 3
 
     get_status_info
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}            Emby 官方原版部署成功！                  ${RESET}"
+    echo -e "${GREEN}            IYUUPlus 自动化部署成功！                ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}HTTP 访问地址  : http://${DETECT_IP}:${custom_http_port}${RESET}"
-    echo -e "${YELLOW}HTTPS 访问地址 : https://${DETECT_IP}:${custom_https_port}${RESET}"
-    echo -e "${YELLOW}本地配置路径   : ${path_config}${RESET}"
-    echo -e "${YELLOW}本地媒体路径   : ${path_media}${RESET}"
-    echo -e "${CYAN}💡 进阶提示：请将你的电影/剧集文件直接存入主机的 ${path_media}${RESET}"
-    echo -e "${CYAN}   进入官方 Emby 网页向导添加媒体库时，请选择【 /mnt/share1 】目录进行绑定！${RESET}"
+    echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}程序配置本地路径 : ${path_iyuu}${RESET}"
+    echo -e "${YELLOW}种子数据本地路径 : ${path_data}${RESET}"
+    echo -e "${CYAN}💡 进阶提示：首次进入后台，默认用户名为 admin，密码自行设置。${RESET}"
+    echo -e "${CYAN}   在 IYUU 后台配置下载器路径映射时，请记得勾选或关联容器内的【 /data 】目录。${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
@@ -207,27 +150,27 @@ update_translate() {
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新 Emby 官方原版镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新 IYUUPlus 官方开发版镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！官方服务已平滑重启。${RESET}"
+    echo -e "${GREEN}更新完成！辅种服务已平滑重启。${RESET}"
 }
 
 # 卸载服务
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 Emby 官方版容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 IYUUPlus 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地保存的 Emby 官方配置和海报缓存？(绝不会动你的视频原文件)(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地保存的 IYUU 辅种站点绑定及转种配置？(⚠️ 绝不会动你的下载盘视频文件)(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 get_status_info
                 rm -rf "$BASE_DIR"
-                [[ "$path_config_show" != "$BASE_DIR"* && -d "$path_config_show" ]] && rm -rf "$path_config_show"
-                echo -e "${GREEN}所有相关的官方元数据与缓存配置已彻底清理。${RESET}"
+                [[ "$path_iyuu_show" != "$BASE_DIR"* && -d "$path_iyuu_show" ]] && rm -rf "$path_iyuu_show"
+                echo -e "${GREEN}所有本地的 IYUU 站点令牌、过滤规则及配置数据已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -245,29 +188,23 @@ show_info() {
     get_status_info
     local DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}当前硬件架构   : ${CURRENT_ARCH_TEXT}${RESET}"
-    echo -e "${YELLOW}官方镜像版本   : ${img_version}${RESET}"
-    echo -e "${YELLOW}显卡硬解状态   : ${hw_status}${RESET}"
-    echo -e "${YELLOW}HTTP 访问地址  : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}HTTPS 访问地址 : https://${DETECT_IP}:${https_port}${RESET}"
-    echo -e "${YELLOW}本地配置路径   : ${path_config_show}${RESET}"
-    echo -e "${YELLOW}本地媒体路径   : ${path_media_show}${RESET}"
+    echo -e "${YELLOW}当前运行状态     : $status"
+    echo -e "${YELLOW}官方开发版镜像   : ${img_version}${RESET}"
+    echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}程序配置本地路径 : ${path_iyuu_show}${RESET}"
+    echo -e "${YELLOW}种子数据本地路径 : ${path_data_show}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}   ◈  Emby Server  官方版管理面板  ◈     ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}状态     :${RESET} $status"
-    echo -e "${GREEN}系统架构 :${RESET} ${CYAN}${CURRENT_ARCH_TEXT}${RESET}"
-    echo -e "${GREEN}硬解状态 :${RESET} ${hw_status}"
-    echo -e "${GREEN}HTTP端口 :${RESET} ${YELLOW}${webui_port}${RESET}" 
-    echo -e "${GREEN}HTTPS端口:${RESET} ${YELLOW}${https_port}${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}   ◈  IYUUPlus 自动辅种/转种矩阵全能集成管理面板  ◈ ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -277,7 +214,7 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in

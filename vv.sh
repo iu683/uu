@@ -1,401 +1,559 @@
 #!/bin/bash
 # =================================================================
-# 名称: 全能网络工具箱 
-# 适配: Debian / Ubuntu / CentOS / Rocky Linux / Alpine Linux
+# Tinyauth v4.1.0+ 全能管理脚本 (基于最新 OAuth Broker 统一驱动)
 # =================================================================
 
+# 颜色
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
-BLUE="\033[36m"
+CYAN="\033[36m"
+MAGENTA="\033[35m"
 RESET="\033[0m"
-ORANGE='\033[38;5;208m'
 
-# 默认配置参数
-IPERF_PORT=5201
-IPERF_TIME=30
-IPERF_PARALLEL=1
-IPERF_UDP_BW="1G"
-MTR_PROTO="ICMP"
-MTR_SHOW_AS="true"
+CONTAINER_NAME="tinyauth"
+BASE_DIR="/opt/tinyauth"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
-# 全局安全退出捕获
-trap "echo -e '${RESET}'; exit" INT TERM
-
-# ==========================================
-# 工具状态动态探测
-# ==========================================
-get_status() {
-    if command -v "$1" >/dev/null 2>&1; then
-        echo -e "${YELLOW}已安装${RESET}"
+# 自动探测 Nginx 最佳配置目录
+get_nginx_config_paths() {
+    if [[ -d "/etc/nginx/sites-available" ]]; then
+        NGINX_AVAILABLE_DIR="/etc/nginx/sites-available"
+        NGINX_ENABLED_DIR="/etc/nginx/sites-enabled"
+        USE_SITES_STRUCTURE=true
     else
-        echo -e "${RED}未安装${RESET}"
+        NGINX_AVAILABLE_DIR="/etc/nginx/conf.d"
+        USE_SITES_STRUCTURE=false
     fi
 }
 
-# ==========================================
-# 自动化安装引擎
-# ==========================================
-check_and_install() {
-    local tool=$1
-    if command -v "$tool" >/dev/null 2>&1; then return; fi
+# 检测基础依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
+    fi
+}
 
-    echo -e "${YELLOW}📦 正在安装必要依赖与工具: $tool ...${RESET}"
-    
-    # 基础依赖环境前置检查与修复
-    if [ -f /etc/alpine-release ]; then
-        apk add --no-cache curl wget tar bash grep gawk openssl
-    elif ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y curl wget tar grep gawk
-        elif command -v dnf >/dev/null 2>&1; then dnf install -y curl wget tar grep gawk
-        elif command -v yum >/dev/null 2>&1; then yum install -y curl wget tar grep gawk
+# 动态获取容器状态和端口
+get_status_info() {
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="v4.1.0"
+
+        if [[ -f "$ENV_FILE" ]]; then
+            local env_url=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'=' -f2-)
+            webui_port=$(echo "$env_url" | awk -F':' '{print $3}' | cut -d'/' -f1)
+            if [[ -z "$webui_port" ]]; then
+                webui_port=$(echo "$env_url" | awk -F':' '{print $2}' | sed 's|//||' | cut -d'/' -f1)
+            fi
         fi
-    fi
-
-    case "$tool" in
-        speedtest)
-            if [ -f /etc/alpine-release ]; then
-                echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
-                apk add --no-cache speedtest-cli
-                if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
-                    ln -sf "$(command -v speedtest-cli)" /usr/bin/speedtest
-                fi
-            else
-                echo -e "${YELLOW}📦 正在通过二进制包快速安装 Ookla Speedtest...${RESET}"
-                local cpu_arch=$(uname -m)
-                local download_url=""
-                case "$cpu_arch" in
-                    x86_64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
-                    aarch64|arm64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
-                    *) echo -e "${RED}❌ 错误: 不支持的架构 ${cpu_arch}${RESET}" >&2; exit 1 ;;
-                esac
-                cd /tmp
-                wget -q "$download_url" -O speedtest.tgz && \
-                tar -xzf speedtest.tgz && \
-                mv -f speedtest /usr/local/bin/ && \
-                rm -f speedtest.tgz speedtest.5 speedtest.md LICENSE.md
-            fi
-            mkdir -p "$HOME/.ookla"
-            echo '{"license_accepted": true, "gdpr_accepted": true}' > "$HOME/.ookla/speedtest-cli.json" 2>/dev/null || true
-            ;;
-        nexttrace)
-            curl -fsSL nxtrace.org/nt | bash || true
-            ;;
-        iperf3)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache iperf3
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y iperf3
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release 2>/dev/null || true; dnf install -y iperf3
-            elif command -v yum >/dev/null 2>&1; then yum install -y epel-release 2>/dev/null || true; yum install -y iperf3
-            fi
-            ;;
-        mtr)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache mtr
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y mtr-tiny || apt-get install -y mtr
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y mtr
-            elif command -v yum >/dev/null 2>&1; then yum install -y mtr
-            fi
-            ;;
-        inetspeed)
-            echo -e "${YELLOW}📦 正在安装 iNetSpeed-CLI (Apple CDN 测速)...${RESET}"
-            # 使用 echo "inetspeed" 管道输入，自动回应安装器的命令名询问
-            echo "2" | curl -fsSL https://raw.githubusercontent.com/tsosunchia/iNetSpeed-CLI/main/scripts/install.sh | bash || true
-            ;;
-        speed-cloudflare-cli)
-            # CRITICAL AT ALL: 如果是 Alpine 系统，必须安装 gcompat 补齐 glibc 运行环境缺失的 __res_init 符号
-            if [ -f /etc/alpine-release ]; then
-                echo -e "${YELLOW}📦 检测到 Alpine 系统，正在补充安装 gcompat 运行环境支持...${RESET}"
-                apk add --no-cache gcompat libc6-compat
-            fi
-
-            echo -e "${YELLOW}🔍 正在通过 GitHub API 获取 Cloudflare-CLI Rust 最新版本信息...${RESET}"
-            
-            local api_response=$(curl -fsSL "https://api.github.com/repos/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/latest" 2>/dev/null)
-            if [ -z "$api_response" ]; then
-                echo -e "${RED}❌ 无法获取 GitHub 最新发布版本信息，请检查网络或 API 速率限制。${RESET}"
-                sleep 2
-                return 1
-            fi
-
-            local latest_tag=$(echo "$api_response" | jq -r '.tag_name')
-            echo -e "${GREEN}✨ 发现最新版本: ${latest_tag}${RESET}"
-
-            local cpu_arch=$(uname -m)
-            local cf_url=""
-            
-            case "$cpu_arch" in
-                x86_64) 
-                    cf_url=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("ubuntu") and (contains("arm") | not) and (contains(".deb") | not)) | .browser_download_url' | head -n 1)
-                    ;;
-                aarch64|arm64) 
-                    cf_url=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("ubuntu") and contains("arm") and (contains(".deb") | not)) | .browser_download_url' | head -n 1)
-                    ;;
-                *) 
-                    echo -e "${RED}❌ 错误: 不支持的系统架构 ${cpu_arch}${RESET}" >&2
-                    exit 1 
-                    ;;
-            esac
-
-            if [ -z "$cf_url" ] || [ "$cf_url" = "null" ]; then
-                echo -e "${YELLOW}⚠️ 提取最新下载链接失败，启用稳定版规则匹配下载...${RESET}"
-                if [ "$cpu_arch" = "x86_64" ]; then
-                    cf_url="https://github.com/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/download/v0.1.0/speed-cloudflare-cli-ubuntu-22.04"
-                else
-                    cf_url="https://github.com/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/download/v0.1.0/speed-cloudflare-cli-ubuntu-22.04-arm"
-                fi
-            fi
-
-            echo -e "${YELLOW}📥 正在下载二进制资产...${RESET}"
-            wget -q "$cf_url" -O /usr/local/bin/speed-cloudflare-cli
-            if [ $? -eq 0 ]; then
-                chmod +x /usr/local/bin/speed-cloudflare-cli
-                echo -e "${GREEN}✅ speed-cloudflare-cli 部署成功！${RESET}"
-                sleep 1
-            else
-                echo -e "${RED}❌ 下载失败，请检查网络或 GitHub 连通性。${RESET}"
-                sleep 2
-            fi
-            ;;
-    esac
-    hash -r 2>/dev/null
-}
-
-# ==========================================
-# 1) Speedtest 模块 (双保险免提示版)
-# ==========================================
-run_speedtest() {
-    clear
-    check_and_install speedtest
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   Speedtest 网速测试   ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}🚀 开始测速...${RESET}"
-    echo "-------------------------------------"
-    if speedtest --help 2>&1 | grep -q "accept-license"; then
-        echo "YES" | speedtest --accept-license --accept-gdpr --force || true
+        
+        if [[ -z "$webui_port" || ! "$webui_port" =~ ^[0-9]+$ ]]; then
+            webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+            [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        fi
+        [[ -z "$webui_port" ]] && webui_port="3000"
     else
-        speedtest || speedtest-cli || true
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
     fi
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
 }
 
-# ==========================================
-# 2) NextTrace 模块
-# ==========================================
-run_nexttrace() {
-    clear
-    check_and_install nexttrace
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   NextTrace 路由追踪   ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p "请输入目标IP或域名: " target
-    if [ -z "$target" ]; then return; fi
-    echo -e "--------------------------------"
-    nexttrace "$target" || true
-    echo -e "${GREEN}================================${RESET}"
-    read -p "追踪完成，按回车返回面板..." dummy
-}
+# 1. 部署 Tinyauth
+install_utils() {
+    check_dependencies
+    mkdir -p "$BASE_DIR/data"
 
-# ==========================================
-# 3) iperf3 
-# ==========================================
-get_iperf_ip() {
-    read -p "请输入远端服务器 IP/域名: " SERVER_IP
-    if [ -z "$SERVER_IP" ]; then
-        echo -e "${RED}❌ 未输入有效 IP，操作取消。${RESET}"
-        sleep 1.5
-        return 1
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入本地监听端口 [默认: 3000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3000"
+
+    echo -e "${YELLOW}====================================================${RESET}"
+    echo -e "${CYAN}接下来将进入 Tinyauth 官方交互式用户创建向导。${RESET}"
+    echo -e "${CYAN}请在提示中输入用户名、密码，并在格式(Format)中选择 ${GREEN}docker${RESET} 格式。${RESET}"
+    echo -e "${YELLOW}====================================================${RESET}"
+    echo -ne "${YELLOW}准备好了吗？按回车键启动创建器... ${RESET}"
+    read -r
+
+    local tmp_log="$BASE_DIR/user_create.log"
+    docker run -i -t --rm ghcr.io/steveiliop56/tinyauth:v4 user create --interactive | tee "$tmp_log"
+
+    local extracted_user=$(grep -a "User created user=" "$tmp_log" | awk -F'user=' '{print $2}' | tr -d '\r' | tr -d '\n')
+    rm -f "$tmp_log"
+
+    if [[ -z "$extracted_user" ]]; then
+        echo -ne "${YELLOW}请手动输入刚才创建好的 USERS 字符串 (例如 iucsy:\$2a\$10\$...): ${RESET}"
+        read -r extracted_user
+        if [[ -z "$extracted_user" ]]; then return; fi
     fi
-    return 0
+
+    local safe_users_string=$(echo "$extracted_user" | sed 's/\$/\$\$/g')
+
+    cat <<EOF > "$ENV_FILE"
+APP_URL=http://127.0.0.1:${custom_port}
+USERS=${safe_users_string}
+DISABLE_ANALYTICS=true
+LOG_JSON=true
+SECURE_COOKIE=true
+EOF
+
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  tinyauth:
+    image: ghcr.io/steveiliop56/tinyauth:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${custom_port}:3000"
+    env_file: .env
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "tinyauth", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+EOF
+
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    sleep 2
 }
 
-run_iperf3() {
-    check_and_install iperf3
+# 10. 联动 Pocket-ID
+configure_pocketid_oauth() {
+    if [[ ! -f "$ENV_FILE" ]]; then echo -e "${RED}错误: 请先安装部署主程序！${RESET}"; return; fi
+    local tiny_url=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'=' -f2-)
+    
+    echo -e "${CYAN}====== Pocket-ID OAuth2 联动配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Pocket-ID 服务完整域名 (如 pocketid.your.domain): ${RESET}"
+    read -r p_domain
+    [[ -z "$p_domain" ]] && return
+    [[ "$p_domain" != http* ]] && p_domain="https://${p_domain}"
+    p_domain=$(echo "$p_domain" | sed 's|/*$||')
+
+    echo -ne "${YELLOW}请输入 Client ID: ${RESET}"
+    read -r client_id
+    echo -ne "${YELLOW}请输入 Client Secret: ${RESET}"
+    read -r client_secret
+
+    # 针对 v4.1.0 统一重构环境变量命名空间
+    sed -i '/^PROVIDERS_POCKETID_/d' "$ENV_FILE"
+    sed -i '/^OAUTH_AUTO_REDIRECT=/d' "$ENV_FILE"
+    cat <<EOF >> "$ENV_FILE"
+PROVIDERS_POCKETID_CLIENT_ID=${client_id}
+PROVIDERS_POCKETID_CLIENT_SECRET=${client_secret}
+PROVIDERS_POCKETID_AUTH_URL=${p_domain}/authorize
+PROVIDERS_POCKETID_TOKEN_URL=${p_domain}/api/oidc/token
+PROVIDERS_POCKETID_USER_INFO_URL=${p_domain}/api/oidc/userinfo
+PROVIDERS_POCKETID_REDIRECT_URL=${tiny_url}/api/oauth/callback/pocketid
+PROVIDERS_POCKETID_SCOPES=openid email profile groups
+PROVIDERS_POCKETID_NAME=Pocket ID
+OAUTH_AUTO_REDIRECT=pocketid
+EOF
+    cd "$BASE_DIR" && docker compose up -d
+    echo -e "${GREEN}Pocket-ID 联动配置已更新，且已激活自动重定向！${RESET}"
+}
+
+# 11. 智能配置第三方应用前置鉴权守卫 (auth_request)
+configure_app_guard() {
+    get_status_info
+    if [[ ! -f "$ENV_FILE" ]]; then echo -e "${RED}错误：请先部署主服务！${RESET}"; return; fi
+    get_nginx_config_paths
+    local current_sso_url=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'=' -f2-)
+    
+    echo -e "${CYAN}====== 配置第三方应用 Nginx 前置鉴权守卫 ======${RESET}"
+    echo -ne "${YELLOW}请输入被保护应用的规划域名 (如: app.otg.dpdns.org): ${RESET}"
+    read -r app_domain
+    if [[ -z "$app_domain" ]]; then echo -e "${RED}域名不能为空！${RESET}"; return; fi
+
+    echo -ne "${YELLOW}请输入被保护应用的本地后端地址 [默认 http://127.0.0.1:8082]: ${RESET}"
+    read -r app_backend
+    [[ -z "$app_backend" ]] && app_backend="http://127.0.0.1:8082"
+
+    local default_cert="/etc/letsencrypt/live/${app_domain}/fullchain.pem"
+    local default_key="/etc/letsencrypt/live/${app_domain}/privkey.pem"
+
+    echo -ne "${YELLOW}请输入 SSL 证书路径 [直接回车使用默认: ${default_cert}]: ${RESET}"
+    read -r app_cert
+    [[ -z "$app_cert" ]] && app_cert="$default_cert"
+
+    echo -ne "${YELLOW}请输入 SSL 私钥路径 [直接回车使用默认: ${default_key}]: ${RESET}"
+    read -r app_key
+    [[ -z "$app_key" ]] && app_key="$default_key"
+
+    local guard_conf_file="${NGINX_AVAILABLE_DIR}/${app_domain}"
+    [[ "$USE_SITES_STRUCTURE" = false ]] && guard_conf_file="${guard_conf_file}.conf"
+
+    cat <<EOF > "$guard_conf_file"
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${app_domain};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${app_domain};
+
+    ssl_certificate ${app_cert};
+    ssl_certificate_key ${app_key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    access_log /var/log/nginx/${app_domain}.access.log;
+    error_log /var/log/nginx/${app_domain}.error.log;
+
+    location = /manifest.json { proxy_pass ${app_backend}; }
+    location = /favicon.ico { proxy_pass ${app_backend}; }
+    location ^~ /assets/ { proxy_pass ${app_backend}; }
+
+    location ^~ / {
+        proxy_pass ${app_backend};
+
+        auth_request /_tinyauth_check;
+        error_page 401 = @tinyauth_login;
+
+        auth_request_set \$ta_user \$upstream_http_remote_user;
+        proxy_set_header Remote-User \$ta_user;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header REMOTE-HOST \$remote_addr;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$http_connection;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Port \$server_port;
+        proxy_http_version 1.1;
+        add_header Cache-Control no-cache;
+    }
+
+    location = /_tinyauth_check {
+        internal;
+        proxy_pass http://127.0.0.1:${webui_port}/api/auth/nginx;
+        proxy_set_header x-forwarded-proto \$scheme;
+        proxy_set_header x-forwarded-host  \$host;
+        proxy_set_header x-forwarded-uri   \$request_uri;
+    }
+
+    location @tinyauth_login {
+        return 302 ${current_sso_url}/login?redirect_uri=\$scheme://\$host\$request_uri;
+    }
+}
+EOF
+
+    if [ "$USE_SITES_STRUCTURE" = true ] && [ -d "$NGINX_ENABLED_DIR" ]; then
+        ln -sf "$guard_conf_file" "${NGINX_ENABLED_DIR}/${app_domain}"
+    fi
+
+    echo -e "${GREEN}守护者配置文件已成功写入: $guard_conf_file${RESET}"
+    if nginx -t &>/dev/null; then
+        systemctl reload nginx
+        echo -e "${GREEN}Nginx 热重载成功！前置守护拦截已全面生效。${RESET}"
+    else
+        echo -e "${RED}警告: Nginx 语法测试失败！请确保刚刚填充的证书链路径文件真实存在！${RESET}"
+    fi
+}
+
+# 12. 联动 Casdoor / 通用 Generic OAuth2 认证 (全面对齐 v4 规范)
+configure_casdoor_oauth() {
+    if [[ ! -f "$ENV_FILE" ]]; then echo -e "${RED}错误: 请先安装部署 Tinyauth 主程序！${RESET}" ; return; fi
+    local tiny_url=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'=' -f2-)
+
+    echo -e "${CYAN}====== Casdoor / 通用 Generic OAuth2 单点登录联动 ======${RESET}"
+    echo -e "${YELLOW}当前 Tinyauth 中央认证根地址为: ${GREEN}${tiny_url}${RESET}"
+    
+    # 根据 v4.1.0 核心工厂，通用适配器的路由标识是 generic
+    local computed_redirect="${tiny_url}/callback/generic"
+    echo -e "${GREEN}请提前在你的 Casdoor 权限应用后台，将回调 URL 注册为: ${MAGENTA}${computed_redirect}${RESET}"
+    echo -e "${YELLOW}-------------------------------------------------------------------------${RESET}"
+
+    echo -ne "${YELLOW}请输入 Casdoor 按钮显示名称 [默认: Casdoor]: ${RESET}"
+    read -r generic_name
+    [[ -z "$generic_name" ]] && generic_name="Casdoor"
+
+    echo -ne "${YELLOW}请输入 Casdoor Client ID: ${RESET}"
+    read -r client_id
+    echo -ne "${YELLOW}请输入 Casdoor Client Secret: ${RESET}"
+    read -r client_secret
+
+    echo -ne "${YELLOW}请输入 Casdoor 认证 URL (Authorize URL): ${RESET}"
+    read -r auth_url
+    echo -ne "${YELLOW}请输入 Casdoor 令牌 URL (Token URL): ${RESET}"
+    read -r token_url
+    echo -ne "${YELLOW}请输入 Casdoor 用户信息 URL (User Info URL): ${RESET}"
+    read -r user_url
+
+    echo -ne "${YELLOW}请输入授权作用域 Scope [默认: openid profile email]: ${RESET}"
+    read -r scopes
+    [[ -z "$scopes" ]] && scopes="openid profile email"
+
+    # 清理旧的 Generic/Casdoor 环境变量，防止重合干扰
+    sed -i '/^GENERIC_/d' "$ENV_FILE"
+    sed -i '/^OAUTH_AUTO_REDIRECT=/d' "$ENV_FILE"
+
+    # 精准写入官方标准 Generic 变量组
+    cat <<EOF >> "$ENV_FILE"
+GENERIC_NAME=${generic_name}
+GENERIC_CLIENT_ID=${client_id}
+GENERIC_CLIENT_SECRET=${client_secret}
+GENERIC_AUTH_URL=${auth_url}
+GENERIC_TOKEN_URL=${token_url}
+GENERIC_USER_URL=${user_url}
+GENERIC_REDIRECT_URL=${computed_redirect}
+GENERIC_SCOPE=${scopes}
+OAUTH_AUTO_REDIRECT=generic
+EOF
+
+    cd "$BASE_DIR" && docker compose up -d
+    echo -e "${GREEN}Casdoor (Generic 托管驱动) 联动配置成功，并已开启全局自动重定向！${RESET}"
+}
+
+# 13. 独立核心：GitHub & Google 官方原生 OAuth2 快捷登录绑定
+configure_big_tech_oauth() {
+    if [[ ! -f "$ENV_FILE" ]]; then echo -e "${RED}错误: 请先安装部署 Tinyauth 主程序！${RESET}" ; return; fi
+    local tiny_url=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'=' -f2-)
+
     while true; do
         clear
-        echo -e "${GREEN}===================================${RESET}"
-        echo -e "${GREEN}     ◈   iperf3 测速管理   ◈      ${RESET}"
-        echo -e "${GREEN}===================================${RESET}"
-        echo -e "${YELLOW}端口 = $IPERF_PORT  | 时长    = ${IPERF_TIME}s ${RESET}"
-        echo -e "${YELLOW}线程 = $IPERF_PARALLEL     | UDP带宽 = $IPERF_UDP_BW${RESET}"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}1) 启动 iperf3 本地服务端"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}2) 发起 TCP 下载 (↓) 测试${RESET}"
-        echo -e " ${GREEN}3) 发起 TCP 上传 (↑) 测试${RESET}"
-        echo -e " ${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}4) 发起 UDP 下载 (↓) 测试${RESET}"
-        echo -e " ${GREEN}5) 发起 UDP 上传 (↑) 测试${RESET}"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}6) 修改测试参数${RESET}"
-        echo -e " ${GREEN}0) 退出${RESET}"
-        echo -e "${GREEN}===================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
+        echo -e "${CYAN}====== GitHub & Google 官方快捷登录配置面板 ======${RESET}"
+        echo -e "${GREEN}1. 启用/配置 GitHub 快捷登录${RESET}"
+        echo -e "${GREEN}2. 启用/配置 Google 快捷登录${RESET}"
+        echo -e "${GREEN}3. 一键注销/禁用大厂快捷登录${RESET}"
+        echo -e "${GREEN}0. 返回主菜单${RESET}"
+        echo -e "${CYAN}==================================================${RESET}"
+        echo -ne "${GREEN}请做出选择: ${RESET}"
+        read -r tech_choice
         
-        case "$choice" in
+        case "$tech_choice" in
             1)
-                clear
-                echo -e "${ORANGE}===================================${RESET}"
-                echo -e "${GREEN}  iperf3 服务器已启动 (监听端口: $IPERF_PORT)${RESET}"
-                echo -e "${YELLOW}  👉 提示: 测速完毕后，按 Ctrl+C 可安全返回菜单${RESET}"
-                echo -e "${ORANGE}===================================${RESET}\n"
-                (trap 'echo -e "${YELLOW}服务端已安全关闭。${RESET}"; exit 0' INT; iperf3 -s -i 10 -p "$IPERF_PORT")
-                echo "-----------------------------------"
-                read -p "按回车继续..." dummy
+                local github_redirect="${tiny_url}/callback/github"
+                echo -e "\n${YELLOW}[GitHub OAuth 配置说明]${RESET}"
+                echo -e "请到 GitHub 开发者设置中创建一个全新的 OAuth App："
+                echo -e "主页地址填: ${GREEN}${tiny_url}${RESET}"
+                echo -e "Authorization callback URL 必须填: ${MAGENTA}${github_redirect}${RESET}\n"
+                
+                echo -ne "${YELLOW}请输入 GitHub Client ID: ${RESET}"
+                read -r gh_id
+                echo -ne "${YELLOW}请输入 GitHub Client Secret: ${RESET}"
+                read -r gh_secret
+                
+                if [[ -n "$gh_id" && -n "$gh_secret" ]]; then
+                    sed -i '/^PROVIDER_GITHUB_/d' "$ENV_FILE"
+                    sed -i '/^GITHUB_/d' "$ENV_FILE" # 双防兼容旧规
+                    cat <<EOF >> "$ENV_FILE"
+GITHUB_CLIENT_ID=${gh_id}
+GITHUB_CLIENT_SECRET=${gh_secret}
+GITHUB_REDIRECT_URI=${github_redirect}
+EOF
+                    cd "$BASE_DIR" && docker compose up -d
+                    echo -e "${GREEN}GitHub 快捷登录驱动已成功激活并应用！${RESET}"
+                fi
+                read -r; break
                 ;;
             2)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -R -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
+                local google_redirect="${tiny_url}/callback/google"
+                echo -e "\n${YELLOW}[Google OAuth 配置说明]${RESET}"
+                echo -e "请前往 Google Cloud Console 凭据中心创建 Web 应用程序 OAuth ID："
+                echo -e "已授权的重定向 URI 必须添加: ${MAGENTA}${google_redirect}${RESET}\n"
+                
+                echo -ne "${YELLOW}请输入 Google Client ID: ${RESET}"
+                read -r gg_id
+                echo -ne "${YELLOW}请输入 Google Client Secret: ${RESET}"
+                read -r gg_secret
+                
+                if [[ -n "$gg_id" && -n "$gg_secret" ]]; then
+                    sed -i '/^PROVIDER_GOOGLE_/d' "$ENV_FILE"
+                    sed -i '/^GOOGLE_/d' "$ENV_FILE"
+                    cat <<EOF >> "$ENV_FILE"
+GOOGLE_CLIENT_ID=${gg_id}
+GOOGLE_CLIENT_SECRET=${gg_secret}
+GOOGLE_REDIRECT_URI=${google_redirect}
+EOF
+                    cd "$BASE_DIR" && docker compose up -d
+                    echo -e "${GREEN}Google 快捷登录驱动已成功激活并应用！${RESET}"
+                fi
+                read -r; break
                 ;;
             3)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
+                sed -i '/^PROVIDER_GITHUB_/d' "$ENV_FILE"
+                sed -i '/^GITHUB_/d' "$ENV_FILE"
+                sed -i '/^PROVIDER_GOOGLE_/d' "$ENV_FILE"
+                sed -i '/^GOOGLE_/d' "$ENV_FILE"
+                cd "$BASE_DIR" && docker compose up -d
+                echo -e "${GREEN}第三方大厂快捷登录配置清理完成！${RESET}"
+                read -r; break
                 ;;
-            4)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -R -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            5)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            6)
-                echo -e "${YELLOW}>>> 修改 iperf3 临时参数 <<<${RESET}"
-                read -p "修改端口 (当前 $IPERF_PORT): " in_p; IPERF_PORT=${in_p:-$IPERF_PORT}
-                read -p "修改时长 (当前 $IPERF_TIME): " in_t; IPERF_TIME=${in_t:-$IPERF_TIME}
-                read -p "修改线程 (当前 $IPERF_PARALLEL): " in_pa; IPERF_PARALLEL=${in_pa:-$IPERF_PARALLEL}
-                read -p "修改UDP带宽 (当前 $IPERF_UDP_BW): " in_b; IPERF_UDP_BW=${in_b:-$IPERF_UDP_BW}
-                ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+            0) return ;;
         esac
     done
 }
 
-# ==========================================
-# 4) MTR 面板模块
-# ==========================================
-run_mtr() {
-    check_and_install mtr
+# 9. 独立反向代理管理菜单
+nginx_proxy_menu() {
+    get_nginx_config_paths
     while true; do
         clear
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}    ◈   MTR 链路诊断面板   ◈    ${RESET}"
+        echo -e "${GREEN}    ◈  Nginx 反向代理管理菜单 ◈  ${RESET}"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}探测协议 :${RESET} ${YELLOW}$(echo "$MTR_PROTO" | tr 'a-z' 'A-Z')${RESET}"
-        echo -e "${GREEN}AS号展示 :${RESET} ${YELLOW}$([ "$MTR_SHOW_AS" = "true" ] && echo "开启" || echo "关闭")${RESET}"
+        echo -e "${GREEN}1. 自动配置/覆盖 Tinyauth 自身反代${RESET}"
+        echo -e "${GREEN}2. 卸载/删除反向代理配置${RESET}"
+        echo -e "${GREEN}3. 检查 Nginx 语法并重载${RESET}"
+        echo -e "${0}. 返回主菜单${RESET}"
         echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1) 实时动态检测${RESET}"
-        echo -e "${GREEN} 2) 静态报告模式${RESET}"
-        echo -e "${GREEN} 0) 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
-        
-        local args=""
-        [ "$MTR_SHOW_AS" = "true" ] && args="$args -z"
-
-        case "$choice" in
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read -r n_choice
+        case "$n_choice" in
             1)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                echo -e "--------------------------------"
-                mtr $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "检测结束，按回车返回..." dummy
+                get_status_info
+                if [[ "$webui_port" == "N/A" ]]; then echo -e "${RED}错误：请先部署容器！${RESET}"; read -r; continue; fi
+                echo -ne "${YELLOW}请输入 Tinyauth 规划域名 (如: faaas.otg.dpdns.org): ${RESET}"
+                read -r domain_name
+                echo -ne "${YELLOW}请输入 SSL 证书 (.pem/.crt) 绝对路径: ${RESET}"
+                read -r ssl_cert_path
+                echo -ne "${YELLOW}请输入 SSL 私钥 (.key) 绝对路径: ${RESET}"
+                read -r ssl_key_path
+                
+                if [[ -f "$ENV_FILE" ]]; then
+                    sed -i "s|^APP_URL=.*|APP_URL=https://${domain_name}|g" "$ENV_FILE"
+                    sed -i "s|^PROVIDERS_POCKETID_REDIRECT_URL=.*|PROVIDERS_POCKETID_REDIRECT_URL=https://${domain_name}/api/oauth/callback/pocketid|g" "$ENV_FILE" 2>/dev/null
+                    sed -i "s|^GENERIC_REDIRECT_URL=.*|GENERIC_REDIRECT_URL=https://${domain_name}/callback/generic|g" "$ENV_FILE" 2>/dev/null
+                    sed -i "s|^GITHUB_REDIRECT_URI=.*|GITHUB_REDIRECT_URI=https://${domain_name}/callback/github|g" "$ENV_FILE" 2>/dev/null
+                    sed -i "s|^GOOGLE_REDIRECT_URI=.*|GOOGLE_REDIRECT_URI=https://${domain_name}/callback/google|g" "$ENV_FILE" 2>/dev/null
+                    cd "$BASE_DIR" && docker compose up -d
+                fi
+
+                local nginx_conf_file="${NGINX_AVAILABLE_DIR}/${domain_name}"
+                [[ "$USE_SITES_STRUCTURE" = false ]] && nginx_conf_file="${nginx_conf_file}.conf"
+                
+                cat <<EOF > "$nginx_conf_file"
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain_name};
+    return 301 https://\$host\$request_uri;
+}
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${domain_name};
+    ssl_certificate ${ssl_cert_path};
+    ssl_certificate_key ${ssl_key_path};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305';
+    ssl_prefer_server_ciphers off;
+    
+    proxy_set_header Host \$http_host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+
+    location / {
+        proxy_pass http://127.0.0.1:${webui_port};
+        proxy_http_version 1.1;
+    }
+}
+EOF
+                [[ "$USE_SITES_STRUCTURE" = true ]] && ln -sf "$nginx_conf_file" "${NGINX_ENABLED_DIR}/${domain_name}"
+                nginx -t &>/dev/null && systemctl reload nginx && echo -e "${GREEN}反代配置成功！${RESET}"
+                read -r; break
                 ;;
             2)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                clear
-                echo -e "${GREEN}报告生成中(发送100个包)...${RESET}\n"
-                mtr -r -c 100 $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "分析结束，按回车返回..." dummy
+                if [[ -f "$ENV_FILE" ]]; then
+                    local d_name=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'/' -f3)
+                    rm -f "/etc/nginx/sites-available/${d_name}" "/etc/nginx/sites-enabled/${d_name}" "/etc/nginx/conf.d/${d_name}.conf"
+                    systemctl reload nginx 2>/dev/null
+                    echo -e "${GREEN}主服务反代配置已清理。${RESET}"
+                fi
+                read -r; break
                 ;;
-            0) exit 0 ;;
+            3)
+                nginx -t && systemctl reload nginx && echo -e "${GREEN}重载成功！${RESET}"
+                read -r; break
+                ;;
+            0) return ;;
         esac
     done
 }
 
-# ==========================================
-# 5) iNetSpeed-CLI 模块 
-# ==========================================
-run_inetspeed() {
-    clear
-    check_and_install inetspeed
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+
+show_info() {
+    get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  iNetSpeed Apple CDN测速  ◈   ${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}容器本地监听   : 127.0.0.1:${webui_port}${RESET}"
+    [[ -f "$ENV_FILE" ]] && echo -e "${YELLOW}SSO 根域名     : ${CYAN}$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'=' -f2-)${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}🚀 开始连接 Apple CDN 节点进行测试...${RESET}"
-    echo "-------------------------------------"
-    inetspeed || true
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
 }
 
-# ==========================================
-# 6) Cloudflare Speedtest Rust 模块
-# ==========================================
-run_cloudflare_cli() {
+menu() {
     clear
-    check_and_install speed-cloudflare-cli
+    get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈ Cloudflare Speedtest (Rust) ◈ ${RESET}"
+    echo -e "${GREEN}    ◈  Tinyauth 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}🚀 开始连接 Cloudflare Anycast 边缘网络...${RESET}"
-    echo "-------------------------------------"
-    speed-cloudflare-cli || true
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
-}
-
-
-
-# ==========================================
-# 工具箱主面板循环
-# ==========================================
-while true; do
-    clear
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}127.0.0.1:${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   网络管理 综合面板   ◈    ${RESET}"
+    echo -e "${GREEN} 1. 部署启动 (全新安装)${RESET}"
+    echo -e "${GREEN} 2. 更新服务${RESET}"
+    echo -e "${GREEN} 3. 卸载服务${RESET}"
+    echo -e "${GREEN} 4. 启动服务${RESET}"
+    echo -e "${GREEN} 5. 停止服务${RESET}"
+    echo -e "${GREEN} 6. 重启服务${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
+    echo -e "${GREEN} 9. 反向代理${RESET}"
+    echo -e "${GREEN}10. 联动 Pocket-ID (连接 OAuth2 单点登录)${RESET}"
+    echo -e "${GREEN}11. 配置第三方应用前置鉴权守卫 (智能 auth_request 模式)${RESET}"
+    echo -e "${GREEN}12. 联动 Casdoor (连接通用 Generic 单点登录)${RESET}"
+    echo -e "${GREEN}13. 配置 GitHub & Google 第三方快捷登录${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}Speedtest :${RESET} $(get_status speedtest)"
-    echo -e "${GREEN}iNetSpeed :${RESET} $(get_status inetspeed)"
-    echo -e "${GREEN}Cloudflare:${RESET} $(get_status speed-cloudflare-cli)"
-    echo -e "${GREEN}NextTrace :${RESET} $(get_status nexttrace)"
-    echo -e "${GREEN}iperf3    :${RESET} $(get_status iperf3)"
-    echo -e "${GREEN}MTR       :${RESET} $(get_status mtr)"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e " ${GREEN}1) 运行 Speedtest  网速测试${RESET}"
-    echo -e " ${GREEN}2) 运行 NextTrace  路由追踪${RESET}"
-    echo -e " ${GREEN}3) 运行 iperf3     测速${RESET}"
-    echo -e " ${GREEN}4) 运行 MTR        链路诊断${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}5) 运行 iNetSpeed  测速 (Apple CDN)${RESET}"
-    echo -e " ${GREEN}6) 运行 Cloudflare 测速${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p $'\033[32m 请选择: \033[0m' choice
-
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
     case "$choice" in
-        1) run_speedtest ;;
-        2) run_nexttrace ;;
-        3) run_iperf3 ;;
-        4) run_mtr ;;
-        5) run_inetspeed ;;
-        6) run_cloudflare_cli ;;
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
+        8) show_info ;;
+        9) nginx_proxy_menu ;;
+        10) configure_pocketid_oauth ;;
+        11) configure_app_guard ;;
+        12) configure_casdoor_oauth ;;
+        13) configure_big_tech_oauth ;;
         0) exit 0 ;;
-        *) echo -e "${RED}输入错误。${RESET}"; sleep 1 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+}
+
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
 done

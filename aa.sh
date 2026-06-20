@@ -168,7 +168,7 @@ show_info() {
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 选项 9：配置顶级安全兼顾 Cloudflare 穿透的高阶模板反代
+# 选项 9：配置包含专业三段式（Web + gRPC + 精准 WebSocket）的反向代理规则
 setup_host_nginx() {
     if [ ! -f "$COMPOSE_FILE" ]; then
         echo -e "${RED}错误: 请先执行选项 1 部署基础服务以确定本地映射端口！${RESET}"
@@ -181,22 +181,22 @@ setup_host_nginx() {
     # 清除残留键盘输入缓冲区，彻底封死粘贴时秒回车的 Bug
     read -t 1 -n 10000 discard 2>/dev/null
 
-    echo -e "${CYAN}====== 宿主机独立 Nginx 自动化配置 (定制顶级哪吒模板) ======${RESET}"
-    echo -ne "${YELLOW}请输入您的反代域名 [默认: nezha.your.domain]: ${RESET}"
+    echo -e "${CYAN}====== 宿主机独立 Nginx 自动化配置 (动态 CDN 识别规则) ======${RESET}"
+    echo -ne "${YELLOW}请输入您的反代域名 [默认: nezha.eu.org]: ${RESET}"
     read -r custom_domain
-    [[ -z "$custom_domain" ]] && custom_domain="nezha.your.domain"
+    [[ -z "$custom_domain" ]] && custom_domain="nezha.eu.org"
 
-    local default_cert_path="/etc/nginx/cert/${custom_domain}/fullchain.pem"
-    local default_key_path="/etc/nginx/cert/${custom_domain}/privkey.pem"
+    local default_cert_path="/etc/letsencrypt/live/${custom_domain}/fullchain.pem"
+    local default_key_path="/etc/letsencrypt/live/${custom_domain}/privkey.pem"
 
     echo -e "\n${CYAN}====== 域名证书自定义路径配置 ======${RESET}"
-    echo -e "${YELLOW}请输入证书 (.pem) 的宿主机绝对路径${RESET}"
+    echo -e "${YELLOW}请输入证书 (fullchain.pem) 的宿主机绝对路径${RESET}"
     echo -ne "[默认: ${CYAN}${default_cert_path}${RESET}]: "
     read -t 1 -n 10000 discard 2>/dev/null
     read -r cert_path
     [[ -z "$cert_path" ]] && cert_path="$default_cert_path"
 
-    echo -e "${YELLOW}请输入私钥 (.key) 的宿主机绝对路径${RESET}"
+    echo -e "${YELLOW}请输入私钥 (privkey.pem) 的宿主机绝对路径${RESET}"
     echo -ne "[默认: ${CYAN}${default_key_path}${RESET}]: "
     read -t 1 -n 10000 discard 2>/dev/null
     read -r key_path
@@ -220,99 +220,103 @@ setup_host_nginx() {
         fi
     fi
 
-    echo -e "\n${YELLOW}正在准备写入定制高级反代到 Nginx 配置文件: ${CYAN}${nginx_avail_file}${RESET}"
+    echo -e "\n${YELLOW}正在准备写入自动化高阶反代到 Nginx 配置文件: ${CYAN}${nginx_avail_file}${RESET}"
     
     local tmp_file=$(mktemp)
     
-    # 使用包含优雅转义符的 EOF 块保护你的完美模板规则
     cat << EOF > "$tmp_file"
 # =================================================================
-# Nezha Dashboard (定制顶级高阶模板) - 本机 Nginx 自动化配置
+# Nezha Dashboard (智能 IP 映射版) - 本机 Nginx 自动化配置
 # =================================================================
 
-map \$http_upgrade \$connection_upgrade {
-    default upgrade;
-    ''      close;
+# 使用 map 指令创建一个名为 \$real_ip 的变量
+# 自动检测是否存在 \$http_cf_connecting_ip：如果存在（开启 CDN），则使用 \$http_cf_connecting_ip；如果不存在（关闭 CDN），则使用 \$remote_addr。
+map \$http_cf_connecting_ip \$real_ip {
+    default \$http_cf_connecting_ip;
+    ''      \$remote_addr;
 }
 
-upstream nezha_dashboard {
+upstream dashboard {
     server 127.0.0.1:${current_port};
-    keepalive 512;
 }
 
 server {
     listen 80;
     listen [::]:80;
     server_name ${custom_domain};
-    return 301 https://\$host\$request_uri;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
 }
 
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
     http2 on;
+    
     server_name ${custom_domain};
 
+    # 证书路径
     ssl_certificate ${cert_path};
     ssl_certificate_key ${key_path};
+    
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ecdh_curve X25519:P-256:P-384;
-    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305:ECDHE+AES128:RSA+AES128:ECDHE+AES256:RSA+AES256';
-    ssl_prefer_server_ciphers off;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
 
-    ssl_session_timeout 1d;
-    ssl_session_cache shared:MozSSL:10m;
+    client_max_body_size 20M;
 
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-XSS-Protection "1; mode=block" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    # 1. Web 页面基础反代服务
+    location ^~ / {
+        proxy_pass http://dashboard;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header REMOTE-HOST \$remote_addr;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header nz-realip \$real_ip;  # 使用动态确定的真实 IP
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        proxy_read_timeout 1800s;
+        proxy_send_timeout 1800s;
+        proxy_buffer_size 128k;
+        proxy_buffers 4 128k;
+        proxy_busy_buffers_size 256k;
+        proxy_max_temp_file_size 0;
+        add_header X-Cache \$upstream_cache_status;
+        add_header Cache-Control no-cache;
+        proxy_ssl_server_name on;
+        add_header Strict-Transport-Security "max-age=31536000";
+    }
 
-    access_log /var/log/nginx/${custom_domain}.access.log;
-    error_log /var/log/nginx/${custom_domain}.error.log;
-
-    client_max_body_size 100M;
-    underscores_in_headers on;
-
-    # 1. gRPC 服务
+    # 2. gRPC 服务 (Agent 数据同步上报)
     location ^~ /proto.NezhaService/ {
         grpc_set_header Host \$host;
-        grpc_set_header nz-realip \$http_cf_connecting_ip;
+        grpc_set_header nz-realip \$real_ip;  # 使用动态确定的真实 IP
         grpc_read_timeout 600s;
         grpc_send_timeout 600s;
         grpc_socket_keepalive on;
         client_max_body_size 10m;
         grpc_buffer_size 4m;
-        grpc_pass grpc://nezha_dashboard;
+        grpc_pass grpc://dashboard;
     }
 
-    # 2. WebSocket 精准路由服务
+    # 3. WebSocket 服务精准反代
     location ~* ^/api/v1/ws/(server|terminal|file)(.*)\$ {
         proxy_set_header Host \$host;
-        proxy_set_header nz-realip \$http_cf_connecting_ip;
+        proxy_set_header nz-realip \$real_ip;  # 使用动态确定的真实 IP
         proxy_set_header Origin https://\$host;
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        proxy_pass http://nezha_dashboard;
-    }
-
-    # 3. 基础 Web 页面流控服务
-    location / {
-        proxy_set_header Host \$host;
-        proxy_set_header nz-realip \$http_cf_connecting_ip;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        proxy_buffer_size 128k;
-        proxy_buffers 4 256k;
-        proxy_busy_buffers_size 256k;
-        proxy_max_temp_file_size 0;
-        proxy_pass http://nezha_dashboard;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 1800s;
+        proxy_send_timeout 1800s;
+        proxy_pass http://dashboard;
     }
 }
 EOF
@@ -325,9 +329,11 @@ EOF
     if sudo nginx -t &>/dev/null; then
         sudo nginx -s reload
         echo -e "${GREEN}====================================================${RESET}"
-        echo -e "${GREEN}  定制高级模板 Nginx 反代配置并平滑重载成功！      ${RESET}"
+        echo -e "${GREEN}   本机 Nginx 智能动态 IP 反代规则配置并重载成功！  ${RESET}"
         echo -e "${GREEN}====================================================${RESET}"
-        echo -e "${YELLOW}外网访问入口 : https://${custom_domain}${RESET}"
+        echo -e "${YELLOW}外网入口: https://${custom_domain}${RESET}"
+        echo -e "${CYAN}💡 后台关键步骤确认:${RESET}"
+        echo -e "   请登录哪吒面板后台设置，将 [前端真实IP请求头] 与 [Agent真实IP请求头] 均手动填写为: ${GREEN}nz-realip${RESET}"
         echo -e "${GREEN}====================================================${RESET}"
     else
         echo -e "${RED}错误: Nginx 语法测试失败！真实错误详情如下：${RESET}"

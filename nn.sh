@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# SaveAny-Bot 机器人服务 Docker Compose 管理面板 (支持自定义路径)
+# MoviePilot V2 (端口映射 3合1全能版) Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="saveany-bot"
-BASE_DIR="/opt/saveany"
+CONTAINER_NAME="moviepilot-v2"
+BASE_DIR="/opt/moviepilot-v2"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONFIG_FILE="$BASE_DIR/config.toml"
 
 # 检测依赖
 check_dependencies() {
@@ -24,20 +23,20 @@ check_dependencies() {
 }
 
 # 生成随机密钥的辅助函数
-generate_random_token() {
+generate_random_password() {
     if command -v openssl &> /dev/null; then
-        openssl_rand=$(openssl rand -hex 16 2>/dev/null)
+        openssl_rand=$(openssl rand -hex 12 2>/dev/null)
         if [[ -n "$openssl_rand" ]]; then
             echo "$openssl_rand"
             return 0
         fi
     fi
-    echo "api_$(date +%s)_$((RANDOM % 10000))"
+    echo "pwd_$((RANDOM % 899999 + 100000))"
 }
 
 # 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    # 1. 检查容器状态
+    # 1. 检查核心 Web 容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -48,21 +47,16 @@ get_status_info() {
 
     # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 解析本地端口
-        if [ -f "$CONFIG_FILE" ]; then
-            webui_port=$(grep -A 5 "\[api\]" "$CONFIG_FILE" | grep "port" | awk -F'=' '{print $2}' | tr -d ' "')
-            [[ -z "$webui_port" ]] && webui_port="Host模式 (默认8080)"
-        else
-            webui_port="Host模式"
-        fi
+        # 从容器状态提取 WebUI 映射出来的宿主机端口 (内部默认 3000)
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
 
-        # 【核心修改】从容器状态中精准提取挂载到 /app/downloads 的宿主机自定义路径
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/downloads"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/downloads"
+        # 提取宿主机配置路径
+        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/config"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
@@ -70,181 +64,305 @@ get_status_info() {
     fi
 }
 
-# 获取公网 IP
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
     local mode=${1:-"auto"}
     local ip=""
+    
     if [[ "$mode" == "v4" ]]; then
         for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
         done
     else
         for url in "https://api.ipify.org" "https://4.ip.sb"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
     echo "127.0.0.1" && return 0
 }
 
-# 部署 SaveAny-Bot
+# 部署核心逻辑
 install_translate() {
     check_dependencies
-    
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入你的 Telegram Bot Token (必填): ${RESET}"
-    read -r tg_token
-    while [[ -z "$tg_token" ]]; do
-        echo -e "${RED}错误: Bot Token 不能为空！${RESET}"
-        echo -ne "${YELLOW}请重新输入 Telegram Bot Token: ${RESET}"
-        read -r tg_token
-    done
+    echo -e "${CYAN}====== 请选择 MoviePilot V2 数据库部署模式 ======${RESET}"
+    echo -e "${GREEN}1. 本地轻量模式 (使用内置 SQLite 数据库，单容器运行) ${RESET}"
+    echo -e "${GREEN}2. 自带集成模式 (自动安装并关联 PostgreSQL + Redis 容器集群) ${RESET}"
+    echo -e "${GREEN}3. 远程/外部数据库模式 (关联您现有的独立 PG 和 Redis 数据库) ${RESET}"
+    echo -ne "${YELLOW}请输入模式序号 [1-3, 默认 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
 
-    echo -ne "${YELLOW}请输入允许使用机器人的 Telegram 用户 ID [默认: 114514]: ${RESET}"
-    read -r tg_user_id
-    [[ -z "$tg_user_id" ]] && tg_user_id="114514"
+    echo -e "\n${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入后台 WebUI 访问映射端口 (宿主机) [默认: 3000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3000"
 
-    # 【新增交互】自定义宿主机下载路径
-    echo -ne "${YELLOW}请输入宿主机文件下载存储的绝对路径 [默认: $BASE_DIR/downloads]: ${RESET}"
-    read -r custom_downloads
-    [[ -z "$custom_downloads" ]] && custom_downloads="$BASE_DIR/downloads"
+    echo -ne "${YELLOW}请输入 API 通讯映射端口 (宿主机) [默认: 3001]: ${RESET}"
+    read -r api_port
+    [[ -z "$api_port" ]] && api_port="3001"
 
-    # 自动创建所需的所有挂载子目录
-    echo -e "${YELLOW}正在初始化宿主机目录...${RESET}"
-    mkdir -p "$BASE_DIR/data" "$BASE_DIR/cache" "$custom_downloads"
-    chmod -R 777 "$BASE_DIR" "$custom_downloads"
+    # 【新增自定义】超级管理员用户名自定义
+    echo -ne "${YELLOW}请输入超级管理员用户名 (SUPERUSER) [默认: admin]: ${RESET}"
+    read -r mp_user
+    [[ -z "$mp_user" ]] && mp_user="admin"
 
-    # 生成一个随机的 API 认证 Token
-    RAND_API_TOKEN=$(generate_random_token)
+    echo -ne "${YELLOW}请输入初始登录超级密码 (SUPERUSER_PASSWORD) [默认: moviepilot123]: ${RESET}"
+    read -r mp_password
+    [[ -z "$mp_password" ]] && mp_password="moviepilot123"
 
-    # 1. 动态生成符合要求的 config.toml 配置文件
-    echo -e "${YELLOW}正在生成规范化的 config.toml 配置文件...${RESET}"
-    cat <<EOF > "$CONFIG_FILE"
-workers = 4    # 同时下载文件数
-retry = 3      # 下载失败重试次数
-threads = 4    # 单个任务下载使用的最大线程数
-stream = false # 使用流式传输模式
+    echo -e "\n${CYAN}--- 目录挂载配置 (若不存在会自动创建) ---${RESET}"
+    echo -ne "${YELLOW}请输入持久化配置目录 [默认: $BASE_DIR/config]: ${RESET}"
+    read -r path_config
+    [[ -z "$path_config" ]] && path_config="$BASE_DIR/config"
 
-[log]
-level = "info"
+    echo -ne "${YELLOW}请输入媒体文件根目录 [默认: /media]: ${RESET}"
+    read -r path_media
+    [[ -z "$path_media" ]] && path_media="/media"
 
-[telegram]
-token = "${tg_token}"
+    # 初始化基础目录
+    mkdir -p "$path_config" "$path_media" "$BASE_DIR/core"
+    chmod -R 777 "$BASE_DIR" "$path_config" "$path_media"
 
-[telegram.proxy]
-enable = false
-url = "socks5://127.0.0.1:7890"
+    echo -e "\n${YELLOW}正在生成规范化 docker-compose.yml 配置文件...${RESET}"
 
-[aria2]
-enable = false
-url = "http://localhost:6800/jsonrpc"
-secret = ""
-remove_after_transfer = true
-
-[api]
-enable = false
-host = "0.0.0.0"
-port = 8080
-token = "${RAND_API_TOKEN}"
-
-[[storages]]
-name = "本机1"
-type = "local"
-enable = true
-base_path = "./downloads"
-
-[[users]]
-id = ${tg_user_id}
-storages = []
-blacklist = true
-EOF
-
-    # 2. 动态生成符合要求的 docker-compose.yml 配置文件 (应用自定义下载路径)
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
+    if [[ "$db_mode" == "1" ]]; then
+        # ==================== 1. SQLite 本地轻量版 ====================
+        cat <<EOF > "$COMPOSE_FILE"
 services:
-  saveany-bot:
-    image: ghcr.io/krau/saveany-bot:latest
+  moviepilot:
+    stdin_open: true
+    tty: true
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
+    hostname: ${CONTAINER_NAME}
+    ports:
+      - '${custom_port}:3000'
+      - '${api_port}:3001'
     volumes:
-      - ${BASE_DIR}/data:/app/data
-      - ${CONFIG_FILE}:/app/config.toml
-      - ${custom_downloads}:/app/downloads
-      - ${BASE_DIR}/cache:/app/cache
-    network_mode: host
+      - '${path_media}:/media'
+      - '${path_config}:/config'
+      - '${BASE_DIR}/core:/moviepilot/.cloakbrowser'
+      - '/var/run/docker.sock:/var/run/docker.sock:ro'
+    environment:
+      - 'NGINX_PORT=3000'
+      - 'PORT=3001'
+      - 'PUID=0'
+      - 'PGID=0'
+      - 'UMASK=000'
+      - 'TZ=Asia/Shanghai'
+      - 'SUPERUSER=${mp_user}'
+      - 'SUPERUSER_PASSWORD=${mp_password}'
+    restart: always
+    image: jxxghp/moviepilot-v2:latest
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 SaveAny-Bot 服务...${RESET}"
+    elif [[ "$db_mode" == "2" ]]; then
+        # ==================== 2. PostgreSQL + Redis 自带集成版 ====================
+        RAND_REDIS_PWD=$(generate_random_password)
+        RAND_PG_PWD=$(generate_random_password)
+        mkdir -p "$BASE_DIR/redis_data" "$BASE_DIR/pg_data"
+
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  moviepilot:
+    stdin_open: true
+    tty: true
+    container_name: ${CONTAINER_NAME}
+    hostname: ${CONTAINER_NAME}
+    ports:
+      - '${custom_port}:3000'
+      - '${api_port}:3001'
+    volumes:
+      - '${path_media}:/media'
+      - '${path_config}:/config'
+      - '${BASE_DIR}/core:/moviepilot/.cloakbrowser'
+      - '/var/run/docker.sock:/var/run/docker.sock:ro'
+    environment:
+      - 'NGINX_PORT=3000'
+      - 'PORT=3001'
+      - 'PUID=0'
+      - 'PGID=0'
+      - 'UMASK=000'
+      - 'TZ=Asia/Shanghai'
+      - 'SUPERUSER=${mp_user}'
+      - 'SUPERUSER_PASSWORD=${mp_password}'
+      - 'DB_TYPE=postgresql'
+      - 'DB_POSTGRESQL_HOST=moviepilot-pg'
+      - 'DB_POSTGRESQL_PORT=5432'
+      - 'DB_POSTGRESQL_DATABASE=moviepilot'
+      - 'DB_POSTGRESQL_USERNAME=moviepilot'
+      - 'DB_POSTGRESQL_PASSWORD=${RAND_PG_PWD}'
+      - 'CACHE_BACKEND_TYPE=redis'
+      - 'CACHE_BACKEND_URL=redis://:${RAND_REDIS_PWD}@moviepilot-redis:6379'
+    restart: always
+    depends_on:
+      moviepilot-pg:
+        condition: service_healthy
+      moviepilot-redis:
+        condition: service_healthy
+    image: jxxghp/moviepilot-v2:latest
+
+  moviepilot-redis:
+    container_name: moviepilot-redis
+    image: redis:alpine
+    restart: always
+    volumes:
+      - ${BASE_DIR}/redis_data:/data
+    command: redis-server --save 600 1 --requirepass ${RAND_REDIS_PWD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${RAND_REDIS_PWD}", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  moviepilot-pg:
+    container_name: moviepilot-pg
+    image: postgres:17-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: moviepilot
+      POSTGRES_USER: moviepilot
+      POSTGRES_PASSWORD: ${RAND_PG_PWD}
+    volumes:
+      - ${BASE_DIR}/pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U moviepilot -d moviepilot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+EOF
+
+    elif [[ "$db_mode" == "3" ]]; then
+        # ==================== 3. 远程/外部数据库连接版 ====================
+        echo -e "\n${CYAN}--- 远程/外部 PostgreSQL 配置 ---${RESET}"
+        echo -ne "${YELLOW}请输入外部 PG 数据库 IP/域名: ${RESET}"
+        read -r rem_pg_host
+        echo -ne "${YELLOW}请输入外部 PG 数据库端口 [默认: 5432]: ${RESET}"
+        read -r rem_pg_port
+        [[ -z "$rem_pg_port" ]] && rem_pg_port="5432"
+        echo -ne "${YELLOW}请输入外部 PG 数据库库名 [默认: moviepilot]: ${RESET}"
+        read -r rem_pg_db
+        [[ -z "$rem_pg_db" ]] && rem_pg_db="moviepilot"
+        echo -ne "${YELLOW}请输入外部 PG 用户名 [默认: moviepilot]: ${RESET}"
+        read -r rem_pg_user
+        [[ -z "$rem_pg_user" ]] && rem_pg_user="moviepilot"
+        echo -ne "${YELLOW}请输入外部 PG 密码 [必填]: ${RESET}"
+        read -r rem_pg_pwd
+
+        echo -e "\n${CYAN}--- 远程/外部 Redis 配置 ---${RESET}"
+        echo -ne "${YELLOW}请输入外部 Redis 连接 URL [格式示例: redis://:密码@IP:端口/0]: ${RESET}"
+        read -r rem_redis_url
+
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  moviepilot:
+    stdin_open: true
+    tty: true
+    container_name: ${CONTAINER_NAME}
+    hostname: ${CONTAINER_NAME}
+    ports:
+      - '${custom_port}:3000'
+      - '${api_port}:3001'
+    volumes:
+      - '${path_media}:/media'
+      - '${path_config}:/config'
+      - '${BASE_DIR}/core:/moviepilot/.cloakbrowser'
+      - '/var/run/docker.sock:/var/run/docker.sock:ro'
+    environment:
+      - 'NGINX_PORT=3000'
+      - 'PORT=3001'
+      - 'PUID=0'
+      - 'PGID=0'
+      - 'UMASK=000'
+      - 'TZ=Asia/Shanghai'
+      - 'SUPERUSER=${mp_user}'
+      - 'SUPERUSER_PASSWORD=${mp_password}'
+      - 'DB_TYPE=postgresql'
+      - 'DB_POSTGRESQL_HOST=${rem_pg_host}'
+      - 'DB_POSTGRESQL_PORT=${rem_pg_port}'
+      - 'DB_POSTGRESQL_DATABASE=${rem_pg_db}'
+      - 'DB_POSTGRESQL_USERNAME=${rem_pg_user}'
+      - 'DB_POSTGRESQL_PASSWORD=${rem_pg_pwd}'
+      - 'CACHE_BACKEND_TYPE=redis'
+      - 'CACHE_BACKEND_URL=${rem_redis_url}'
+    restart: always
+    image: jxxghp/moviepilot-v2:latest
+EOF
+    fi
+
+    echo -e "\n${YELLOW}正在通过 Docker Compose 启动部署集群...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}等待服务容器群启动初始化 (约5秒)...${RESET}"
+    sleep 5
 
+    DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     SaveAny-Bot 部署成功！     ${RESET}"
+    echo -e "${GREEN}    MoviePilot V2 部署成功！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前管理员 ID  : $tg_user_id${RESET}"
-    echo -e "${YELLOW}宿主机下载路径 : $custom_downloads${RESET}"
-    echo -e "${YELLOW}提示: 已经成功将下载目录映射至您自定义的路径。${RESET}"
+    echo -e "${YELLOW}部署模式       : 模式 ${db_mode}${RESET}"
+    echo -e "${YELLOW}WEB 访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}超级管理员账号 : ${mp_user}${RESET}"
+    echo -e "${YELLOW}超级管理员密码 : ${mp_password}${RESET}"
+    echo -e "${YELLOW}持久化配置路径 : ${path_config}${RESET}"
+    echo -e "${YELLOW}网络访问模式   : 端口映射模式 (宿主机 ${custom_port} -> 容器 3000)${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 SaveAny-Bot 镜像
+# 更新集群镜像
 update_translate() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 SaveAny-Bot 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！容器已安全重启并保持最新。${RESET}"
 }
 
-# 卸载 SaveAny-Bot
+# 卸载集群
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 SaveAny-Bot 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 MoviePilot V2 运行环境吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            # 提前捕获下载路径，防止 down 之后读不到 inspect
-            get_status_info
-            local current_download_dir="$data_dir"
-
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除配置文件、缓存以及已下载的文件？(y/n): ${RESET}"
+            echo -e "${GREEN}所有关联容器已停止并安全移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地配置和数据库运行缓存？(绝不会删除您的电影媒体视频)(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                # 如果自定义下载路径不在 BASE_DIR 下，单独将其清理
-                if [[ "$current_download_dir" != "$BASE_DIR"* && -d "$current_download_dir" ]]; then
-                    rm -rf "$current_download_dir"
-                fi
-                echo -e "${GREEN}所有数据和自定义下载目录已彻底清理。${RESET}"
+                echo -e "${GREEN}主配置与数据目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" moviepilot-redis moviepilot-pg 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_translate() { docker logs -f "$CONTAINER_NAME"; }
+start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务集群已启动${RESET}"; }
+stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务集群已停止${RESET}"; }
+restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务集群已重启${RESET}"; }
+logs_translate() { cd "$BASE_DIR" && docker compose logs -f --tail=100 moviepilot; }
 
 show_info() {
     get_status_info
+    local DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务网络模式   : ${webui_port}${RESET}"
-    echo -e "${YELLOW}宿主机下载路径 : ${data_dir}${RESET}"
+    echo -e "${YELLOW}核心镜像       : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}宿主机配置路径 : ${data_dir}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -252,10 +370,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}◈  SaveAny-Bot 机器人管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}   ◈  MoviePilot V2 端口映射版  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}路径 :${RESET} ${YELLOW}${data_dir}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

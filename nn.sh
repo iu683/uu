@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Twilight 影音工具箱 Docker Compose 运维管理面板（修复版）
+# Pocket-ID 身份验证中心 集成管理面板 (含标准 sites-available 反代)
 # =================================================================
 
 # 颜色
@@ -10,38 +10,50 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/twilight"
+CONTAINER_NAME="pocket-id"
+BASE_DIR="/opt/pocket-id"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
-# 检测依赖
+# 自动探测 Nginx 最佳配置目录
+get_nginx_config_paths() {
+    if [[ -d "/etc/nginx/sites-available" ]]; then
+        NGINX_AVAILABLE_DIR="/etc/nginx/sites-available"
+        NGINX_ENABLED_DIR="/etc/nginx/sites-enabled"
+        USE_SITES_STRUCTURE=true
+    else
+        NGINX_AVAILABLE_DIR="/etc/nginx/conf.d"
+        USE_SITES_STRUCTURE=false
+    fi
+}
+
+# 检测基础依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git 依赖！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态获取容器状态
+# 动态获取容器状态和端口
 get_status_info() {
-    if [ "$(docker ps -q -f name=twilight-webui)" ] || [ "$(docker ps -q -f name=twilight-backend)" ]; then
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=twilight-webui)" ]; then
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    if [ "$(docker ps -aq -f name=twilight-webui)" ]; then
-        if [ -f "$BASE_DIR/.env" ]; then
-            webui_port=$(grep "^WEBUI_PORT=" "$BASE_DIR/.env" | cut -d'=' -f2)
-        fi
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "twilight-webui" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3000"
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="v2"
+
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "1411/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="1411"
     else
+        img_version="${RED}未安装${RESET}"
         webui_port="N/A"
     fi
 }
@@ -69,375 +81,268 @@ get_public_ip() {
     fi
     echo "127.0.0.1" && return 0
 }
-
-
-# 部署 Twilight
+# 1. 部署 Pocket-ID
 install_utils() {
     check_dependencies
-    
-    # 1. 克隆或更新项目源码
-    if [ -d "$BASE_DIR/.git" ]; then
-        echo -e "${YELLOW}检测到项目目录已存在，正在同步最新源码...${RESET}"
-        cd "$BASE_DIR" && git pull
-    else
-        echo -e "${YELLOW}正在克隆 Twilight 项目源码到 $BASE_DIR ...${RESET}"
-        git clone https://github.com/Prejudice-Studio/Twilight.git "$BASE_DIR"
-        cd "$BASE_DIR"
-    fi
+    mkdir -p "$BASE_DIR/data"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入前端对外访问端口 [默认: 3000]: ${RESET}"
+    echo -ne "${YELLOW}请输入本地监听端口 [默认: 1411]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
-
-    echo -ne "${YELLOW}请输入 Emby 服务器地址 (例如 http://192.168.1.100:8096): ${RESET}"
-    read -r emby_url
-
-    echo -ne "${YELLOW}请输入 Emby API Token: ${RESET}"
-    read -r emby_token
-
-    echo -ne "${YELLOW}请输入管理员用户名 [默认: admin]: ${RESET}"
-    read -r admin_user
-    [[ -z "$admin_user" ]] && admin_user="admin"
-
-    echo -ne "${YELLOW}请输入 PostgreSQL 数据库密码 [默认: twilight_pwd]: ${RESET}"
-    read -r db_pwd
-    [[ -z "$db_pwd" ]] && db_pwd="twilight_pwd"
-
-    # 自动生成强随机的安全密钥
-    generated_secret=$(date +%s | sha256sum | base64 | head -c 32)
-
-    # 2. 生成满足 Docker 覆盖要求的全局 .env 配置文件
-    echo -e "${YELLOW}正在生成满足 Docker 覆盖要求的全局 .env 配置文件...${RESET}"
-    cat <<EOF > .env
-# Twilight 部署级核心环境变量
-TWILIGHT_API_HOST=0.0.0.0
-TWILIGHT_API_PORT=5000
-SITE_NAME=Twilight
-
-# 映射给 Compose 内置服务的核心密钥与端口
-POSTGRES_PASSWORD=${db_pwd}
-ADMIN_USERNAMES=${admin_user}
-BOT_INTERNAL_SECRET=${generated_secret}
-WEBUI_PORT=${custom_port}
-EOF
-
-    # 3. 释放基础主的 config.toml
-    echo -e "${YELLOW}正在生成基础主配置源 config.toml...${RESET}"
-    cat <<EOF > config.toml
-[Global]
-server_name = "Twilight"
-server_icon = ""
-log_level = "info"
-runtime_log_limit = 5000
-redis_url = "redis://redis:6379/0"
-telegram_mode = true
-force_bind_telegram = false
-tmdb_api_key = ""
-tmdb_api_url = "https://api.themoviedb.org/3"
-tmdb_image_url = "https://image.tmdb.org/t/p"
-bangumi_token = ""
-bangumi_api_url = "https://api.bgm.tv/v0"
-auth_background_url = ""
-
-[Admin]
-usernames = ["${admin_user}"]
-
-[Database]
-driver = "postgres"
-postgres_host = "postgres"
-postgres_port = 5432
-postgres_user = "twilight"
-postgres_password = "${db_pwd}"
-postgres_database = "twilight"
-postgres_sslmode = "disable"
-postgres_max_open_conns = 16
-postgres_max_idle_conns = 8
-state_file = "db/twilight_go_state.json"
-backup_dir = "db/backups"
-migration_panel_enabled = false
-
-[Emby]
-emby_url = "${emby_url}"
-emby_token = ""
-emby_username = ""
-emby_password = ""
-emby_url_list = []
-emby_url_list_for_whitelist = []
-
-[Telegram]
-bot_token = ""
-admin_id = []
-group_id = []
-channel_id = []
-force_bind_group = false
-force_bind_channel = false
-require_group_membership = false
-ban_on_leave = false
-auto_enable_rejoined = false
-enable_tg_panel = true
-
-[SAR]
-register_mode = false
-register_code_limit = false
-allow_pending_register = false
-emby_direct_register_enabled = false
-emby_direct_register_days = 30
-user_limit = -1
-emby_user_limit = -1
-regcode_format = "TW-{type}-{random}"
-regcode_random_algorithm = "base32-20"
-invite_code_format = "INV{random}"
-invite_code_random_algorithm = "hex10"
-regcode_decoy_action = "log_only"
-media_request_enabled = true
-max_concurrent_requests_per_user = 3
-max_concurrent_requests_global = -1
-invite_enabled = true
-invite_limit = 10
-invite_root_user_limit = -1
-invite_max_depth = 3
-invite_require_emby = false
-invite_code_default_days = 30
-permanent_invite_max_days = 365
-auto_cleanup_no_emby = false
-auto_cleanup_no_emby_days = 7
-auto_cleanup_pending_emby = false
-auto_cleanup_pending_emby_days = 7
-signin_enabled = true
-currency_name = "星币"
-daily_min = 5
-daily_max = 20
-streak_bonus_enabled = true
-streak_bonus_days = [3, 7, 14, 30]
-streak_bonus_points = [10, 50, 100, 300]
-reset_after_miss = true
-signin_renewal_enabled = false
-signin_renewal_cost = 100
-signin_renewal_days = 30
-
-[DeviceLimit]
-device_limit_enabled = false
-max_devices = 5
-max_streams = 2
-
-[API]
-host = "0.0.0.0"
-port = 5000
-cors_origins = ["http://localhost:3000"]
-upload_folder = "uploads"
-max_upload_size = 5242880
-session_cookie_name = "twilight_session"
-session_cookie_secure = true
-session_cookie_samesite = "lax"
-session_cookie_domain = ""
-trust_proxy_headers = false
-trusted_proxy_cidrs = ["127.0.0.0/8", "::1/128"]
-
-[Security]
-forgot_password_enabled = true
-forgot_password_emby_enabled = true
-forgot_password_email_enabled = true
-bot_internal_secret = ""
-
-[RateLimit]
-enabled = true
-global_per_minute = 1200
-login_per_minute = 60
-login_user_per_5m = 10
-register_per_10m = 30
-forgot_password_ip_per_10m = 20
-forgot_password_user_per_30m = 10
-email_code_ip_per_10m = 20
-email_code_addr_per_10m = 5
-email_code_uid_per_10m = 10
-upload_per_minute = 60
-admin_icon_per_minute = 20
-api_key_default_per_minute = 300
-
-[Scheduler]
-enabled = true
-tick_interval_seconds = 30
-expired_check_time = "03:00"
-expiring_check_time = "09:00"
-daily_stats_time = "00:05"
-session_cleanup_interval = 6
-cleanup_no_emby_time = "03:30"
-cleanup_pending_emby_time = "03:45"
-cleanup_unused_uploads_time = "02:20"
-cleanup_audit_logs_time = "04:30"
-
-[SystemUpdate]
-auto_update_enabled = false
-repo_url = "https://github.com/Prejudice-Studio/Twilight.git"
-branch = "main"
-restart_services = false
-
-[Notification]
-enabled = true
-expiry_remind_days = 3
-
-[BangumiSync]
-enabled = false
-webhook_secret = ""
-
-[Ticket]
-enabled = false
-types = ["all"]
-
-[AuditLog]
-enabled = true
-auto_cleanup_enabled = false
-retention_days = 90
-max_entries = 10000
-preserve_admin = true
-cleanup_check_time = "04:30"
-
-[Email]
-enabled = false
-smtp_host = ""
-smtp_port = 587
-smtp_username = ""
-smtp_password = ""
-smtp_encryption = "starttls"
-smtp_from_address = ""
-smtp_from_name = ""
-smtp_timeout_seconds = 10
-force_bind = false
-code_length = 6
-code_type = "numeric"
-code_ttl_minutes = 10
-box_resend_cooldown_seconds = 60
-max_attempts = 5
-subject_template = "{site} 邮箱验证码"
-body_template = """您正在 {site} 进行邮箱验证。\n\n验证码：{code}\n\n验证码 {ttl} 分钟内有效，请勿向任何人泄露。如非本人操作，请忽略本邮件。"""
-EOF
-
-    # 4. 生成私密覆盖配置 config.local.toml
-    echo -e "${YELLOW}正在生成私密覆盖配置 config.local.toml...${RESET}"
-    cat <<EOF > config.local.toml
-# Twilight Local Private Configuration (Overrides config.toml)
-
-[Database]
-postgres_password = "${db_pwd}"
-
-[Emby]
-emby_token = "${emby_token}"
-
-[Security]
-bot_internal_secret = "${generated_secret}"
-EOF
-
-    # 5. 生成前端环境变量 webui/.env
-    echo -e "${YELLOW}正在生成前端环境变量...${RESET}"
-    if [ -f "webui/.env.example" ]; then
-        cp webui/.env.example webui/.env
-    else
-        cat <<EOF > webui/.env
-VITE_API_BASE_URL=/api/v1
-NEXT_PUBLIC_SITE_NAME=Twilight
-EOF
-    fi
-
-    # 📌 【核心修复代码】：通过 sed 移去 Dockerfile 中导致报错的 pnpm 严格锁定校验
-    if [ -f "webui/Dockerfile" ]; then
-        echo -e "${YELLOW}正在优化前端 Dockerfile 以规避 pnpm 锁文件冲突...${RESET}"
-        sed -i 's/pnpm install --frozen-lockfile/pnpm install/g' webui/Dockerfile
-    fi
-
-    # 6. 构建并运行服务
-    echo -e "${YELLOW}正在构建镜像并启动 Twilight 容器组 (首次编译较慢)...${RESET}"
-    docker compose up -d --build
-
-    echo -e "${YELLOW}等待服务健康检查完成...${RESET}"
-    sleep 5
-
-    DETECT_IP=$(get_public_ip)
-
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN}          Twilight 影音工具箱部署成功！         ${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${YELLOW}前端访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}管理用户名     : ${admin_user}${RESET}"
-    echo -e "${RED}⚠️  注意: 首次打开网页注册的第一个账号，名字必须叫: ${admin_user}${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-}
-
-# 更新 Twilight
-update_utils() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到项目，请先执行选项 1 进行部署！${RESET}"
+    [[ -z "$custom_port" ]] && custom_port="1411"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端同步最新源码并重新打包...${RESET}"
-    cd "$BASE_DIR" && git pull
-    # 更新源码后，同样需要做防冲突处理
-    if [ -f "webui/Dockerfile" ]; then
-        sed -i 's/pnpm install --frozen-lockfile/pnpm install/g' webui/Dockerfile
+
+    echo -e "${YELLOW}正在自动生成安全加密密钥 (ENCRYPTION_KEY)...${RESET}"
+    if command -v openssl &> /dev/null; then
+        auto_key=$(openssl rand -base64 32)
+    else
+        auto_key=$(date +%s | sha256sum | base64 | head -c 44)
     fi
-    docker compose up -d --build --remove-orphans
-    echo -e "${GREEN}更新并构建完成！${RESET}"
+
+    DETECT_IP=$(get_public_ip)
+    echo -e "${YELLOW}正在生成环境变量文件 .env...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+APP_URL=http://${DETECT_IP}:${custom_port}
+ENCRYPTION_KEY=${auto_key}
+TRUST_PROXY=true
+MAXMIND_LICENSE_KEY=
+GEOLITE_DB_PATH=data/GeoLite2-City.mmdb
+PUID=1000
+PGID=1000
+LOG_LEVEL=info
+LOG_JSON=true
+ANALYTICS_DISABLED=true
+ALLOW_USER_SIGNUPS=open
+EOF
+
+    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  pocket-id:
+    image: ghcr.io/pocket-id/pocket-id:v2
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:${custom_port}:1411"
+    volumes:
+      - "./data:/app/data"
+    healthcheck:
+      test: [ "CMD", "/app/pocket-id", "healthcheck" ]
+      interval: 1m30s
+      timeout: 5s
+      retries: 2
+      start_period: 10s
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Pocket-ID...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    sleep 5
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}      Pocket-ID 部署成功！      ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}本地安全监听端口 : 127.0.0.1:${custom_port}${RESET}"
+    echo -e "${CYAN}提示: 当前容器仅监听在本机，请紧接着进入 [选项 9] 配置反向代理公网域名访问！${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 卸载 Twilight
+# 2. 更新 Pocket-ID 镜像
+update_utils() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 部署！${RESET}"; return; fi
+    cd "$BASE_DIR" && docker compose pull && docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！${RESET}"
+}
+
+# 3. 卸载 Pocket-ID
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 Twilight 容器组吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Pocket-ID 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -d "$BASE_DIR" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            get_nginx_config_paths
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器及卷已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地源码、数据库和所有配置文件？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+            
+            # 彻底清理可能留存的所有形式反代配置与软链
+            if [[ -f "$ENV_FILE" ]]; then
+                local d_name=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'/' -f3)
+                if [[ -n "$d_name" ]]; then
+                    rm -f "/etc/nginx/sites-available/${d_name}"
+                    rm -f "/etc/nginx/sites-enabled/${d_name}"
+                    rm -f "/etc/nginx/conf.d/${d_name}.conf"
+                    rm -f "$BASE_DIR/${d_name}.conf"
+                fi
             fi
+            rm -rf "$BASE_DIR"
+            [[ -x "$(command -v nginx)" ]] && systemctl reload nginx 2>/dev/null
+            echo -e "${GREEN}全套数据及反代环境已彻底清理。${RESET}"
+        else
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
+# 9. 独立反向代理管理菜单
+nginx_proxy_menu() {
+    get_nginx_config_paths
+    while true; do
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}  ◈  Nginx 反向代理管理菜单 ◈  ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}1. 自动配置/覆盖反向代理${RESET}"
+        echo -e "${GREEN}2. 卸载/删除反向代理配置${RESET}"
+        echo -e "${GREEN}3. 检查 Nginx 语法并重载${RESET}"
+        echo -e "${GREEN}0. 返回主菜单${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read -r n_choice
+        case "$n_choice" in
+            1)
+                get_status_info
+                if [[ "$webui_port" == "N/A" ]]; then
+                    echo -e "${RED}错误：请先在主菜单部署 Pocket-ID 容器后再进行反代配置！${RESET}"
+                    read -r; continue
+                fi
+                
+                echo -ne "${YELLOW}请输入 Pocket-ID 规划域名 (如: id.66666.xyz): ${RESET}"
+                read -r domain_name
+                if [[ -z "$domain_name" ]]; then echo -e "${RED}错误: 域名不能为空！${RESET}"; read -r; continue; fi
+                
+                echo -ne "${YELLOW}请输入 SSL 证书 (.pem/.crt) 绝对路径: ${RESET}"
+                read -r ssl_cert_path
+                echo -ne "${YELLOW}请输入 SSL 私钥 (.key) 绝对路径: ${RESET}"
+                read -r ssl_key_path
+                if [[ -z "$ssl_cert_path" || -z "$ssl_key_path" ]]; then echo -e "${RED}错误: 证书或私钥路径不能为空！${RESET}"; read -r; continue; fi
+
+                # 更新 .env
+                if [[ -f "$ENV_FILE" ]]; then
+                    sed -i "s|^APP_URL=.*|APP_URL=https://${domain_name}|g" "$ENV_FILE"
+                    cd "$BASE_DIR" && docker compose up -d
+                fi
+
+                # 确立实际配置文件目标
+                local nginx_conf_file=""
+                if ! command -v nginx &> /dev/null; then
+                    echo -e "${RED}未检测到 Nginx 环境，文件将输出至 $BASE_DIR/${domain_name}.conf${RESET}"
+                    nginx_conf_file="$BASE_DIR/${domain_name}.conf"
+                elif [ "$USE_SITES_STRUCTURE" = true ]; then
+                    nginx_conf_file="${NGINX_AVAILABLE_DIR}/${domain_name}"
+                else
+                    nginx_conf_file="${NGINX_AVAILABLE_DIR}/${domain_name}.conf"
+                fi
+                
+                cat <<EOF > "$nginx_conf_file"
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain_name};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${domain_name};
+
+    ssl_certificate ${ssl_cert_path};
+    ssl_certificate_key ${ssl_key_path};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ecdh_curve X25519:P-256:P-384;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305:ECDHE+AES128:RSA+AES128:ECDHE+AES256:RSA+AES256';
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:MozSSL:10m;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    access_log /var/log/nginx/${domain_name}.access.log;
+    error_log /var/log/nginx/${domain_name}.error.log;
+
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+
+    proxy_busy_buffers_size 512k;
+    proxy_buffers 4 512k;
+    proxy_buffer_size 256k;
+
+    location / {
+        proxy_pass http://127.0.0.1:${webui_port};
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Forwarded-For \$realip_remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+                # 如果是 sites-available 架构，自动创建软链激活
+                if [ "$USE_SITES_STRUCTURE" = true ] && [ -d "$NGINX_ENABLED_DIR" ]; then
+                    ln -sf "$nginx_conf_file" "${NGINX_ENABLED_DIR}/${domain_name}"
+                    echo -e "${GREEN}已创建软链接激活配置: ${NGINX_ENABLED_DIR}/${domain_name}${RESET}"
+                fi
+
+                echo -e "${GREEN}配置文件已写入: $nginx_conf_file${RESET}"
+                if command -v nginx &> /dev/null; then
+                    nginx -t &>/dev/null && systemctl reload nginx && echo -e "${GREEN}Nginx 热重载成功！反代已生效。${RESET}" || echo -e "${RED}警告: Nginx 测试未通过，请检查证书路径！${RESET}"
+                fi
+                read -r; break
+                ;;
+            2)
+                if [[ -f "$ENV_FILE" ]]; then
+                    local d_name=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'/' -f3)
+                    if [[ -n "$d_name" ]]; then
+                        rm -f "/etc/nginx/sites-available/${d_name}"
+                        rm -f "/etc/nginx/sites-enabled/${d_name}"
+                        rm -f "/etc/nginx/conf.d/${d_name}.conf"
+                        rm -f "$BASE_DIR/${d_name}.conf"
+                        [[ -x "$(command -v nginx)" ]] && systemctl reload nginx 2>/dev/null
+                        echo -e "${GREEN}已成功删除域名为 ${d_name} 的全部反代配置文件及软链！${RESET}"
+                        DETECT_IP=$(get_public_ip)
+                        sed -i "s|^APP_URL=.*|APP_URL=http://${DETECT_IP}:${webui_port}|g" "$ENV_FILE"
+                        cd "$BASE_DIR" && docker compose up -d
+                    else
+                        echo -e "${YELLOW}未检测到可清理的反代配置文件。${RESET}"
+                    fi
+                else
+                    echo -e "${RED}错误：未找到环境文件，无法识别域名。${RESET}"
+                fi
+                read -r; break
+                ;;
+            3)
+                if command -v nginx &> /dev/null; then
+                    nginx -t && systemctl reload nginx && echo -e "${GREEN}重载成功！${RESET}"
+                else
+                    echo -e "${RED}当前服务器未安装原生 Nginx。${RESET}"
+                fi
+                read -r; break
+                ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
 start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
 stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
 restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
-
-# 细化日志查询选项
-logs_utils() {
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}         查看运行日志           ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 查看 后端 Go API 日志${RESET}"
-    echo -e "${GREEN}2. 查看 前端 WebUI 日志${RESET}"
-    echo -e "${GREEN}3. 查看 数据库 Postgres 日志${RESET}"
-    echo -e "${GREEN}4. 查看 缓存 Redis 日志${RESET}"
-    echo -e "${GREEN}5. 查看 容器组全部混合日志${RESET}"
-    echo -e "${GREEN}0. 返回主菜单${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请选择要查看的日志组件: ${RESET}"
-    read -r log_choice
-    cd "$BASE_DIR" || return
-    case "$log_choice" in
-        1) docker compose logs -f twilight ;;
-        2) docker compose logs -f webui ;;
-        3) docker compose logs -f postgres ;;
-        4) docker compose logs -f redis ;;
-        5) docker compose logs -f ;;
-        0) return ;;
-        *) echo -e "${RED}无效参数${RESET}" ;;
-    esac
-}
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}主配置文件路径 : $BASE_DIR/config.toml"
-    echo -e "${YELLOW}秘密配置文件路径: $BASE_DIR/config.local.toml${RESET}"
+    echo -e "${YELLOW}当前镜像       : ${img_version}${RESET}"
+    if [[ -f "$ENV_FILE" ]]; then
+        local current_url=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'=' -f2-)
+        echo -e "${YELLOW}当前配置域名  : ${CYAN}${current_url}${RESET}"
+    fi
+    echo -e "${YELLOW}容器本地监听   : 127.0.0.1:${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -445,19 +350,20 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  Twilight 核心面板  ◈     ${RESET}"
+    echo -e "${GREEN}    ◈  Pocket-ID 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}127.0.0.1:${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 源码部署与构建${RESET}"
-    echo -e "${GREEN}2. 拉取源码并更新${RESET}"
-    echo -e "${GREEN}3. 卸载清除服务${RESET}"
-    echo -e "${GREEN}4. 启动所有容器${RESET}"
-    echo -e "${GREEN}5. 停止所有容器${RESET}"
-    echo -e "${GREEN}6. 重启所有容器${RESET}"
-    echo -e "${GREEN}7. 查看运行日志${RESET}"
-    echo -e "${GREEN}8. 查看基本信息${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新服务${RESET}"
+    echo -e "${GREEN}3. 卸载服务${RESET}"
+    echo -e "${GREEN}4. 启动服务${RESET}"
+    echo -e "${GREEN}5. 停止服务${RESET}"
+    echo -e "${GREEN}6. 重启服务${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 反向代理${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
@@ -471,6 +377,7 @@ menu() {
         6) restart_utils ;;
         7) logs_utils ;;
         8) show_info ;;
+        9) nginx_proxy_menu ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

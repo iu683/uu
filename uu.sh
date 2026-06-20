@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# LrcApi 歌词接口工具 
+# Emby Server (开心版) 架构/硬解/本地数据挂载自适应管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="lrcapi"
-BASE_DIR="/opt/lrcapi"
+CONTAINER_NAME="amilys_embyserver"
+BASE_DIR="/opt/emby"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,19 +22,7 @@ check_dependencies() {
     fi
 }
 
-# 自动生成一个默认鉴权 Key 的辅助函数
-generate_auth_key() {
-    if command -v openssl &> /dev/null; then
-        openssl_rand=$(openssl rand -hex 8 2>/dev/null)
-        if [[ -n "$openssl_rand" ]]; then
-            echo "lrc_$openssl_rand"
-            return 0
-        fi
-    fi
-    echo "lrc_key_$((RANDOM % 8999 + 1000))"
-}
-
-# 动态获取容器状态、映射端口、鉴权秘钥和数据目录（精准修复版）
+# 动态获取容器状态、架构、端口及本地挂载配置
 get_status_info() {
     # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -45,30 +33,44 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，精准提取信息
+    # 2. 自动检测当前宿主机 CPU 架构
+    ARCH=$(uname -m)
+    if [[ "$ARCH" == "x86_64" ]]; then
+        CURRENT_ARCH_TEXT="AMD64 (x86_64)"
+    elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+        CURRENT_ARCH_TEXT="ARM64 (arm64v8)"
+    else
+        CURRENT_ARCH_TEXT="未知架构 ($ARCH)"
+    fi
+
+    # 3. 如果容器存在，精准提取本地挂载路径
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 提取端口 (内部默认 28883)
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "28883/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="28883"
+        # 提取端口 (内部默认 8096)
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8096/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="7568"
 
-        # 【精准修复路径抓取】直接获取第一个挂载卷的 Source 和 Destination
-        path_music_show=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        path_container_show=$(docker inspect -f '{{range .Mounts}}{{.Destination}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$path_music_show" ]] && path_music_show="未检测到挂载"
-        [[ -z "$path_container_show" ]] && path_container_show="未检测到挂载"
+        # 【核心：精准提取本地挂载路径】
+        path_config_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        path_media_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$path_config_show" ]] && path_config_show="未检测到挂载"
+        [[ -z "$path_media_show" ]] && path_media_show="未检测到挂载"
 
-        # 【精准修复环境变量抓取】直接遍历并提取包含 API_AUTH= 的整行
-        auth_key_show=$(docker inspect -f '{{range .Config.Env}}{{if ge (len .) 9}}{{if eq (slice . 0 9) "API_AUTH="}}{{.}}{{end}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | awk -F'=' '{print $2}')
-        [[ -z "$auth_key_show" ]] && auth_key_show="未检测到/无鉴权"
+        # 检查是否挂载了硬解设备
+        has_dri=$(docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep "/dev/dri")
+        if [[ -n "$has_dri" ]]; then
+            hw_status="${GREEN}已开启 (/dev/dri)${RESET}"
+        else
+            hw_status="${RED}已关闭${RESET}"
+        fi
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        path_music_show="N/A"
-        path_container_show="N/A"
-        auth_key_show="N/A"
+        path_config_show="N/A"
+        path_media_show="N/A"
+        hw_status="N/A"
     fi
 }
 
@@ -96,65 +98,97 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署核心逻辑
+# 部署并配置本地挂载核心逻辑
 install_translate() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== LrcApi 歌词接口参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入服务访问映射端口 (宿主机) [默认: 28883]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="28883"
-
-    DEFAULT_KEY=$(generate_auth_key)
-    echo -e "\n${CYAN}--- 安全鉴权配置 (API_AUTH) ---${RESET}"
-    echo -ne "${YELLOW}请输入自定义鉴权 Key [默认自动生成: ${DEFAULT_KEY}]: ${RESET}"
-    read -r custom_auth
-    [[ -z "$custom_auth" ]] && custom_auth="${DEFAULT_KEY}"
-
-    echo -e "\n${CYAN}--- 双向绝对路径同步挂载 ---${RESET}"
-    echo -e "${GREEN}提示: 接下来输入的路径将同时作为【宿主机】与【容器内部】的等价路径映射。${RESET}"
-    echo -ne "${YELLOW}请输入您的音乐媒体存储绝对目录 [示例: /www/path/music]: ${RESET}"
-    read -r path_music
-    
-    if [[ -z "$path_music" ]]; then
-        path_music="/opt/navidrome/music"
-        echo -e "${YELLOW}由于未输入，已采用默认路径: ${path_music}${RESET}"
+    echo -e "${CYAN}====== 1. 系统架构自动判定 ======${RESET}"
+    ARCH=$(uname -m)
+    if [[ "$ARCH" == "x86_64" ]]; then
+        IMAGE_NAME="amilys/embyserver"
+        ARCH_TEXT="AMD64 (x86_64)"
+    elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+        IMAGE_NAME="amilys/embyserver_arm64v8"
+        ARCH_TEXT="ARM64 (arm64v8)"
+    else
+        echo -e "${RED}❌ 未知或不支持的系统架构: $ARCH${RESET}"
+        return
     fi
+    echo -e "硬件架构: ${GREEN}${ARCH_TEXT}${RESET} -> 匹配镜像: ${CYAN}${IMAGE_NAME}${RESET}"
 
-    mkdir -p "$path_music"
-    chmod -R 777 "$path_music"
+    echo -e "\n${CYAN}====== 2. 基础网络端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Emby WEB 访问映射端口 (宿主机) [默认: 7568]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="7568"
 
-    echo -e "\n${YELLOW}正在生成符合双向一致规则的 docker-compose.yml 配置文件...${RESET}"
+    echo -e "\n${CYAN}====== 3. 本地数据挂载自定义 (绝对路径) ======${RESET}"
+    echo -e "${GREEN}提示：挂载到本地可以确保容器删除、更新时，你的观影记录和媒体文件绝不丢失。${RESET}"
+    
+    echo -ne "${YELLOW}1. 请输入【本地 Emby 配置与缓存】保存路径 [默认: /opt/emby/config]: ${RESET}"
+    read -r path_config
+    [[ -z "$path_config" ]] && path_config="/opt/emby/config"
+
+    echo -ne "${YELLOW}2. 请输入【本地媒体电影/剧集视频】存放路径 [默认: /opt/emby/media]: ${RESET}"
+    read -r path_media
+    [[ -z "$path_media" ]] && path_media="/opt/emby/media"
+
+    echo -e "\n${CYAN}====== 4. 显卡核显硬件解码配置 ======${RESET}"
+    echo -ne "${YELLOW}是否需要启用 Intel/AMD 核显硬解解压（挂载 /dev/dri）？(y/n, 默认 n): ${RESET}"
+    read -r HW_TRANSCODE
+
+    # 自动创建本地挂载目录并赋予最高权限，防止 Emby 容器内部产生 Permission Denied
+    echo -e "\n${YELLOW}正在创建并初始化本地挂载目录权限...${RESET}"
+    mkdir -p "$path_config" "$path_media"
+    chmod -R 777 "$path_config" "$path_media"
+
+    # 生成规范化 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合本地挂载规范的 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  lrcapi:
-    image: hisatri/lrcapi:latest
+  embyserver:
+    image: ${IMAGE_NAME}
     container_name: ${CONTAINER_NAME}
-    ports:
-      - "${custom_port}:28883"
-    volumes:
-      - "${path_music}:${path_music}"
+    network_mode: bridge
     environment:
-      - API_AUTH=${custom_auth}
-    restart: always
+      - UID=0
+      - GID=0
+      - GIDLIST=0
+      - TZ=Asia/Shanghai
+    volumes:
+      - "${path_config}:/config"
+      - "${path_media}:/data"
+    ports:
+      - "${custom_port}:8096"
+    restart: unless-stopped
 EOF
 
-    echo -e "\n${YELLOW}正在通过 Docker Compose 启动 LrcApi 歌词接口...${RESET}"
+    # 动态追加硬解
+    if [[ "$HW_TRANSCODE" == "y" || "$HW_TRANSCODE" == "Y" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
+    devices:
+      - /dev/dri:/dev/dri
+EOF
+    fi
+
+    # 启动容器
+    echo -e "\n${YELLOW}正在通过 Docker Compose 启动本地挂载版 Emby Server...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约 3 秒)...${RESET}"
+    echo -e "${YELLOW}等待服务构建并扫描环境 (约 3 秒)...${RESET}"
     sleep 3
 
     get_status_info
     DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     LrcApi 部署成功！          ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}API 接口访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}当前接口鉴权 Key : ${CYAN}${custom_auth}${RESET}"
-    echo -e "${YELLOW}等价映射规则     : ${path_music} : ${path_music}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}              Emby 本地挂载部署成功！                ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}WEB 访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}本地配置路径   : ${path_config}${RESET}"
+    echo -e "${YELLOW}本地媒体路径   : ${path_media}${RESET}"
+    echo -e "${CYAN}💡 进阶提示：请将你的电影/电视剧文件直接上传到主机的 ${path_media} 目录中。${RESET}"
+    echo -e "${CYAN}   进入 Emby 网页端后台添加媒体库时，选择容器内的【 /data 】目录即可读取！${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
 # 更新镜像
@@ -163,25 +197,27 @@ update_translate() {
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新 LrcApi 官方镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新开心版 Emby 官方镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！接口已安全重启。${RESET}"
+    echo -e "${GREEN}更新完成！Emby 服务已平滑重启。${RESET}"
 }
 
 # 卸载服务
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 LrcApi 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Emby 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否彻底删除 LrcApi 自身的 Compose 配置文件？(注意：绝不会删除您的任何音乐文件)(y/n): ${RESET}"
+            echo -e "${GREEN}容器已停止并安全移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地保存的 Emby 刮削配置与海报数据？(⚠️ 绝不会删除你的电影和视频文件)(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                get_status_info
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}LrcApi 管理配置已彻底清理。${RESET}"
+                [[ "$path_config_show" != "$BASE_DIR"* && -d "$path_config_show" ]] && rm -rf "$path_config_show"
+                echo -e "${GREEN}所有相关的本地刮削海报及配置缓存已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -198,25 +234,28 @@ logs_translate() { docker logs -f --tail=100 "$CONTAINER_NAME"; }
 show_info() {
     get_status_info
     local DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}核心镜像       : ${img_version}${RESET}"
-    echo -e "${YELLOW}API 接口地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}接口鉴权密码   : ${CYAN}${auth_key_show}${RESET}"
-    echo -e "${YELLOW}宿主机音乐路径 : ${path_music_show}${RESET}"
-    echo -e "${YELLOW}容器内映射路径 : ${path_container_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前硬件架构   : ${CURRENT_ARCH_TEXT}${RESET}"
+    echo -e "${YELLOW}核心镜像版本   : ${img_version}${RESET}"
+    echo -e "${YELLOW}显卡硬解状态   : ${hw_status}${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}本地配置路径   : ${path_config_show}${RESET}"
+    echo -e "${YELLOW}本地媒体路径   : ${path_media_show}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈ LrcApi 自动歌词下载接口面板 ◈ ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}   ◈  Emby Server 开心版面板  ◈    ${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}状态    :${RESET} $status"
+    echo -e "${GREEN}系统架构:${RESET} ${CYAN}${CURRENT_ARCH_TEXT}${RESET}" 
+    echo -e "${GREEN}硬解状态:${RESET} ${hw_status}${RESET}"
+    echo -e "${GREEN}端口    :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -224,9 +263,9 @@ menu() {
     echo -e "${GREEN}5. 停止容器${RESET}"
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}8. 查看配置"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in

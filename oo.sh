@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# AutoBangumi 全自动追番工具 Docker Compose 管理面板
+# Kavita (Manga/Comics/Books) 多类目电子书库全自动化管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="AutoBangumi"
-BASE_DIR="/opt/autobangumi"
+CONTAINER_NAME="kavita"
+BASE_DIR="/opt/kavita"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,13 +22,8 @@ check_dependencies() {
     fi
 }
 
-# 动态获取当前终端执行用户的真实 UID 和 GID
-REAL_UID=$(id -u)
-REAL_GID=$(id -g)
-
-# 动态获取容器状态、映射端口和各数据目录
+# 动态获取容器状态及多个独立书架的真实物理挂载路径
 get_status_info() {
-    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -37,27 +32,31 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中精准提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
+        [[ -z "$img_version" ]] && img_version="latest"
 
-        # 提取 WebUI 映射出来的宿主机端口 (内部默认 7892)
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "7892/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="7892"
+        # 提取 Web 访问端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="5000"
 
-        # 提取宿主机应用配置目录
-        path_config_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 提取本地多类别挂载物理路径
+        path_config_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/kavita/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        path_manga_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/manga"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        path_comics_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/comics"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        path_books_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/books"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        
         [[ -z "$path_config_show" ]] && path_config_show="$BASE_DIR/config"
-
-        # 提取宿主机数据缓存目录
-        path_data_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$path_data_show" ]] && path_data_show="$BASE_DIR/data"
+        [[ -z "$path_manga_show" ]] && path_manga_show="$BASE_DIR/manga"
+        [[ -z "$path_comics_show" ]] && path_comics_show="$BASE_DIR/comics"
+        [[ -z "$path_books_show" ]] && path_books_show="$BASE_DIR/books"
     else
-        img_version="${RED}未安装${RESET}"
+        img_version="N/A"
         webui_port="N/A"
         path_config_show="N/A"
-        path_data_show="N/A"
+        path_manga_show="N/A"
+        path_comics_show="N/A"
+        path_books_show="N/A"
     fi
 }
 
@@ -85,107 +84,106 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署核心逻辑
+# 部署并配置多目录核心逻辑
 install_translate() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== AutoBangumi 参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 WebUI 访问映射端口 (宿主机) [默认: 7892]: ${RESET}"
+    echo -e "${CYAN}====== 1. 网络访问端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Kavita 网页访问映射端口 (宿主机) [默认: 5000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="7892"
+    [[ -z "$custom_port" ]] && custom_port="5000"
 
-    echo -e "\n${CYAN}--- 宿主机目录自定义 (建议填写绝对路径) ---${RESET}"
-    echo -ne "${YELLOW}1. 请输入【程序配置文件】存放路径 [默认: $BASE_DIR/config]: ${RESET}"
+    echo -e "\n${CYAN}====== 2. 分类书架数据挂载自定义 (绝对路径) ======${RESET}"
+    echo -ne "${YELLOW}1. 请输入【程序系统配置 ./config】保存路径 [默认: $BASE_DIR/config]: ${RESET}"
     read -r path_config
     [[ -z "$path_config" ]] && path_config="$BASE_DIR/config"
 
-    echo -ne "${YELLOW}2. 请输入【追番数据库及媒体数据】存放路径 [默认: $BASE_DIR/data]: ${RESET}"
-    read -r path_data
-    [[ -z "$path_data" ]] && path_data="$BASE_DIR/data"
+    echo -ne "${YELLOW}2. 请输入【日漫/韩漫本地仓 ./manga】保存路径 [默认: $BASE_DIR/manga]: ${RESET}"
+    read -r path_manga
+    [[ -z "$path_manga" ]] && path_manga="$BASE_DIR/manga"
 
-    # 自动创建所需目录并授权
-    echo -e "\n${YELLOW}正在初始化并检查宿主机目录与硬编码权限...${RESET}"
-    mkdir -p "$path_config" "$path_data"
-    
-    # 注入当前用户权限，防止因 Docker 权限导致的挂载卷无法写入
-    if [ "$REAL_UID" != "0" ]; then
-        chown -R "$REAL_UID":"$REAL_GID" "$path_config" "$path_data"
-    fi
-    chmod -R 777 "$BASE_DIR" "$path_config" "$path_data"
+    echo -ne "${YELLOW}3. 请输入【美漫/港漫本地仓 ./comics】保存路径 [默认: $BASE_DIR/comics]: ${RESET}"
+    read -r path_comics
+    [[ -z "$path_comics" ]] && path_comics="$BASE_DIR/comics"
 
-    # 生成规范化 docker-compose.yml 配置文件 (已在宿主机端解析并固化 PUID/PGID)
-    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    echo -ne "${YELLOW}4. 请输入【文学电子书本地仓 ./books】保存路径 [默认: $BASE_DIR/books]: ${RESET}"
+    read -r path_books
+    [[ -z "$path_books" ]] && path_books="$BASE_DIR/books"
+
+    # 批量创建本地分类目录并赋予高兼容读写权限
+    echo -e "\n${YELLOW}正在批量初始化 Kavita 分类物理仓所有权及读写权限...${RESET}"
+    mkdir -p "$path_config" "$path_manga" "$path_comics" "$path_books"
+    chmod -R 777 "$path_config" "$path_manga" "$path_comics" "$path_books"
+
+    # 生成规范化 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在构建符合 Kavita 图书规范的 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  AutoBangumi:
-    image: "ghcr.io/estrellaxd/auto_bangumi:latest"
+  kavita:
+    image: jvmilazz0/kavita:latest
     container_name: ${CONTAINER_NAME}
-    volumes:
-      - "${path_config}:/app/config"
-      - "${path_data}:/app/data"
-    ports:
-      - "${custom_port}:7892"
-    network_mode: bridge
-    restart: unless-stopped
-    dns:
-      - 8.8.8.8
     environment:
       - TZ=Asia/Shanghai
-      - PUID=${REAL_UID}
-      - PGID=${REAL_GID}
-      - UMASK=022
+    volumes:
+      - "${path_config}:/kavita/config"
+      - "${path_manga}:/manga"
+      - "${path_comics}:/comics"
+      - "${path_books}:/books"
+    ports:
+      - "${custom_port}:5000"
+    restart: unless-stopped
 EOF
 
     # 启动容器
-    echo -e "\n${YELLOW}正在通过 Docker Compose 启动 AutoBangumi 服务...${RESET}"
+    echo -e "\n${YELLOW}正在通过 Docker Compose 部署 Kavita 数字化书房...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务初始化并构建网络环境 (约 3 秒)...${RESET}"
+    echo -e "${YELLOW}等待 Kavita 核心扫描本地磁盘文件结构 (约 3 秒)...${RESET}"
     sleep 3
 
     get_status_info
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}            AutoBangumi 部署成功！                  ${RESET}"
+    echo -e "${GREEN}              Kavita 媒体库部署成功！                ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}WEB 后台访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}默认账号/密码    : admin/adminadmin${RESET}"
-    echo -e "${YELLOW}自动绑定的 PUID  : ${REAL_UID}  |  PGID: ${REAL_GID}${RESET}"
-    echo -e "${YELLOW}应用配置存储路径 : ${path_config}${RESET}"
-    echo -e "${YELLOW}番剧媒体数据路径 : ${path_data}${RESET}"
-    echo -e "${YELLOW}提示: 请在后台设置好你的下载器（如 Downloader/qBittorrent）联动。${RESET}"
+    echo -e "${YELLOW}Web 阅读器访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}元数据配置本地路径 : ${path_config}${RESET}"
+    echo -e "${YELLOW}Manga 漫画本地路径 : ${path_manga}${RESET}"
+    echo -e "${YELLOW}Comics美漫本地路径 : ${path_comics}${RESET}"
+    echo -e "${YELLOW}Books 电子书主路径 : ${path_books}${RESET}"
+    echo -e "${CYAN}💡 进阶提示：请将对应种类的电子书分别放入主机的上述物理路径中。${RESET}"
+    echo -e "${CYAN}   在 Kavita 后台新建媒体库时，直接关联容器内的【 /manga 】、【 /comics 】或【 /books 】即可！${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新镜像
+# 更新服务
 update_translate() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新 AutoBangumi 官方镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新 Kavita 官方发布版镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！追番服务已成功平滑重启。${RESET}"
+    echo -e "${GREEN}更新完成！数字化阅读服务已平滑重启。${RESET}"
 }
 
 # 卸载服务
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 AutoBangumi 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Kavita 图书容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地保存的配置文件和追番缓存数据库？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地保存的书架刮削海报、阅读记录及索引数据库？(⚠️绝不会动你的书籍漫画原文件)(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 get_status_info
                 rm -rf "$BASE_DIR"
                 [[ "$path_config_show" != "$BASE_DIR"* && -d "$path_config_show" ]] && rm -rf "$path_config_show"
-                [[ "$path_data_show" != "$BASE_DIR"* && -d "$path_data_show" ]] && rm -rf "$path_data_show"
-                echo -e "${GREEN}所有相关的配置文件与追番媒体库元数据已彻底清理。${RESET}"
+                echo -e "${GREEN}所有本地的 Kavita 账户信息、页码缓存、元数据已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -205,21 +203,23 @@ show_info() {
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}当前运行状态     : $status"
     echo -e "${YELLOW}核心镜像版本     : ${img_version}${RESET}"
-    echo -e "${YELLOW}WEB 后台访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}应用配置存储路径 : ${path_config_show}${RESET}"
-    echo -e "${YELLOW}番剧媒体数据路径 : ${path_data_show}${RESET}"
+    echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}配置存储本地路径 : ${path_config_show}${RESET}"
+    echo -e "${YELLOW}Manga 漫画本地路径 : ${path_manga_show}${RESET}"
+    echo -e "${YELLOW}Comics美漫本地路径 : ${path_comics_show}${RESET}"
+    echo -e "${YELLOW}Books 电子书本地路 : ${path_books_show}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}=================================================${RESET}"
-    echo -e "${GREEN}   ◈  AutoBangumi 全自动追番工具集成管理面板  ◈ ${RESET}"
-    echo -e "${GREEN}=================================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}=================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈  Kavita  漫画管理面板  ◈  ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态    :${RESET} $status"
+    echo -e "${GREEN}端口    :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -229,7 +229,7 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}=================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in

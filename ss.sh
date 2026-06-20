@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Emby Server (开心版) 架构/硬解自适应 Docker Compose 管理面板
+# MHTI 媒体自动化处理工具 Docker Compose 集成管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="amilys_embyserver"
-BASE_DIR="/opt/emby"
+CONTAINER_NAME="mhti"
+BASE_DIR="/opt/mhti"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,9 +22,8 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、架构、端口及硬解配置
+# 动态获取容器状态及多个独立数据卷的物理挂载路径
 get_status_info() {
-    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -33,43 +32,28 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 自动检测当前宿主机 CPU 架构
-    ARCH=$(uname -m)
-    if [[ "$ARCH" == "x86_64" ]]; then
-        CURRENT_ARCH_TEXT="AMD64 (x86_64)"
-    elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
-        CURRENT_ARCH_TEXT="ARM64 (arm64v8)"
-    else
-        CURRENT_ARCH_TEXT="未知架构 ($ARCH)"
-    fi
-
-    # 3. 如果容器存在，精准提取实时配置
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
+        [[ -z "$img_version" ]] && img_version="latest"
 
-        # 提取 HTTP 映射出来的宿主机端口 (内部默认 8096)
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8096/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="7568"
+        # 提取 Web 访问端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8000"
 
-        # 提取宿主机配置保存目录
-        path_config_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 提取宿主机媒体目录
-        path_media_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-
-        # 检查是否挂载了硬解设备
-        has_dri=$(docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep "/dev/dri")
-        if [[ -n "$has_dri" ]]; then
-            hw_status="${GREEN}已开启 (/dev/dri)${RESET}"
-        else
-            hw_status="${RED}已关闭${RESET}"
-        fi
+        # 提取本地多类别挂载物理路径
+        path_data_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        path_media_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/media"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        path_output_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/output"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        
+        [[ -z "$path_data_show" ]] && path_data_show="$BASE_DIR/data"
+        [[ -z "$path_media_show" ]] && path_media_show="$BASE_DIR/media"
+        [[ -z "$path_output_show" ]] && path_output_show="$BASE_DIR/output"
     else
-        img_version="${RED}未安装${RESET}"
+        img_version="N/A"
         webui_port="N/A"
-        path_config_show="N/A"
+        path_data_show="N/A"
         path_media_show="N/A"
-        hw_status="N/A"
+        path_output_show="N/A"
     fi
 }
 
@@ -97,126 +81,101 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署核心逻辑
+# 部署并配置多目录核心逻辑
 install_translate() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 1. 系统架构自动判定 ======${RESET}"
-    ARCH=$(uname -m)
-    if [[ "$ARCH" == "x86_64" ]]; then
-        IMAGE_NAME="amilys/embyserver"
-        ARCH_TEXT="AMD64 (x86_64)"
-    elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
-        IMAGE_NAME="amilys/embyserver_arm64v8"
-        ARCH_TEXT="ARM64 (arm64v8)"
-    else
-        echo -e "${RED}❌ 未知或不支持的系统架构: $ARCH${RESET}"
-        return
-    fi
-    echo -e "检测到当前硬件架构为: ${GREEN}${ARCH_TEXT}${RESET}"
-    echo -e "将自动匹配核心镜像: ${CYAN}${IMAGE_NAME}${RESET}"
-
-    echo -e "\n${CYAN}====== 2. 基础网络与服务配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Emby WEB 访问映射端口 (宿主机) [默认: 7568]: ${RESET}"
+    echo -e "${CYAN}====== 1. 网络访问端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 MHTI 网页访问映射端口 (宿主机) [默认: 8000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="7568"
+    [[ -z "$custom_port" ]] && custom_port="8000"
 
-    echo -e "\n${CYAN}====== 3. 宿主机目录挂载配置 ======${RESET}"
-    echo -ne "${YELLOW}1. 请输入【Emby 配置数据】保存路径 [默认: /data/docker_app/amilys_embyserver/config]: ${RESET}"
-    read -r path_config
-    [[ -z "$path_config" ]] && path_config="/data/docker_app/amilys_embyserver/config"
+    echo -e "\n${CYAN}====== 2. 媒体库与输出路径挂载 (绝对路径) ======${RESET}"
+    echo -ne "${YELLOW}1. 请输入【系统程序数据 ./data】保存路径 [默认: $BASE_DIR/data]: ${RESET}"
+    read -r path_data
+    [[ -z "$path_data" ]] && path_data="$BASE_DIR/data"
 
-    echo -ne "${YELLOW}2. 请输入【媒体电影/剧集视频】存放路径 [默认: /data]: ${RESET}"
+    echo -ne "${YELLOW}2. 请输入【原始视频媒体库 ./media】主路径 (只读安全挂载) [默认: $BASE_DIR/media]: ${RESET}"
     read -r path_media
-    [[ -z "$path_media" ]] && path_media="/data"
+    [[ -z "$path_media" ]] && path_media="$BASE_DIR/media"
 
-    echo -e "\n${CYAN}====== 4. 显卡核显硬件解码配置 ======${RESET}"
-    echo -ne "${YELLOW}是否需要启用 Intel/AMD 核显硬解解压（挂载 /dev/dri）？(y/n, 默认 n): ${RESET}"
-    read -r HW_TRANSCODE
+    echo -ne "${YELLOW}3. 请输入【自动化结果输出 ./output】存储路径 [默认: $BASE_DIR/output]: ${RESET}"
+    read -r path_output
+    [[ -z "$path_output" ]] && path_output="$BASE_DIR/output"
 
-    # 自动创建宿主机挂载目录
-    mkdir -p "$path_config" "$path_media"
-    chmod -R 777 "$path_config"
+    # 批量创建本地分类目录并赋予高兼容读写权限 (media层仅创建，容器内通过:ro控制只读)
+    echo -e "\n${YELLOW}正在批量初始化本地存储仓与安全权限结构...${RESET}"
+    mkdir -p "$path_data" "$path_media" "$path_output"
+    chmod -R 777 "$path_data" "$path_output"
 
-    # 生成基础 docker-compose.yml 结构
-    echo -e "\n${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    # 生成规范化 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在构建符合 MHTI 生产规范的 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  embyserver:
-    image: ${IMAGE_NAME}
+  mhti:
+    image: xiyan520/mhti:latest
     container_name: ${CONTAINER_NAME}
-    network_mode: bridge
-    environment:
-      - UID=0
-      - GID=0
-      - GIDLIST=0
-      - TZ=Asia/Shanghai
-    volumes:
-      - "${path_config}:/config"
-      - "${path_media}:/data"
-    ports:
-      - "${custom_port}:8096"
     restart: unless-stopped
+    ports:
+      - "${custom_port}:8000"
+    volumes:
+      - "${path_data}:/app/data"
+      - "${path_media}:/media:ro"
+      - "${path_output}:/output"
+    environment:
+      - TZ=Asia/Shanghai
+      - DATA_DIR=/app/data
 EOF
-
-    # 如果启用硬解，动态追加 devices 配置（严格遵循 YAML 缩进）
-    if [[ "$HW_TRANSCODE" == "y" || "$HW_TRANSCODE" == "Y" ]]; then
-        echo -e "${GREEN}正在为配置文追加核显驱动硬件映射 (/dev/dri)...${RESET}"
-        cat <<EOF >> "$COMPOSE_FILE"
-    devices:
-      - /dev/dri:/dev/dri
-EOF
-    fi
 
     # 启动容器
-    echo -e "\n${YELLOW}正在通过 Docker Compose 启动 Emby Server 媒体集群...${RESET}"
+    echo -e "\n${YELLOW}正在通过 Docker Compose 部署 MHTI 服务端...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务构建并扫描环境 (约 3 秒)...${RESET}"
+    echo -e "${YELLOW}等待 MHTI 完成首次环境环境初始化 (约 3 秒)...${RESET}"
     sleep 3
 
     get_status_info
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}              Emby Server 部署成功！                ${RESET}"
+    echo -e "${GREEN}              MHTI 服务端部署成功！                ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}WEB 访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}适配硬件架构   : ${ARCH_TEXT}${RESET}"
-    echo -e "${YELLOW}显卡硬解状态   : ${hw_status}${RESET}"
-    echo -e "${YELLOW}配置保存路径   : ${path_config}${RESET}"
-    echo -e "${YELLOW}媒体电影路径   : ${path_media}${RESET}"
-    echo -e "${YELLOW}提示: 首次进入向导，媒体库路径请选择挂载在容器内的 /data 目录。${RESET}"
+    echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}持久化配置路径   : ${path_data}${RESET}"
+    echo -e "${YELLOW}媒体仓路径(只读) : ${path_media}${RESET}"
+    echo -e "${YELLOW}结果输出存储路径 : ${path_output}${RESET}"
+    echo -e "${CYAN}💡 进阶安全提示：已启用 \":ro\" 只读磁盘机制。${RESET}"
+    echo -e "${CYAN}   MHTI 仅能读取 ${path_media} 内的视频，绝不会由于误操作破坏或删减源盘文件！${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新镜像
+# 更新服务
 update_translate() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新开心版 Emby 官方镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新 MHTI 官方发布镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！Emby 服务已平滑重启。${RESET}"
+    echo -e "${GREEN}更新完成！MHTI 自动化服务已平滑重启。${RESET}"
 }
 
 # 卸载服务
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 Emby 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 MHTI 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除 Emby 的全部元数据、刮削海报墙和配置？(注意: 绝不会动你的电影视频原文件)(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地保存的 MHTI 运行参数及缓存数据库？(绝不会动你的媒体原文件)(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 get_status_info
                 rm -rf "$BASE_DIR"
-                [[ "$path_config_show" != "$BASE_DIR"* && -d "$path_config_show" ]] && rm -rf "$path_config_show"
-                echo -e "${GREEN}所有相关的刮削海报、刮削元数据配置已彻底清理。${RESET}"
+                [[ "$path_data_show" != "$BASE_DIR"* && -d "$path_data_show" ]] && rm -rf "$path_data_show"
+                echo -e "${GREEN}所有本地的 MHTI 任务队列、日志及缓存数据已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -234,27 +193,24 @@ show_info() {
     get_status_info
     local DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}当前硬件架构   : ${CURRENT_ARCH_TEXT}${RESET}"
-    echo -e "${YELLOW}核心镜像版本   : ${img_version}${RESET}"
-    echo -e "${YELLOW}显卡硬解状态   : ${hw_status}${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}配置保存路径   : ${path_config_show}${RESET}"
-    echo -e "${YELLOW}媒体数据路径   : ${path_media_show}${RESET}"
+    echo -e "${YELLOW}当前运行状态     : $status"
+    echo -e "${YELLOW}核心镜像版本     : ${img_version}${RESET}"
+    echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}系统持久化数据路径: ${path_data_show}${RESET}"
+    echo -e "${YELLOW}媒体仓本地路径(ro): ${path_media_show}${RESET}"
+    echo -e "${YELLOW}结果输出本地路径 : ${path_output_show}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}   ◈  Emby Server 开心版面板  ◈    ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}状态    :${RESET} $status"
-    echo -e "${GREEN}系统架构:${RESET} ${CYAN}${CURRENT_ARCH_TEXT}${RESET}" 
-    echo -e "${GREEN}硬解状态:${RESET} ${hw_status}${RESET}"
-    echo -e "${GREEN}端口    :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}  ◈  MHTI 里番刮削管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -264,7 +220,7 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in

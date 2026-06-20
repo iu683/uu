@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# DecoTV (Core + Kvrocks) 双容器集群自动化集成与全生命周期管理面板
+# Komga (Manga/EPUB/CBZ) 数字化漫画服务器 自动化集成管理面板
 # =================================================================
 
 # 颜色
@@ -10,9 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CORE_NAME="decotv-core"
-DB_NAME="decotv-kvrocks"
-BASE_DIR="/opt/decotv"
+CONTAINER_NAME="komga"
+BASE_DIR="/opt/komga"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -23,33 +22,35 @@ check_dependencies() {
     fi
 }
 
-# 动态获取双容器集群运行状态
+# 动态获取容器状态及多品类书架的真实物理挂载路径
 get_status_info() {
-    local core_run=$(docker ps -q -f name=^/${CORE_NAME}$)
-    local db_run=$(docker ps -q -f name=^/${DB_NAME}$)
-    local core_exist=$(docker ps -aq -f name=^/${CORE_NAME}$)
-    local db_exist=$(docker ps -aq -f name=^/${DB_NAME}$)
-
-    # 集群状态综合判定
-    if [[ -n "$core_run" && -n "$db_run" ]]; then
-        status="${GREEN}集群健康 (双容器运行中)${RESET}"
-    elif [[ -n "$core_run" || -n "$db_run" ]]; then
-        status="${YELLOW}集群异常 (部分容器停止)${RESET}"
-    elif [[ -n "$core_exist" || -n "$db_exist" ]]; then
-        status="${RED}集群已停止${RESET}"
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    # 提取实时端口
-    if [[ -n "$core_exist" ]]; then
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CORE_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3000"
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="latest"
+
+        # 提取 Web 访问端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "25600/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="45600"
+
+        # 提取本地多类别挂载物理路径
+        path_config_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        path_comic_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/comic"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
         
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CORE_NAME" 2>/dev/null)
+        [[ -z "$path_config_show" ]] && path_config_show="$BASE_DIR/config"
+        [[ -z "$path_comic_show" ]] && path_comic_show="$BASE_DIR/comic"
     else
-        webui_port="N/A"
         img_version="N/A"
+        webui_port="N/A"
+        path_config_show="N/A"
+        path_comic_show="N/A"
     fi
 }
 
@@ -77,151 +78,140 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署核心逻辑
+# 部署并配置多目录核心逻辑
 install_translate() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 1. 网络访问端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 DecoTV 网页端访问映射端口 (宿主机) [默认: 3000]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Komga 网页访问映射端口 (宿主机) [默认: 45600]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
+    [[ -z "$custom_port" ]] && custom_port="45600"
 
-    echo -e "\n${CYAN}====== 2. 安全鉴权账户配置 ======${RESET}"
-    echo -ne "${YELLOW}1. 请输入后台管理【用户名】 [默认: admin]: ${RESET}"
-    read -r custom_user
-    [[ -z "$custom_user" ]] && custom_user="admin"
+    echo -e "\n${CYAN}====== 2. 分类书架数据挂载自定义 (绝对路径) ======${RESET}"
+    echo -ne "${YELLOW}1. 请输入【程序系统配置 ./config】保存路径 [默认: $BASE_DIR/config]: ${RESET}"
+    read -r path_config
+    [[ -z "$path_config" ]] && path_config="$BASE_DIR/config"
 
-    echo -ne "${YELLOW}2. 请输入后台管理【密  码】 [默认: admin_password]: ${RESET}"
-    read -r custom_pass
-    [[ -z "$custom_pass" ]] && custom_pass="admin_password"
+    echo -ne "${YELLOW}2. 请输入【本地核心漫画库 ./comic】保存路径 [默认: $BASE_DIR/comic]: ${RESET}"
+    read -r path_comic
+    [[ -z "$path_comic" ]] && path_comic="$BASE_DIR/comic"
+
+    # 批量创建本地分类目录并赋予高兼容读写权限
+    echo -e "\n${YELLOW}正在批量初始化 Komga 分类物理仓所有权及强力读写权限...${RESET}"
+    mkdir -p "$path_config" "$path_comic"
+    chmod -R 777 "$path_config" "$path_comic"
 
     # 生成规范化 docker-compose.yml 配置文件
-    echo -e "\n${YELLOW}正在构建多容器网络拓扑并生成 docker-compose.yml...${RESET}"
+    echo -e "${YELLOW}正在构建符合 Komga 标准规范的 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  decotv-core:
-    image: ghcr.io/decohererk/decotv:latest
-    container_name: ${CORE_NAME}
-    restart: on-failure
+  komga:
+    image: gotson/komga:latest
+    container_name: ${CONTAINER_NAME}
     ports:
-      - "${custom_port}:3000"
+      - "${custom_port}:25600"
     environment:
-      - USERNAME=${custom_user}
-      - PASSWORD=${custom_pass}
-      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
-      - KVROCKS_URL=redis://${DB_NAME}:6666
-    networks:
-      - decotv-network
-    depends_on:
-      - decotv-kvrocks
-
-  decotv-kvrocks:
-    image: apache/kvrocks
-    container_name: ${DB_NAME}
-    restart: unless-stopped
+      - UID=0
+      - GID=0
+      - TZ=Asia/Shanghai
     volumes:
-      - kvrocks-data:/var/lib/kvrocks
-    networks:
-      - decotv-network
-
-networks:
-  decotv-network:
-    driver: bridge
-
-volumes:
-  kvrocks-data:
+      - "${path_config}:/config"
+      - "${path_comic}:/comic"
+    restart: unless-stopped
 EOF
 
-    # 启动集群
-    echo -e "\n${YELLOW}正在通过 Docker Compose 同步编排双容器集群...${RESET}"
+    # 启动容器
+    echo -e "\n${YELLOW}正在通过 Docker Compose 编排启动 Komga 漫画库...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待 Kvrocks 数据库持久化层及核心初始化 (约 5 秒)...${RESET}"
-    sleep 5
+    echo -e "${YELLOW}等待 Komga 引擎构建元数据库及索引环境 (约 3 秒)...${RESET}"
+    sleep 3
 
     get_status_info
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}            DecoTV 集群全套部署成功！                ${RESET}"
+    echo -e "${GREEN}              Komga 漫画服务器部署成功！                ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}配置管理用户名   : ${custom_user}${RESET}"
-    echo -e "${YELLOW}配置管理登录密码 : ${custom_pass}${RESET}"
-    echo -e "${YELLOW}后端数据库持久化 : Docker 内嵌独立卷 (kvrocks-data)${RESET}"
-    echo -e "${CYAN}💡 架构提示：已自动创建高隔离专属网卡 [decotv-network]${RESET}"
-    echo -e "${CYAN}   Core 与 Kvrocks 数据库通过内网 6666 端口加密联动，确保公网数据绝对安全。${RESET}"
+    echo -e "${YELLOW}系统元数据配置路径: ${path_config}${RESET}"
+    echo -e "${YELLOW}漫画流媒体物理路径: ${path_comic}${RESET}"
+    echo -e "${CYAN}💡 进阶提示：请将你的 CBZ, CBR, EPUB 或 PDF 漫画归类放入主机的 ${path_comic}。${RESET}"
+    echo -e "${CYAN}   首次登录进入 Web 页面注册管理员后，新建媒体库时直接选择【 /comic 】目录即可！${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新整个集群
+# 更新服务
 update_translate() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在同步拉取 Core 核心与 Apache/Kvrocks 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新 Komga 官方发布版镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}整个 DecoTV 矩阵集群更新完毕并平滑重启。${RESET}"
+    echo -e "${GREEN}更新完成！数字化阅读服务已平滑重启。${RESET}"
 }
 
-# 卸载集群
+# 卸载服务
 uninstall_translate() {
-    echo -ne "${RED}⚠️ 确定要彻底卸载并删除 DecoTV 双容器集群吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Komga 漫画容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down -v
-            rm -rf "$BASE_DIR"
-            echo -e "${GREEN}双容器、专属网卡及内嵌 Kvrocks 数据库大容量数据卷已安全彻底清理！${RESET}"
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并安全移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地保存的书架内页缓存、阅读进度及 SQLite 数据库？(⚠️绝不会动你的漫画原文件)(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                get_status_info
+                rm -rf "$BASE_DIR"
+                [[ "$path_config_show" != "$BASE_DIR"* && -d "$path_config_show" ]] && rm -rf "$path_config_show"
+                echo -e "${GREEN}所有本地的 Komga 账户信息、页码缓存、元数据已彻底清理。${RESET}"
+            fi
         else
-            docker rm -f "$CORE_NAME" "$DB_NAME" 2>/dev/null
-            docker volume rm kvrocks-data 2>/dev/null
-            docker network rm decotv-network 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
-        echo -e "${GREEN}集群卸载完成！${RESET}"
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 集群级联动控制
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}DecoTV 集群已全面启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}DecoTV 集群已安全停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}DecoTV 集群已平滑重启${RESET}"; }
-
-# 查看双容器合并日志
-logs_translate() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_translate() { docker logs -f --tail=100 "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
     local DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}集群运行状态     : $status"
-    echo -e "${YELLOW}Core 核心映像    : ${img_version}${RESET}"
-    echo -e "${YELLOW}Web 映射访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}持久化数据库类型 : Apache Kvrocks (NoSQL 高性能引擎)${RESET}"
+    echo -e "${YELLOW}当前运行状态     : $status"
+    echo -e "${YELLOW}核心镜像版本     : ${img_version}${RESET}"
+    echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}系统元数据配置路径: ${path_config_show}${RESET}"
+    echo -e "${YELLOW}漫画流媒体本地路径: ${path_comic_show}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}    ◈  DecoTV 管理面板  ◈     ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}集群状态 :${RESET} $status"
-    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     ◈  Komga 漫画仓面板  ◈     ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新集群镜像${RESET}"
-    echo -e "${GREEN}3. 卸载集群服务${RESET}"
-    echo -e "${GREEN}4. 启动集群容器${RESET}"
-    echo -e "${GREEN}5. 停止集群容器${RESET}"
-    echo -e "${GREEN}6. 重启集群容器${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in

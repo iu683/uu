@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Komga (Manga/EPUB/CBZ) 数字化漫画服务器 自动化集成管理面板
+# Emby-Proxy-Go 高性能流媒体代理网关 Docker Compose 自动化管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="komga"
-BASE_DIR="/opt/komga"
+CONTAINER_NAME="emby-proxy"
+BASE_DIR="/opt/emby-proxy"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,7 +22,7 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态及多品类书架的真实物理挂载路径
+# 动态获取容器状态及网络端口映射
 get_status_info() {
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
@@ -34,23 +34,14 @@ get_status_info() {
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="latest"
+        [[ -z "$img_version" ]] && img_version="v1.3"
 
         # 提取 Web 访问端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "25600/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="45600"
-
-        # 提取本地多类别挂载物理路径
-        path_config_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        path_comic_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/comic"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        
-        [[ -z "$path_config_show" ]] && path_config_show="$BASE_DIR/config"
-        [[ -z "$path_comic_show" ]] && path_comic_show="$BASE_DIR/comic"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="22567"
     else
         img_version="N/A"
         webui_port="N/A"
-        path_config_show="N/A"
-        path_comic_show="N/A"
     fi
 }
 
@@ -78,66 +69,54 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署并配置多目录核心逻辑
+# 部署核心逻辑
 install_translate() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 1. 网络访问端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Komga 网页访问映射端口 (宿主机) [默认: 45600]: ${RESET}"
+    echo -e "${CYAN}====== 1. 网络代理网关端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Emby-Proxy 外网代理监听端口 [默认: 22567]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="45600"
-
-    echo -e "\n${CYAN}====== 2. 分类书架数据挂载自定义 (绝对路径) ======${RESET}"
-    echo -ne "${YELLOW}1. 请输入【程序系统配置 ./config】保存路径 [默认: $BASE_DIR/config]: ${RESET}"
-    read -r path_config
-    [[ -z "$path_config" ]] && path_config="$BASE_DIR/config"
-
-    echo -ne "${YELLOW}2. 请输入【本地核心漫画库 ./comic】保存路径 [默认: $BASE_DIR/comic]: ${RESET}"
-    read -r path_comic
-    [[ -z "$path_comic" ]] && path_comic="$BASE_DIR/comic"
-
-    # 批量创建本地分类目录并赋予高兼容读写权限
-    echo -e "\n${YELLOW}正在批量初始化 Komga 分类物理仓所有权及强力读写权限...${RESET}"
-    mkdir -p "$path_config" "$path_comic"
-    chmod -R 777 "$path_config" "$path_comic"
+    [[ -z "$custom_port" ]] && custom_port="22567"
 
     # 生成规范化 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在构建符合 Komga 标准规范的 docker-compose.yml...${RESET}"
+    echo -e "\n${YELLOW}正在构建符合高性能规范的 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  komga:
-    image: gotson/komga:latest
+  emby-proxy:
+    image: ghcr.io/gsy-allen/emby-proxy-go:v1.3
     container_name: ${CONTAINER_NAME}
-    ports:
-      - "${custom_port}:25600"
-    environment:
-      - UID=0
-      - GID=0
-      - TZ=Asia/Shanghai
-    volumes:
-      - "${path_config}:/config"
-      - "${path_comic}:/comic"
     restart: unless-stopped
+    ports:
+      - "${custom_port}:8080"
+    logging:
+      driver: 'local'
+      options:
+        max-size: '10m'
+        max-file: '5'
+    environment:
+      LISTEN_ADDR: ':8080'
+      BLOCK_PRIVATE_TARGETS: 'true'
 EOF
 
     # 启动容器
-    echo -e "\n${YELLOW}正在通过 Docker Compose 编排启动 Komga 漫画库...${RESET}"
+    echo -e "\n${YELLOW}正在通过 Docker Compose 启动 Emby-Proxy 高性能网关...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待 Komga 引擎构建元数据库及索引环境 (约 3 秒)...${RESET}"
+    echo -e "${YELLOW}等待 Go 代理引擎拉起网络端口 (约 3 秒)...${RESET}"
     sleep 3
 
     get_status_info
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}              Komga 漫画服务器部署成功！                ${RESET}"
+    echo -e "${GREEN}           Emby-Proxy 网关部署成功！              ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}系统元数据配置路径: ${path_config}${RESET}"
-    echo -e "${YELLOW}漫画流媒体物理路径: ${path_comic}${RESET}"
-    echo -e "${CYAN}💡 进阶提示：请将你的 CBZ, CBR, EPUB 或 PDF 漫画归类放入主机的 ${path_comic}。${RESET}"
-    echo -e "${CYAN}   首次登录进入 Web 页面注册管理员后，新建媒体库时直接选择【 /comic 】目录即可！${RESET}"
+    echo -e "${YELLOW}代理公网入口地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}日志滚动安全策略 : local (最大 10MB * 5 自动截断，拒绝爆盘)${RESET}"
+    echo -e "${YELLOW}安全沙箱防护     : BLOCK_PRIVATE_TARGETS=true (已拒绝探测内网)${RESET}"
+    echo -e "${CYAN}🌐 使用方法: https://{你的反代域名}/{emby服务器协议}/{emby服务器地址}/{emby服务器端口}${RESET}"
+    echo -e "${CYAN}💡 使用提示：请将客户端（如 Infuse、Emby App）连接地址指向此代理端口。${RESET}"
+    echo -e "${CYAN}   网关将自动根据后台配置接管流量，实现公网播放与直链优化加速。${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
@@ -147,28 +126,21 @@ update_translate() {
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新 Komga 官方发布版镜像...${RESET}"
+    echo -e "${YELLOW}正在检查并拉取最新稳定版 Emby-Proxy 镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！数字化阅读服务已平滑重启。${RESET}"
+    echo -e "${GREEN}更新完成！Go 高性能流媒体代理网关已平滑重启。${RESET}"
 }
 
 # 卸载服务
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 Komga 漫画容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并停止 Emby-Proxy 代理服务吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地保存的书架内页缓存、阅读进度及 SQLite 数据库？(⚠️绝不会动你的漫画原文件)(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                get_status_info
-                rm -rf "$BASE_DIR"
-                [[ "$path_config_show" != "$BASE_DIR"* && -d "$path_config_show" ]] && rm -rf "$path_config_show"
-                echo -e "${GREEN}所有本地的 Komga 账户信息、页码缓存、元数据已彻底清理。${RESET}"
-            fi
+            rm -rf "$BASE_DIR"
+            echo -e "${GREEN}网关已停止，相关编排配置目录已彻底清理。${RESET}"
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
@@ -186,10 +158,9 @@ show_info() {
     local DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}当前运行状态     : $status"
-    echo -e "${YELLOW}核心镜像版本     : ${img_version}${RESET}"
-    echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}系统元数据配置路径: ${path_config_show}${RESET}"
-    echo -e "${YELLOW}漫画流媒体本地路径: ${path_comic_show}${RESET}"
+    echo -e "${YELLOW}网关镜像版本     : ${img_version}${RESET}"
+    echo -e "${YELLOW}网关代理入口     : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}架构属性         : 高性能 Go 运行时 (状态无关/不占磁盘空间)${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
@@ -197,10 +168,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  Komga 漫画仓面板  ◈     ${RESET}"
+    echo -e "${GREEN}  ◈  Emby-Proxy-Go 管理面板  ◈ ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}状态    :${RESET} $status"
+    echo -e "${GREEN}端口    :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

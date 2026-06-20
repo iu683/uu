@@ -37,6 +37,7 @@ check_dependencies() {
 
 # 动态获取容器状态和端口
 get_status_info() {
+    # 1. 提取基础运行状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -45,18 +46,38 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
+    # 2. 如果容器存在，深入提取版本与端口状态
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="v4"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 【核心优化】端口提取逻辑：优先从环境配置文件中提取
+        if [[ -f "$ENV_FILE" ]]; then
+            local env_url=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'=' -f2-)
+            # 尝试匹配 URL 中的端口号 (如 :5799)
+            webui_port=$(echo "$env_url" | awk -F':' '{print $3}' | cut -d'/' -f1)
+            # 如果没有提取到第三段(说明URL没带端口，可能是标准https)，尝试提取第二段
+            if [[ -z "$webui_port" ]]; then
+                webui_port=$(echo "$env_url" | awk -F':' '{print $2}' | sed 's|//||' | cut -d'/' -f1)
+            fi
+        fi
+        
+        # 如果从 .env 没提取到纯数字端口，则通过 docker inspect 智能兜底
+        if [[ -z "$webui_port" || ! "$webui_port" =~ ^[0-9]+$ ]]; then
+            webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+            # 如果上面那种格式没拿到，用 range 遍历拿
+            [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        fi
+        
+        # 最终死守兜底
         [[ -z "$webui_port" ]] && webui_port="3000"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
     fi
 }
+
 
 # 1. 部署 Tinyauth
 install_utils() {
@@ -72,7 +93,7 @@ install_utils() {
         return
     fi
 
-    echo -e "${YELLOW}====================================================${RESET}"
+   echo -e "${YELLOW}====================================================${RESET}"
     echo -e "${CYAN}接下来将进入 Tinyauth 官方交互式用户创建向导。${RESET}"
     echo -e "${CYAN}请在提示中输入用户名、密码，并在格式(Format)中选择 ${GREEN}docker${RESET} 格式。${RESET}"
     echo -e "${YELLOW}====================================================${RESET}"
@@ -80,23 +101,38 @@ install_utils() {
     read -r
 
     local tmp_log="$BASE_DIR/user_create.log"
+    
+    # 💡 核心修改 1：必须保留 -t，否则 Tinyauth 的交互 UI 库 (huh) 会因找不到 TTY 而崩溃
     docker run -i -t --rm ghcr.io/steveiliop56/tinyauth:v4 user create --interactive | tee "$tmp_log"
 
-    local extracted_user=$(grep -a "User created user=" "$tmp_log" | awk -F'user=' '{print $2}' | tr -d '\r' | tr -d '\n')
+    # 💡 核心修改 2：由于开启了 -t，必须先用 tr 将回车符 \r 换成标准换行 \n，再用 sed 剥离 ANSI 颜色乱码
+    local cleaned_log=$(tr '\r' '\n' < "$tmp_log" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g")
+    
+    # 精准提取 Hash 字符串
+    local extracted_user=$(echo "$cleaned_log" | grep -a "User created user=" | awk -F'user=' '{print $2}' | tr -d '\n')
     rm -f "$tmp_log"
 
     if [[ -z "$extracted_user" ]]; then
         echo -e "${RED}错误: 未能成功捕获到用户 Hash！${RESET}"
-        echo -ne "${YELLOW}是否手动输入创建好的 USERS 字符串? (例如 UserName:\$\$2a\$\$10\$\$...): ${RESET}"
+        echo -ne "${YELLOW}是否手动输入创建好的 USERS 字符串? (例如 iucsy:\$2a\$10\$...): ${RESET}"
         read -r extracted_user
         if [[ -z "$extracted_user" ]]; then
             echo -e "${RED}部署终止。${RESET}"
             return
         fi
+        
+        # 用户手动输入的通常是单 $，统一转换为双 $$ 防止 docker-compose 报错
+        # 顺便防一手：先变回单 $，再统一变双 $$，确保不会变成 $$$$
+        extracted_user=$(echo "$extracted_user" | sed 's/\$\$/\$/g' | sed 's/\$/$$/g')
+    else
+        # 💡 核心修改 3：智能转义兼容。
+        # 如果用户听话选了 docker 格式，提取出来的已经是 $$ 格式；如果选错成 standard，则是单 $。
+        # 这里用 sed 's/\$\$/\$/g' 先全部降维成单 $，再统一升维成双 $$，完美杜绝 $$$$ 乱码！
+        extracted_user=$(echo "$extracted_user" | sed 's/\$\$/\$/g' | sed 's/\$/$$/g')
     fi
 
     echo -e "${GREEN}成功捕获用户配置: ${YELLOW}$extracted_user${RESET}"
-
+    
     echo -e "${YELLOW}正在生成环境变量文件 .env...${RESET}"
     cat <<EOF > "$ENV_FILE"
 APP_URL=http://127.0.0.1:${custom_port}
@@ -134,7 +170,8 @@ EOF
     echo -e "${GREEN}      Tinyauth 部署启动成功！      ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}本地安全监听端口 : 127.0.0.1:${custom_port}${RESET}"
-    echo -e "${CYAN}提示: 建议紧接着进入 [选项 9] 配置反代域名，随后进入 [选项 10] 联动 Pocket-ID！${RESET}"
+    echo -e "${YELLOW}本地安全访问地址 : 127.0.0.1:${custom_port}${RESET}"
+    echo -e "${CYAN}提示: 当前容器仅监听在本机，请配置反向代理公网域名访问！${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
@@ -235,6 +272,8 @@ EOF
     echo -e "${GREEN}====================================================${RESET}"
 }
 
+
+
 # 9. 独立反向代理管理菜单
 nginx_proxy_menu() {
     get_nginx_config_paths
@@ -289,6 +328,7 @@ nginx_proxy_menu() {
                     nginx_conf_file="${NGINX_AVAILABLE_DIR}/${domain_name}.conf"
                 fi
                 
+                # 核心修正：移除未定义的 $realip_remote_addr，改用标准全套反代头
                 cat <<EOF > "$nginx_conf_file"
 server {
     listen 80;
@@ -324,8 +364,11 @@ server {
     add_header Referrer-Policy "no-referrer-when-downgrade" always;
     add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval';" always;
 
+    # 精准修复头配置
     proxy_set_header Host \$http_host;
-    proxy_set_header X-Forwarded-For \$realip_remote_addr;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
 
     location / {
         proxy_pass http://127.0.0.1:${webui_port};
@@ -339,7 +382,13 @@ EOF
 
                 echo -e "${GREEN}配置文件已成功写入: $nginx_conf_file${RESET}"
                 if command -v nginx &> /dev/null; then
-                    nginx -t &>/dev/null && systemctl reload nginx && echo -e "${GREEN}Nginx 重载成功！反代已生效。${RESET}" || echo -e "${RED}警告: Nginx 语法测试失败，请检查证书路径！${RESET}"
+                    # 语法测试不卡死输出，直接执行反馈
+                    if nginx -t &>/dev/null; then
+                        systemctl reload nginx
+                        echo -e "${GREEN}Nginx 重载成功！反代已生效。${RESET}"
+                    else
+                        echo -e "${RED}警告: Nginx 语法测试失败，可能是由于证书权限或路径不正确！${RESET}"
+                    fi
                 fi
                 read -r; break
                 ;;
@@ -357,7 +406,10 @@ EOF
                 read -r; break
                 ;;
             3)
-                nginx -t && systemctl reload nginx && echo -e "${GREEN}Nginx 重载应用成功！${RESET}"
+                if nginx -t; then
+                    systemctl reload nginx
+                    echo -e "${GREEN}Nginx 重载应用成功！${RESET}"
+                fi
                 read -r; break
                 ;;
             0) return ;;
@@ -388,6 +440,191 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
 }
 
+
+# 11. 独立核心：智能配置第三方应用前置鉴权守卫 (auth_request)
+configure_app_guard() {
+    get_status_info
+    if [[ ! -f "$ENV_FILE" ]]; then
+        echo -e "${RED}错误：未检测到 Tinyauth 部署，请先安装 Tinyauth！${RESET}"
+        return
+    fi
+    get_nginx_config_paths
+    local current_sso_url=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'=' -f2-)
+    
+    echo -e "${CYAN}====== 配置第三方应用 Nginx 前置鉴权守卫 ======${RESET}"
+    echo -ne "${YELLOW}请输入被保护应用的规划域名 (如: app.eu.org): ${RESET}"
+    read -r app_domain
+    if [[ -z "$app_domain" ]]; then echo -e "${RED}域名不能为空！${RESET}"; return; fi
+
+    echo -ne "${YELLOW}请输入被保护应用的本地后端地址 [默认 http://127.0.0.1:8082]: ${RESET}"
+    read -r app_backend
+    [[ -z "$app_backend" ]] && app_backend="http://127.0.0.1:8082"
+
+    # 根据输入的域名自动生成默认 Let's Encrypt 证书链路径
+    local default_cert="/etc/letsencrypt/live/${app_domain}/fullchain.pem"
+    local default_key="/etc/letsencrypt/live/${app_domain}/privkey.pem"
+
+    echo -ne "${YELLOW}请输入 SSL 证书路径 [直接回车使用默认: ${default_cert}]: ${RESET}"
+    read -r app_cert
+    [[ -z "$app_cert" ]] && app_cert="$default_cert"
+
+    echo -ne "${YELLOW}请输入 SSL 私钥路径 [直接回车使用默认: ${default_key}]: ${RESET}"
+    read -r app_key
+    [[ -z "$app_key" ]] && app_key="$default_key"
+
+    local guard_conf_file="${NGINX_AVAILABLE_DIR}/${app_domain}"
+    [[ "$USE_SITES_STRUCTURE" = false ]] && guard_conf_file="${guard_conf_file}.conf"
+
+    # 生成高度融合的鉴权守卫配置
+    cat <<EOF > "$guard_conf_file"
+# =============================================================
+# 自动生成：被保护应用的前置 Nginx 鉴权守卫配置
+# =============================================================
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${app_domain};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${app_domain};
+
+    ssl_certificate ${app_cert};
+    ssl_certificate_key ${app_key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    access_log /var/log/nginx/${app_domain}.access.log;
+    error_log /var/log/nginx/${app_domain}.error.log;
+
+    # 静态资源放行（免验证优化体验）
+    location = /manifest.json {
+        proxy_pass ${app_backend};
+    }
+
+    location = /favicon.ico {
+        proxy_pass ${app_backend};
+    }
+
+    location ^~ /assets/ {
+        proxy_pass ${app_backend};
+    }
+
+    # 其他所有请求均通过本地 Tinyauth 强行子请求拦截
+    location ^~ / {
+        proxy_pass ${app_backend};
+
+        # ---------------------
+        # tinyauth 前置鉴权核心
+        # ---------------------
+        auth_request /_tinyauth_check;
+        error_page 401 = @tinyauth_login;
+
+        auth_request_set \$ta_user \$upstream_http_remote_user;
+        proxy_set_header Remote-User \$ta_user;
+        # ---------------------
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header REMOTE-HOST \$remote_addr;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$http_connection;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Port \$server_port;
+        proxy_http_version 1.1;
+        add_header Cache-Control no-cache;
+    }
+
+    # 子请求指向：指向本地部署的 Tinyauth 服务内部验证端口
+    location = /_tinyauth_check {
+        internal;
+        proxy_pass http://127.0.0.1:${webui_port}/api/auth/nginx;
+        proxy_set_header x-forwarded-proto \$scheme;
+        proxy_set_header x-forwarded-host  \$host;
+        proxy_set_header x-forwarded-uri   \$request_uri;
+    }
+
+    # 未登录时自动跳转回中央单点登录系统
+    location @tinyauth_login {
+        return 302 ${current_sso_url}/login?redirect_uri=\$scheme://\$host\$request_uri;
+    }
+}
+EOF
+
+    if [ "$USE_SITES_STRUCTURE" = true ] && [ -d "$NGINX_ENABLED_DIR" ]; then
+        ln -sf "$guard_conf_file" "${NGINX_ENABLED_DIR}/${app_domain}"
+    fi
+
+    echo -e "${GREEN}守护者配置文件已成功写入: $guard_conf_file${RESET}"
+    if nginx -t &>/dev/null; then
+        systemctl reload nginx
+        echo -e "${GREEN}Nginx 验证通过并已顺利热重载！前置拦截守护已全面上线！${RESET}"
+    else
+        echo -e "${RED}警告: Nginx 语法测试失败！请确保刚刚填充的证书链路径文件存在且 Nginx 有读取权限！${RESET}"
+    fi
+}
+
+# 12. 独立核心：联动 Casdoor / 通用 Generic OAuth2 认证
+configure_casdoor_oauth() {
+    if [[ ! -f "$ENV_FILE" ]]; then echo -e "${RED}错误: 请先安装部署 Tinyauth 主程序！${RESET}" ; return; fi
+    local tiny_url=$(grep -E '^APP_URL=' "$ENV_FILE" | cut -d'=' -f2-)
+    local provider_id="generic" # 锁定全局 Generic 适配规则
+
+    echo -e "${CYAN}====== Casdoor / 通用 Generic OAuth2 单点登录联动 ======${RESET}"
+    echo -e "${YELLOW}当前 Tinyauth 中央认证根地址为: ${GREEN}${tiny_url}${RESET}"
+    
+    # 完美拼装并提示符合规范的回调 URL
+    local computed_redirect="${tiny_url}/callback/${provider_id}"
+    echo -e "${GREEN}请提前在你的 Casdoor/OAuth2 后台注册此重定向回调 URL: ${MAGENTA}${computed_redirect}${RESET}"
+    echo -e "${YELLOW}-------------------------------------------------------------------------${RESET}"
+
+    echo -ne "${YELLOW}请输入 Casdoor 上的登录按钮显示名称 [默认: Casdoor]: ${RESET}"
+    read -r generic_name
+    [[ -z "$generic_name" ]] && generic_name="Casdoor"
+
+    echo -ne "${YELLOW}请输入 Casdoor Client ID: ${RESET}"
+    read -r client_id
+    echo -ne "${YELLOW}请输入 Casdoor Client Secret: ${RESET}"
+    read -r client_secret
+
+    echo -ne "${YELLOW}请输入 Casdoor 认证 URL (如 https://casdoor.example.com/login/oauth/authorize): ${RESET}"
+    read -r auth_url
+    echo -ne "${YELLOW}请输入 Casdoor 令牌 URL (如 https://casdoor.example.com/api/login/oauth/access_token): ${RESET}"
+    read -r token_url
+    echo -ne "${YELLOW}请输入 Casdoor 用户信息 URL (如 https://casdoor.example.com/api/get-account): ${RESET}"
+    read -r user_url
+
+    echo -ne "${YELLOW}请输入授权作用域 Scope [默认: openid profile email]: ${RESET}"
+    read -r scopes
+    [[ -z "$scopes" ]] && scopes="openid profile email"
+
+    # 清理已有的 GENERIC 旧配置项避免冲突
+    sed -i '/^GENERIC_/d' "$ENV_FILE"
+    sed -i '/^OAUTH_AUTO_REDIRECT=/d' "$ENV_FILE"
+
+    # 完美注入最新版官方支持的 GENERIC 变量配置标准
+    cat <<EOF >> "$ENV_FILE"
+GENERIC_NAME=${generic_name}
+GENERIC_CLIENT_ID=${client_id}
+GENERIC_CLIENT_SECRET=${client_secret}
+GENERIC_AUTH_URL=${auth_url}
+GENERIC_TOKEN_URL=${token_url}
+GENERIC_USER_URL=${user_url}
+GENERIC_REDIRECT_URL=${computed_redirect}
+GENERIC_SCOPE=${scopes}
+OAUTH_AUTO_REDIRECT=generic
+EOF
+
+    echo -e "${YELLOW}正在更新并重新加载容器配置...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d
+    echo -e "${GREEN}Casdoor / Generic OAuth2 单点登录绑定成功！并已开启自动重定向！${RESET}"
+}
+
 menu() {
     clear
     get_status_info
@@ -397,17 +634,19 @@ menu() {
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}127.0.0.1:${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动 (全新安装)${RESET}"
-    echo -e "${GREEN}2. 更新服务${RESET}"
-    echo -e "${GREEN}3. 卸载服务${RESET}"
-    echo -e "${GREEN}4. 启动服务${RESET}"
-    echo -e "${GREEN}5. 停止服务${RESET}"
-    echo -e "${GREEN}6. 重启服务${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看详细状态${RESET}"
-    echo -e "${CYAN}9. 反向代理（Nginx）管理专属菜单${RESET}"
-    echo -e "${YELLOW}10. 联动 Pocket-ID (连接 OAuth2 单点登录)${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN} 1. 部署启动${RESET}"
+    echo -e "${GREEN} 2. 更新服务${RESET}"
+    echo -e "${GREEN} 3. 卸载服务${RESET}"
+    echo -e "${GREEN} 4. 启动服务${RESET}"
+    echo -e "${GREEN} 5. 停止服务${RESET}"
+    echo -e "${GREEN} 6. 重启服务${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
+    echo -e "${GREEN} 9. 反向代理${RESET}"
+    echo -e "${GREEN}10. 联动Pocket-ID(连接OAuth2单点登录)${RESET}"
+    echo -e "${GREEN}11. 配置第三方应用前置鉴权守卫${RESET}"
+    echo -e "${GREEN}12. 联动 Casdoor (连接通用 Generic 单点登录)${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
@@ -422,6 +661,8 @@ menu() {
         8) show_info ;;
         9) nginx_proxy_menu ;;
         10) configure_pocketid_oauth ;;
+        11) configure_app_guard ;;
+        12) configure_casdoor_oauth ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

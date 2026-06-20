@@ -69,25 +69,30 @@ EOF
     mkdir -p "$APP_DIR/data"
     CONFIG_FILE="$APP_DIR/data/config.yaml"
 
-    # 【核心修改逻辑】：如果原有的 config.yaml 已经存在，安全进行局部擦洗，绝不破坏 custom_code 和其他自定义选项
+    # 如果原有的 config.yaml 已经存在，安全进行局部擦洗，绝不破坏 custom_code 和其他自定义选项
     if [ -f "$CONFIG_FILE" ]; then
         # 移除可能存在的旧 language 配置
         sed -i '/^language:/d' "$CONFIG_FILE" 2>/dev/null
-        # 精准切除已有的旧 tsdb 标签块，防止多次追加导致配置错位损坏
-        sed -i '/^tsdb:/,/^[a-zA-Z]/ { /^tsdb:/d; /data_path:/d }' "$CONFIG_FILE" 2>/dev/null
+        # 精准切除已有的旧 tsdb 标签块及其全部关联子项/注释（防止多次追加导致配置错位冲突）
+        sed -i '/^tsdb:/,/^[a-zA-Z]/ { /^tsdb:/d; /data_path:/d; /min_free_disk_space_gb:/d; /retention_days:/d; /max_memory_mb:/d; /write_buffer_size:/d; /write_buffer_flush_interval:/d; /# 启用/d; /# 保留/d }' "$CONFIG_FILE" 2>/dev/null
     fi
 
-    # 在原文件最末尾直接进行干净利落的追加 (带单引号 'EOF'，100% 保证不破坏里面的特殊美化符号)
+    # 在原文件最末尾直接进行全参数高级 TSDB 配置追加 (已删掉残留的错行)
     echo "language: zh_CN" >> "$CONFIG_FILE"
     cat >> "$CONFIG_FILE" << 'EOF'
+# 启用 TSDB 支持，保存保存更长时间的监控历史
 tsdb:
-  data_path: data/tsdb
+  data_path: "data/tsdb"
+  retention_days: 30
+  min_free_disk_space_gb: 1
+  max_memory_mb: 256
+  write_buffer_size: 512
+  write_buffer_flush_interval: 5
 EOF
 
-    # 修复并规范化文件权限
+    # 规范化文件权限
     chmod 644 "$CONFIG_FILE"
 
-    # 启动容器
     echo -e "\n${YELLOW}正在通过 Docker Compose 启动 哪吒监控面板...${RESET}"
     cd "$APP_DIR" && docker compose up -d
 
@@ -95,6 +100,7 @@ EOF
     sleep 3
 
     get_status_info
+    echo -e "${GREEN}Nezha Dashboard 面板部署完成！${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${GREEN}          Nezha Dashboard 面板部署成功！            ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
@@ -103,7 +109,21 @@ EOF
     echo -e "${YELLOW}TSDB数据存储路径 : ${APP_DIR}/data/tsdb${RESET}"
     echo -e "${CYAN}💡 提示：该服务仅监听在 127.0.0.1，请配合 Nginx 反代提供外网 HTTPS 访问。${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
+
 }
+
+# 选项 2：更新服务
+update_dashboard() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在拉取最新版 哪吒面板 镜像...${RESET}"
+    cd "$APP_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！哪吒面板已平滑重启。${RESET}"
+}
+
 
 # 选项 2：更新服务
 update_dashboard() {
@@ -148,7 +168,7 @@ show_info() {
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 选项 9：配置包含专业三段式（Web + gRPC + 精准 WebSocket）的反向代理规则
+# 选项 9：配置顶级安全兼顾 Cloudflare 穿透的高阶模板反代
 setup_host_nginx() {
     if [ ! -f "$COMPOSE_FILE" ]; then
         echo -e "${RED}错误: 请先执行选项 1 部署基础服务以确定本地映射端口！${RESET}"
@@ -158,21 +178,28 @@ setup_host_nginx() {
     local current_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8008/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
     [[ -z "$current_port" ]] && current_port="8008"
 
-    echo -e "${CYAN}====== 宿主机独立 Nginx 自动化配置 (高阶哪吒规则) ======${RESET}"
-    echo -ne "${YELLOW}请输入您的反代域名[默认: nezha.eu.org]: ${RESET}"
-    [[ -z "$custom_domain" ]] && custom_domain="nezha.eu.org"
+    # 清除残留键盘输入缓冲区，彻底封死粘贴时秒回车的 Bug
+    read -t 1 -n 10000 discard 2>/dev/null
+
+    echo -e "${CYAN}====== 宿主机独立 Nginx 自动化配置 (定制顶级哪吒模板) ======${RESET}"
+    echo -ne "${YELLOW}请输入您的反代域名 [默认: nezha.your.domain]: ${RESET}"
+    read -r custom_domain
+    [[ -z "$custom_domain" ]] && custom_domain="nezha.your.domain"
 
     local default_cert_path="/etc/letsencrypt/live/${custom_domain}/fullchain.pem"
     local default_key_path="/etc/letsencrypt/live/${custom_domain}/privkey.pem"
 
+
     echo -e "\n${CYAN}====== 域名证书自定义路径配置 ======${RESET}"
-    echo -e "${YELLOW}请输入证书 (fullchain.pem) 的宿主机绝对路径${RESET}"
+    echo -e "${YELLOW}请输入证书 (.pem) 的宿主机绝对路径${RESET}"
     echo -ne "[默认: ${CYAN}${default_cert_path}${RESET}]: "
+    read -t 1 -n 10000 discard 2>/dev/null
     read -r cert_path
     [[ -z "$cert_path" ]] && cert_path="$default_cert_path"
 
-    echo -e "${YELLOW}请输入私钥 (privkey.pem) 的宿主机绝对路径${RESET}"
+    echo -e "${YELLOW}请输入私钥 (.key) 的宿主机绝对路径${RESET}"
     echo -ne "[默认: ${CYAN}${default_key_path}${RESET}]: "
+    read -t 1 -n 10000 discard 2>/dev/null
     read -r key_path
     [[ -z "$key_path" ]] && key_path="$default_key_path"
 
@@ -187,83 +214,72 @@ setup_host_nginx() {
     if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
         echo -e "\n${RED}警告: 宿主机未检测到指定的证书或私钥文件！${RESET}"
         echo -ne "${YELLOW}是否强制继续生成 Nginx 站点配置？(y/n): ${RESET}"
+        read -t 1 -n 10000 discard 2>/dev/null
         read -r force_confirm
         if [[ "$force_confirm" != "y" && "$force_confirm" != "Y" ]]; then
             return
         fi
     fi
 
-    echo -e "\n${YELLOW}正在准备写入高级三段式反代到 Nginx 配置文件: ${CYAN}${nginx_avail_file}${RESET}"
+    echo -e "\n${YELLOW}正在准备写入定制高级反代到 Nginx 配置文件: ${CYAN}${nginx_avail_file}${RESET}"
     
     local tmp_file=$(mktemp)
     
-    # 采用 'EOF' 防止转义碎裂，完美支持传入的全新规则
+    # 使用包含优雅转义符的 EOF 块保护你的完美模板规则
     cat << EOF > "$tmp_file"
 # =================================================================
-# Nezha Dashboard (高阶哪吒三段式) - 本机 Nginx 自动化配置
+# Nezha Dashboard (定制顶级高阶模板) - 本机 Nginx 自动化配置
 # =================================================================
+
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    ''      close;
+}
 
 upstream nezha_dashboard {
     server 127.0.0.1:${current_port};
+    keepalive 512;
 }
 
 server {
     listen 80;
     listen [::]:80;
     server_name ${custom_domain};
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
+    return 301 https://\$host\$request_uri;
 }
 
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
     http2 on;
-    
     server_name ${custom_domain};
 
-    # 证书路径
     ssl_certificate ${cert_path};
     ssl_certificate_key ${key_path};
-    
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
+    ssl_ecdh_curve X25519:P-256:P-384;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305:ECDHE+AES128:RSA+AES128:ECDHE+AES256:RSA+AES256';
+    ssl_prefer_server_ciphers off;
 
-    client_max_body_size 20M;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:MozSSL:10m;
 
-    # 1. 基础 Web 反代
-    location ^~ / {
-        proxy_pass http://nezha_dashboard;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header REMOTE-HOST \$remote_addr;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_http_version 1.1;
-        proxy_read_timeout 1800s;
-        proxy_send_timeout 1800s;
-        proxy_buffer_size 128k;
-        proxy_buffers 4 128k;
-        proxy_busy_buffers_size 256k;
-        proxy_max_temp_file_size 0;
-        add_header X-Cache \$upstream_cache_status;
-        add_header Cache-Control "private, no-store";
-        proxy_ssl_server_name on;
-    }
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
-    # 2. gRPC 服务反代 (Agent上报支持)
+    access_log /var/log/nginx/${custom_domain}.access.log;
+    error_log /var/log/nginx/${custom_domain}.error.log;
+
+    client_max_body_size 100M;
+    underscores_in_headers on;
+
+    # 1. gRPC 服务
     location ^~ /proto.NezhaService/ {
         grpc_set_header Host \$host;
-        grpc_set_header X-Real-IP \$remote_addr;
+        grpc_set_header nz-realip \$http_cf_connecting_ip;
         grpc_read_timeout 600s;
         grpc_send_timeout 600s;
         grpc_socket_keepalive on;
@@ -272,15 +288,31 @@ server {
         grpc_pass grpc://nezha_dashboard;
     }
 
-    # 3. WebSocket 服务精准反代
-    location ~* ^/api/v1/ws/(server|terminal|file)(.*)$ {
+    # 2. WebSocket 精准路由服务
+    location ~* ^/api/v1/ws/(server|terminal|file)(.*)\$ {
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header nz-realip \$http_cf_connecting_ip;
         proxy_set_header Origin https://\$host;
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_read_timeout 1800s;
-        proxy_send_timeout 1800s;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_pass http://nezha_dashboard;
+    }
+
+    # 3. 基础 Web 页面流控服务
+    location / {
+        proxy_set_header Host \$host;
+        proxy_set_header nz-realip \$http_cf_connecting_ip;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
+        proxy_busy_buffers_size 256k;
+        proxy_max_temp_file_size 0;
         proxy_pass http://nezha_dashboard;
     }
 }
@@ -294,15 +326,16 @@ EOF
     if sudo nginx -t &>/dev/null; then
         sudo nginx -s reload
         echo -e "${GREEN}====================================================${RESET}"
-        echo -e "${GREEN}   本机 Nginx 高阶三段式反代规则配置并重载成功！   ${RESET}"
+        echo -e "${GREEN}  定制高级模板 Nginx 反代配置并平滑重载成功！      ${RESET}"
         echo -e "${GREEN}====================================================${RESET}"
-        echo -e "${YELLOW}外网入口: https://${custom_domain}${RESET}"
+        echo -e "${YELLOW}外网访问入口 : https://${custom_domain}${RESET}"
         echo -e "${GREEN}====================================================${RESET}"
     else
         echo -e "${RED}错误: Nginx 语法测试失败！真实错误详情如下：${RESET}"
         sudo nginx -t
     fi
 }
+
 
 menu() {
     clear

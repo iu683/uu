@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Reclip 视频切片自动下载器 Docker Compose 自动化管理面板
+# Emby-Proxy-Go 高性能流媒体代理网关 Docker Compose 自动化管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="reclip"
-BASE_DIR="/opt/reclip"
+CONTAINER_NAME="emby-proxy"
+BASE_DIR="/opt/emby-proxy"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,7 +22,7 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态及多个独立数据卷的物理挂载路径
+# 动态获取容器状态及网络端口映射
 get_status_info() {
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
@@ -34,19 +34,14 @@ get_status_info() {
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="latest"
+        [[ -z "$img_version" ]] && img_version="v1.3"
 
         # 提取 Web 访问端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8899/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8899"
-
-        # 提取本地下载卷的真实挂载物理路径
-        path_download_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/downloads"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$path_download_show" ]] && path_download_show="$BASE_DIR/downloads"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="22567"
     else
         img_version="N/A"
         webui_port="N/A"
-        path_download_show="N/A"
     fi
 }
 
@@ -73,56 +68,56 @@ get_public_ip() {
     fi
     echo "127.0.0.1" && return 0
 }
-# 部署并配置核心逻辑
+
+
+# 部署核心逻辑
 install_translate() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 1. 网络访问端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Reclip 后台访问映射端口 (宿主机) [默认: 8899]: ${RESET}"
+    echo -e "${CYAN}====== 1. 网络代理网关端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Emby-Proxy 外网代理监听端口 [默认: 22567]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8899"
-
-    echo -e "\n${CYAN}====== 2. 物理数据挂载自定义 (绝对路径) ======${RESET}"
-    echo -ne "${YELLOW}请输入【切片视频下载 ./downloads】保存绝对路径 [默认: $BASE_DIR/downloads]: ${RESET}"
-    read -r path_download
-    [[ -z "$path_download" ]] && path_download="$BASE_DIR/downloads"
-
-    # 初始化本地目录，并注入 777 读写权限防止下载流落盘失败
-    echo -e "\n${YELLOW}正在初始化文件系统并注入高兼容读写所有权...${RESET}"
-    mkdir -p "$path_download"
-    chmod -R 777 "$path_download"
+    [[ -z "$custom_port" ]] && custom_port="22567"
 
     # 生成规范化 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在构建符合 Reclip 规范的 docker-compose.yml...${RESET}"
+    echo -e "\n${YELLOW}正在构建符合高性能规范的 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  reclip:
-    image: reclipd/reclip
+  emby-proxy:
+    image: ghcr.io/gsy-allen/emby-proxy-go:v1.3
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     ports:
-      - "${custom_port}:8899"
-    volumes:
-      - "${path_download}:/app/downloads"
+      - "${custom_port}:8080"
+    logging:
+      driver: 'local'
+      options:
+        max-size: '10m'
+        max-file: '5'
+    environment:
+      LISTEN_ADDR: ':8080'
+      BLOCK_PRIVATE_TARGETS: 'true'
 EOF
 
     # 启动容器
-    echo -e "\n${YELLOW}正在通过 Docker Compose 编排拉起 Reclip 核心...${RESET}"
+    echo -e "\n${YELLOW}正在通过 Docker Compose 启动 Emby-Proxy 高性能网关...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待网关响应完成首次环境搭建 (约 3 秒)...${RESET}"
+    echo -e "${YELLOW}等待 Go 代理引擎拉起网络端口 (约 3 秒)...${RESET}"
     sleep 3
 
     get_status_info
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}             Reclip 视频切片控制台部署成功！          ${RESET}"
+    echo -e "${GREEN}           Emby-Proxy 网关部署成功！              ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}后台管理地址     : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}物理视频下载路径 : ${path_download}${RESET}"
-    echo -e "${CYAN}💡 进阶使用提示：所有的切片、缓存以及长视频录制成果都会自动保存到主机的 ${path_download} 目录中。${RESET}"
-    echo -e "${CYAN}   你可以随时将该物理路径挂载给 Emby、Jellyfin 或 AList 轻松实现全网点播。${RESET}"
+    echo -e "${YELLOW}代理公网入口地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}日志滚动安全策略 : local (最大 10MB * 5 自动截断，拒绝爆盘)${RESET}"
+    echo -e "${YELLOW}安全沙箱防护     : BLOCK_PRIVATE_TARGETS=true (已拒绝探测内网)${RESET}"
+    echo -e "${CYAN}🌐 使用方法: https://{你的反代域名}/{emby服务器协议}/{emby服务器地址}/{emby服务器端口}${RESET}"
+    echo -e "${CYAN}💡 使用提示：请将客户端（如 Infuse、Emby App）连接地址指向此代理端口。${RESET}"
+    echo -e "${CYAN}   网关将自动根据后台配置接管流量，实现公网播放与直链优化加速。${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
@@ -132,28 +127,21 @@ update_translate() {
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在检查并同步拉取最新 Reclip 官方映像...${RESET}"
+    echo -e "${YELLOW}正在检查并拉取最新稳定版 Emby-Proxy 镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！自动化切片提取服务已平滑重启。${RESET}"
+    echo -e "${GREEN}更新完成！Go 高性能流媒体代理网关已平滑重启。${RESET}"
 }
 
 # 卸载服务
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并停止 Reclip 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并停止 Emby-Proxy 代理服务吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时清空本地物理存储目录中已下载的所有切片和视频源文件？(删除后不可恢复)(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                get_status_info
-                rm -rf "$BASE_DIR"
-                [[ "$path_download_show" != "$BASE_DIR"* && -d "$path_download_show" ]] && rm -rf "$path_download_show"
-                echo -e "${GREEN}本地已保存的全部视频文件及缓存已被深度格式化清理。${RESET}"
-            fi
+            rm -rf "$BASE_DIR"
+            echo -e "${GREEN}网关已停止，相关编排配置目录已彻底清理。${RESET}"
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
@@ -171,17 +159,160 @@ show_info() {
     local DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}当前运行状态     : $status"
-    echo -e "${YELLOW}核心镜像版本     : ${img_version}${RESET}"
-    echo -e "${YELLOW}Web 后台访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}视频下载本地路径 : ${path_download_show}${RESET}"
+    echo -e "${YELLOW}网关镜像版本     : ${img_version}${RESET}"
+    echo -e "${YELLOW}网关代理入口     : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}架构属性         : 高性能 Go 运行时 (状态无关/不占磁盘空间)${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
+
+
+# 9. 独立菜单：直接修改本机 Nginx 配置文件 (支持证书自定义路径)
+setup_host_nginx() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        echo -e "${RED}错误: 请先执行选项 1 部署基础服务以确定本地映射端口！${RESET}"
+        return
+    fi
+
+    # 自动获取当前容器在宿主机映射的实际端口
+    local current_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+    [[ -z "$current_port" ]] && current_port="22567"
+
+    echo -e "${CYAN}====== 宿主机独立 Nginx 自动化配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入您的反代域名 [默认: emby.eu.org]: ${RESET}"
+    read -r custom_domain
+    [[ -z "$custom_domain" ]] && custom_domain="emby.eu.org"
+
+    # 1. 自动根据域名生成默认证书路径建议
+    local default_cert_path="/etc/letsencrypt/live/${custom_domain}/fullchain.pem"
+    local default_key_path="/etc/letsencrypt/live/${custom_domain}/privkey.pem"
+
+    # 2. 允许用户交互修改或直接回车确认
+    echo -e "\n${CYAN}====== 域名证书自定义路径配置 ======${RESET}"
+    echo -e "${YELLOW}请输入证书 (fullchain.pem) 的宿主机绝对路径${RESET}"
+    echo -ne "[默认: ${CYAN}${default_cert_path}${RESET}]: "
+    read -r cert_path
+    [[ -z "$cert_path" ]] && cert_path="$default_cert_path"
+
+    echo -e "${YELLOW}请输入私钥 (privkey.pem) 的宿主机绝对路径${RESET}"
+    echo -ne "[默认: ${CYAN}${default_key_path}${RESET}]: "
+    read -r key_path
+    [[ -z "$key_path" ]] && key_path="$default_key_path"
+
+    # 定义宿主机 Nginx 网站配置路径
+    local nginx_avail_file="/etc/nginx/sites-available/${custom_domain}"
+    local nginx_enabled_file="/etc/nginx/sites-enabled/${custom_domain}"
+
+    if [ ! -d "/etc/nginx/sites-available" ]; then
+        echo -e "${RED}错误: 未在本机检测到 /etc/nginx/sites-available 目录，请确认本机是否正确安装并运行了 Nginx！${RESET}"
+        return
+    fi
+
+    # 校验自定义输入的证书文件是否存在
+    if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+        echo -e "\n${RED}警告: 宿主机未检测到指定的证书或私钥文件！${RESET}"
+        echo -e "当前路径:\n证书: $cert_path\n私钥: $key_path"
+        echo -ne "${YELLOW}是否强制继续生成 Nginx 站点配置？(y/n): ${RESET}"
+        if [[ "$force_confirm" != "y" && "$force_confirm" != "Y" ]]; then
+            return
+        fi
+    fi
+
+    # 生成并写入宿主机的 Nginx 配置文件
+    echo -e "\n${YELLOW}正在直接写入本机 Nginx 配置文件: ${CYAN}${nginx_avail_file}${RESET}"
+    
+    # 修复：这里改为 EOF 并不带单引号，代码块内部变量采用强转义规则，确保准确传给外部 Bash
+    sudo bash -c "cat << EOF > ${nginx_avail_file}
+# =================================================================
+# Emby-Proxy-Go 高性能流媒体代理网关 - 本机 Nginx 自动化配置
+# =================================================================
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${custom_domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://\\\$host\\\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    
+    server_name ${custom_domain};
+
+    # 自定义指定的证书路径
+    ssl_certificate ${cert_path};
+    ssl_certificate_key ${key_path};
+    
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    client_max_body_size 100M;
+
+    location / {
+        # 自动转发至本地 docker-compose 映射端口
+        proxy_pass http://127.0.0.1:${current_port};
+        
+        proxy_set_header Host \\\$http_host;
+        proxy_set_header X-Real-IP \\\$remote_addr;
+        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \\\$scheme;
+        proxy_set_header X-Forwarded-Host \\\$http_host;
+
+        # 禁用流媒体缓冲防止卡顿
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_max_temp_file_size 0;
+
+        # WebSocket 双向透传支持
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \\\$http_upgrade;
+        proxy_set_header Connection \\"upgrade\\";
+
+        proxy_read_timeout 360s;
+        proxy_send_timeout 360s;
+    }
+}
+EOF"
+
+    # 创建软链接启用配置
+    echo -e "${YELLOW}正在建立 Nginx sites-enabled 启用软链接...${RESET}"
+    sudo ln -sf "$nginx_avail_file" "$nginx_enabled_file"
+
+    # 测试 Nginx 配置并重载
+    echo -e "${YELLOW}正在测试本机 Nginx 配置语法...${RESET}"
+    if sudo nginx -t &>/dev/null; then
+        echo -e "${YELLOW}语法正确，正在让本机 Nginx 平滑重载配置...${RESET}"
+        sudo nginx -s reload
+        echo -e "${GREEN}====================================================${RESET}"
+        echo -e "${GREEN}      本机 Nginx 反向代理配置并重载成功！          ${RESET}"
+        echo -e "${GREEN}====================================================${RESET}"
+        echo -e "${YELLOW}外网 HTTPS 入口地址 : https://${custom_domain}${RESET}"
+        echo -e "${YELLOW}已成功绑定外部证书  : ${cert_path}${RESET}"
+        echo -e "${YELLOW}已成功将流量转发至  : 本地端口 ${current_port}${RESET}"
+        echo -e "${GREEN}====================================================${RESET}"
+    else
+        echo -e "${RED}错误: Nginx 语法测试失败！${RESET}"
+        echo -e "${RED}请检查证书文件是否有效或权限是否正确。站点配置已保存，您可以手动排查后执行 nginx -s reload。${RESET}"
+        # 打印一下真实的报错，方便当场排查
+        sudo nginx -t
+    fi
+}
+
 
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}◈ Reclip  自动化视频切片下载器 ◈ ${RESET}"
+    echo -e "${GREEN}  ◈  Emby-Proxy-Go 管理面板  ◈ ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态    :${RESET} $status"
     echo -e "${GREEN}端口    :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -194,6 +325,7 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 反向代理${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
@@ -207,6 +339,7 @@ menu() {
         6) restart_translate ;;
         7) logs_translate ;;
         8) show_info ;;
+        9) setup_host_nginx ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

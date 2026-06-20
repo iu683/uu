@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# MoviePilot V2 (Host网络 3合1版) Docker Compose 管理面板 
+# OpenList 聚合网盘/文件列表工具 Docker Compose 管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="moviepilot-v2"
-BASE_DIR="/opt/moviepilot-v2"
+CONTAINER_NAME="openlist"
+BASE_DIR="/opt/openlist"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,21 +22,13 @@ check_dependencies() {
     fi
 }
 
-# 生成随机密钥的辅助函数
-generate_random_password() {
-    if command -v openssl &> /dev/null; then
-        openssl_rand=$(openssl rand -hex 12 2>/dev/null)
-        if [[ -n "$openssl_rand" ]]; then
-            echo "$openssl_rand"
-            return 0
-        fi
-    fi
-    echo "pwd_$((RANDOM % 899999 + 100000))"
-}
+# 动态获取当前系统用户的 UID 和 GID 作为默认安全权限
+CURRENT_UID=$(id -u)
+CURRENT_GID=$(id -g)
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取容器状态、映射端口和各数据目录
 get_status_info() {
-    # 1. 检查核心 Web 容器状态
+    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -45,29 +37,24 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从环境或配置中提取信息
+    # 2. 如果容器存在，从容器状态中精准提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 因开启 network_mode: host，从容器环境变量中提取 NGINX_PORT
-        webui_port=$(docker inspect -f '{{range .Config.Env}}{{if Royal "NGINX_PORT="}}{{.}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | awk -F'=' '{print $2}')
-        # 兜底
-        if [ -z "$webui_port" ] && [ -f "$COMPOSE_FILE" ]; then
-            webui_port=$(grep "NGINX_PORT" "$COMPOSE_FILE" | awk -F'=' '{print $2}' | tr -d " '" )
-        fi
-        [[ -z "$webui_port" ]] && webui_port="3000 (Host)"
+        # 提取 WebUI 映射出来的宿主机端口 (内部默认 5244)
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5244/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="5244"
 
-        # 提取宿主机配置路径
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/config"
+        # 提取宿主机数据保存目录
+        path_data_show=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/openlist/data"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$path_data_show" ]] && path_data_show="$BASE_DIR/data"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        data_dir="N/A"
+        path_data_show="N/A"
     fi
 }
-
 
 # 获取公网 IP (兼容双栈环境)
 get_public_ip() {
@@ -92,254 +79,113 @@ get_public_ip() {
     fi
     echo "127.0.0.1" && return 0
 }
+
 # 部署核心逻辑
 install_translate() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 请选择 MoviePilot V2 数据库部署模式 ======${RESET}"
-    echo -e "${GREEN}1. 本地轻量模式 (使用内置 SQLite 数据库，无需安装任何额外数据库) ${RESET}"
-    echo -e "${GREEN}2. 自带集成模式 (全自动全新安装并关联 PostgreSQL + Redis 容器) ${RESET}"
-    echo -e "${GREEN}3. 远程/外部数据库模式 (关联你自建的或远程服务器上的 PG 和 Redis) ${RESET}"
-    echo -ne "${YELLOW}请输入模式序号 [1-3, 默认 1]: ${RESET}"
-    read -r db_mode
-    [[ -z "$db_mode" ]] && db_mode="1"
-
-    echo -e "\n${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入后台 WebUI 访问端口 [默认: 3000]: ${RESET}"
+    echo -e "${CYAN}====== OpenList 参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 WebUI 访问映射端口 (宿主机) [默认: 5244]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
+    [[ -z "$custom_port" ]] && custom_port="5244"
 
-    echo -ne "${YELLOW}请输入 API 通讯端口 [默认: 3001]: ${RESET}"
-    read -r api_port
-    [[ -z "$api_port" ]] && api_port="3001"
+    echo -e "\n${CYAN}--- 运行权限配置 (User ID : Group ID) ---${RESET}"
+    echo -ne "${YELLOW}请输入运行容器的用户 UID [默认当前用户: ${CURRENT_UID}]: ${RESET}"
+    read -r custom_uid
+    [[ -z "$custom_uid" ]] && custom_uid="${CURRENT_UID}"
 
-    echo -ne "${YELLOW}请输入初始登录超级密码 [默认: moviepilot123]: ${RESET}"
-    read -r mp_password
-    [[ -z "$mp_password" ]] && mp_password="moviepilot123"
+    echo -ne "${YELLOW}请输入运行容器的用户组 GID [默认当前用户组: ${CURRENT_GID}]: ${RESET}"
+    read -r custom_gid
+    [[ -z "$custom_gid" ]] && custom_gid="${CURRENT_GID}"
 
-    echo -e "\n${CYAN}--- 目录挂载配置 (若不存在会自动创建) ---${RESET}"
-    echo -ne "${YELLOW}请输入持久化配置目录 [默认: $BASE_DIR/config]: ${RESET}"
-    read -r path_config
-    [[ -z "$path_config" ]] && path_config="$BASE_DIR/config"
+    echo -e "\n${CYAN}--- 宿主机目录自定义 (建议填写绝对路径) ---${RESET}"
+    echo -ne "${YELLOW}请输入数据持久化保存路径 [默认: $BASE_DIR/data]: ${RESET}"
+    read -r path_data
+    [[ -z "$path_data" ]] && path_data="$BASE_DIR/data"
 
-    echo -ne "${YELLOW}请输入媒体文件根目录 [默认: /media]: ${RESET}"
-    read -r path_media
-    [[ -z "$path_media" ]] && path_media="/media"
-
-    # 初始化基础目录
-    mkdir -p "$path_config" "$path_media" "$BASE_DIR/core"
-    chmod -R 777 "$BASE_DIR" "$path_config" "$path_media"
-
-    # 开始根据不同模式构建 docker-compose.yml
-    echo -e "\n${YELLOW}正在生成符合 Host 网络的 docker-compose.yml 配置文件...${RESET}"
-
-    if [[ "$db_mode" == "1" ]]; then
-        # ==================== 1. SQLite 本地轻量版 ====================
-        cat <<EOF > "$COMPOSE_FILE"
-version: '3.3'
-services:
-  moviepilot:
-    stdin_open: true
-    tty: true
-    container_name: ${CONTAINER_NAME}
-    hostname: ${CONTAINER_NAME}
-    network_mode: host
-    volumes:
-      - '${path_media}:/media'
-      - '${path_config}:/config'
-      - '${BASE_DIR}/core:/moviepilot/.cloakbrowser'
-      - '/var/run/docker.sock:/var/run/docker.sock:ro'
-    environment:
-      - 'NGINX_PORT=${custom_port}'
-      - 'PORT=${api_port}'
-      - 'PUID=0'
-      - 'PGID=0'
-      - 'UMASK=000'
-      - 'TZ=Asia/Shanghai'
-      - 'SUPERUSER=admin'
-      - 'SUPERUSER_PASSWORD=${mp_password}'
-    restart: always
-    image: jxxghp/moviepilot-v2:latest
-EOF
-
-    elif [[ "$db_mode" == "2" ]]; then
-        # ==================== 2. PostgreSQL + Redis 自带集成版 ====================
-        RAND_REDIS_PWD=$(generate_random_password)
-        RAND_PG_PWD=$(generate_random_password)
-        mkdir -p "$BASE_DIR/redis_data" "$BASE_DIR/pg_data"
-
-        # 因为是 Host 模式，底层数据库容器也需要暴露非冲突端口，这里默认设为标准端口
-        cat <<EOF > "$COMPOSE_FILE"
-version: '3.3'
-services:
-  moviepilot:
-    stdin_open: true
-    tty: true
-    container_name: ${CONTAINER_NAME}
-    hostname: ${CONTAINER_NAME}
-    network_mode: host
-    volumes:
-      - '${path_media}:/media'
-      - '${path_config}:/config'
-      - '${BASE_DIR}/core:/moviepilot/.cloakbrowser'
-      - '/var/run/docker.sock:/var/run/docker.sock:ro'
-    environment:
-      - 'NGINX_PORT=${custom_port}'
-      - 'PORT=${api_port}'
-      - 'PUID=0'
-      - 'PGID=0'
-      - 'UMASK=000'
-      - 'TZ=Asia/Shanghai'
-      - 'SUPERUSER=admin'
-      - 'SUPERUSER_PASSWORD=${mp_password}'
-      - 'DB_TYPE=postgresql'
-      - 'DB_POSTGRESQL_HOST=127.0.0.1'
-      - 'DB_POSTGRESQL_PORT=5432'
-      - 'DB_POSTGRESQL_DATABASE=moviepilot'
-      - 'DB_POSTGRESQL_USERNAME=moviepilot'
-      - 'DB_POSTGRESQL_PASSWORD=${RAND_PG_PWD}'
-      - 'CACHE_BACKEND_TYPE=redis'
-      - 'CACHE_BACKEND_URL=redis://:${RAND_REDIS_PWD}@127.0.0.1:6379'
-    restart: always
-    image: jxxghp/moviepilot-v2:latest
-
-  moviepilot-redis:
-    container_name: moviepilot-redis
-    image: redis:alpine
-    restart: always
-    network_mode: host
-    volumes:
-      - ${BASE_DIR}/redis_data:/data
-    command: redis-server --port 6379 --save 600 1 --requirepass ${RAND_REDIS_PWD}
-
-  moviepilot-pg:
-    container_name: moviepilot-pg
-    image: postgres:17-alpine
-    restart: always
-    network_mode: host
-    environment:
-      POSTGRES_DB: moviepilot
-      POSTGRES_USER: moviepilot
-      POSTGRES_PASSWORD: ${RAND_PG_PWD}
-    volumes:
-      - ${BASE_DIR}/pg_data:/var/lib/postgresql/data
-EOF
-
-    elif [[ "$db_mode" == "3" ]]; then
-        # ==================== 3. 远程/外部数据库连接版 ====================
-        echo -e "\n${CYAN}--- 远程/外部 PostgreSQL 配置 ---${RESET}"
-        echo -ne "${YELLOW}请输入 PG 数据库 IP/域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r rem_pg_host
-        [[ -z "$rem_pg_host" ]] && rem_pg_host="127.0.0.1"
-        echo -ne "${YELLOW}请输入 PG 数据库端口 [默认: 5432]: ${RESET}"
-        read -r rem_pg_port
-        [[ -z "$rem_pg_port" ]] && rem_pg_port="5432"
-        echo -ne "${YELLOW}请输入 PG 数据库库名 [默认: moviepilot]: ${RESET}"
-        read -r rem_pg_db
-        [[ -z "$rem_pg_db" ]] && rem_pg_db="moviepilot"
-        echo -ne "${YELLOW}请输入 PG 用户名 [默认: moviepilot]: ${RESET}"
-        read -r rem_pg_user
-        [[ -z "$rem_pg_user" ]] && rem_pg_user="moviepilot"
-        echo -ne "${YELLOW}请输入 PG 密码 [必填]: ${RESET}"
-        read -r rem_pg_pwd
-
-        echo -e "\n${CYAN}--- 远程/外部 Redis 配置 ---${RESET}"
-        echo -ne "${YELLOW}请输入 Redis 连接 URL [格式示例: redis://:密码@IP:端口/0]: ${RESET}"
-        read -r rem_redis_url
-
-        cat <<EOF > "$COMPOSE_FILE"
-version: '3.3'
-services:
-  moviepilot:
-    stdin_open: true
-    tty: true
-    container_name: ${CONTAINER_NAME}
-    hostname: ${CONTAINER_NAME}
-    network_mode: host
-    volumes:
-      - '${path_media}:/media'
-      - '${path_config}:/config'
-      - '${BASE_DIR}/core:/moviepilot/.cloakbrowser'
-      - '/var/run/docker.sock:/var/run/docker.sock:ro'
-    environment:
-      - 'NGINX_PORT=${custom_port}'
-      - 'PORT=${api_port}'
-      - 'PUID=0'
-      - 'PGID=0'
-      - 'UMASK=000'
-      - 'TZ=Asia/Shanghai'
-      - 'SUPERUSER=admin'
-      - 'SUPERUSER_PASSWORD=${mp_password}'
-      - 'DB_TYPE=postgresql'
-      - 'DB_POSTGRESQL_HOST=${rem_pg_host}'
-      - 'DB_POSTGRESQL_PORT=${rem_pg_port}'
-      - 'DB_POSTGRESQL_DATABASE=${rem_pg_db}'
-      - 'DB_POSTGRESQL_USERNAME=${rem_pg_user}'
-      - 'DB_POSTGRESQL_PASSWORD=${rem_pg_pwd}'
-      - 'CACHE_BACKEND_TYPE=redis'
-      - 'CACHE_BACKEND_URL=${rem_redis_url}'
-    restart: always
-    image: jxxghp/moviepilot-v2:latest
-EOF
+    # 自动创建所需目录并授权
+    echo -e "\n${YELLOW}正在初始化并检查宿主机目录权限...${RESET}"
+    mkdir -p "$path_data"
+    # 如果指定非 root 用户运行，确保该用户对挂载目录有所有权
+    if [ "$custom_uid" != "0" ]; then
+        chown -R "$custom_uid":"$custom_gid" "$path_data"
     fi
+    chmod -R 755 "$BASE_DIR" "$path_data"
 
-    echo -e "\n${YELLOW}正在通过 Docker Compose 启动部署集群...${RESET}"
+    # 生成规范化 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  openlist:
+    image: 'openlistteam/openlist:latest'
+    container_name: ${CONTAINER_NAME}
+    user: '${custom_uid}:${custom_gid}'
+    volumes:
+      - '${path_data}:/opt/openlist/data'
+    ports:
+      - '${custom_port}:5244'
+    environment:
+      - UMASK=022
+    restart: unless-stopped
+EOF
+
+    # 启动容器
+    echo -e "\n${YELLOW}正在通过 Docker Compose 启动 OpenList 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务网络端口初始化 (约5秒)...${RESET}"
-    sleep 5
+    echo -e "${YELLOW}等待服务初始化 (约 3 秒)...${RESET}"
+    sleep 3
 
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    MoviePilot V2 部署成功！    ${RESET}"
+    echo -e "${GREEN}     OpenList 部署成功！        ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}部署模式       : 模式 ${db_mode}${RESET}"
     echo -e "${YELLOW}WEB 访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}初始超级账号   : admin${RESET}"
-    echo -e "${YELLOW}初始超级密码   : ${mp_password}${RESET}"
-    echo -e "${YELLOW}持久化配置路径 : ${path_config}${RESET}"
-    echo -e "${YELLOW}网络访问模式   : Host模式 (直接占用宿主机端口)${RESET}"
+    echo -e "${YELLOW}运行用户权限   : ${custom_uid}:${custom_gid}${RESET}"
+    echo -e "${YELLOW}数据保存路径   : ${path_data}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新集群镜像
+# 更新镜像
 update_translate() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新 OpenList 官方镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已安全重启。${RESET}"
+    echo -e "${GREEN}更新完成！容器已成功安全重启。${RESET}"
 }
 
-# 卸载集群
+# 卸载服务
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 MoviePilot V2 运行环境吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 OpenList 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}所有关联容器已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地配置和数据库文件？(绝不会删除您的媒体视频文件)(y/n): ${RESET}"
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地保存的数据及配置文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                get_status_info
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}主配置与运行数据目录已彻底清理。${RESET}"
+                [[ "$path_data_show" != "$BASE_DIR"* && -d "$path_data_show" ]] && rm -rf "$path_data_show"
+                echo -e "${GREEN}所有相关的网盘配置和缓存数据已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" moviepilot-redis moviepilot-pg 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务集群已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务集群已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务集群已重启${RESET}"; }
-logs_translate() { cd "$BASE_DIR" && docker compose logs -f --tail=100 moviepilot; }
+start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_translate() { docker logs -f --tail=100 "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
@@ -347,8 +193,8 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}核心镜像       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}宿主机配置路径 : ${data_dir}${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}数据保存路径   : ${path_data_show}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -356,7 +202,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈  MoviePilot V2 管理面板 ◈   ${RESET}"
+    echo -e "${GREEN}◈OpenList 聚合网盘自动化管理面板◈ ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"

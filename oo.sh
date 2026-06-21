@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Magnet Fix (磁力检索与下载系统) Docker Compose 纯净管理脚本
+# Magnet Fix (磁力检索与下载系统) Docker Compose 管理脚本
 # =================================================================
 
 # 颜色定义
@@ -12,7 +12,10 @@ RESET="\033[0m"
 
 INSTALL_DIR="/opt/magnet-fix"
 CONTAINER_NAME="magnet-search"
-WEBUI_PORT="8080"  # Magnet Fix 默认运行端口
+
+# 默认端口配置
+DEFAULT_WEB_PORT="8080"
+DEFAULT_UDP_PORT="6881"
 
 # 检测基础依赖
 check_dependencies() {
@@ -26,6 +29,18 @@ check_dependencies() {
     fi
 }
 
+# 动态从 docker-compose.yml 实时读取当前【仅属于 magnet-search】配置的端口
+load_current_ports() {
+    if [ -f "$INSTALL_DIR/docker-compose.yml" ]; then
+        # 精准定位：只看 magnet-search 服务定义区间的端口（取前两行匹配项）
+        WEBUI_PORT=$(sed -n '/magnet-search:/,/qbittorrent:/p' "$INSTALL_DIR/docker-compose.yml" | grep -E '[0-9]+:8080' | head -n1 | awk -F'"' '{print $2}' | cut -d':' -f1)
+        UDP_PORT=$(sed -n '/magnet-search:/,/qbittorrent:/p' "$INSTALL_DIR/docker-compose.yml" | grep -E '[0-9]+:6881/udp' | head -n1 | awk -F'"' '{print $2}' | cut -d':' -f1)
+    fi
+    
+    # 兜底默认值
+    : "${WEBUI_PORT:=$DEFAULT_WEB_PORT}"
+    : "${UDP_PORT:=$DEFAULT_UDP_PORT}"
+}
 
 # 获取公网 IP (兼容双栈环境)
 get_public_ip() {
@@ -62,7 +77,7 @@ get_status_info() {
     fi
 }
 
-# 自动分析当前已部署的 Profile 状态，确保开关不错乱
+# 自动分析当前已部署的 Profile 状态
 get_current_profiles() {
     local profiles=""
     if [ "$(docker ps -aq -f name=^/qbittorrent$)" ]; then
@@ -88,6 +103,28 @@ deploy_magnet() {
     fi
 
     cd "$INSTALL_DIR" || return
+    load_current_ports
+
+    # 1. 交互式配置 Web 端口（只通过 sed 作用于 magnet-search 到 qbittorrent 之间的行）
+    echo -e "\n${CYAN}====== ⚙️ 配置核心磁力站服务端口 ======${RESET}"
+    echo -ne "${GREEN}请输入核心磁力站访问 Web 端口 (当前/默认: ${WEBUI_PORT}): ${RESET}"
+    read -r input_web_port
+    if [[ -n "$input_web_port" ]]; then
+        # 精准替换：只修改 magnet-search 块内部的 :8080 端口
+        sed -i "/magnet-search:/,/qbittorrent:/ {s/-[[:space:]]*\"[0-9]+:8080\"/- \"$input_web_port:8080\"/g}" docker-compose.yml
+        WEBUI_PORT="$input_web_port"
+    fi
+
+    # 2. 交互式配置 UDP 端口
+    echo -ne "${GREEN}请输入磁力检索 UDP 传输端口 (当前/默认: ${UDP_PORT}): ${RESET}"
+    read -r input_udp_port
+    if [[ -n "$input_udp_port" ]]; then
+        # 精准替换：只修改 magnet-search 块内部的 :6881/udp 端口
+        sed -i "/magnet-search:/,/qbittorrent:/ {s/-[[:space:]]*\"[0-9]+:6881\/udp\"/- \"$input_udp_port:6881\/udp\"/g}" docker-compose.yml
+        UDP_PORT="$input_udp_port"
+    fi
+    
+    echo -e "${GREEN}核心站端口配置已成功保存！Web端口: $WEBUI_PORT，UDP端口: $UDP_PORT${RESET}\n"
 
     clear
     echo -e "${CYAN}====== 🚀 选择组合模式启动 Magnet Fix ======${RESET}"
@@ -114,17 +151,17 @@ deploy_magnet() {
         echo -e "\n${GREEN}====================================================${RESET}"
         echo -e "${GREEN}     🧲 Magnet Fix 磁力检索系统部署/启动成功！      ${RESET}"
         echo -e "${GREEN}====================================================${RESET}"
-        echo -e "${YELLOW} 页面 / 服务       地址${RESET}"
-        echo -e " 搜索首页:        http://${DETECT_IP}:${WEBUI_PORT}"
-        echo -e " 管理后台:        http://${DETECT_IP}:${WEBUI_PORT}/admin"
-        echo -e " 默认后台密码:    ${RED}admin123${RESET}"
-        [[ "$mode_choice" =~ ^(2|4)$ ]] && echo -e " qBittorrentUI:  http://${DETECT_IP}:18080"
-        [[ "$mode_choice" =~ ^(3|4)$ ]] && echo -e " MySQL 地址:     ${DETECT_IP}:13306"
+        echo -e "${YELLOW} 页面服务         地址${RESET}"
+        echo -e "${YELLOW} 搜索首页:        http://${DETECT_IP}:${WEBUI_PORT}${RESET}"
+        echo -e "${YELLOW} 管理后台:        http://${DETECT_IP}:${WEBUI_PORT}/admin${RESET}"
+        echo -e "${YELLOW} 默认后台密码:${RESET}    ${RED}admin123${RESET}"
+        [[ "$mode_choice" =~ ^(2|4)$ ]] && echo -e "${YELLOW} qBittorrentUI:  http://${DETECT_IP}:18080${RESET}"
+        [[ "$mode_choice" =~ ^(3|4)$ ]] && echo -e "${YELLOW} MySQL 地址:     ${DETECT_IP}:13306${RESET}"
         echo -e "${GREEN}====================================================${RESET}"
     fi
 }
 
-# 选项 2：更新容器（【升级】支持手动选择范围）
+# 选项 2：更新容器
 update_magnet() {
     if [ ! -d "$INSTALL_DIR" ]; then
         echo -e "${RED}错误: 未检测到安装目录！${RESET}"
@@ -132,8 +169,16 @@ update_magnet() {
     fi
 
     cd "$INSTALL_DIR" || return
+    
+    # 暂存本地用户配置过的核心服务端口
+    load_current_ports
+    
     echo -e "${YELLOW}正在拉取 Git 源码仓库更新...${RESET}"
     git pull
+    
+    # 拉取更新后，将自定义端口重新应用回 magnet-search 局部区块，确保 qb 端口不受干扰
+    sed -i "/magnet-search:/,/qbittorrent:/ {s/-[[:space:]]*\"[0-9]+:8080\"/- \"$WEBUI_PORT:8080\"/g}" docker-compose.yml
+    sed -i "/magnet-search:/,/qbittorrent:/ {s/-[[:space:]]*\"[0-9]+:6881\/udp\"/- \"$UDP_PORT:6881\/udp\"/g}" docker-compose.yml
 
     clear
     echo -e "${CYAN}====== 🔄 请选择需要更新的服务范围 ======${RESET}"
@@ -174,7 +219,7 @@ uninstall_magnet() {
     fi
 }
 
-# 自适应群控：如果是启动或重启，只控制当前存在的组件，绝对不盲目唤醒未部署的 profile
+# 基础群控控制
 start_magnet() {
     if [ -d "$INSTALL_DIR" ]; then 
         cd "$INSTALL_DIR" || return
@@ -212,11 +257,13 @@ show_logs() {
 
 show_config() {
     if [ -d "$INSTALL_DIR" ]; then
+        load_current_ports
         echo -e "${CYAN}====== 当前环境配置 ======${RESET}"
-        echo -e "${YELLOW}安装路径:${RESET} $INSTALL_DIR"
+        echo -e "${YELLOW}安装路径: $INSTALL_DIR${RESET}"
         local active_profiles=$(get_current_profiles)
-        echo -e "${YELLOW}当前启用的 Profile:${RESET} ${active_profiles:-仅核心站点}"
-        echo -e "${YELLOW}本地映射端口:${RESET} $WEBUI_PORT"
+        echo -e "${YELLOW}当前启用的 Profile: ${active_profiles:-仅核心站点}${RESET}"
+        echo -e "${YELLOW}网页映射端口: $WEBUI_PORT${RESET}"
+        echo -e "${YELLOW}UDP 传输端口: $UDP_PORT${RESET}"
     else
         echo -e "${RED}未检测到安装配置。${RESET}"
     fi
@@ -225,12 +272,14 @@ show_config() {
 # 主菜单循环
 menu() {
     clear
+    load_current_ports
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Magnet-Fix 管理面板  ◈ ${RESET}"
+    echo -e "${GREEN}   ◈  Magnet-Fix 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态    :${RESET} $status"
-    echo -e "${GREEN}端口    :${RESET} ${YELLOW}${WEBUI_PORT}${RESET}"
+    echo -e "${GREEN}网页端口:${RESET} ${YELLOW}${WEBUI_PORT}${RESET}"
+    echo -e "${GREEN}UDP 端口:${RESET} ${YELLOW}${UDP_PORT}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

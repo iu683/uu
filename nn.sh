@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Wallos 财务订阅管理 Docker Compose 独立管理面板
+# Subs-Check 订阅检测工具 Docker Compose 独立管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="wallos"
-BASE_DIR="/opt/wallos"
+CONTAINER_NAME="subs-check"
+BASE_DIR="/opt/subs-check"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -36,11 +36,15 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8080"
+        # 分别抓取主控端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8199/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        api_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8299/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8199"
+        [[ -z "$api_port" ]] && api_port="8299"
+        port_display="${webui_port} (主) | ${api_port} (辅)"
     else
         img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
+        port_display="N/A"
     fi
 }
 
@@ -82,57 +86,74 @@ get_real_path() {
     fi
 }
 
-# 部署 Wallos
+# 部署 Subs-Check
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径进行挂载。${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用脚本同级路径进行挂载。${RESET}"
     
-    # 路径 1: 数据库目录
-    echo -ne "${YELLOW}请输入数据库(data)本地挂载路径 [默认: ./data]: ${RESET}"
-    read -r input_data
-    local path_data_raw="${input_data:-./data}"
-    local real_path_data=$(get_real_path "$path_data_raw" "./data")
+    # 路径 1: 配置目录
+    echo -ne "${YELLOW}请输入配置(config)本地挂载路径 [默认: ./config]: ${RESET}"
+    read -r input_config
+    local path_config_raw="${input_config:-./config}"
+    local real_path_config=$(get_real_path "$path_config_raw" "./config")
 
-    # 路径 2: Logo上传目录
-    echo -ne "${YELLOW}请输入图标(logos)本地挂载路径 [默认: ./logos]: ${RESET}"
-    read -r input_logos
-    local path_logos_raw="${input_logos:-./logos}"
-    local real_path_logos=$(get_real_path "$path_logos_raw" "./logos")
+    # 路径 2: 输出目录
+    echo -ne "${YELLOW}请输入数据输出(output)本地挂载路径 [默认: ./output]: ${RESET}"
+    read -r input_output
+    local path_output_raw="${input_output:-./output}"
+    local real_path_output=$(get_real_path "$path_output_raw" "./output")
 
     # 预创建目录防权限错乱
-    mkdir -p "$real_path_data" "$real_path_logos"
+    mkdir -p "$real_path_config" "$real_path_output"
 
-    echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Wallos 访问端口 [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+    echo -e "\n${CYAN}====== 2. 网络双端口配置 ======${RESET}"
+    
+    # 主端口 8199
+    echo -ne "${YELLOW}请输入 Subs-Check 主面板端口 [默认: 8199]: ${RESET}"
+    read -r port_main
+    [[ -z "$port_main" ]] && port_main="8199"
+    
+    # 辅助端口 8299
+    echo -ne "${YELLOW}请输入 Subs-Check /API端口 [默认: 8299]: ${RESET}"
+    read -r port_sub
+    [[ -z "$port_sub" ]] && port_sub="8299"
+
+    if ! [[ "$port_main" =~ ^[0-9]+$ && "$port_sub" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成完美的双挂载 docker-compose.yml 配置文件
+    # 【自动化安全保障】自动生成一个 32 位的强随机字符串作为 API_KEY
+    echo -e "${YELLOW}正在自动生成 32 位高强度 API_KEY...${RESET}"
+    local random_api_key=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
+
+    # 动态生成完美的含有资源控制的 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  wallos:
-    image: bellamy/wallos:latest
+  subs-check:
+    image: ghcr.io/beck-8/subs-check:latest
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:80"
+    mem_limit: 500m
     volumes:
-      - ${path_data_raw}:/var/www/html/db
-      - ${path_logos_raw}:/var/www/html/images/uploads/logos
+      - ${path_config_raw}:/app/config
+      - ${path_output_raw}:/app/output
+    ports:
+      - "${port_main}:8199"
+      - "${port_sub}:8299"
     environment:
       - TZ=Asia/Shanghai
+      - API_KEY=${random_api_key}
+    restart: always
+    tty: true
+    network_mode: bridge
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Wallos...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Subs-Check...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
@@ -141,40 +162,44 @@ EOF
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}          Wallos 部署成功！       ${RESET}"
+    echo -e "${GREEN}         Subs-Check 部署成功！   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}数据库挂载路径 : ${real_path_data}${RESET}"
-    echo -e "${YELLOW}图标挂载路径   : ${real_path_logos}${RESET}"
+    echo -e "${YELLOW}主面板访问地址 : http://${DETECT_IP}:${port_main}${RESET}"
+    echo -e "${YELLOW}API对接地址    : http://${DETECT_IP}:${port_sub}${RESET}"
+    echo -e "${YELLOW}自动生成API_KEY: ${random_api_key}${RESET}"
+    echo -e "${YELLOW}通用订阅地址   : http://${DETECT_IP}:${port_sub}/download/sub${RESET}"
+    echo -e "${YELLOW}配置挂载路径   : ${real_path_config}${RESET}"
+    echo -e "${YELLOW}输出挂载路径   : ${real_path_output}${RESET}"
+    echo -e "${YELLOW}内存安全配额   : 已锁死最多 500M 突发内存使用${RESET}"
     echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Wallos 镜像
+# 更新 Subs-Check 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Wallos 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Subs-Check 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Wallos
+# 卸载 Subs-Check
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 Wallos 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Subs-Check 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时彻底删除本地全部账单、记账数据库及上传的 Logo 图标？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时彻底删除本地全部检测缓存及生成的输出配置？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地数据已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有数据已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -194,7 +219,11 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}端口分配详情   : ${port_display}${RESET}"
+    if [ -f "$COMPOSE_FILE" ]; then
+        local current_key=$(grep -E "API_KEY=" "$COMPOSE_FILE" | cut -d'=' -f2)
+        echo -e "${YELLOW}当前 API_KEY   : ${current_key}${RESET}"
+    fi
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -202,10 +231,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      ◈  Wallos 管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}     ◈  Subs-Check 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

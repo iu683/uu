@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Emby-In-One 工具箱 Docker Compose 管理面板 
+# MiaoMiaoWuX (喵喵屋增强版) Docker Compose 独立管理面板
 # =================================================================
 
 # 颜色
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="emby-in-one"
-BASE_DIR="/opt/emby-in-one"
+CONTAINER_NAME="miaomiaowux"
+BASE_DIR="/opt/miaomiaowux"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONFIG_FILE="$BASE_DIR/config/config.yaml"
 
 # 检测依赖
 check_dependencies() {
@@ -21,15 +20,10 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取容器状态与映射端口
 get_status_info() {
-    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -38,19 +32,13 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="本地构建 (Local Build)"
+        [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 8096 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8096/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 兜底获取第一个绑定的端口
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8096"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "12889/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="12889"
     else
-        # 容器未安装/未部署时的返回值
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
     fi
@@ -80,119 +68,127 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Emby-In-One
+
+# 处理绝对路径与相对路径转换
+get_real_path() {
+    local input_path="$1"
+    local default_path="$2"
+    [[ -z "$input_path" ]] && input_path="$default_path"
+
+    if [[ "$input_path" == "./"* ]]; then
+        echo "$BASE_DIR/${input_path#./}"
+    else
+        echo "$input_path"
+    fi
+}
+
+# 部署 MiaoMiaoWuX
 install_utils() {
     check_dependencies
     
-    # 创建项目基础目录结构
-    mkdir -p "$BASE_DIR"/{config,data}
+    mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径进行挂载。${RESET}"
     
-    # 端口配置
-    echo -ne "${YELLOW}请输入 Emby-In-One 访问端口 (宿主机端口) [默认: 8096]: ${RESET}"
+    # 数据持久化目录
+    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
+    read -r input_data
+    local path_data_raw="${input_data:-./data}"
+    local real_path_data=$(get_real_path "$path_data_raw" "./data")
+
+    # 预创建目录
+    mkdir -p "$real_path_data"
+
+    echo -e "\n${CYAN}====== 2. 网络与内置 HTTPS 配置 ======${RESET}"
+    
+    # 主控端口配置
+    echo -ne "${YELLOW}请输入 MiaoMiaoWuX 主控面板访问端口 [默认: 12889]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8096"
+    [[ -z "$custom_port" ]] && custom_port="12889"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 密码配置
-    echo -ne "${YELLOW}请输入首次启动的管理面板初始密码 [默认: admin123]: ${RESET}"
-    read -r admin_pwd
-    [[ -z "$admin_pwd" ]] && admin_pwd="admin123"
-
-    # 1. 克隆或同步源码（【修复点】：进入目录后克隆到当前点，兼容非空目录）
-    echo -e "${YELLOW}正在拉取 Emby-In-One 源码仓库...${RESET}"
-    if [ -d "$BASE_DIR/.git" ]; then
-        cd "$BASE_DIR" && git pull
+    # HTTPS 联动开关
+    echo -ne "${YELLOW}是否需要启用内置 Nginx 证书申请与 HTTPS 功能 (会占用宿主机 80/443 端口)？(y/n) [默认: n]: ${RESET}"
+    read -r https_choice
+    local port_mappings="- \"${custom_port}:12889\""
+    
+    if [[ "$https_choice" == "y" || "$https_choice" == "Y" ]]; then
+        port_mappings="- \"${custom_port}:12889\"
+      - \"80:80\"
+      - \"443:443\""
+        echo -e "${GREEN}已联动启用 ACME 校验与 HTTPS 端口 (80/443)。${RESET}"
     else
-        cd "$BASE_DIR" && git clone https://github.com/ArizeSky/Emby-In-One.git .
+        echo -e "${YELLOW}已保持常规部署，仅映射主控面板端口。${RESET}"
     fi
 
-    # 再一次检查关键文件，确保拉取成功
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 源码拉取失败，未找到 docker-compose.yml！请检查网络后重试。${RESET}"
-        return
-    fi
+    # 自动化安全保障：随机生成 32 位 JWT 密钥
+    echo -e "${YELLOW}正在自动生成高强度 JWT 安全密钥...${RESET}"
+    local random_secret=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
 
-    # 2. 动态生成符合要求的 config.yaml 配置文件
-    echo -e "${YELLOW}正在生成初始配置文件 config.yaml...${RESET}"
-    cat <<EOF > "$CONFIG_FILE"
-server:
-  port: 8096
-  name: "Emby-In-One"
-  # trustProxy: true        # 部署在反向代理（Nginx/Caddy 等）后面时设为 true
-
-admin:
-  username: "admin"
-  password: "${admin_pwd}" # 首次启动后自动加密存储
-
-playback:
-  mode: "proxy"
-
-timeouts:
-  api: 30000
-  global: 15000
-  login: 10000
-  healthCheck: 10000
-  healthInterval: 60000
-
-proxies: []
-upstream: []
+    # 动态生成规范的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  miaomiaowux:
+    image: ghcr.io/iluobei/miaomiaowux:latest
+    container_name: ${CONTAINER_NAME}
+    restart: always
+    ports:
+      ${port_mappings}
+    volumes:
+      - ${path_data_raw}:/app/data
+    environment:
+      - PORT=12889
+      - JWT_SECRET=${random_secret}
 EOF
 
-    # 3. 修正 docker-compose.yml 的端口映射以匹配用户输入的端口
-    echo -e "${YELLOW}正在微调 docker-compose.yml 端口映射...${RESET}"
-    sed -i "s/- \"[0-9]*:8096\"/- \"${custom_port}:8096\"/g" "$COMPOSE_FILE" 2>/dev/null
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 MiaoMiaoWuX...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}正在通过 Docker Compose 构建并启动服务...${RESET}"
-    cd "$BASE_DIR" && docker compose build
-    docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待服务初始化 (约3秒)...${RESET}"
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Emby-In-One 部署成功！      ${RESET}"
+    echo -e "${GREEN}        MiaoMiaoWuX 部署成功！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}客户端连接地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}后台管理面板   : http://${DETECT_IP}:${custom_port}/admin${RESET}"
-    echo -e "${YELLOW}初始管理账号   : admin${RESET}"
-    echo -e "${YELLOW}初始管理密码   : ${admin_pwd}${RESET}"
-    echo -e "${YELLOW}配置文件路径   : $CONFIG_FILE${RESET}"
+    echo -e "${YELLOW}主控访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}已生成安全密钥 : ${random_secret}${RESET}"
+    echo -e "${YELLOW}数据存储路径   : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Emby-In-One（源码拉取并重新编译构建）
+# 更新 MiaoMiaoWuX 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到项目，请先执行选项 1 进行部署！${RESET}"
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新源码并重新构建镜像...${RESET}"
-    cd "$BASE_DIR" && git pull
-    docker compose build
+    echo -e "${YELLOW}正在从远端拉取 MiaoMiaoWuX 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新并构建完成！服务已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Emby-In-One
+# 卸载 MiaoMiaoWuX
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 Emby-In-One 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 MiaoMiaoWuX 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地数据与核心配置文件？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时彻底删除本地全部数据库与证书配置缓存？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}项目目录及数据已彻底清理。${RESET}"
+                echo -e "${GREEN}本地全部配置与缓存已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -211,9 +207,12 @@ show_info() {
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}部署工作目录   : ${BASE_DIR}${RESET}"
-    echo -e "${YELLOW}客户端连接地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}后台管理面板   : http://${DETECT_IP}:${webui_port}/admin${RESET}"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}面板访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    if [ -f "$COMPOSE_FILE" ]; then
+        local current_secret=$(grep -E "JWT_SECRET=" "$COMPOSE_FILE" | cut -d'=' -f2)
+        echo -e "${YELLOW}当前安全密钥   : ${current_secret}${RESET}"
+    fi
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -221,19 +220,19 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  Emby-In-One 管理面板 ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  MiaoMiaoWuX 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动 (源码构建)${RESET}"
-    echo -e "${GREEN}2. 更新源码并重构${RESET}"
-    echo -e "${GREEN}3. 卸载容器与删除${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
     echo -e "${GREEN}4. 启动容器${RESET}"
     echo -e "${GREEN}5. 停止容器${RESET}"
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置状态${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"

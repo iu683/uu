@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# MiaoMiaoWuX (喵喵屋增强版) Docker Compose 独立管理面板
+# DDNS-Go 动态域名解析服务 Docker Compose 独立管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="miaomiaowux"
-BASE_DIR="/opt/miaomiaowux"
+CONTAINER_NAME="ddns-go"
+BASE_DIR="/opt/ddns-go"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -25,7 +25,7 @@ check_dependencies() {
 # 动态获取容器状态与映射端口
 get_status_info() {
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
+        status="${GREEN}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
@@ -34,13 +34,15 @@ get_status_info() {
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "12889/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="12889"
+        [[ -z "$img_version" ]] && img_version="jeessy/ddns-go:latest"
+        
+        # 动态抓取映射到容器 9876 端口的宿主机实际端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9876/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="9876"
+        port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
+        port_display="N/A"
     fi
 }
 
@@ -82,113 +84,91 @@ get_real_path() {
     fi
 }
 
-# 部署 MiaoMiaoWuX
+# 部署 DDNS-Go
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
+    DETECT_IP=$(get_public_ip)
 
     echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径进行挂载。${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用标准路径 $BASE_DIR 文件夹进行直挂。${RESET}"
     
-    # 数据持久化目录
-    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
+    echo -ne "${YELLOW}请输入数据本地挂载路径 [默认: $BASE_DIR]: ${RESET}"
     read -r input_data
-    local path_data_raw="${input_data:-./data}"
-    local real_path_data=$(get_real_path "$path_data_raw" "./data")
+    local real_path_data="${input_data:-$BASE_DIR}"
+    real_path_data=$(get_real_path "$real_path_data" "$BASE_DIR")
 
-    # 预创建目录
+    # 预创建物理目录并穿透赋权
     mkdir -p "$real_path_data"
+    chmod -R 777 "$real_path_data"
 
-    echo -e "\n${CYAN}====== 2. 网络与内置 HTTPS 配置 ======${RESET}"
+    echo -e "\n${CYAN}====== 2. 网络端口与访问配置 ======${RESET}"
     
-    # 主控端口配置
-    echo -ne "${YELLOW}请输入 MiaoMiaoWuX 主控面板访问端口 [默认: 12889]: ${RESET}"
+    # 允许自定义宿主机端口
+    echo -ne "${YELLOW}请输入 DDNS-Go 宿主机 WebUI 访问端口 [默认: 9876]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="12889"
+    [[ -z "$custom_port" ]] && custom_port="9876"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # HTTPS 联动开关
-    echo -ne "${YELLOW}是否需要启用内置 Nginx 证书申请与 HTTPS 功能 (会占用宿主机 80/443 端口)？(y/n) [默认: n]: ${RESET}"
-    read -r https_choice
-    local port_mappings="- \"${custom_port}:12889\""
-    
-    if [[ "$https_choice" == "y" || "$https_choice" == "Y" ]]; then
-        port_mappings="- \"${custom_port}:12889\"
-      - \"80:80\"
-      - \"443:443\""
-        echo -e "${GREEN}已联动启用 ACME 校验与 HTTPS 端口 (80/443)。${RESET}"
-    else
-        echo -e "${YELLOW}已保持常规部署，仅映射主控面板端口。${RESET}"
-    fi
-
-    # 自动化安全保障：随机生成 32 位 JWT 密钥
-    echo -e "${YELLOW}正在自动生成高强度 JWT 安全密钥...${RESET}"
-    local random_secret=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
-
-    # 动态生成规范的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
+    # 动态生成纯净版 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成直挂本地版 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  miaomiaowux:
-    image: ghcr.io/iluobei/miaomiaowux:latest
+  ddns-go:
+    image: jeessy/ddns-go:latest
     container_name: ${CONTAINER_NAME}
     restart: always
     ports:
-      ${port_mappings}
+      - "${custom_port}:9876"
     volumes:
-      - ${path_data_raw}:/app/data
-    environment:
-      - PORT=12889
-      - JWT_SECRET=${random_secret}
+      - ${real_path_data}:/root
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 MiaoMiaoWuX...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 DDNS-Go...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
-    DETECT_IP=$(get_public_ip)
-
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        MiaoMiaoWuX 部署成功！    ${RESET}"
+    echo -e "${GREEN}         DDNS-Go 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}主控访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}已生成安全密钥 : ${random_secret}${RESET}"
-    echo -e "${YELLOW}数据存储路径   : ${real_path_data}${RESET}"
-    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}WebUI 管理后台   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}本地配置挂载路径 : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}配置文件路径     : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 MiaoMiaoWuX 镜像
+# 更新 DDNS-Go 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 MiaoMiaoWuX 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 DDNS-Go 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 MiaoMiaoWuX
+# 卸载 DDNS-Go
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 MiaoMiaoWuX 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您配置的 DNS 服务商 Token 及域名同步列表！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 DDNS-Go 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时彻底删除本地全部数据库与证书配置缓存？(y/n): ${RESET}"
+            echo -ne "${RED}【高风险】是否同时彻底删除本地全量挂载的域名解析配置？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地全部配置与缓存已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有 DDNS-Go 配置文件已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -208,11 +188,7 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}面板访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    if [ -f "$COMPOSE_FILE" ]; then
-        local current_secret=$(grep -E "JWT_SECRET=" "$COMPOSE_FILE" | cut -d'=' -f2)
-        echo -e "${YELLOW}当前安全密钥   : ${current_secret}${RESET}"
-    fi
+    echo -e "${YELLOW}管理后台地址   : http://${DETECT_IP}:${port_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -220,10 +196,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  MiaoMiaoWuX 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}     ◈  DDNS-Go 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

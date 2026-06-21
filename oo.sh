@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# 青龙面板自动化定时任务管理服务 Docker Compose 独立管理面板
+# WebSSH 浏览器终端服务 Docker Compose 独立管理面板 (安全验证版)
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="qinglong"
-BASE_DIR="/opt/qinglong"
+CONTAINER_NAME="webssh"
+BASE_DIR="/opt/webssh"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -34,11 +34,11 @@ get_status_info() {
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="whyour/qinglong:latest"
+        [[ -z "$img_version" ]] && img_version="eooce/webssh:latest"
         
-        # 动态抓取映射到容器 5700 端口的宿主机实际端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5700/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="5700"
+        # 动态抓取映射到容器 8888 端口的宿主机实际端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8888/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8888"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -71,108 +71,98 @@ get_public_ip() {
 }
 
 
-# 处理绝对路径与相对路径转换
-get_real_path() {
-    local input_path="$1"
-    local default_path="$2"
-    [[ -z "$input_path" ]] && input_path="$default_path"
-
-    if [[ "$input_path" == "./"* ]]; then
-        echo "$BASE_DIR/${input_path#./}"
-    else
-        echo "$input_path"
-    fi
-}
-
-# 部署青龙面板
+# 部署 WebSSH
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 文件夹（聚合存储脚本、日志及配置）。${RESET}"
+    echo -e "${CYAN}====== 1. 网页端安全验证配置 ======${RESET}"
+    echo -e "${YELLOW}提示: 如果不需要为网页端设置登录密码，直接一路回车留空即可。${RESET}"
     
-    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
-    read -r input_data
-    local path_data_raw="${input_data:-./data}"
-    local real_path_data=$(get_real_path "$path_data_raw" "./data")
-
-    # 预创建全量依赖目录并穿透赋权
-    echo -e "${YELLOW}正在宿主机预构建并穿透赋权青龙物理数据目录...${RESET}"
-    mkdir -p "$real_path_data"
-    chmod -R 777 "$real_path_data"
+    echo -ne "${YELLOW}请输入 Web 登录用户名 (USER) [默认留空]: ${RESET}"
+    read -r web_user
+    
+    local web_pass=""
+    if [[ -n "$web_user" ]]; then
+        echo -ne "${YELLOW}请设置该用户的登录密码 (PASS): ${RESET}"
+        read -r web_pass
+        if [[ -z "$web_pass" ]]; then
+            echo -e "${RED}警告: 已设置用户名但密码为空，将不激活安全验证机制！${RESET}"
+        fi
+    fi
 
     echo -e "\n${CYAN}====== 2. 网络端口与访问配置 ======${RESET}"
     
     # 允许自定义宿主机端口
-    echo -ne "${YELLOW}请输入青龙面板宿主机 WebUI 访问端口 [默认: 5700]: ${RESET}"
+    echo -ne "${YELLOW}请输入 WebSSH 宿主机外部访问端口 [默认: 8888]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="5700"
+    [[ -z "$custom_port" ]] && custom_port="8888"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成自定义端口的 docker-compose.yml 配置文件 (纯净直挂版)
+    # 动态生成自定义端口与环境变量的 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成原生直挂版 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  qinglong:
-    image: whyour/qinglong:latest
+  webssh:
+    image: eooce/webssh:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     ports:
-      - "${custom_port}:5700"
-    volumes:
-      - ${path_data_raw}:/ql/data
+      - "${custom_port}:8888"
+    environment:
+      - USER=${web_user}
+      - PASS=${web_pass}
+      - PORT=8888
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动青龙面板...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 WebSSH...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}         青龙面板 部署成功！       ${RESET}"
+    echo -e "${GREEN}          WebSSH 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}WebUI 管理后台   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}数据本地直挂路径 : ${real_path_data}${RESET}"
-    echo -e "${YELLOW}配置文件路径     : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}终端访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    if [[ -n "$web_user" && -n "$web_pass" ]]; then
+        echo -e "${GREEN}网页访问认证 : 已启用 [用户: ${web_user}]${RESET}"
+    else
+        echo -e "${RED}网页访问认证 : 未启用 (任何人可直接进入后台)${RESET}"
+    fi
+    echo -e "${YELLOW}配置文件路径 : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${CYAN}💡 提示: 首次进入后台请根据向导设置您的管理员账号和密码。${RESET}"
+    echo -e "${CYAN}💡 提示: 进入网页后，您可以输入您任意服务器的 IP、端口、账号及密码直接发起 SSH 连接。${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新青龙面板镜像
+# 更新 WebSSH 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取青龙面板最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 WebSSH 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！青龙面板已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！组件已处于最新状态。${RESET}"
 }
 
-# 卸载青龙面板
+# 卸载 WebSSH
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您在面板里配置的定时任务、环境变量、互助码及所有脚本！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除青龙面板容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 WebSSH 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}【高风险】是否同时彻底删除本地全量挂载的所有自动化脚本及配置数据库？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有青龙历史任务数据已被彻底销毁。${RESET}"
-            fi
+            rm -rf "$BASE_DIR"
+            echo -e "${GREEN}本地配置文件夹已清理。${RESET}"
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
@@ -191,7 +181,7 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}管理后台地址   : http://${DETECT_IP}:${port_display}${RESET}"
+    echo -e "${YELLOW}访问地址       : http://${DETECT_IP}:${port_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -199,7 +189,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  青龙面板 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}       ◈  WebSSH 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
@@ -211,7 +201,7 @@ menu() {
     echo -e "${GREEN}5. 停止容器${RESET}"
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}8. 查看配置状态${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"

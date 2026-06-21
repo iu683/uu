@@ -1,45 +1,57 @@
 #!/bin/bash
 # =================================================================
-# Magnet Fix (磁力检索与下载系统) Docker Compose 管理脚本
+# embypulse-pro 工具箱 Docker Compose 管理面板 
 # =================================================================
 
-# 颜色定义
+# 颜色
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-INSTALL_DIR="/opt/magnet-fix"
-CONTAINER_NAME="magnet-search"
+CONTAINER_NAME="embypulse-pro"
+BASE_DIR="/opt/embypulse_pro"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
-# 默认端口配置
-DEFAULT_WEB_PORT="8080"
-DEFAULT_UDP_PORT="6881"
-
-# 检测基础依赖
+# 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态从 docker-compose.yml 实时读取当前配置的端口
-load_current_ports() {
-    if [ -f "$INSTALL_DIR/docker-compose.yml" ]; then
-        # 利用 grep 和 sed 提取当前设置的端口
-        WEBUI_PORT=$(grep -E '[0-9]+:8080' "$INSTALL_DIR/docker-compose.yml" | head -n1 | awk -F'"' '{print $2}' | cut -d':' -f1)
-        UDP_PORT=$(grep -E '[0-9]+:6881/udp' "$INSTALL_DIR/docker-compose.yml" | head -n1 | awk -F'"' '{print $2}' | cut -d':' -f1)
+# 动态获取容器状态、映射端口和数据目录
+get_status_info() {
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
     fi
-    
-    # 兜底默认值
-    : "${WEBUI_PORT:=$DEFAULT_WEB_PORT}"
-    : "${UDP_PORT:=$DEFAULT_UDP_PORT}"
+
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        # 从容器状态提取管理端口（容器内部 10307）
+        admin_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "10307/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$admin_port" ]] && admin_port="10307"
+
+        # 从容器状态提取用户端口（容器内部 10308）
+        user_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "10308/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$user_port" ]] && user_port="10308"
+    else
+        # 容器未安装/未部署时的返回值
+        img_version="${RED}未安装${RESET}"
+        admin_port="N/A"
+        user_port="N/A"
+    fi
 }
 
 # 获取公网 IP (兼容双栈环境)
@@ -66,220 +78,126 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器当前运行状态
-get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
-}
-
-# 自动分析当前已部署的 Profile 状态
-get_current_profiles() {
-    local profiles=""
-    if [ "$(docker ps -aq -f name=^/qbittorrent$)" ]; then
-        profiles="$profiles --profile with-qb"
-    fi
-    if [ "$(docker ps -aq -f name=^/magnet-mysql$)" ]; then
-        profiles="$profiles --profile with-mysql"
-    fi
-    echo "$profiles"
-}
-
-# 选项 1：一键拉取仓库并支持直接修改端口部署
-deploy_magnet() {
+# 部署 embypulse-pro
+install_utils() {
     check_dependencies
     
-    if [ ! -d "$INSTALL_DIR" ]; then
-        echo -e "${YELLOW}正在从 GitHub 克隆 magnet_fix 源码仓库...${RESET}"
-        git clone https://github.com/poouo/magnet_fix.git "$INSTALL_DIR"
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}错误: 克隆仓库失败！${RESET}"
-            return
-        fi
-    fi
+    # 创建主目录及挂载所需的子目录
+    mkdir -p "$BASE_DIR/config" "$BASE_DIR/data"
 
-    cd "$INSTALL_DIR" || return
-    load_current_ports
-
-    # 1. 交互式直接修改 Web 端口
-    echo -e "\n${CYAN}====== ⚙️ 配置磁力站服务端口 ======${RESET}"
-    echo -ne "${GREEN}请输入核心磁力站访问 Web 端口 (当前/默认: ${WEBUI_PORT}): ${RESET}"
-    read -r input_web_port
-    if [[ -n "$input_web_port" ]]; then
-        # 直接使用 sed 精准替换 docker-compose.yml 中包含 :8080 的端口行
-        sed -i -E "s/-[[:space:]]*\"[0-9]+:8080\"/- \"$input_web_port:8080\"/g" docker-compose.yml
-        WEBUI_PORT="$input_web_port"
-    fi
-
-    # 2. 交互式直接修改 UDP 端口
-    echo -ne "${GREEN}请输入磁力检索 UDP 传输端口 (当前/默认: ${UDP_PORT}): ${RESET}"
-    read -r input_udp_port
-    if [[ -n "$input_udp_port" ]]; then
-        # 直接使用 sed 精准替换 docker-compose.yml 中包含 :6881/udp 的端口行
-        sed -i -E "s/-[[:space:]]*\"[0-9]+:6881\/udp\"/- \"$input_udp_port:6881\/udp\"/g" docker-compose.yml
-        UDP_PORT="$input_udp_port"
-    fi
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -e "${GREEN}端口配置已直接写入修改！网页端口: $WEBUI_PORT，UDP端口: $UDP_PORT${RESET}\n"
+    # 配置管理端口
+    echo -ne "${YELLOW}请输入管理端口 (宿主机端口，建议仅内网暴露) [默认: 10307]: ${RESET}"
+    read -r custom_admin_port
+    [[ -z "$custom_admin_port" ]] && custom_admin_port="10307"
+    if ! [[ "$custom_admin_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
 
-    clear
-    echo -e "${CYAN}====== 🚀 选择组合模式启动 Magnet Fix ======${RESET}"
-    echo -e " [1] 仅启动搜索站点 (默认内置 SQLite)"
-    echo -e " [2] 同时启动搜索站点 + 示例 qBittorrent 服务"
-    echo -e " [3] 同时启动搜索站点 + 示例 MySQL 服务"
-    echo -e " [4] 同时启动全家桶 (站点 + qBittorrent + MySQL)"
-    echo -ne "${GREEN}请选择启动模式 (1-4): ${RESET}"
-    read -r mode_choice
+    # 配置用户端口
+    echo -ne "${YELLOW}请输入用户端口 (宿主机端口，可对外开放) [默认: 10308]: ${RESET}"
+    read -r custom_user_port
+    [[ -z "$custom_user_port" ]] && custom_user_port="10308"
+    if ! [[ "$custom_user_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
 
-    echo -e "\n${YELLOW}正在通过 Docker Compose 构建并拉起容器...${RESET}"
-    
-    case "$mode_choice" in
-        1) docker compose up -d --build magnet-search ;;
-        2) docker compose --profile with-qb up -d --build ;;
-        3) docker compose --profile with-mysql up -d --build ;;
-        4) docker compose --profile with-qb --profile with-mysql up -d --build ;;
-        *) echo -e "${RED}无效选择，放弃部署。${RESET}" ; return ;;
-    esac
+    # 1. 动态生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  embypulse-pro:
+    image: ghcr.io/amlkiller/emby-pulse:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    ports:
+      - "${custom_admin_port}:10307"
+      - "${custom_user_port}:10308"
+    volumes:
+      - ./config:/workspace/config
+      - ./data:/workspace/data
+    environment:
+      - TZ=Asia/Shanghai
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 embypulse-pro...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
 
     DETECT_IP=$(get_public_ip)
 
-    if [ $? -eq 0 ]; then
-        echo -e "\n${GREEN}====================================================${RESET}"
-        echo -e "${GREEN}     🧲 Magnet Fix 磁力检索系统部署/启动成功！      ${RESET}"
-        echo -e "${GREEN}====================================================${RESET}"
-        echo -e "${YELLOW} 页面服务         地址${RESET}"
-        echo -e "${YELLOW} 搜索首页:        http://${DETECT_IP}:${WEBUI_PORT}${RESET}"
-        echo -e "${YELLOW} 管理后台:        http://${DETECT_IP}:${WEBUI_PORT}/admin${RESET}"
-        echo -e "${YELLOW} 默认后台密码:${RESET}    ${RED}admin123${RESET}"
-        [[ "$mode_choice" =~ ^(2|4)$ ]] && echo -e "${YELLOW} qBittorrentUI:  http://${DETECT_IP}:18080${RESET}"
-        [[ "$mode_choice" =~ ^(3|4)$ ]] && echo -e "${YELLOW} MySQL 地址:     ${DETECT_IP}:13306${RESET}"
-        echo -e "${GREEN}====================================================${RESET}"
-    fi
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     embypulse-pro 部署成功！    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}管理界面地址   : http://${DETECT_IP}:${custom_admin_port}${RESET}"
+    echo -e "${YELLOW}用户界面地址   : http://${DETECT_IP}:${custom_user_port}${RESET}"
+    echo -e "${YELLOW}请修改配置 $APP_DIR/config并重启${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 选项 2：更新容器
-update_magnet() {
-    if [ ! -d "$INSTALL_DIR" ]; then
-        echo -e "${RED}错误: 未检测到安装目录！${RESET}"
+# 更新 embypulse-pro 镜像
+update_utils() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-
-    cd "$INSTALL_DIR" || return
-    
-    # 临时备份本地已经直接修改过的端口配置
-    load_current_ports
-    
-    echo -e "${YELLOW}正在拉取 Git 源码仓库更新...${RESET}"
-    git pull
-    
-    # 拉取更新后，重新把之前直接修改的端口写回去，防止被仓库源码覆盖
-    sed -i -E "s/-[[:space:]]*\"[0-9]+:8080\"/- \"$WEBUI_PORT:8080\"/g" docker-compose.yml
-    sed -i -E "s/-[[:space:]]*\"[0-9]+:6881\/udp\"/- \"$UDP_PORT:6881\/udp\"/g" docker-compose.yml
-
-    clear
-    echo -e "${CYAN}====== 🔄 请选择需要更新的服务范围 ======${RESET}"
-    echo -e " [1] 仅更新/拉取核心磁力站 (不触动/不唤醒 qB 和 MySQL)"
-    echo -e " [2] 完全更新当前环境中已存在的所有组件 (根据本地已有容器自动匹配)"
-    echo -ne "${GREEN}请选择操作 (1/2): ${RESET}"
-    read -r up_choice
-
-    if [ "$up_choice" = "1" ]; then
-        echo -e "${YELLOW}正在精准更新核心容器...${RESET}"
-        docker compose pull magnet-search
-        docker compose up -d --build magnet-search
-    elif [ "$up_choice" = "2" ]; then
-        local active_profiles=$(get_current_profiles)
-        echo -e "${YELLOW}识别到当前关联组件:${RESET} ${active_profiles:-无(仅核心)}"
-        echo -e "${YELLOW}正在全面更新关联的组件容器...${RESET}"
-        docker compose $active_profiles pull
-        docker compose $active_profiles up -d --build
-    else
-        echo -e "${RED}无效选项，已取消更新。${RESET}"
-        return
-    fi
-    echo -e "${GREEN}更新及重构流程完成！${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 embypulse-pro 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 选项 3：彻底卸载清理
-uninstall_magnet() {
-    echo -ne "${RED}警告: 确定要彻底卸载磁力站并清理所有相关数据吗？(y/n): ${RESET}"
+# 卸载 embypulse-pro
+uninstall_utils() {
+    echo -ne "${YELLOW}确定要卸载并删除 embypulse-pro 容器吗？(y/n): ${RESET}"
     read -r confirm
-    if [[ "$confirm" = "y" || "$confirm" = "Y" ]]; then
-        if [ -d "$INSTALL_DIR" ]; then
-            cd "$INSTALL_DIR" && docker compose --profile with-qb --profile with-mysql down -v
-            rm -rf "$INSTALL_DIR"
-            echo -e "${GREEN}彻底卸载清理完成。${RESET}"
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地数据与配置文件？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}配置及数据目录已彻底清理。${RESET}"
+            fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 群控命令
-start_magnet() {
-    if [ -d "$INSTALL_DIR" ]; then 
-        cd "$INSTALL_DIR" || return
-        local active_profiles=$(get_current_profiles)
-        docker compose $active_profiles start
-        echo -e "${GREEN}关联容器已全面拉起！${RESET}"
-    fi
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+
+show_info() {
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}管理界面地址   : http://${DETECT_IP}:${admin_port}${RESET}"
+    echo -e "${YELLOW}用户界面地址   : http://${DETECT_IP}:${user_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-stop_magnet() {
-    if [ -d "$INSTALL_DIR" ]; then 
-        cd "$INSTALL_DIR" || return
-        local active_profiles=$(get_current_profiles)
-        docker compose $active_profiles stop
-        echo -e "${YELLOW}关联容器已全面停止！${RESET}"
-    fi
-}
-
-restart_magnet() {
-    if [ -d "$INSTALL_DIR" ]; then 
-        cd "$INSTALL_DIR" || return
-        local active_profiles=$(get_current_profiles)
-        docker compose $active_profiles restart
-        echo -e "${GREEN}关联容器已平滑重启！${RESET}"
-    fi
-}
-
-show_logs() {
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        docker logs -f --tail=100 "$CONTAINER_NAME"
-    else
-        echo -e "${RED}容器未运行！${RESET}"
-    fi
-}
-
-show_config() {
-    if [ -d "$INSTALL_DIR" ]; then
-        load_current_ports
-        echo -e "${CYAN}====== 当前环境配置 ======${RESET}"
-        echo -e "${YELLOW}安装路径: $INSTALL_DIR${RESET}"
-        local active_profiles=$(get_current_profiles)
-        echo -e "${YELLOW}当前启用的 Profile: ${active_profiles:-仅核心站点}${RESET}"
-        echo -e "${YELLOW}网页映射端口: $WEBUI_PORT${RESET}"
-        echo -e "${YELLOW}UDP 传输端口: $UDP_PORT${RESET}"
-    else
-        echo -e "${RED}未检测到安装配置。${RESET}"
-    fi
-}
-
-# 主菜单循环
 menu() {
     clear
-    load_current_ports
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Magnet-Fix 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}  ◈  embypulse-pro 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态    :${RESET} $status"
-    echo -e "${GREEN}网页端口:${RESET} ${YELLOW}${WEBUI_PORT}${RESET}"
-    echo -e "${GREEN}UDP 端口:${RESET} ${YELLOW}${UDP_PORT}${RESET}"
+    echo -e "${GREEN}状态     :${RESET} $status"
+    echo -e "${GREEN}管理端口 :${RESET} ${YELLOW}${admin_port}${RESET}"
+    echo -e "${GREEN}用户端口 :${RESET} ${YELLOW}${user_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -289,19 +207,19 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) deploy_magnet ;;
-        2) update_magnet ;;
-        3) uninstall_magnet ;;
-        4) start_magnet ;;
-        5) stop_magnet ;;
-        6) restart_magnet ;;
-        7) show_logs ;;
-        8) show_config ;;
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
+        8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac
@@ -309,6 +227,6 @@ menu() {
 
 while true; do
     menu
-    echo -ne "\n${YELLOW}按回车键继续...${RESET}"
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
     read -r
 done

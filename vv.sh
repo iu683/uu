@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# DDNS-Go 动态域名解析服务 Docker Compose 独立管理面板 (支持 Host 模式)
+# Baihu (白虎) 网关/应用服务 Docker Compose 独立管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="ddns-go"
-BASE_DIR="/opt/ddns-go"
+CONTAINER_NAME="baihu"
+BASE_DIR="/opt/baihu"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,7 +22,7 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态与网络/端口模式
+# 动态获取容器状态与映射端口
 get_status_info() {
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${GREEN}运行中${RESET}"
@@ -34,18 +34,12 @@ get_status_info() {
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="jeessy/ddns-go:latest"
+        [[ -z "$img_version" ]] && img_version="ghcr.io/engigu/baihu:latest"
         
-        # 检测是否为 host 网络模式
-        local net_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CONTAINER_NAME" 2>/dev/null)
-        if [ "$net_mode" = "host" ]; then
-            port_display="Host 模式共享宿主机 (默认 9876)"
-        else
-            # 动态抓取映射到容器 9876 端口的宿主机实际端口
-            webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9876/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-            [[ -z "$webui_port" ]] && webui_port="9876"
-            port_display="${webui_port} (Bridge 模式)"
-        fi
+        # 动态抓取映射到容器 8052 端口的宿主机实际端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8052/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8052"
+        port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
         port_display="N/A"
@@ -76,6 +70,27 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
+
+# 提取并显示初始密码
+find_initial_password() {
+    if [ ! "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        echo -e "${RED}错误: 容器未部署，无法获取密码。${RESET}"
+        return
+    fi
+    echo -e "${CYAN}正在检索容器日志中的管理员初始化信息...${RESET}"
+    local pwd_log=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -A 3 "管理员账号创建成功")
+    if [[ -n "$pwd_log" ]]; then
+        echo -e "${GREEN}===============================================${RESET}"
+        echo -e "${GREEN}🎉 成功找到系统生成的管理员初始信息：${RESET}"
+        echo -e "${YELLOW}${pwd_log}${RESET}"
+        echo -e "${GREEN}默认用户名 : admin${RESET}"
+        echo -e "${GREEN}===============================================${RESET}"
+    else
+        echo -e "${YELLOW}提示: 未在当前日志中捕获到初始密码信息。${RESET}"
+        echo -e "${YELLOW}原因可能是：您已经不是首次启动，或者日志已被刷新轮转。${RESET}"
+    fi
+}
+
 # 处理绝对路径与相对路径转换
 get_real_path() {
     local input_path="$1"
@@ -89,7 +104,7 @@ get_real_path() {
     fi
 }
 
-# 部署 DDNS-Go
+# 部署 Baihu
 install_utils() {
     check_dependencies
     
@@ -97,104 +112,105 @@ install_utils() {
     DETECT_IP=$(get_public_ip)
 
     echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用标准路径 $BASE_DIR 文件夹进行直挂。${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 和 envs 文件夹。${RESET}"
     
-    echo -ne "${YELLOW}请输入数据本地挂载路径 [默认: $BASE_DIR]: ${RESET}"
+    echo -ne "${YELLOW}请输入数据根挂载路径 [默认: ./]: ${RESET}"
     read -r input_data
-    local real_path_data="${input_data:-$BASE_DIR}"
-    real_path_data=$(get_real_path "$real_path_data" "$BASE_DIR")
+    local path_root_raw="${input_data:-./}"
+    
+    # 动态预计算物理绝对路径
+    local real_path_data=$(get_real_path "${path_root_raw%/}/data" "./data")
+    local real_path_envs=$(get_real_path "${path_root_raw%/}/envs" "./envs")
 
-    # 预创建物理目录并穿透赋权
-    mkdir -p "$real_path_data"
-    chmod -R 777 "$real_path_data"
+    # 预创建全量依赖目录并穿透赋权
+    echo -e "${YELLOW}正在宿主机预构建并穿透赋权物理目录...${RESET}"
+    mkdir -p "$real_path_data" "$real_path_envs"
+    chmod -R 777 "$real_path_data" "$real_path_envs"
 
-    echo -e "\n${CYAN}====== 2. 网络模式配置 (Host / Bridge) ======${RESET}"
-    echo -e "${YELLOW}提示: 强烈推荐 Host 模式，能直通宿主机网络，完美获取本地 IPv6 地址。${RESET}"
-    echo -ne "${GREEN}是否启用 Host 网络模式？(y/n) [默认: y]: ${RESET}"
-    read -r net_choice
-    [[ -z "$net_choice" ]] && net_choice="y"
-
-    local net_block=""
-    local port_block=""
-    local final_port="9876"
-
-    if [[ "$net_choice" == "y" || "$net_choice" == "Y" ]]; then
-        # Host 模式配置
-        net_block="network_mode: \"host\""
-        port_block=""
-        final_port="9876"
-        echo -e "${GREEN}已选择 Host 网络模式（将直接使用宿主机 9876 端口）${RESET}"
-    else
-        # Bridge 模式配置，允许自定端口
-        net_block=""
-        echo -ne "${YELLOW}请输入 DDNS-Go 宿主机 WebUI 访问端口 [默认: 9876]: ${RESET}"
-        read -r custom_port
-        [[ -z "$custom_port" ]] && custom_port="9876"
-        if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-            return
-        fi
-        port_block="ports:
-      - \"${custom_port}:9876\""
-        final_port="$custom_port"
-        echo -e "${GREEN}已选择 Bridge 网络模式（映射端口: ${custom_port}）${RESET}"
+    echo -e "\n${CYAN}====== 2. 网络端口与访问配置 ======${RESET}"
+    
+    # 允许自定义宿主机端口
+    echo -ne "${YELLOW}请输入 Baihu 宿主机外部访问端口 [默认: 8052]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8052"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
     fi
 
-    # 动态生成纯净版 docker-compose.yml 配置文件
+    # 动态生成自定义端口的 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成原生直挂版 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  ddns-go:
-    image: jeessy/ddns-go:latest
+  baihu:
+    image: ghcr.io/engigu/baihu:latest
     container_name: ${CONTAINER_NAME}
-    restart: always
-    ${net_block}
-    ${port_block}
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:8052"
     volumes:
-      - ${real_path_data}:/root
+      - ${path_root_raw%/}/data:/app/data
+      - ${path_root_raw%/}/envs:/app/envs
+    environment:
+      - TZ=Asia/Shanghai
+      - BH_SERVER_PORT=8052
+      - BH_SERVER_HOST=0.0.0.0
+      - BH_DB_TYPE=sqlite
+      - BH_DB_PATH=/app/data/baihu.db
+      - BH_DB_TABLE_PREFIX=baihu_
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 DDNS-Go...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Baihu...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}等待容器初始化并生成密码 (约5秒)...${RESET}"
+    sleep 5
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}         DDNS-Go 部署成功！       ${RESET}"
+    echo -e "${GREEN}          Baihu 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}WebUI 管理后台   : http://${DETECT_IP}:${final_port}${RESET}"
-    echo -e "${YELLOW}本地配置挂载路径 : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}服务访问/API 地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}本地数据直挂路径 : ${real_path_data}${RESET}"
     echo -e "${YELLOW}配置文件路径     : $COMPOSE_FILE${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    
+    # 首次部署成功直接在此处调用智提密码函数
+    find_initial_password
+    
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 DDNS-Go 镜像
+# 更新 Baihu 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 DDNS-Go 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Baihu 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！组件已处于最新状态。${RESET}"
 }
 
-# 卸载 DDNS-Go
+# 卸载 Baihu
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您配置的 DNS 服务商 Token 及域名同步列表！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 DDNS-Go 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的 SQLite 数据库内容及环境变动！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Baihu 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}【高风险】是否同时彻底删除本地全量挂载的域名解析配置？(y/n): ${RESET}"
+            echo -ne "${RED}【高风险】是否同时彻底删除本地全量挂载的数据库和环境配置文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有 DDNS-Go 配置文件已被彻底销毁。${RESET}"
+                echo -e "${GREEN}本地所有 Baihu 历史数据已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -214,7 +230,7 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}当前网络/端口  : ${port_display}${RESET}"
+    echo -e "${YELLOW}访问地址       : http://${DETECT_IP}:${port_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -222,10 +238,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  DDNS-Go 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}      ◈  Baihu 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}网络 :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -234,7 +250,7 @@ menu() {
     echo -e "${GREEN}5. 停止容器${RESET}"
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}8. 查看配置状态${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# WebSSH 浏览器终端服务 Docker Compose 独立管理面板 (安全验证版)
+# 思源笔记 (SiYuan) 双链知识库 Docker Compose 独立管理面板
 # =================================================================
 
 # 颜色
@@ -10,9 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="webssh"
-BASE_DIR="/opt/webssh"
+CONTAINER_NAME="siyuan-notebook"
+BASE_DIR="/opt/siyuan"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -25,7 +26,7 @@ check_dependencies() {
 # 动态获取容器状态与映射端口
 get_status_info() {
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${GREEN}运行中${RESET}"
+        status="${GREEN}运行中 (多端安全同步中)${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
@@ -34,11 +35,11 @@ get_status_info() {
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="eooce/webssh:latest"
+        [[ -z "$img_version" ]] && img_version="b3log/siyuan:latest"
         
-        # 动态抓取映射到容器 8888 端口的宿主机实际端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8888/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8888"
+        # 动态抓取映射到容器 6806 端口的宿主机实际端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "6806/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="6806"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -71,98 +72,136 @@ get_public_ip() {
 }
 
 
-# 部署 WebSSH
-install_utils() {
+# 处理绝对路径与相对路径转换
+get_real_path() {
+    local input_path="$1"
+    local default_path="$2"
+    [[ -z "$input_path" ]] && input_path="$default_path"
+
+    if [[ "$input_path" == "./"* ]]; then
+        echo "$BASE_DIR/${input_path#./}"
+    else
+        echo "$input_path"
+    fi
+}
+
+# 一键部署思源笔记
+install_siyuan() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 网页端安全验证配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 如果不需要为网页端设置登录密码，直接一路回车留空即可。${RESET}"
+    echo -e "${CYAN}====== 1. 知识库数据挂载路径 ======${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用脚本同级路径下的 workspace 文件夹。${RESET}"
     
-    echo -ne "${YELLOW}请输入 Web 登录用户名 (USER) [默认留空]: ${RESET}"
-    read -r web_user
+    echo -ne "${YELLOW}请输入笔记数据存放路径 [默认: ./workspace]: ${RESET}"
+    read -r input_data
+    local path_data_raw="${input_data:-./workspace}"
+    local real_path_data=$(get_real_path "$path_data_raw" "./workspace")
+
+    echo -e "\n${CYAN}====== 2. 安全访问与网络端口 ======${RESET}"
     
-    local web_pass=""
-    if [[ -n "$web_user" ]]; then
-        echo -ne "${YELLOW}请设置该用户的登录密码 (PASS): ${RESET}"
-        read -r web_pass
-        if [[ -z "$web_pass" ]]; then
-            echo -e "${RED}警告: 已设置用户名但密码为空，将不激活安全验证机制！${RESET}"
-        fi
+    # 交互式设定 AuthCode
+    echo -e "${YELLOW}提示: 思源笔记必须设置访问授权码，用于网页端及 APP 端同步校验。${RESET}"
+    echo -ne "${YELLOW}请设置您的安全访问密码 (AuthCode) [留空则随机生成]: ${RESET}"
+    read -r custom_auth
+    if [[ -z "$custom_auth" ]]; then
+        # 随机生成一个 8 位高强度口令
+        custom_auth=$(head -c 4 /dev/urandom | xxd -p | tr -d '[:space:]')
     fi
 
-    echo -e "\n${CYAN}====== 2. 网络端口与访问配置 ======${RESET}"
-    
     # 允许自定义宿主机端口
-    echo -ne "${YELLOW}请输入 WebSSH 宿主机外部访问端口 [默认: 8888]: ${RESET}"
+    echo -ne "${YELLOW}请输入思源笔记宿主机外部访问端口 [默认: 6806]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8888"
+    [[ -z "$custom_port" ]] && custom_port="6806"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成自定义端口与环境变量的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成原生直挂版 docker-compose.yml...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  webssh:
-    image: eooce/webssh:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:8888"
-    environment:
-      - USER=${web_user}
-      - PASS=${web_pass}
-      - PORT=8888
+    # 智能提取当前宿主执行用户的专属 PUID/PGID，彻底解决 Docker 挂载写入挂掉的通病
+    local current_puid=$(id -u)
+    local current_pgid=$(id -g)
+
+    # 预先构建物理目录、将所有权无缝转换给思源运行用户组并穿透赋权
+    echo -e "${YELLOW}正在对宿主机进行物理知识库目录预建与降权赋权安全对齐...${RESET}"
+    mkdir -p "$real_path_data"
+    chown -R "$current_puid:$current_pgid" "$real_path_data"
+    chmod -R 777 "$real_path_data"
+
+    # 生成环境配置文件 .env
+    cat <<EOF > "$ENV_FILE"
+AuthCode=${custom_auth}
+YOUR_TIME_ZONE=Asia/Shanghai
+YOUR_USER_PUID=${current_puid}
+YOUR_USER_PGID=${current_pgid}
+HOST_PORT=${custom_port}
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 WebSSH...${RESET}"
+    # 生成标准的解耦版 docker-compose.yml 结构体
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  main:
+    image: b3log/siyuan:latest
+    container_name: ${CONTAINER_NAME}
+    command: ['--workspace=/siyuan/workspace/', '--accessAuthCode=\${AuthCode}']
+    ports:
+      - "\${HOST_PORT:-6806}:6806"
+    volumes:
+      - ${path_data_raw}:/siyuan/workspace
+    restart: unless-stopped
+    environment:
+      - TZ=\${YOUR_TIME_ZONE}
+      - PUID=\${YOUR_USER_PUID}
+      - PGID=\${YOUR_USER_PGID}
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 拉起思源笔记引擎...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    echo -e "${YELLOW}等待容器安全建立块级索引 (约3秒)...${RESET}"
     sleep 3
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}          WebSSH 部署成功！       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}终端访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    if [[ -n "$web_user" && -n "$web_pass" ]]; then
-        echo -e "${GREEN}网页访问认证 : 已启用 [用户: ${web_user}]${RESET}"
-    else
-        echo -e "${RED}网页访问认证 : 未启用 (任何人可直接进入后台)${RESET}"
-    fi
-    echo -e "${YELLOW}配置文件路径 : $COMPOSE_FILE${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${CYAN}💡 提示: 进入网页后，您可以输入您任意服务器的 IP、端口、账号及密码直接发起 SSH 连接。${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}         🎉 思源笔记 (SiYuan) 部署成功！             ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}服务面板访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${GREEN}安全访问授权密码 : ${custom_auth}${RESET}"
+    echo -e "${YELLOW}宿主机数据存储夹 : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}宿主机底座所有权 : UID=${current_puid} | GID=${current_pgid} (已完美融合)${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    echo -e "${CYAN}💡 使用指南: 打开网页或在桌面/手机端 SiYuan APP 中连接此地址，输入上述密码即可开始无网本地优先的块级双链笔记之旅！${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新 WebSSH 镜像
-update_utils() {
+# 更新思源内核
+update_siyuan() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 WebSSH 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从官方远端仓库获取最新版思源内核镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！组件已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！思源笔记引擎已经安全升级。${RESET}"
 }
 
-# 卸载 WebSSH
-uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 WebSSH 容器吗？(y/n): ${RESET}"
+# 彻底销毁组件
+uninstall_siyuan() {
+    echo -e "${RED}警告: 销毁笔记数据是不可逆行为！${RESET}"
+    echo -ne "${YELLOW}确定要停用并卸载思源笔记容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            rm -rf "$BASE_DIR"
-            echo -e "${GREEN}本地配置文件夹已清理。${RESET}"
+            echo -ne "${RED}【极度危险】是否同时彻底删除本地全量挂载的知识库数据文件夹（包含所有笔记、历史资产）？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}本地所有思源笔记历史资产、块索引数据库已被彻底灰飞烟灭。${RESET}"
+            fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
@@ -170,18 +209,24 @@ uninstall_utils() {
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}思源引擎已复苏启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}思源引擎已安全挂起${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}思源引擎已执行重启${RESET}"; }
 logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 
+# 状态与凭证查看补丁
 show_info() {
     get_status_info
     DETECT_IP=$(get_public_ip)
+    local cur_auth="未知 (请在选项1中重新配置)"
+    if [ -f "$ENV_FILE" ]; then
+        # 提取当前有效的登录口令
+        cur_auth=$(grep "AuthCode=" "$ENV_FILE" | cut -d'=' -f2)
+    fi
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}访问地址       : http://${DETECT_IP}:${port_display}${RESET}"
+    echo -e "${YELLOW}当前内核状态   : $status"
+    echo -e "${YELLOW}服务网络入口   : http://${DETECT_IP}:${port_display}"
+    echo -e "${GREEN}安全访问密码   : ${cur_auth}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -189,7 +234,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       ◈  WebSSH 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}     ◈  思源笔记 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
@@ -201,15 +246,15 @@ menu() {
     echo -e "${GREEN}5. 停止容器${RESET}"
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置状态${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_utils ;;
-        2) update_utils ;;
-        3) uninstall_utils ;;
+        1) install_siyuan ;;
+        2) update_siyuan ;;
+        3) uninstall_siyuan ;;
         4) start_utils ;;
         5) stop_utils ;;
         6) restart_utils ;;

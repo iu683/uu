@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# ech0 服务 Docker Compose 独立管理面板
+# Cloudflare 优选面板 Docker Compose 独立管理面板
 # =================================================================
 
 # 颜色
@@ -10,9 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="ech0"
-BASE_DIR="/opt/ech0"
+CONTAINER_NAME="cloudflare-preferred-panel"
+BASE_DIR="/opt/cloudflare-panel"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+VOLUME_NAME="cloudflare-panel-data"
 
 # 检测依赖
 check_dependencies() {
@@ -34,11 +35,11 @@ get_status_info() {
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="sn0wl1n/ech0:latest"
+        [[ -z "$img_version" ]] && img_version="baize233/network:latest"
         
-        # 动态抓取映射到容器 6277 端口的宿主机实际端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "6277/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="6277"
+        # 动态抓取映射到容器 3000 端口的宿主机实际端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -70,113 +71,114 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 处理绝对路径与相对路径转换
-get_real_path() {
-    local input_path="$1"
-    local default_path="$2"
-    [[ -z "$input_path" ]] && input_path="$default_path"
 
-    if [[ "$input_path" == "./"* ]]; then
-        echo "$BASE_DIR/${input_path#./}"
+# 读取初始化口令 Token
+read_setup_token() {
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        local token=$(docker exec "$CONTAINER_NAME" cat /data/setup-token.txt 2>/dev/null)
+        if [[ -n "$token" ]]; then
+            echo -e "${GREEN}$token${RESET}"
+        else
+            echo -e "${RED}未找到 Token 文件，可能您已经完成了初始化流程。${RESET}"
+        fi
     else
-        echo "$input_path"
+        echo -e "${RED}容器未运行，无法读取 Token。请先启动容器！${RESET}"
     fi
 }
 
-# 部署 ech0
+# 部署 Cloudflare 优选面板
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 文件夹。${RESET}"
-    
-    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
-    read -r input_data
-    local path_data_raw="${input_data:-./data}"
-    local real_path_data=$(get_real_path "$path_data_raw" "./data")
+    echo -e "${CYAN}====== 1. Docker 外部数据卷校验 ======${RESET}"
+    if ! docker volume inspect "$VOLUME_NAME" &>/dev/null; then
+        echo -e "${YELLOW}检测到外部数据卷 [$VOLUME_NAME] 不存在，正在自动为您创建...${RESET}"
+        docker volume create "$VOLUME_NAME"
+        echo -e "${GREEN}数据卷创建成功。${RESET}"
+    else
+        echo -e "${GREEN}检测到外部数据卷 [$VOLUME_NAME] 已存在，将直接复用。${RESET}"
+    fi
 
-    # 预创建目录并赋予标准权限
-    mkdir -p "$real_path_data"
-    chmod -R 777 "$real_path_data"
-
-    echo -e "\n${CYAN}====== 2. 网络端口与安全配置 ======${RESET}"
-    
+    echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
     # 允许自定义宿主机端口
-    echo -ne "${YELLOW}请输入 ech0 宿主机访问端口 [默认: 6277]: ${RESET}"
+    echo -ne "${YELLOW}请输入宿主机访问端口 [默认: 3000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="6277"
+    [[ -z "$custom_port" ]] && custom_port="3000"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 允许自定义 JWT_SECRET，并提供高强度随机默认值
-    local default_jwt=$(date +%s | sha256sum | base64 | head -c 32)
-    echo -ne "${YELLOW}请设置 JWT_SECRET 密钥 [默认随机生成]: ${RESET}"
-    read -r jwt_secret
-    [[ -z "$jwt_secret" ]] && jwt_secret="$default_jwt"
-
-    # 动态生成自定义端口的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成原生直挂版 docker-compose.yml...${RESET}"
+    # 动态生成符合规范的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成直挂版 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  ech0:
-    image: "sn0wl1n/ech0:latest"
+  network:
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     ports:
-      - "${custom_port}:6277"
+      - "${custom_port}:3000"
     volumes:
-      - ${path_data_raw}:/app/data
-    environment:
-      - JWT_SECRET=${jwt_secret}
+      - ${VOLUME_NAME}:/data
+    image: baize233/network:latest
+
+volumes:
+  ${VOLUME_NAME}:
+    external: true
+    name: ${VOLUME_NAME}
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 ech0...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动面板...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}等待容器初始化并生成 Token (约 5 秒)...${RESET}"
+    sleep 5
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}         ech0 部署成功！         ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址     : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}JWT_SECRET 密钥  : ${jwt_secret}${RESET}"
-    echo -e "${YELLOW}数据直挂路径     : ${real_path_data}${RESET}"
+    echo -e "${GREEN}================================================================${RESET}"
+    echo -e "${GREEN}           Cloudflare 优选面板 部署成功！                ${RESET}"
+    echo -e "${GREEN}================================================================${RESET}"
+    echo -e "${YELLOW}面板访问地址     : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -ne "${CYAN}当前初始化口令   : ${RESET}"
+    read_setup_token
+    echo -e "----------------------------------------------------------------"
+    echo -e "${YELLOW}💡 初始化向导指引：${RESET}"
+    echo -e "${YELLOW} 1. 在浏览器打开上方地址，在 [第 1 页] 输入上面的初始化口令。${RESET}"
+    echo -e "${YELLOW} 2. 扫描生成的 2FA 二维码并保存到身份验证器，创建管理员账号密码。${RESET}"
+    echo -e "${YELLOW} 3. 在 [第 2 页] 录入您的 Cloudflare 账号名称、邮箱及 Global API Key。${RESET}"
     echo -e "${YELLOW}配置文件路径     : $COMPOSE_FILE${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}================================================================${RESET}"
 }
 
-# 更新 ech0 镜像
+# 更新镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 ech0 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！ech0 已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！面板已处于最新状态。${RESET}"
 }
 
-# 卸载 ech0
+# 卸载面板
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失该服务内的全量历史数据！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 ech0 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载容器默认会保留您的 Cloudflare 账号等核心数据。${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}【高风险】是否同时彻底删除本地全量挂载的数据文件夹？(y/n): ${RESET}"
+            echo -ne "${RED}【超高风险】是否连同 Docker 外部数据卷(包含CF密钥和配置)一起彻底删除？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                docker volume rm "$VOLUME_NAME" 2>/dev/null
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有 ech0 历史数据已被彻底销毁。${RESET}"
+                echo -e "${GREEN}本地及数据卷内所有核心数据已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -203,7 +205,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  ech0 服务管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}  ◈  Cloudflare 优选面板管理  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
@@ -215,7 +217,7 @@ menu() {
     echo -e "${GREEN}5. 停止容器${RESET}"
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}8. 查看配置/Token${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"

@@ -69,7 +69,7 @@ EOF
     mkdir -p "$APP_DIR/data"
     CONFIG_FILE="$APP_DIR/data/config.yaml"
 
-    # 2. 如果原有的 config.yaml 已经存在，安全进行全量局部擦洗，绝不破坏 custom_code 和其他自定义选项
+    # 如果原有的 config.yaml 已经存在，安全进行局部擦洗，绝不破坏 custom_code 和其他自定义选项
     if [ -f "$CONFIG_FILE" ]; then
         # 移除可能存在的旧 language 配置
         sed -i '/^language:/d' "$CONFIG_FILE" 2>/dev/null
@@ -77,13 +77,12 @@ EOF
         sed -i '/^tsdb:/,/^[a-zA-Z]/ { /^tsdb:/d; /data_path:/d; /min_free_disk_space_gb:/d; /retention_days:/d; /max_memory_mb:/d; /write_buffer_size:/d; /write_buffer_flush_interval:/d; /# 启用/d; /# 保留/d }' "$CONFIG_FILE" 2>/dev/null
     fi
 
-    # 3. 在原文件最末尾直接进行全参数高级 TSDB 配置追加 (带单引号 'EOF'，100% 免疫任何系统变量吞噬)
+    # 在原文件最末尾直接进行全参数高级 TSDB 配置追加 (已删掉残留的错行)
     echo "language: zh_CN" >> "$CONFIG_FILE"
-    cat >> "$FILEPATH" 2>/dev/null
     cat >> "$CONFIG_FILE" << 'EOF'
 # 启用 TSDB 支持，保存保存更长时间的监控历史
 tsdb:
-  data_path: data/tsdb
+  data_path: "data/tsdb"
   retention_days: 30
   min_free_disk_space_gb: 1
   max_memory_mb: 256
@@ -94,7 +93,6 @@ EOF
     # 规范化文件权限
     chmod 644 "$CONFIG_FILE"
 
-    # 启动容器
     echo -e "\n${YELLOW}正在通过 Docker Compose 启动 哪吒监控面板...${RESET}"
     cd "$APP_DIR" && docker compose up -d
 
@@ -102,6 +100,7 @@ EOF
     sleep 3
 
     get_status_info
+    echo -e "${GREEN}Nezha Dashboard 面板部署完成！${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${GREEN}          Nezha Dashboard 面板部署成功！            ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
@@ -110,7 +109,21 @@ EOF
     echo -e "${YELLOW}TSDB数据存储路径 : ${APP_DIR}/data/tsdb${RESET}"
     echo -e "${CYAN}💡 提示：该服务仅监听在 127.0.0.1，请配合 Nginx 反代提供外网 HTTPS 访问。${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
+
 }
+
+# 选项 2：更新服务
+update_dashboard() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在拉取最新版 哪吒面板 镜像...${RESET}"
+    cd "$APP_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！哪吒面板已平滑重启。${RESET}"
+}
+
 
 # 选项 2：更新服务
 update_dashboard() {
@@ -155,7 +168,7 @@ show_info() {
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 选项 9：配置包含专业三段式（Web + gRPC + 精准 WebSocket）的反向代理规则
+# 选项 9：完全同步 1Panel 终极修复方案的自动化 Nginx 反代配置
 setup_host_nginx() {
     if [ ! -f "$COMPOSE_FILE" ]; then
         echo -e "${RED}错误: 请先执行选项 1 部署基础服务以确定本地映射端口！${RESET}"
@@ -165,12 +178,10 @@ setup_host_nginx() {
     local current_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8008/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
     [[ -z "$current_port" ]] && current_port="8008"
 
-    # ==========================================
-    # 🌟 核心修复：清除残留缓冲区，防止粘贴时秒回车
-    # ==========================================
+    # 清除残留键盘输入缓冲区，彻底封死粘贴时秒回车的 Bug
     read -t 1 -n 10000 discard 2>/dev/null
 
-    echo -e "${CYAN}====== 宿主机独立 Nginx 自动化配置 (高阶哪吒规则) ======${RESET}"
+    echo -e "${CYAN}====== 宿主机独立 Nginx 自动化配置 ======${RESET}"
     echo -ne "${YELLOW}请输入您的反代域名 [默认: nezha.eu.org]: ${RESET}"
     read -r custom_domain
     [[ -z "$custom_domain" ]] && custom_domain="nezha.eu.org"
@@ -181,7 +192,6 @@ setup_host_nginx() {
     echo -e "\n${CYAN}====== 域名证书自定义路径配置 ======${RESET}"
     echo -e "${YELLOW}请输入证书 (fullchain.pem) 的宿主机绝对路径${RESET}"
     echo -ne "[默认: ${CYAN}${default_cert_path}${RESET}]: "
-    # 再次清理可能产生的缓存
     read -t 1 -n 10000 discard 2>/dev/null
     read -r cert_path
     [[ -z "$cert_path" ]] && cert_path="$default_cert_path"
@@ -210,19 +220,35 @@ setup_host_nginx() {
         fi
     fi
 
-    echo -e "\n${YELLOW}正在准备写入高级三段式反代到 Nginx 配置文件: ${CYAN}${nginx_avail_file}${RESET}"
+    echo -e "\n${YELLOW}正在准备写入 1Panel 方案级高阶反代到 Nginx 配置文件: ${CYAN}${nginx_avail_file}${RESET}"
     
     local tmp_file=$(mktemp)
     
+    # 【核心修正】完全依照 http/server 外层解耦结构，注入 real_ip_header 与 map 关系流
     cat << EOF > "$tmp_file"
 # =================================================================
-# Nezha Dashboard (高阶哪吒三段式) - 本机 Nginx 自动化配置
+# Nezha Dashboard (1Panel 解耦架构方案) - 本机 Nginx 自动化配置
 # =================================================================
 
-upstream nezha_dashboard {
+# 1. 外层全局解耦控制块 (定义真实 IP 变量)
+map \$http_cf_connecting_ip \$real_ip {
+    ""      \$remote_addr;
+    default \$http_cf_connecting_ip;
+}
+ 
+# 允许请求头部包含下划线 (极其关键，否则 nz_realip 会被直接滤除丢弃)
+underscores_in_headers on;
+
+# 设置真实 IP 头部映射
+real_ip_header nz-realip;
+ 
+# 定义上游高可用负载组 (供 gRPC 路由无缝引用)
+upstream dashboard {
+    keepalive 512;
     server 127.0.0.1:${current_port};
 }
 
+# 2. 基础 80 端口强转 https 块
 server {
     listen 80;
     listen [::]:80;
@@ -237,6 +263,7 @@ server {
     }
 }
 
+# 3. 核心 443 安全及反向代理分流块
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
@@ -254,14 +281,15 @@ server {
 
     client_max_body_size 20M;
 
-    # 1. 基础 Web 反代
+    # ⚙️ A 块：Web 页面基础反代流
     location ^~ / {
-        proxy_pass http://nezha_dashboard;
+        proxy_pass http://127.0.0.1:${current_port};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header REMOTE-HOST \$remote_addr;
         proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header nz-realip \$real_ip;  # 注入动态确定的真实 IP 变量
         proxy_set_header Connection "upgrade";
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_http_version 1.1;
@@ -272,32 +300,33 @@ server {
         proxy_busy_buffers_size 256k;
         proxy_max_temp_file_size 0;
         add_header X-Cache \$upstream_cache_status;
-        add_header Cache-Control "private, no-store";
+        add_header Cache-Control no-cache;
         proxy_ssl_server_name on;
+        add_header Strict-Transport-Security "max-age=31536000";
     }
-
-    # 2. gRPC 服务反代 (Agent上报支持)
+ 
+    # ⚙️ B 块：gRPC 服务安全路由 (CF 小黄云回源关键点)
     location ^~ /proto.NezhaService/ {
         grpc_set_header Host \$host;
-        grpc_set_header X-Real-IP \$remote_addr;
+        grpc_set_header nz-realip \$real_ip;  # 注入动态确定的真实 IP 变量
         grpc_read_timeout 600s;
         grpc_send_timeout 600s;
         grpc_socket_keepalive on;
         client_max_body_size 10m;
         grpc_buffer_size 4m;
-        grpc_pass grpc://nezha_dashboard;
+        grpc_pass grpc://dashboard;        # 完美呼应上游独立集群
     }
-
-    # 3. WebSocket 服务精准反代
-    location ~* ^/api/v1/ws/(server|terminal|file)(.*)$ {
+ 
+    # ⚙️ C 块：WebSocket 精准长连接服务
+    location ~* ^/api/v1/ws/(server|terminal|file)(.*)\$ {
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header nz-realip \$real_ip;  # 注入动态确定的真实 IP 变量
         proxy_set_header Origin https://\$host;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_read_timeout 1800s;
         proxy_send_timeout 1800s;
-        proxy_pass http://nezha_dashboard;
+        proxy_pass http://127.0.0.1:${current_port};
     }
 }
 EOF
@@ -310,9 +339,12 @@ EOF
     if sudo nginx -t &>/dev/null; then
         sudo nginx -s reload
         echo -e "${GREEN}====================================================${RESET}"
-        echo -e "${GREEN}   本机 Nginx 高阶三段式反代规则配置并重载成功！   ${RESET}"
+        echo -e "${GREEN}          Nginx 反代配置并平滑重载成功！   ${RESET}"
         echo -e "${GREEN}====================================================${RESET}"
         echo -e "${YELLOW}外网入口: https://${custom_domain}${RESET}"
+        echo -e "${CYAN}💡 提醒:${RESET} 请确保 Cloudflare 后台 [Network] 中的 [gRPC] 开关已保持开启。"
+        echo -e "${YELLOW}前端真实 IP 请求头设置为   :  nz-realip${RESET}"
+        echo -e "${YELLOW}Agent 真实 IP 请求头设置为 :  nz-realip${RESET}"
         echo -e "${GREEN}====================================================${RESET}"
     else
         echo -e "${RED}错误: Nginx 语法测试失败！真实错误详情如下：${RESET}"
@@ -320,6 +352,74 @@ EOF
     fi
 }
 
+
+# 选项 10：单独的 OAuth 2.0 绑定菜单逻辑
+setup_oauth2() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}错误: 未检测到 config.yaml 配置文件，请先执行选项 1 部署面板！${RESET}"
+        return
+    fi
+
+    # 清除键盘输入缓冲区，防止秒回车
+    read -t 1 -n 10000 discard 2>/dev/null
+
+    echo -e "${CYAN}====== 独立 OAuth 2.0 登录配置管理 ======${RESET}"
+    echo -e "${YELLOW}1. 绑定/更新 GitHub OAuth 2.0 配置${RESET}"
+    echo -e "${RED}2. 清除已有的 OAuth 2.0 配置${RESET}"
+    echo -ne "${GREEN}请选择操作 (1/2): ${RESET}"
+    read -r oauth_choice
+
+    if [ "$oauth_choice" = "1" ]; then
+        echo -ne "${YELLOW}请输入 GitHub Client ID: ${RESET}"
+        read -r GITHUB_ID
+        echo -ne "${YELLOW}请输入 GitHub Client Secret: ${RESET}"
+        read -r GITHUB_SECRET
+
+        if [[ -z "$GITHUB_ID" || -z "$GITHUB_SECRET" ]]; then
+            echo -e "${RED}错误: Client ID 和 Secret 不能为空！配置未写入。${RESET}"
+            return
+        fi
+
+        # 擦除旧的 oauth2 块
+        sed -i '/^oauth2:/,/^[a-zA-Z]/ { /^oauth2:/d; /GitHub:/d; /client_id:/d; /client_secret:/d; /endpoint:/d; /auth_url:/d; /token_url:/d; /user_info_url:/d; /user_id_path:/d }' "$CONFIG_FILE" 2>/dev/null
+
+        # 追加新配置
+        cat >> "$CONFIG_FILE" << EOF
+oauth2:
+  GitHub:
+    client_id: "${GITHUB_ID}"
+    client_secret: "${GITHUB_SECRET}"
+    endpoint:
+      auth_url: "https://github.com/login/oauth/authorize"
+      token_url: "https://github.com/login/oauth/access_token"
+    user_info_url: "https://api.github.com/user"
+    user_id_path: "id"
+EOF
+        echo -e "${GREEN}GitHub OAuth 2.0 规则已成功写入配置文件！${RESET}"
+        
+        # 提示用户重启面板使配置生效
+        echo -ne "${YELLOW}是否立即重启哪吒面板容器使配置生效？(y/n): ${RESET}"
+        read -r restart_confirm
+        if [[ "$restart_confirm" = "y" || "$restart_confirm" = "Y" ]]; then
+            restart_dashboard
+        else
+            echo -e "${YELLOW}提示: 配置已保存，但需手动重启容器后才能在后台生效。${RESET}"
+        fi
+
+    elif [ "$oauth_choice" = "2" ]; then
+        # 仅仅执行擦除
+        sed -i '/^oauth2:/,/^[a-zA-Z]/ { /^oauth2:/d; /GitHub:/d; /client_id:/d; /client_secret:/d; /endpoint:/d; /auth_url:/d; /token_url:/d; /user_info_url:/d; /user_id_path:/d }' "$CONFIG_FILE" 2>/dev/null
+        echo -e "${GREEN}已成功从 config.yaml 中移除了 OAuth 2.0 配置块。${RESET}"
+        
+        echo -ne "${YELLOW}是否立即重启哪吒面板容器使配置生效？(y/n): ${RESET}"
+        read -r restart_confirm
+        if [[ "$restart_confirm" = "y" || "$restart_confirm" = "Y" ]]; then
+            restart_dashboard
+        fi
+    else
+        echo -e "${RED}无效选项，已退出。${RESET}"
+    fi
+}
 
 menu() {
     clear
@@ -330,16 +430,17 @@ menu() {
     echo -e "${GREEN}状态  :${RESET} $status"
     echo -e "${GREEN}端口  :${RESET} ${YELLOW}${web_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}9. 反向代理${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN} 1. 部署启动${RESET}"
+    echo -e "${GREEN} 2. 更新容器${RESET}"
+    echo -e "${GREEN} 3. 卸载容器${RESET}"
+    echo -e "${GREEN} 4. 启动容器${RESET}"
+    echo -e "${GREEN} 5. 停止容器${RESET}"
+    echo -e "${GREEN} 6. 重启容器${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
+    echo -e "${GREEN} 9. 反向代理${RESET}"
+    echo -e "${GREEN}10. 配置OAuth2登录${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
@@ -353,6 +454,7 @@ menu() {
         7) logs_dashboard ;;
         8) show_info ;;
         9) setup_host_nginx ;;
+        10) setup_oauth2 ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

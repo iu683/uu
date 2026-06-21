@@ -1,45 +1,53 @@
 #!/bin/bash
 # =================================================================
-# Magnet Fix (磁力检索与下载系统) Docker Compose 管理脚本
+# Pansou-Web 聚合搜索工具 Docker Compose 管理面板 
 # =================================================================
 
-# 颜色定义
+# 颜色
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-INSTALL_DIR="/opt/magnet-fix"
-CONTAINER_NAME="magnet-search"
+CONTAINER_NAME="pansou"
+BASE_DIR="/opt/pansou"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/config.env"
 
-# 默认端口配置
-DEFAULT_WEB_PORT="8080"
-DEFAULT_UDP_PORT="6881"
-
-# 检测基础依赖
+# 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态从 docker-compose.yml 实时读取当前【仅属于 magnet-search】配置的端口
-load_current_ports() {
-    if [ -f "$INSTALL_DIR/docker-compose.yml" ]; then
-        # 精准定位：只看 magnet-search 服务定义区间的端口（取前两行匹配项）
-        WEBUI_PORT=$(sed -n '/magnet-search:/,/qbittorrent:/p' "$INSTALL_DIR/docker-compose.yml" | grep -E '[0-9]+:8080' | head -n1 | awk -F'"' '{print $2}' | cut -d':' -f1)
-        UDP_PORT=$(sed -n '/magnet-search:/,/qbittorrent:/p' "$INSTALL_DIR/docker-compose.yml" | grep -E '[0-9]+:6881/udp' | head -n1 | awk -F'"' '{print $2}' | cut -d':' -f1)
+# 动态获取容器状态、映射端口
+get_status_info() {
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
     fi
-    
-    # 兜底默认值
-    : "${WEBUI_PORT:=$DEFAULT_WEB_PORT}"
-    : "${UDP_PORT:=$DEFAULT_UDP_PORT}"
+
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        # 从容器状态提取 Web 端口（容器内部映射到 80 端口）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="34654"
+    else
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+    fi
 }
 
 # 获取公网 IP (兼容双栈环境)
@@ -66,220 +74,152 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器当前运行状态
-get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
-}
-
-# 自动分析当前已部署的 Profile 状态
-get_current_profiles() {
-    local profiles=""
-    if [ "$(docker ps -aq -f name=^/qbittorrent$)" ]; then
-        profiles="$profiles --profile with-qb"
-    fi
-    if [ "$(docker ps -aq -f name=^/magnet-mysql$)" ]; then
-        profiles="$profiles --profile with-mysql"
-    fi
-    echo "$profiles"
-}
-
-# 选项 1：一键拉取仓库并选择模式启动
-deploy_magnet() {
+# 部署 Pansou-Web
+install_utils() {
     check_dependencies
     
-    if [ ! -d "$INSTALL_DIR" ]; then
-        echo -e "${YELLOW}正在从 GitHub 克隆 magnet_fix 源码仓库...${RESET}"
-        git clone https://github.com/poouo/magnet_fix.git "$INSTALL_DIR"
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}错误: 克隆仓库失败！${RESET}"
-            return
-        fi
-    fi
+    # 自动创建持久化数据目录
+    mkdir -p "$BASE_DIR/data"
 
-    cd "$INSTALL_DIR" || return
-    load_current_ports
-
-    # 1. 交互式配置 Web 端口（只通过 sed 作用于 magnet-search 到 qbittorrent 之间的行）
-    echo -e "\n${CYAN}====== ⚙️ 配置核心磁力站服务端口 ======${RESET}"
-    echo -ne "${GREEN}请输入核心磁力站访问 Web 端口 (当前/默认: ${WEBUI_PORT}): ${RESET}"
-    read -r input_web_port
-    if [[ -n "$input_web_port" ]]; then
-        # 精准替换：只修改 magnet-search 块内部的 :8080 端口
-        sed -i "/magnet-search:/,/qbittorrent:/ {s/-[[:space:]]*\"[0-9]+:8080\"/- \"$input_web_port:8080\"/g}" docker-compose.yml
-        WEBUI_PORT="$input_web_port"
-    fi
-
-    # 2. 交互式配置 UDP 端口
-    echo -ne "${GREEN}请输入磁力检索 UDP 传输端口 (当前/默认: ${UDP_PORT}): ${RESET}"
-    read -r input_udp_port
-    if [[ -n "$input_udp_port" ]]; then
-        # 精准替换：只修改 magnet-search 块内部的 :6881/udp 端口
-        sed -i "/magnet-search:/,/qbittorrent:/ {s/-[[:space:]]*\"[0-9]+:6881\/udp\"/- \"$input_udp_port:6881\/udp\"/g}" docker-compose.yml
-        UDP_PORT="$input_udp_port"
-    fi
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -e "${GREEN}核心站端口配置已成功保存！Web端口: $WEBUI_PORT，UDP端口: $UDP_PORT${RESET}\n"
+    # 1. 端口配置
+    echo -ne "${YELLOW}请输入浏览器访问端口 (宿主机端口) [默认: 34654]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="34654"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
 
-    clear
-    echo -e "${CYAN}====== 🚀 选择组合模式启动 Magnet Fix ======${RESET}"
-    echo -e " [1] 仅启动搜索站点 (默认内置 SQLite)"
-    echo -e " [2] 同时启动搜索站点 + 示例 qBittorrent 服务"
-    echo -e " [3] 同时启动搜索站点 + 示例 MySQL 服务"
-    echo -e " [4] 同时启动全家桶 (站点 + qBittorrent + MySQL)"
-    echo -ne "${GREEN}请选择启动模式 (1-4): ${RESET}"
-    read -r mode_choice
-
-    echo -e "\n${YELLOW}正在通过 Docker Compose 构建并拉起容器...${RESET}"
+    # 2. 认证账号配置
+    echo -ne "${YELLOW}请输入 Web 认证用户名 [默认: admin]: ${RESET}"
+    read -r custom_user
+    [[ -z "$custom_user" ]] && custom_user="admin"
     
-    case "$mode_choice" in
-        1) docker compose up -d --build magnet-search ;;
-        2) docker compose --profile with-qb up -d --build ;;
-        3) docker compose --profile with-mysql up -d --build ;;
-        4) docker compose --profile with-qb --profile with-mysql up -d --build ;;
-        *) echo -e "${RED}无效选择，放弃部署。${RESET}" ; return ;;
-    esac
+    echo -ne "${YELLOW}请输入 Web 认证密码 [默认: admin123]: ${RESET}"
+    read -r custom_pass
+    [[ -z "$custom_pass" ]] && custom_pass="admin123"
+
+    # 3. 动态生成环境变量文件 config.env
+    echo -e "${YELLOW}正在生成独立配置文件 config.env...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+# 插件配置
+ENABLED_PLUGINS=labi,zhizhen,shandian,duoduo,muou,wanou,hunhepan,jikepan,panwiki,pansearch,panta,qupansou,hdr4k,pan666,susu,thepiratebay,xuexizhinan,panyq,ouge,huban,cyg,erxiao,miaoso,fox4k,pianku,clmao,wuji,cldi,xiaozhang,libvio,leijing,xb6v,xys,ddys,hdmoli,clxiong,jutoushe,sdso,xiaoji,xdyh,haisou,bixin,djgou,nyaa,xinjuc,aikanzy,qupanshe,xdpan,discourse,yunsou,ahhhhfs,nsgame,quark4k,quarksoo,sousou,ash,feikuai,kkmao,alupan,ypfxw,mikuclub,daishudj,dyyj,meitizy,jsnoteclub,mizixing,lou1,yiove,zxzj,qingying,kkv
+
+# Telegram频道配置
+CHANNELS=tgsearchers4,Aliyun_4K_Movies,bdbdndn11,yunpanx,bsbdbfjfjff,yp123pan,sbsbsnsqq,yunpanxunlei,tianyifc,BaiduCloudDisk,txtyzy,peccxinpd,gotopan,PanjClub,kkxlzy,baicaoZY,MCPH01,MCPH02,MCPH03,bdwpzhpd,ysxb48,jdjdn1111,yggpan,MCPH086,zaihuayun,Q66Share,ucwpzy,shareAliyun,alyp_1,dianyingshare,Quark_Movies,XiangxiuNBB,ydypzyfx,ucquark,xx123pan,yingshifenxiang123,zyfb123,tyypzhpd,tianyirigeng,cloudtianyi,hdhhd21,Lsp115,oneonefivewpfx,qixingzhenren,taoxgzy,Channel_Shares_115,tyysypzypd,vip115hot,wp123zy,yunpan139,yunpan189,yunpanuc,yydf_hzl,leoziyuan,Q_dongman,yoyokuakeduanju,TG654TG,WFYSFX02,QukanMovie,yeqingjie_GJG666,movielover8888_film3,Baidu_netdisk,D_wusun,FLMdongtianfudi,KaiPanshare,QQZYDAPP,rjyxfx,PikPak_Share_Channel,btzhi,newproductsourcing,cctv1211,duan_ju,QuarkFree,yunpanNB,kkdj001,xxzlzn,pxyunpanxunlei,jxwpzy,kuakedongman,liangxingzhinan,xiangnikanj,solidsexydoll,guoman4K,zdqxm,kduanju,cilidianying,CBduanju,SharePanFilms,dzsgx,BooksRealm,Oscar_4Kmovies,douerpan,baidu_yppan,Q_jilupian,Netdisk_Movies,yunpanquark,ammmziyuan,ciliziyuanku,cili8888,jzmm_123pan,Q_dianying,domgmingapk,dianying4k,q_dianshiju,tgbokee,ucshare,godupan,gokuapan
+EOF
+
+    # 4. 动态生成 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合新规范的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  pansou:
+    image: ghcr.io/fish2018/pansou-web:latest
+    container_name: ${CONTAINER_NAME}
+    ports:
+      - "${custom_port}:80"
+    env_file:
+      - config.env
+    environment:
+      - DOMAIN=localhost
+      - PANSOU_PORT=8888
+      - PANSOU_HOST=127.0.0.1
+      - CACHE_PATH=/app/data/cache
+      - LOG_PATH=/app/data/logs
+      - CACHE_MAX_SIZE=100
+      - CACHE_ENABLED=true
+      - CACHE_TTL=60
+      - MAX_CONCURRENCY=200
+      - MAX_PAGES=30
+      - ASYNC_PLUGIN_ENABLED=true
+      - ASYNC_RESPONSE_TIMEOUT=60
+      - ASYNC_MAX_BACKGROUND_WORKERS=20
+      - ASYNC_MAX_BACKGROUND_TASKS=100
+      - ASYNC_CACHE_TTL_HOURS=1
+      - AUTH_ENABLED=true
+      - AUTH_USERS=${custom_user}:${custom_pass}
+      - AUTH_TOKEN_EXPIRY=24
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Pansou-Web...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}正在等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
 
     DETECT_IP=$(get_public_ip)
 
-    if [ $? -eq 0 ]; then
-        echo -e "\n${GREEN}====================================================${RESET}"
-        echo -e "${GREEN}     🧲 Magnet Fix 磁力检索系统部署/启动成功！      ${RESET}"
-        echo -e "${GREEN}====================================================${RESET}"
-        echo -e "${YELLOW} 页面服务         地址${RESET}"
-        echo -e "${YELLOW} 搜索首页:        http://${DETECT_IP}:${WEBUI_PORT}${RESET}"
-        echo -e "${YELLOW} 管理后台:        http://${DETECT_IP}:${WEBUI_PORT}/admin${RESET}"
-        echo -e "${YELLOW} 默认后台密码:${RESET}    ${RED}admin123${RESET}"
-        [[ "$mode_choice" =~ ^(2|4)$ ]] && echo -e "${YELLOW} qBittorrentUI:  http://${DETECT_IP}:18080${RESET}"
-        [[ "$mode_choice" =~ ^(3|4)$ ]] && echo -e "${YELLOW} MySQL 地址:     ${DETECT_IP}:13306${RESET}"
-        echo -e "${GREEN}====================================================${RESET}"
-    fi
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     Pansou-Web 部署成功！       ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}登录认证账号   : ${custom_user} / ${custom_pass}${RESET}"
+    echo -e "${YELLOW}环境配置文件   : $ENV_FILE${RESET}"
+    echo -e "${YELLOW}Docker 配置文件 : $COMPOSE_FILE${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 选项 2：更新容器
-update_magnet() {
-    if [ ! -d "$INSTALL_DIR" ]; then
-        echo -e "${RED}错误: 未检测到安装目录！${RESET}"
+# 更新 Pansou-Web 镜像
+update_utils() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-
-    cd "$INSTALL_DIR" || return
-    
-    # 暂存本地用户配置过的核心服务端口
-    load_current_ports
-    
-    echo -e "${YELLOW}正在拉取 Git 源码仓库更新...${RESET}"
-    git pull
-    
-    # 拉取更新后，将自定义端口重新应用回 magnet-search 局部区块，确保 qb 端口不受干扰
-    sed -i "/magnet-search:/,/qbittorrent:/ {s/-[[:space:]]*\"[0-9]+:8080\"/- \"$WEBUI_PORT:8080\"/g}" docker-compose.yml
-    sed -i "/magnet-search:/,/qbittorrent:/ {s/-[[:space:]]*\"[0-9]+:6881\/udp\"/- \"$UDP_PORT:6881\/udp\"/g}" docker-compose.yml
-
-    clear
-    echo -e "${CYAN}====== 🔄 请选择需要更新的服务范围 ======${RESET}"
-    echo -e " [1] 仅更新/拉取核心磁力站 (不触动/不唤醒 qB 和 MySQL)"
-    echo -e " [2] 完全更新当前环境中已存在的所有组件 (根据本地已有容器自动匹配)"
-    echo -ne "${GREEN}请选择操作 (1/2): ${RESET}"
-    read -r up_choice
-
-    if [ "$up_choice" = "1" ]; then
-        echo -e "${YELLOW}正在精准更新核心容器...${RESET}"
-        docker compose pull magnet-search
-        docker compose up -d --build magnet-search
-    elif [ "$up_choice" = "2" ]; then
-        local active_profiles=$(get_current_profiles)
-        echo -e "${YELLOW}识别到当前关联组件:${RESET} ${active_profiles:-无(仅核心)}"
-        echo -e "${YELLOW}正在全面更新关联的组件容器...${RESET}"
-        docker compose $active_profiles pull
-        docker compose $active_profiles up -d --build
-    else
-        echo -e "${RED}无效选项，已取消更新。${RESET}"
-        return
-    fi
-    echo -e "${GREEN}更新及重构流程完成！${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Pansou-Web 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 选项 3：彻底卸载清理
-uninstall_magnet() {
-    echo -ne "${RED}警告: 确定要彻底卸载磁力站并清理所有相关数据吗？(y/n): ${RESET}"
+# 卸载 Pansou-Web
+uninstall_utils() {
+    echo -ne "${YELLOW}确定要卸载并删除 Pansou-Web 容器吗？(y/n): ${RESET}"
     read -r confirm
-    if [[ "$confirm" = "y" || "$confirm" = "Y" ]]; then
-        if [ -d "$INSTALL_DIR" ]; then
-            cd "$INSTALL_DIR" && docker compose --profile with-qb --profile with-mysql down -v
-            rm -rf "$INSTALL_DIR"
-            echo -e "${GREEN}彻底卸载清理完成。${RESET}"
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时彻底删除本地全部配置与持久化搜索缓存数据？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}本地数据目录已彻底清理。${RESET}"
+            fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 基础群控控制
-start_magnet() {
-    if [ -d "$INSTALL_DIR" ]; then 
-        cd "$INSTALL_DIR" || return
-        local active_profiles=$(get_current_profiles)
-        docker compose $active_profiles start
-        echo -e "${GREEN}关联容器已全面拉起！${RESET}"
-    fi
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+
+show_info() {
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-stop_magnet() {
-    if [ -d "$INSTALL_DIR" ]; then 
-        cd "$INSTALL_DIR" || return
-        local active_profiles=$(get_current_profiles)
-        docker compose $active_profiles stop
-        echo -e "${YELLOW}关联容器已全面停止！${RESET}"
-    fi
-}
-
-restart_magnet() {
-    if [ -d "$INSTALL_DIR" ]; then 
-        cd "$INSTALL_DIR" || return
-        local active_profiles=$(get_current_profiles)
-        docker compose $active_profiles restart
-        echo -e "${GREEN}关联容器已平滑重启！${RESET}"
-    fi
-}
-
-show_logs() {
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        docker logs -f --tail=100 "$CONTAINER_NAME"
-    else
-        echo -e "${RED}容器未运行！${RESET}"
-    fi
-}
-
-show_config() {
-    if [ -d "$INSTALL_DIR" ]; then
-        load_current_ports
-        echo -e "${CYAN}====== 当前环境配置 ======${RESET}"
-        echo -e "${YELLOW}安装路径: $INSTALL_DIR${RESET}"
-        local active_profiles=$(get_current_profiles)
-        echo -e "${YELLOW}当前启用的 Profile: ${active_profiles:-仅核心站点}${RESET}"
-        echo -e "${YELLOW}网页映射端口: $WEBUI_PORT${RESET}"
-        echo -e "${YELLOW}UDP 传输端口: $UDP_PORT${RESET}"
-    else
-        echo -e "${RED}未检测到安装配置。${RESET}"
-    fi
-}
-
-# 主菜单循环
 menu() {
     clear
-    load_current_ports
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Magnet-Fix 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}   ◈  Pansou-Web 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态    :${RESET} $status"
-    echo -e "${GREEN}网页端口:${RESET} ${YELLOW}${WEBUI_PORT}${RESET}"
-    echo -e "${GREEN}UDP 端口:${RESET} ${YELLOW}${UDP_PORT}${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -289,19 +229,19 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) deploy_magnet ;;
-        2) update_magnet ;;
-        3) uninstall_magnet ;;
-        4) start_magnet ;;
-        5) stop_magnet ;;
-        6) restart_magnet ;;
-        7) show_logs ;;
-        8) show_config ;;
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
+        8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac
@@ -309,6 +249,6 @@ menu() {
 
 while true; do
     menu
-    echo -ne "\n${YELLOW}按回车键继续...${RESET}"
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
     read -r
 done

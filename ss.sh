@@ -1,6 +1,6 @@
-=#!/bin/bash
+#!/bin/bash
 # =================================================================
-# AdGuard Home 广告拦截/DNS 服务 Docker Compose 独立管理面板
+# ghproxy & Smart-Git 独立/伴生服务 Docker Compose 独立管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,7 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="adguardhome"
-BASE_DIR="/opt/adguardhome"
+BASE_DIR="/opt/github-proxy"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -24,24 +23,30 @@ check_dependencies() {
 
 # 动态获取容器状态与映射端口
 get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${GREEN}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
+    # 检查 ghproxy
+    if [ "$(docker ps -q -f name=^/ghproxy$)" ]; then
+        gh_status="${GREEN}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/ghproxy$)" ]; then
+        gh_status="${RED}已停止${RESET}"
     else
-        status="${RED}未部署${RESET}"
+        gh_status="${RED}未部署${RESET}"
     fi
 
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="adguard/adguardhome:latest"
-        
-        # 动态抓取映射到容器内 80 端口的宿主机实际 Web 管理端口
-        local check_web_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$check_web_port" ]] && check_web_port="801"
-        port_display="${check_web_port} (管理端口)"
+    # 检查 smart-git
+    if [ "$(docker ps -q -f name=^/smart-git$)" ]; then
+        git_status="${GREEN}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/smart-git$)" ]; then
+        git_status="${RED}已停止${RESET}"
     else
-        img_version="${RED}未安装${RESET}"
+        git_status="${RED}未部署${RESET}"
+    fi
+
+    # 动态抓取 ghproxy 映射到容器 8080 端口的宿主机实际端口
+    if [ "$(docker ps -aq -f name=^/ghproxy$)" ]; then
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "ghproxy" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="7210"
+        port_display="${webui_port}"
+    else
         port_display="N/A"
     fi
 }
@@ -84,7 +89,7 @@ get_real_path() {
     fi
 }
 
-# 部署 AdGuard Home
+# 部署服务
 install_utils() {
     check_dependencies
     
@@ -92,142 +97,159 @@ install_utils() {
     DETECT_IP=$(get_public_ip)
 
     echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用脚本同级路径下的各功能文件夹。${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用脚本同级路径下的文件夹(即 ./ghproxy/ 和 ./smart-git/)。${RESET}"
     
     echo -ne "${YELLOW}请输入数据根挂载路径 [默认: ./]: ${RESET}"
     read -r input_data
     local path_root_raw="${input_data:-./}"
     
-    # 动态计算绝对路径
-    local real_work_path=$(get_real_path "${path_root_raw%/}/workdir" "./workdir")
-    local real_conf_path=$(get_real_path "${path_root_raw%/}/confdir" "./confdir")
+    # 动态预计算物理绝对路径
+    local real_gh_log=$(get_real_path "${path_root_raw%/}/ghproxy/log" "./ghproxy/log")
+    local real_gh_conf=$(get_real_path "${path_root_raw%/}/ghproxy/config" "./ghproxy/config")
 
-    # 预创建目录并赋权
-    echo -e "${YELLOW}正在宿主机预构建并赋权对应物理目录...${RESET}"
-    mkdir -p "$real_work_path" "$real_conf_path"
-    chmod -R 777 "$real_work_path" "$real_conf_path"
+    echo -e "${YELLOW}正在宿主机预构建并穿透赋权 ghproxy 物理目录...${RESET}"
+    mkdir -p "$real_gh_log" "$real_gh_conf"
+    chmod -R 777 "$real_gh_log" "$real_gh_conf"
 
-    echo -e "\n${CYAN}====== 2. 自定义端口配置 (Bridge 模式) ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入初始化向导端口 (映射容器内 3000) [默认: 3000]: ${RESET}"
-    read -r port_init
-    [[ -z "$port_init" ]] && port_init="3000"
+    echo -e "\n${CYAN}====== 2. 可选伴生组件配置 ======${RESET}"
+    echo -ne "${GREEN}是否需要同时安装 Smart-Git 服务？(y/n) [默认: n]: ${RESET}"
+    read -r install_git
+    [[ -z "$install_git" ]] && install_git="n"
 
-    echo -ne "${YELLOW}请输入 Web 管理端口 (映射容器内 80) [默认: 801]: ${RESET}"
-    read -r port_web
-    [[ -z "$port_web" ]] && port_web="801"
+    # 如果需要安装 smart-git，为其预创建目录
+    local real_git_log="" real_git_conf="" real_git_repos="" real_git_db=""
+    if [[ "$install_git" == "y" || "$install_git" == "Y" ]]; then
+        real_git_log=$(get_real_path "${path_root_raw%/}/smart-git/log" "./smart-git/log")
+        real_git_conf=$(get_real_path "${path_root_raw%/}/smart-git/config" "./smart-git/config")
+        real_git_repos=$(get_real_path "${path_root_raw%/}/smart-git/repos" "./smart-git/repos")
+        real_git_db=$(get_real_path "${path_root_raw%/}/smart-git/db" "./smart-git/db")
 
-    echo -ne "${YELLOW}请输入 HTTPS 访问端口 (映射容器内 443) [默认: 4431]: ${RESET}"
-    read -r port_https
-    [[ -z "$port_https" ]] && port_https="4431"
-
-    # 动态生成纯净版 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成原生直挂版 docker-compose.yml...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  adguardhome:
-    image: adguard/adguardhome:latest
-    container_name: ${CONTAINER_NAME}
-    restart: always
-    ports:
-      - "53:53/tcp"
-      - "53:53/udp"
-      - "${port_init}:3000/tcp"
-      - "${port_init}:3000/udp"
-      - "${port_web}:80/tcp"
-      - "${port_web}:80/udp"
-      - "${port_https}:443/tcp"
-      - "${port_https}:443/udp"
-      - "853:853/tcp"
-      - "853:853/udp"
-    volumes:
-      - ${path_root_raw%/}/workdir:/opt/adguardhome/work
-      - ${path_root_raw%/}/confdir:/opt/adguardhome/conf
-EOF
-
-    # 检查宿主机 53 端口冲突提示
-    if [ "$(ss -ulnm | grep -w 53)" ]; then
-        echo -e "${RED}警告: 宿主机 53 端口已被占用（可能是 systemd-resolved 或 dnsmasq）。${RESET}"
-        echo -e "${RED}请确保您已关闭本地 DNS 监听，否则 AdGuard 容器会启动失败。${RESET}"
-        echo -ne "${YELLOW}按回车尝试启动...${RESET}"
-        read -r
+        echo -e "${YELLOW}正在宿主机预构建并穿透赋权 Smart-Git 物理目录...${RESET}"
+        mkdir -p "$real_git_log" "$real_git_conf" "$real_git_repos" "$real_git_db"
+        chmod -R 777 "$real_git_log" "$real_git_conf" "$real_git_repos" "$real_git_db"
     fi
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 AdGuard Home...${RESET}"
+    echo -e "\n${CYAN}====== 3. 网络端口与访问配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 ghproxy 宿主机外部访问端口 [默认: 7210]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="7210"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
+
+    # 动态组装 docker-compose.yml 文本
+    echo -e "${YELLOW}正在生成高阶分流版 docker-compose.yml...${RESET}"
+    
+    # 基础 ghproxy 模块
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  ghproxy:
+    image: wjqserver/ghproxy:latest
+    container_name: ghproxy
+    restart: always
+    ports:
+      - "${custom_port}:8080"
+    volumes:
+      - ${path_root_raw%/}/ghproxy/log:/data/ghproxy/log
+      - ${path_root_raw%/}/ghproxy/config:/data/ghproxy/config
+EOF
+
+    # 伴生可选 smart-git 模块追加
+    if [[ "$install_git" == "y" || "$install_git" == "Y" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
+  smart-git:
+    image: wjqserver/smart-git:latest
+    container_name: smart-git
+    restart: always
+    volumes:
+      - ${path_root_raw%/}/smart-git/log:/data/smart-git/log
+      - ${path_root_raw%/}/smart-git/config:/data/smart-git/config
+      - ${path_root_raw%/}/smart-git/repos:/data/smart-git/repos
+      - ${path_root_raw%/}/smart-git/db:/data/smart-git/db
+EOF
+    fi
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动容器服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    echo -e "${YELLOW}等待容器群组初始化 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        AdGuard Home 部署成功！  ${RESET}"
+    echo -e "${GREEN}         服务集群部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}首次配置/初始化向导 : http://${DETECT_IP}:${port_init}${RESET}"
-    echo -e "${YELLOW}本地工作挂载路径   : ${real_work_path}${RESET}"
-    echo -e "${YELLOW}本地配置挂载路径   : ${real_conf_path}${RESET}"
-    echo -e "${YELLOW}配置文件路径       : $COMPOSE_FILE${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${CYAN}💡 提示: 进入初始化向导后，请将 [Web 界面端口] 修改为你刚刚指定的: ${port_web}${RESET}"
+    echo -e "${YELLOW}ghproxy 加速访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    if [[ "$install_git" == "y" || "$install_git" == "Y" ]]; then
+        echo -e "${GREEN}Smart-Git 伴生组件   : [已成功捆绑启动并挂载挂载点]${RESET}"
+    else
+        echo -e "${RED}Smart-Git 伴生组件   : [已跳过安装，保持环境纯净]${RESET}"
+    fi
+    echo -e "${YELLOW}配置文件路径         : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 AdGuard Home 镜像
+# 更新镜像群
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 AdGuard Home 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取最新镜像群组...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！所有已安装的组件都已处于最新状态。${RESET}"
 }
 
-# 卸载 AdGuard Home
+# 卸载集群
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您配置的所有 DNS 过滤规则与白名单！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 AdGuard Home 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失你拉取同步的所有本地仓库和日志配置！${RESET}"
+    echo -ne "${YELLOW}确定要下线并彻底删除此集群内的所有容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}【高风险】是否同时彻底删除本地挂载的全量规则与配置文件？(y/n): ${RESET}"
+            echo -e "${GREEN}所有相关容器已安全下线。${RESET}"
+            echo -ne "${RED}【高风险】是否同时彻底删除本地全量挂载的仓库、配置与日志数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有 AdGuard 历史配置数据已被彻底销毁。${RESET}"
+                echo -e "${GREEN}本地物理全量数据及缓存已被彻底销毁。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            docker rm -f ghproxy smart-git 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_utils() { docker logs -f "$CONTAINER_NAME"; }
-
-show_info() {
-    get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}当前映射状态   : ${port_display}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}群组内已安装容器已全部拉起${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}群组内已安装容器已全部挂起停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}群组内已安装容器已全部完成重启${RESET}"; }
+logs_utils() {
+    echo -e "${CYAN}1. 查看 ghproxy 日志${RESET}"
+    echo -e "${CYAN}2. 查看 smart-git 日志${RESET}"
+    echo -ne "${GREEN}请输入想要查看日志的容器编号: ${RESET}"
+    read -r log_choice
+    if [ "$log_choice" = "1" ]; then
+        docker logs -f ghproxy
+    elif [ "$log_choice" = "2" ]; then
+        docker logs -f smart-git
+    else
+        echo -e "${RED}无效输入，返回主菜单。${RESET}"
+    fi
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈  AdGuard Home 管理面板  ◈  ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}映射 :${RESET} ${YELLOW}${port_display}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${GREEN}     ◈  ghproxy & Smart-Git 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}===============================================${RESET}"
+    echo -e "${GREEN}ghproxy 状态   :${RESET} $gh_status"
+    echo -e "${GREEN}Smart-Git 状态 :${RESET} $git_status"
+    echo -e "${GREEN}ghproxy 映射口 :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}===============================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -235,9 +257,8 @@ menu() {
     echo -e "${GREEN}5. 停止容器${RESET}"
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===============================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
@@ -248,7 +269,6 @@ menu() {
         5) stop_utils ;;
         6) restart_utils ;;
         7) logs_utils ;;
-        8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

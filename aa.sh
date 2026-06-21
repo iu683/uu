@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# qBit-Bot (Telegram 机器人) 专属管理面板 
+# iptv-trams 工具箱 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="my-qbit-bot"
-BASE_DIR="/opt/my_qbit_bot"
+CONTAINER_NAME="trams_rust"
+BASE_DIR="/opt/iptv_trams"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,8 +22,9 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态
+# 动态获取容器状态、映射端口和数据目录
 get_status_info() {
+    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -31,91 +32,136 @@ get_status_info() {
     else
         status="${RED}未部署${RESET}"
     fi
+
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 19890 端口）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "19890/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 兜底获取第一个绑定的端口
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="19890"
+    else
+        # 容器未安装/未部署时的返回值
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+    fi
 }
 
-# 部署 qBit-Bot
-install_qbit_bot() {
+# 获取公网 IP (兼容双栈环境)
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
+}
+
+# 部署 iptv-trams
+install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 配置 qBit-Bot 环境变量 ======${RESET}"
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -ne "${YELLOW}1. 请输入 qBittorrent 地址 (例如 http://127.0.0.1:8080): ${RESET}"
-    read -r qb_host
-    if [[ -z "$qb_host" ]]; then
-        echo -e "${RED}错误: 地址不能为空！${RESET}"
+    echo -ne "${YELLOW}请输入 iptv-trams 访问端口 (宿主机端口) [默认: 19890]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="19890"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -ne "${YELLOW}2. 请输入 qBittorrent 用户名: ${RESET}"
-    read -r qb_user
+    echo -ne "${YELLOW}请输入管理员用户名 [默认: myadmin]: ${RESET}"
+    read -r admin_user
+    [[ -z "$admin_user" ]] && admin_user="myadmin"
 
-    echo -ne "${YELLOW}3. 请输入 qBittorrent 密码: ${RESET}"
-    read -r qb_pass
+    echo -ne "${YELLOW}请输入管理员密码 [默认: secret]: ${RESET}"
+    read -r admin_pass
+    [[ -z "$admin_pass" ]] && admin_pass="secret"
 
-    echo -ne "${YELLOW}4. 请输入 Telegram Bot Token: ${RESET}"
-    read -r tg_token
-    if [[ -z "$tg_token" ]]; then
-        echo -e "${RED}错误: Token 不能为空！${RESET}"
-        return
-    fi
+    echo -ne "${YELLOW}请输入播放鉴权 Token [默认: abc123]: ${RESET}"
+    read -r play_token
+    [[ -z "$play_token" ]] && play_token="abc123"
 
-    echo -ne "${YELLOW}5. 请输入 你的 Telegram User ID: ${RESET}"
-    read -r tg_user_id
-
-    # 动态生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
+    # 1. 动态生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  qbit-bot:
-    image: gblaowang12138/my_qbit_bot:latest
+  iptv-trams:
+    image: instituteiptv/iptv-trmas:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
-    network_mode: "host"
+    ports:
+      - "${custom_port}:19890"
     environment:
-      QB_HOST: "${qb_host}"
-      QB_USER: "${qb_user}"
-      QB_PASS: "${qb_pass}"
-      TG_TOKEN: "${tg_token}"
-      TG_USER_ID: "${tg_user_id}"
+      - ADMIN_USER=${admin_user}
+      - ADMIN_PASS=${admin_pass}
+      - PLAY_TOKEN=${play_token}
 EOF
 
-    echo -e "${YELLOW}正在拉取镜像并启动 qBit-Bot...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --force-recreate
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 iptv-trams...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化...${RESET}"
-    sleep 2
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
+
+    DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    qBit-Bot 部署流程完成！     ${RESET}"
+    echo -e "${GREEN}      iptv-trams 部署成功！      ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}由于采用 Host 网络模式，请直接在 Telegram 客户端中测试机器人是否上线。${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}管理员账号     : ${admin_user}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新镜像
-update_qbit_bot() {
+# 更新 iptv-trams 镜像
+update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 iptv-trams 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！机器人容器已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载机器人
-uninstall_qbit_bot() {
-    echo -ne "${YELLOW}确定要卸载并删除 qBit-Bot 容器吗？(y/n): ${RESET}"
+# 卸载 iptv-trams
+uninstall_utils() {
+    echo -ne "${YELLOW}确定要卸载并删除 iptv-trams 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            rm -rf "$BASE_DIR"
-            echo -e "${GREEN}容器已停止，本地配置目录已彻底清理。${RESET}"
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地配置文件？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}配置目录已彻底清理。${RESET}"
+            fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
@@ -123,19 +169,29 @@ uninstall_qbit_bot() {
     fi
 }
 
-start_bot() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}机器人已启动${RESET}"; }
-stop_bot() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}机器人已停止${RESET}"; }
-restart_bot() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}机器人已重启${RESET}"; }
-logs_bot() { docker logs -f "$CONTAINER_NAME"; }
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+
+show_info() {
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
 
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  qBit-Bot 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}    ◈  iptv-trams 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}模式 :${RESET} ${YELLOW}Host${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -144,18 +200,20 @@ menu() {
     echo -e "${GREEN}5. 停止容器${RESET}"
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_qbit_bot ;;
-        2) update_qbit_bot ;;
-        3) uninstall_qbit_bot ;;
-        4) start_bot ;;
-        5) stop_bot ;;
-        6) restart_bot ;;
-        7) logs_bot ;;
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
+        8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

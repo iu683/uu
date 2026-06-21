@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Paperphone-plus - 跨环境（MySQL/Redis 双自适应 + Redis 分区）运维面板
+# WordPress Docker Compose 管理面板
 # =================================================================
 
 # 颜色定义
@@ -8,17 +8,17 @@ RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
-MAGENTA="\033[35m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/paperphone"
+BASE_DIR="/opt/wordpress"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/server/.env"
-DEFAULT_BACKUP_DIR="$BASE_DIR/backups"
+DEFAULT_IMAGE="wordpress:latest"
 
+# 检测依赖环境
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker！${RESET}"; exit 1
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
     fi
 }
 
@@ -51,424 +51,330 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
+# 动态获取容器整体状态和端口
 get_status_info() {
-    local active_id=$(docker ps -q --filter "name=paperphone-plus-client" --filter "status=running" | head -n 1)
-    if [ -n "$active_id" ]; then
-        status="${GREEN}运行中${RESET}"
-        # 动态获取 client 容器映射到宿主机的端口
-        port_display=$(docker port paperphone-plus-client 80 2>/dev/null | cut -d':' -f2)
-        [[ -z "$port_display" ]] && port_display="80"
+    if [ -f "$COMPOSE_FILE" ]; then
+        if [ "$(docker ps -q -f name=wordpress-server)" ]; then
+            status="${GREEN}运行中${RESET}"
+            web_port=$(docker ps -f name=wordpress-server --format "{{.Ports}}" | sed -E 's/.*0.0.0.0:([0-9]+)->.*/\1/' | head -n 1)
+            if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
+                web_port=$(sed -n '/wordpress:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+            fi
+        elif [ "$(docker ps -aq -f name=wordpress-server)" ]; then
+            status="${YELLOW}已停止${RESET}"
+            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' wordpress-server 2>/dev/null)
+        else
+            status="${RED}未部署${RESET}"
+        fi
+        [[ -z "$web_port" ]] && web_port="80"
     else
-        local dead_id=$(docker ps -aq --filter "name=paperphone-plus-client" | head -n 1)
-        if [ -n "$dead_id" ]; then status="${RED}已停止${RESET}"; else status="${RED}未部署${RESET}"; fi
-        port_display="N/A"
+        status="${RED}未初始化${RESET}"
+        web_port="N/A"
     fi
 }
 
-
-
-install_utils() {
+# 部署 WordPress
+install_wordpress() {
     check_dependencies
-    mkdir -p "$BASE_DIR/server"
-    
-    echo -e "${CYAN}====== 1. 数据库与缓存部署模式选择 ======${RESET}"
-    echo -e "${GREEN}1) 内置常规模式${RESET} (本地跑 MySQL 和 Redis 容器)"
-    echo -e "${GREEN}2) 远程数据模式${RESET} (连接外部已有的 MySQL/Redis，跳过本地库)"
-    echo -ne "${YELLOW}请选择模式 [默认 1]: ${RESET}"; read -r db_mode
+    mkdir -p "$BASE_DIR"
+
+    # 1. 基础映射端口配置
+    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 WordPress 宿主机映射访问端口 [默认: 8080]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8080"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
+
+    # 2. 数据库运行模式选择
+    echo -e "\n${CYAN}====== 1. MySQL 数据库运行模式选择 ======${RESET}"
+    echo -e " 1) 直接部署全新的 MySQL 8.0 容器 (包含本地持久化卷)"
+    echo -e " 2) 使用已有的外部/远程 MySQL 数据库 (需提前手动建好空库)"
+    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
+    read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
-    local db_host="mysql" local redis_host="redis" local db_user="paperphoneplus" local db_pass="changeme"
-    local db_name="paperphoneplus" local db_port="3306" local redis_pass="" local redis_port="6379" local redis_db="0"
+    local db_host="db"
+    local db_user="wordpress"
+    local db_pass=""
+    local db_name="wordpress"
+    local root_pass=""
 
-    if [ "$db_mode" = "2" ]; then
-        echo -e "\n${CYAN}➜ 请输入远程 MySQL 配置:${RESET}"
-        echo -ne "${YELLOW}远程 MySQL 地址 (Host): ${RESET}"; read -r db_host
-        echo -ne "${YELLOW}远程 MySQL 端口 (Port) [默认 3306]: ${RESET}"; read -r tmp_port; [[ -n "$tmp_port" ]] && db_port="$tmp_port"
-        echo -ne "${YELLOW}远程 MySQL 用户 (User) [默认 paperphoneplus]: ${RESET}"; read -r tmp_user; [[ -n "$tmp_user" ]] && db_user="$tmp_user"
-        echo -ne "${YELLOW}远程 MySQL 密码 (Password): ${RESET}"; read -r db_pass
-        echo -ne "${YELLOW}远程 MySQL 数据库名 (DB Name) [默认 paperphoneplus]: ${RESET}"; read -r tmp_db; [[ -n "$tmp_db" ]] && db_name="$tmp_db"
-
-        echo -e "\n${CYAN}➜ 请输入远程 Redis 配置:${RESET}"
-        echo -ne "${YELLOW}远程 Redis 地址 (Host): ${RESET}"; read -r redis_host
-        echo -ne "${YELLOW}远程 Redis 端口 (Port) [默认 6379]: ${RESET}"; read -r tmp_rport; [[ -n "$tmp_rport" ]] && redis_port="$tmp_rport"
-        echo -ne "${YELLOW}远程 Redis 分区/库编号 (DB Index) [默认 0]: ${RESET}"; read -r tmp_rdb; [[ -n "$tmp_rdb" ]] && redis_db="$tmp_rdb"
-        echo -ne "${YELLOW}远程 Redis 密码 (无密码直接回车): ${RESET}"; read -r redis_pass
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}正在自动计算生成数据库高强度防破解随机密码...${RESET}"
+        root_pass=$(openssl rand -hex 12)
+        db_pass=$(openssl rand -hex 12)
+    else
+        echo -ne "${YELLOW}请输入外部 MySQL 的 IP 或域名 [默认: 172.17.0.1]: ${RESET}"
+        read -r ext_db_ip
+        [[ -z "$ext_db_ip" ]] && ext_db_ip="172.17.0.1"
+        echo -ne "${YELLOW}请输入外部 MySQL 端口 [默认: 3306]: ${RESET}"
+        read -r ext_db_port
+        [[ -z "$ext_db_port" ]] && ext_db_port="3306"
+        db_host="${ext_db_ip}:${ext_db_port}"
+        echo -ne "${YELLOW}请输入外部 MySQL 用户名 [默认: wordpress]: ${RESET}"
+        read -r db_user
+        [[ -z "$db_user" ]] && db_user="wordpress"
+        echo -ne "${YELLOW}请输入外部 MySQL 密码: ${RESET}"
+        read -r db_pass
+        echo -ne "${YELLOW}请输入外部已存在的数据库名 [默认: wordpress]: ${RESET}"
+        read -r db_name
+        [[ -z "$db_name" ]] && db_name="wordpress"
+        
+        # 破壁 Docker 宿主机回环地址限制
+        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
+            db_host="172.17.0.1:${ext_db_port}"
+        fi
+        echo -e "${YELLOW}提示: 请确保远程 MySQL (${db_host}) 中已提前手动创建好名为 '${db_name}' 的数据库！${RESET}"
     fi
 
-    echo -e "\n${CYAN}====== 2. 安全与基础密钥配置 ======${RESET}"
-    local rand_jwt=$(date +%s | sha256sum | base64 | head -c 32)
-    echo -ne "${YELLOW}请输入前端访问端口 [默认 80]: ${RESET}"; read -r custom_port; [[ -z "$custom_port" ]] && custom_port="80"
-    echo -ne "${YELLOW}后台管理密码 [默认 admin123]: ${RESET}"; read -r admin_pass; [[ -z "$admin_pass" ]] && admin_pass="admin123"
+    # 3. Redis 运行模式选择与分区注入
+    echo -e "\n${CYAN}====== 2. Redis 缓存运行模式选择 ======${RESET}"
+    echo -e " 1) 直接部署全新的 Redis 容器 (免密本地内部网络访问)"
+    echo -e " 2) 使用已有的外部/远程 Redis 缓存服务 (支持密码+库分区绑定)"
+    echo -ne "${YELLOW}请选择 Redis 模式 [默认: 1]: ${RESET}"
+    read -r redis_mode
+    [[ -z "$redis_mode" ]] && redis_mode="1"
 
-    # 写入 .env 文件
-    cat <<EOF > "$ENV_FILE"
-PORT=3000
-JWT_SECRET="${rand_jwt}"
-JWT_EXPIRES_IN=7d
-DB_HOST=${db_host}
-DB_PORT=${db_port}
-DB_USER=${db_user}
-DB_PASS=${db_pass}
-DB_NAME=${db_name}
-REDIS_HOST=${redis_host}
-REDIS_PORT=${redis_port}
-REDIS_PASS=${redis_pass}
-REDIS_DB=${redis_db}
-ADMIN_PATH=/admin
-ADMIN_PASSWORD=${admin_pass}
-EOF
+    local wp_redis_host="redis"
+    local wp_redis_password=""
+    local wp_redis_db="0"
 
-    # 根据部署模式，智能生成 server 的内部依赖块，彻底废除不稳定的 sed 逻辑
+    if [[ "$redis_mode" == "2" ]]; then
+        echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 172.17.0.1]: ${RESET}"
+        read -r ext_redis_ip
+        [[ -z "$ext_redis_ip" ]] && ext_redis_ip="172.17.0.1"
+        echo -ne "${YELLOW}请输入外部 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r ext_redis_port
+        [[ -z "$ext_redis_port" ]] && ext_redis_port="6379"
+        wp_redis_host="${ext_redis_ip}:${ext_redis_port}"
+        echo -ne "${YELLOW}远程 Redis 分区/库编号 (DB Index) [默认 0]: ${RESET}"
+        read -r tmp_rdb; [[ -n "$tmp_rdb" ]] && wp_redis_db="$tmp_rdb"
+        echo -ne "${YELLOW}请输入外部 Redis 密码 (若无密码请直接留空回车): ${RESET}"
+        read -r wp_redis_password
+        
+        # 破壁 Docker 宿主机回环地址限制
+        if [[ "$ext_redis_ip" == "127.0.0.1" || "$ext_redis_ip" == "localhost" ]]; then
+            wp_redis_host="172.17.0.1:${ext_redis_port}"
+        fi
+    else
+        # 常规内置模式也允许选择独立分区，方便单 Redis 跑多站
+        echo -ne "${YELLOW}请输入内置 Redis 独占分区/库编号 (DB Index) [默认 0]: ${RESET}"
+        read -r tmp_rdb; [[ -n "$tmp_rdb" ]] && wp_redis_db="$tmp_rdb"
+    fi
+
+    # 4. 精准分割 Redis 主机与端口并处理字符串机制
+    local redis_pure_host="${wp_redis_host%%:*}"
+    local redis_pure_port="${wp_redis_host##*:}"
+    if [[ "$redis_pure_host" == "$redis_pure_port" ]]; then
+        redis_pure_port="6379"
+    fi
+
+    # 5. 生成结构化的依赖节点（放弃不稳定的 sed，采用内存拼接注入）
     local server_depends=""
-    if [ "$db_mode" = "1" ]; then
-        server_depends=$(cat <<EOF
-    depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-EOF
-)
+    if [[ "$db_mode" == "1" || "$redis_mode" == "1" ]]; then
+        server_depends="    depends_on:"
+        [[ "$db_mode" == "1" ]] && server_depends="${server_depends}\n      - db"
+        [[ "$redis_mode" == "1" ]] && server_depends="${server_depends}\n      - redis"
     fi
 
-    # 构造基础双容器架构
-    cat <<EOF > "$COMPOSE_FILE"
+    # 6. 生成 docker-compose.yml 文本
+    echo -e "\n${YELLOW}正在生成持久化 Docker Compose 配置文件...${RESET}"
+    mkdir -p "$BASE_DIR/data"
+
+    # 生成核心业务基础拓扑
+    cat << EOF > "$COMPOSE_FILE"
 services:
-  client:
-    container_name: paperphone-plus-client
-    image: facilisvelox/paperphone-plus-client:latest
+  wordpress:
+    image: ${DEFAULT_IMAGE}
+    container_name: wordpress-server
+    restart: unless-stopped
     ports:
       - "${custom_port}:80"
-    depends_on:
-      server:
-        condition: service_healthy
-    restart: unless-stopped
-
-  server:
-    container_name: paperphone-plus-server
-    image: facilisvelox/paperphone-plus-server:latest
-    ports:
-      - "3000:3000"
-    env_file:
-      - ./server/.env
+    volumes:
+      - ${BASE_DIR}/data:/var/www/html
     environment:
-      REDIS_DB: \${REDIS_DB:-0}
-${server_depends}
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
+      WORDPRESS_DB_HOST: ${db_host}
+      WORDPRESS_DB_NAME: ${db_name}
+      WORDPRESS_DB_USER: ${db_user}
+      WORDPRESS_DB_PASSWORD: ${db_pass}
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_REDIS_HOST', '${redis_pure_host}');
+        define('WP_REDIS_PORT', ${redis_pure_port});
+        define('WP_REDIS_DATABASE', ${wp_redis_db});
 EOF
 
-    # 只有常规模式（db_mode 为 1）下，才会继续在文件尾部追加本地数据库卷
-    if [ "$db_mode" = "1" ]; then
-        cat <<EOF >> "$COMPOSE_FILE"
+    # 如果配置了密码，动态优雅注入密码常量
+    if [[ -n "$wp_redis_password" ]]; then
+        cat << EOF >> "$COMPOSE_FILE"
+        define('WP_REDIS_PASSWORD', '${wp_redis_password}');
+EOF
+    fi
 
-  mysql:
-    container_name: paperphone-mysql
+    # 追加安全生成的依赖拓扑
+    if [[ -n "$server_depends" ]]; then
+        echo -e "${server_depends}" >> "$COMPOSE_FILE"
+    fi
+
+    # 7. 动态追加本地内置底层服务组件
+    if [[ "$db_mode" == "1" ]]; then
+        mkdir -p "$BASE_DIR/db"
+        cat << EOF >> "$COMPOSE_FILE"
+
+  db:
     image: mysql:8.0
+    container_name: wordpress-db
+    restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${db_pass}
+      MYSQL_ROOT_PASSWORD: ${root_pass}
       MYSQL_DATABASE: ${db_name}
       MYSQL_USER: ${db_user}
       MYSQL_PASSWORD: ${db_pass}
     volumes:
-      - mysql_data:/var/lib/mysql
-    ports:
-      - "127.0.0.1:3306:3306"
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-
-  redis:
-    container_name: paperphone-redis
-    image: redis:7-alpine
-    command: >
-      sh -c "if [ -n '${redis_pass}' ]; then
-        redis-server --requirepass '${redis_pass}'
-      else
-        redis-server
-      fi"
-    volumes:
-      - redis_data:/data
-    ports:
-      - "127.0.0.1:6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
-volumes:
-  mysql_data:
-  redis_data:
+      - ${BASE_DIR}/db:/var/lib/mysql
 EOF
     fi
 
-    echo -e "${YELLOW}正在通过 Docker Compose 部署并拉起集群...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d
-    echo -e "${GREEN}Paperphone-plus 部署成功！${RESET}"
+    if [[ "$redis_mode" == "1" ]]; then
+        mkdir -p "$BASE_DIR/redis"
+        cat << EOF >> "$COMPOSE_FILE"
 
-    # 智能防护获取公网 IP。若环境没有 get_public_ip 函数，自适应切回本地公网卡网段
-    local SERVER_IP
-    if command -v get_public_ip &> /dev/null; then
-        SERVER_IP=$(get_public_ip)
-    else
-        SERVER_IP=$(hostname -I | awk '{print $1}')
+  redis:
+    image: redis:alpine
+    container_name: wordpress-redis
+    restart: unless-stopped
+    volumes:
+      - ${BASE_DIR}/redis:/data
+EOF
     fi
 
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}         Paperphone-plus 部署成功！               ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://${SERVER_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}👑 后端地址: http://${SERVER_IP}:3000${RESET}/admin"
-    echo -e "${YELLOW}🔑 管理密码: ${admin_pass}${RESET}"
-    echo -e "${YELLOW}📂 数据目录: ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-    
+    # 8. 执行一键安全洗牌拉起
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 WordPress 容器集群...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    
-
-
-trigger_backup() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then echo -e "${RED}错误: 未部署系统！${RESET}"; return; fi
-    
-    echo -ne "${YELLOW}请输入备份保存的绝对路径 [默认: $DEFAULT_BACKUP_DIR]: ${RESET}"
-    read -r backup_dir
-    [[ -z "$backup_dir" ]] && backup_dir="$DEFAULT_BACKUP_DIR"
-    mkdir -p "$backup_dir" && chmod -R 777 "$backup_dir"
-    
-    cd "$BASE_DIR"
-    local timestamp=$(date +%Y%m%d-%H%M%S)
-
-    # 1. 智能判定 MySQL 是否属于远程模式
-    if grep -q "mysql:" "$COMPOSE_FILE"; then
-        echo -e "${CYAN}[数据库备份] 内置模式：正在热导出本地 MySQL 数据快照...${RESET}"
-        local db_user=$(grep -E "^DB_USER=" "$ENV_FILE" | cut -d'=' -f2)
-        local db_pass=$(grep -E "^DB_PASS=" "$ENV_FILE" | cut -d'=' -f2)
-        local db_name=$(grep -E "^DB_NAME=" "$ENV_FILE" | cut -d'=' -f2)
-        docker exec -e MYSQL_PWD="${db_pass}" paperphone-mysql mysqldump -u "${db_user}" "${db_name}" > "${backup_dir}/paperphone-${timestamp}.sql" 2>/dev/null
-    else
-        echo -e "${CYAN}[数据库备份] ${YELLOW}检测到远程 MySQL 环境，自动跳过本地数据备份。${RESET}"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}错误: 架构拉起失败，请检查端口是否被占用。${RESET}"
+        return
     fi
 
-    # 2. 智能判定 Redis 是否属于远程模式
-    if grep -q "redis:" "$COMPOSE_FILE"; then
-        echo -e "${CYAN}[缓存备份] 内置模式：正在同步本地 Redis 缓存盘...${RESET}"
-        docker exec paperphone-redis redis-cli save 2>/dev/null
-    else
-        echo -e "${CYAN}[缓存备份] ${YELLOW}检测到远程 Redis 环境，自动跳过本地缓存备份。${RESET}"
-    fi
-    
-    echo -e "${CYAN}[物理打包] 正在打包核心环境配置文件资产...${RESET}"
-    tar -czf "${backup_dir}/paperphone-files-${timestamp}.tar.gz" server/.env docker-compose.yml 2>/dev/null
-    echo -e "${GREEN}备份打包成功！保存在: $backup_dir${RESET}"
-}
-
-restore_utils() {
-    echo -ne "${YELLOW}请输入你的备份文件存放绝对路径 [默认: $DEFAULT_BACKUP_DIR]: ${RESET}"
-    read -r backup_dir
-    [[ -z "$backup_dir" ]] && backup_dir="$DEFAULT_BACKUP_DIR"
-
-    if [[ ! -d "$backup_dir" ]]; then echo -e "${RED}错误: 未检测到备份路径 $backup_dir${RESET}"; return; fi
-    clear
-    echo -e "${CYAN}====== 📥 Paperphone-plus 智能全自动恢复面板 ======${RESET}"
-    echo -e "读取路径: $backup_dir"
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}             WordPress 部署成功！                    ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}外部访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}宿主机映射端口 : ${custom_port}${RESET}"
     echo -e "----------------------------------------------------"
-    
-    local tar_files=($(ls "$backup_dir" 2>/dev/null | grep -E "paperphone-files-.*\.tar\.gz"))
-    if [ ${#tar_files[@]} -eq 0 ]; then echo -e "${RED}未找到符合条件的 paperphone-files-*.tar.gz 压缩包！${RESET}"; return; fi
-    
-    for i in "${!tar_files[@]}"; do echo -e "${GREEN}[$i]${RESET} 压缩包: ${tar_files[$i]}"; done
-    echo -e "----------------------------------------------------"
-    echo -ne "${YELLOW}请选择要恢复的物理资产包(tar.gz)编号: ${RESET}"
-    read -r tar_idx
-    if [[ -z "$tar_idx" || ! "$tar_idx" =~ ^[0-9]+$ || $tar_idx -ge ${#tar_files[@]} ]]; then return; fi
-    local selected_tar="${backup_dir}/${tar_files[$tar_idx]}"
-
-    echo -ne "\n${RED}警告: 本操作会强行覆盖现有环境配置！确认回灌部署吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then return; fi
-
-    echo -e "${YELLOW}正在安全停止本地业务前端及集群容器...${RESET}"
-    if [ -d "$BASE_DIR" ]; then
-        cd "$BASE_DIR" && docker compose down 2>/dev/null
-    fi
-
-    echo -e "${YELLOW}[智能基建] 检测并全自动创建本地系统主环境主目录: $BASE_DIR ...${RESET}"
-    mkdir -p "$BASE_DIR/server"
-
-    echo -e "${YELLOW}[物理释放] 正在释放回填物理配置文件资产...${RESET}"
-    tar -xzf "$selected_tar" -C "$BASE_DIR/"
-    cd "$BASE_DIR"
-
-    # 3. 智能联动：MySQL 远程环境检测与直跳
-    if ! grep -q "mysql:" "$COMPOSE_FILE"; then
-        echo -e "${CYAN}[智能判定] MySQL 属于【远程数据库模式】，直接跳过本地 MySQL 库灌录。${RESET}"
+    echo -e "${CYAN}[数据库凭据回显]${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}MySQL 运行模式 : ${GREEN}全新内置容器 (MySQL 8.0)${RESET}"
+        echo -e "${YELLOW}内置实例库名   : ${db_name}${RESET}"
+        echo -e "${YELLOW}MySQL root密码 : ${RED}${root_pass}${RESET}"
+        echo -e "${YELLOW}WP专账用户名   : ${GREEN}${db_user}${RESET}"
+        echo -e "${YELLOW}WP专账访问密码 : ${GREEN}${db_pass}${RESET}"
     else
-        echo -e "${YELLOW}[库灌录] 检测到内置 MySQL，正在单独拉起本地数据节点准备回灌...${RESET}"
-        local sql_files=($(ls "$backup_dir" 2>/dev/null | grep -E "paperphone-.*\.sql"))
-        if [ ${#sql_files[@]} -gt 0 ]; then
-            docker compose up -d mysql
-            echo -e "${YELLOW}等待本地 MySQL 响应初始化中...${RESET}"
-            sleep 15
-            
-            local db_user=$(grep -E "^DB_USER=" "$ENV_FILE" | cut -d'=' -f2)
-            local db_pass=$(grep -E "^DB_PASS=" "$ENV_FILE" | cut -d'=' -f2)
-            local db_name=$(grep -E "^DB_NAME=" "$ENV_FILE" | cut -d'=' -f2)
-            
-            docker cp "${backup_dir}/${sql_files[0]}" paperphone-mysql:/tmp/restore.sql 2>/dev/null
-            docker exec -i paperphone-mysql sh -c "export MYSQL_PWD='${db_pass}'; mysql -u ${db_user} ${db_name} < /tmp/restore.sql" 2>/dev/null
-            docker exec paperphone-mysql rm -f /tmp/restore.sql 2>/dev/null
+        echo -e "${YELLOW}MySQL 运行模式 : ${CYAN}外部远程连接${RESET}"
+        echo -e "${YELLOW}远程目标主机   : ${db_host}${RESET}"
+        echo -e "${YELLOW}指定连接库名   : ${db_name}${RESET}"
+        echo -e "${YELLOW}连接用户名     : ${db_user}${RESET}"
+        echo -e "${YELLOW}连接密码       : ****** (您输入的外部密码)${RESET}"
+    fi
+    echo -e "----------------------------------------------------"
+    echo -e "${CYAN}[Redis 凭据回显]${RESET}"
+    if [[ "$redis_mode" == "1" ]]; then
+        echo -e "${YELLOW}Redis 运行模式 : ${GREEN}全新内置容器 (隔离专用网段)${RESET}"
+        echo -e "${YELLOW}独占绑库分区   : ${MAGENTA}DB Index [ ${wp_redis_db} ]${RESET}"
+    else
+        echo -e "${YELLOW}Redis 运行模式 : ${CYAN}外部远程缓存${RESET}"
+        echo -e "${YELLOW}Redis 目标主机 : ${wp_redis_host}${RESET}"
+        echo -e "${YELLOW}流向绑库分区   : ${MAGENTA}DB Index [ ${wp_redis_db} ]${RESET}"
+        if [[ -n "$wp_redis_password" ]]; then
+            echo -e "${YELLOW}Redis 验证状态 : ${GREEN}带密码安全认证 (已成功注入环境)${RESET}"
         else
-            echo -e "${YELLOW}未检测到对应数据库 .sql 文件，跳过库回灌。${RESET}"
+            echo -e "${YELLOW}Redis 验证状态 : ${YELLOW}免密开放模式${RESET}"
         fi
     fi
+    echo -e "----------------------------------------------------"
+    echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+}
 
-    # 4. 智能联动：Redis 远程环境检测与直跳
-    if ! grep -q "redis:" "$COMPOSE_FILE"; then
-        echo -e "${CYAN}[智能判定] Redis 属于【远程缓存模式】，无需本地容器，直接跳过。${RESET}"
-    else
-        echo -e "${YELLOW}[缓存拉起] 检测到内置缓存拓扑，正在拉起本地 Redis 节点...${RESET}"
-        docker compose up -d redis
+
+# 更新镜像
+update_wp() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
+        return
     fi
-
-    echo -e "${YELLOW}正在全量复活整个前端与核心业务节点...${RESET}"
-    docker compose up -d --force-recreate
-    echo -e "${GREEN}🌟 集群资产及业务已完美归位！请刷新页面进行业务验证！${RESET}"
+    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}升级完成！${RESET}"
 }
 
-logs_menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}===================================${RESET}"
-        echo -e "${CYAN}      📋 集群分流实时运行日志审计       ${RESET}"
-        echo -e "${CYAN}===================================${RESET}"
-        echo -e "${GREEN}1. 查看 Client 端 (前端 Nginx 流量日志)${RESET}"
-        echo -e "${GREEN}2. 查看 Server 端 (Rust 后端业务核心日志)${RESET}"
-        echo -e "${GREEN}3. 查看 MySQL (本地数据持久化层日志)${RESET}"
-        echo -e "${GREEN}4. 查看 Redis (本地高频缓存层日志)${RESET}"
-        echo -e "${RED}0. 返回主菜单${RESET}"
-        echo -e "${CYAN}===================================${RESET}"
-        echo -ne "${GREEN}请选择要审计的容器日志编号: ${RESET}"
-        read -r log_choice
-        if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR"; fi
-        case "$log_choice" in
-            1) docker compose logs -f --tail=100 client ;;
-            2) docker compose logs -f --tail=100 server ;;
-            3) docker compose logs -f --tail=100 mysql 2>/dev/null || echo -e "${RED}远程模式未启用内置数据库。${RESET}" ;;
-            4) docker compose logs -f --tail=100 redis 2>/dev/null || echo -e "${RED}远程模式未启用内置缓存。${RESET}" ;;
-            0) break ;;
-            *) echo -e "${RED}选择无效！${RESET}" && sleep 1 ;;
-        esac
-    done
-}
-
-uninstall_utils() {
-    echo -ne "${YELLOW}确定要彻底卸载并删除 Paperphone-plus 吗？(y/n): ${RESET}"
+# 卸载 WordPress
+uninstall_wp() {
+    echo -ne "${RED}确定要完全卸载并删除 WordPress 服务吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器集群已安全解除绑架并释放。${RESET}"
-            echo -ne "${YELLOW}是否同时彻底清除宿主机物理配置和核心缓存卷？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}物理痕迹已彻底抹去。${RESET}"
-            fi
+            cd "$BASE_DIR" && docker compose down -v
+            rm -rf "$BASE_DIR"
+        else
+            docker rm -f wordpress-server wordpress-db wordpress-redis 2>/dev/null
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        echo -e "${GREEN}完全卸载成功，数据已彻底清理。${RESET}"
     fi
 }
 
-start_utils() { if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}已启动${RESET}"; fi; }
-stop_utils() { if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}已停止${RESET}"; fi; }
-restart_utils() { if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}已重启${RESET}"; fi; }
+start_wp() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
+stop_wp() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
+restart_wp() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
+logs_wp() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
 show_info() {
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}Client 端服务状态: $status"
-    echo -e "${YELLOW}默认前端服务端口 : ${port_display}${RESET}"
-    echo -e "--------------------------------"
-    docker ps --format "table {{.Names}}\t{{.Status}}" | grep -E "paperphone"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}当前运行状态   : $status"
+    echo -e "${YELLOW}外部提取端口   : ${web_port}${RESET}"
+    echo -e "${YELLOW}安装绝对路径   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-update_utils() {
-    # 1. 核心配置文件健壮性检查
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到集群编排文件 ($COMPOSE_FILE)！${RESET}"
-        echo -e "${YELLOW}请先执行选项 1 部署/启动新实例。${RESET}"
-        return 1
-    fi
-
-    echo -e "${CYAN}===================================${RESET}"
-    echo -e "${CYAN}      🔄 正在滚动拉取并同步最新镜像      ${RESET}"
-    echo -e "${CYAN}===================================${RESET}"
-    
-    cd "$BASE_DIR" || exit 1
-
-    # 2. 执行滚动拉取
-    echo -e "${YELLOW}➜ 正在连接远程仓库拉取最新镜像层...${RESET}"
-    if docker compose pull; then
-        echo -e "${GREEN}✔ 镜像下载/更新完成。${RESET}"
-        
-        # 3. 平滑应用变更（只重启有更新的容器，零停机或极短停机时间）
-        echo -e "${YELLOW}➜ 正在热重载容器集群以应用新镜像...${RESET}"
-        docker compose up -d --remove-orphans
-        echo -e "${GREEN}🌟 集群容器已成功滚动更新！${RESET}"
-    else
-        echo -e "${RED}❌ 镜像拉取失败！请检查网络连接或 GitHub/DockerHub 连通性。${RESET}"
-    fi
-}
-
+# 主菜单管理
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN} ◈  Paperphone-plus  管理面板  ◈ ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}前端状态 :${RESET} $status"
-    echo -e "${GREEN}活动端口 :${RESET} ${YELLOW}${port_display}${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}      ◈  WordPress 管理面板  ◈        ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 当前状态 :${RESET} $status"
+    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 1. 部署启动${RESET}"
-    echo -e "${GREEN} 2. 更新容器${RESET}"
-    echo -e "${GREEN} 3. 卸载容器${RESET}"
-    echo -e "${GREEN} 4. 启动容器${RESET}"
-    echo -e "${GREEN} 5. 停止容器${RESET}"
-    echo -e "${GREEN} 6. 重启容器${RESET}"
+    echo -e "${GREEN} 2. 更新服务${RESET}"
+    echo -e "${GREEN} 3. 卸载服务${RESET}"
+    echo -e "${GREEN} 4. 启动服务${RESET}"
+    echo -e "${GREEN} 5. 停止服务${RESET}"
+    echo -e "${GREEN} 6. 重启服务${RESET}"
     echo -e "${GREEN} 7. 查看日志${RESET}"
-    echo -e "${GREEN} 8. 状态报告${RESET}"
-    echo -e "${GREEN} 9. 备份${RESET}"
-    echo -e "${GREEN}10. 恢复${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -ne "${GREEN}请输入操作代号: ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_utils ;;
-        2) update_utils ;;
-        3) uninstall_utils ;;
-        4) start_utils ;;
-        5) stop_utils ;;
-        6) restart_utils ;;
-        7) logs_menu ;;
+        1) install_wordpress ;;
+        2) update_wp ;;
+        3) uninstall_wp ;;
+        4) start_wp ;;
+        5) stop_wp ;;
+        6) restart_wp ;;
+        7) logs_wp ;;
         8) show_info ;;
-        9) trigger_backup ;;
-        10) restore_utils ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效代号！${RESET}" ;;
+        *) echo -e "${RED}输入无效${RESET}" ;;
     esac
 }
 

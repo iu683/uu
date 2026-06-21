@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# embypulse-pro 工具箱 Docker Compose 管理面板 
+# Pansou 网盘聚合搜索工具 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="embypulse-pro"
-BASE_DIR="/opt/embypulse_pro"
+CONTAINER_NAME="pansou"
+BASE_DIR="/opt/pansou"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,7 +22,7 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取容器状态、映射端口
 get_status_info() {
     # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -39,18 +39,12 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取管理端口（容器内部 10307）
-        admin_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "10307/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$admin_port" ]] && admin_port="10307"
-
-        # 从容器状态提取用户端口（容器内部 10308）
-        user_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "10308/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$user_port" ]] && user_port="10308"
+        # 从容器配置中提取实际映射的外部端口
+        webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8888"
     else
-        # 容器未安装/未部署时的返回值
         img_version="${RED}未安装${RESET}"
-        admin_port="N/A"
-        user_port="N/A"
+        webui_port="N/A"
     fi
 }
 
@@ -78,93 +72,138 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 embypulse-pro
+
+# 部署 Pansou
 install_utils() {
     check_dependencies
     
-    # 创建主目录及挂载所需的子目录
-    mkdir -p "$BASE_DIR/config" "$BASE_DIR/data"
+    mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    # 配置管理端口
-    echo -ne "${YELLOW}请输入管理端口 (宿主机端口，建议仅内网暴露) [默认: 10307]: ${RESET}"
-    read -r custom_admin_port
-    [[ -z "$custom_admin_port" ]] && custom_admin_port="10307"
-    if ! [[ "$custom_admin_port" =~ ^[0-9]+$ ]]; then
+    # 1. 端口配置
+    echo -ne "${YELLOW}请输入 Pansou 访问端口 (宿主机端口) [默认: 8888]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8888"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 配置用户端口
-    echo -ne "${YELLOW}请输入用户端口 (宿主机端口，可对外开放) [默认: 10308]: ${RESET}"
-    read -r custom_user_port
-    [[ -z "$custom_user_port" ]] && custom_user_port="10308"
-    if ! [[ "$custom_user_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
+    # 2. 认证功能配置
+    echo -ne "${YELLOW}是否启用用户登录认证功能？(y/n) [默认: y]: ${RESET}"
+    read -r auth_choice
+    [[ -z "$auth_choice" ]] && auth_choice="y"
+    
+    local auth_enabled="false"
+    local auth_users="admin:admin123"
+    local jwt_secret="pansou-default-jwt-secret-key-2026"
+    
+    if [[ "$auth_choice" == "y" || "$auth_choice" == "Y" ]]; then
+        auth_enabled="true"
+        echo -ne "${YELLOW}请输入认证账号密码 (格式 用户名:密码) [默认: admin:admin123]: ${RESET}"
+        read -r custom_users
+        [[ -n "$custom_users" ]] && auth_users="$custom_users"
+        
+        echo -ne "${YELLOW}请输入自定义 JWT 签名密钥 (安全起见建议随便敲一串复杂字母) [有默认值]: ${RESET}"
+        read -r custom_jwt
+        [[ -n "$custom_jwt" ]] && jwt_secret="$custom_jwt"
     fi
 
-    # 1. 动态生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    # 动态生成极其壮观的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  embypulse-pro:
-    image: ghcr.io/amlkiller/emby-pulse:latest
+  pansou:
+    image: ghcr.io/fish2018/pansou:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     ports:
-      - "${custom_admin_port}:10307"
-      - "${custom_user_port}:10308"
-    volumes:
-      - ./config:/workspace/config
-      - ./data:/workspace/data
+      - "${custom_port}:8888"
     environment:
-      - TZ=Asia/Shanghai
+      - PORT=8888
+      - CHANNELS=tgsearchers6,Aliyun_4K_Movies,bdbdndn11,yunpanx,bsbdbfjfjff,yp123pan,sbsbsnsqq,yunpanxunlei,tianyifc,BaiduCloudDisk,txtyzy,peccxinpd,gotopan,PanjClub,kkxlzy,baicaoZY,MCPH01,MCPH02,MCPH03,bdwpzhpd,ysxb48,jdjdn1111,yggpan,MCPH086,zaihuayun,Q66Share,ucwpzy,shareAliyun,alyp_1,dianyingshare,Quark_Movies,XiangxiuNBB,ydypzyfx,ucquark,xx123pan,yingshifenxiang123,zyfb123,tyypzhpd,tianyirigeng,cloudtianyi,hdhhd21,Lsp115,oneonefivewpfx,qixingzhenren,taoxgzy,Channel_Shares_115,tyysypzypd,vip115hot,wp123zy,yunpan139,yunpan189,yunpanuc,yydf_hzl,leoziyuan,Q_dongman,yoyokuakeduanju,TG654TG,WFYSFX02,QukanMovie,yeqingjie_GJG666,movielover8888_film3,Baidu_netdisk,D_wusun,FLMdongtianfudi,KaiPanshare,QQZYDAPP,rjyxfx,PikPak_Share_Channel,btzhi,newproductsourcing,cctv1211,duan_ju,QuarkFree,yunpanNB,kkdj001,xxzlzn,pxyunpanxunlei,jxwpzy,kuakedongman,liangxingzhinan,xiangnikanj,solidsexydoll,guoman4K,zdqxm,kduanju,cilidianying,CBduanju,SharePanFilms,dzsgx,BooksRealm,Oscar_4Kmovies,douerpan,baidu_yppan,Q_jilupian,Netdisk_Movies,yunpanquark,ammmziyuan,ciliziyuanku,cili8888,jzmm_123pan,Q_dianying,domgmingapk,dianying4k,q_dianshiju,tgbokee,ucshare,godupan,gokuapan,gimy115,WFYSFX03,peccxin,Movie888035,xlwpzy,zyywpzy,wydwpzy,gimy100,ucshare,gimy115iso
+      - ENABLED_PLUGINS=hunhepan,jikepan,panwiki,pansearch,panta,qupansou,hdr4k,pan666,susu,thepiratebay,wanou,xuexizhinan,panyq,zhizhen,labi,muou,ouge,shandian,duoduo,huban,cyg,erxiao,miaoso,fox4k,pianku,clmao,wuji,cldi,xiaozhang,libvio,leijing,xb6v,xys,ddys,hdmoli,yuhuage,u3c3,javdb,clxiong,jutoushe,sdso,xiaoji,xdyh,haisou,bixin,djgou,nyaa,xinjuc,aikanzy,qupanshe,xdpan,discourse,yunsou,qqpd,ahhhhfs,nsgame,gying,quark4k,quarksoo,sousou,ash,weibo,feikuai,kkmao,alupan,ypfxw,mikuclub,daishudj,dyyj,meitizy,jsnoteclub,mizixing,lou1,yiove,zxzj,qingying,kkv,yulinshufa
+      - CACHE_ENABLED=true
+      - CACHE_PATH=/app/cache
+      - CACHE_MAX_SIZE=100
+      - CACHE_TTL=60
+      - ASYNC_PLUGIN_ENABLED=true
+      - ASYNC_RESPONSE_TIMEOUT=4
+      - ASYNC_MAX_BACKGROUND_WORKERS=20
+      - ASYNC_MAX_BACKGROUND_TASKS=100
+      - ASYNC_CACHE_TTL_HOURS=1
+      - AUTH_ENABLED=${auth_enabled}
+      - AUTH_USERS=${auth_users}
+      - AUTH_TOKEN_EXPIRY=24
+      - AUTH_JWT_SECRET=${jwt_secret}
+    volumes:
+      - pansou-cache:/app/cache
+    networks:
+      - pansou-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8888/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  pansou-cache:
+    name: pansou-cache
+
+networks:
+  pansou-network:
+    name: pansou-network
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 embypulse-pro...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Pansou 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}正在等待容器通过内部健康检查 (约5秒)...${RESET}"
+    sleep 5
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     embypulse-pro 部署成功！    ${RESET}"
+    echo -e "${GREEN}       Pansou 部署成功！        ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}管理界面地址   : http://${DETECT_IP}:${custom_admin_port}${RESET}"
-    echo -e "${YELLOW}用户界面地址   : http://${DETECT_IP}:${custom_user_port}${RESET}"
-    echo -e "${YELLOW}请修改配置 $APP_DIR/config并重启${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    if [[ "$auth_enabled" == "true" ]]; then
+        echo -e "${YELLOW}认证状态       : ${GREEN}已启用${RESET}"
+        echo -e "${YELLOW}登录账号配置   : ${auth_users}${RESET}"
+    else
+        echo -e "${YELLOW}认证状态       : ${RED}未启用 (任何人皆可直接访问)${RESET}"
+    fi
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 embypulse-pro 镜像
+# 更新 Pansou 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 embypulse-pro 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Pansou 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 embypulse-pro
+# 卸载 Pansou
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 embypulse-pro 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Pansou 容器及关联缓存卷吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地数据与配置文件？(y/n): ${RESET}"
+            cd "$BASE_DIR" && docker compose down -v
+            echo -e "${GREEN}容器、专用网络及 Volume 缓存卷已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地配置文件目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}配置及数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}本地配置目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -184,8 +223,7 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}管理界面地址   : http://${DETECT_IP}:${admin_port}${RESET}"
-    echo -e "${YELLOW}用户界面地址   : http://${DETECT_IP}:${user_port}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -193,11 +231,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈  embypulse-pro 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}     ◈  Pansou 管理面板  ◈      ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态     :${RESET} $status"
-    echo -e "${GREEN}管理端口 :${RESET} ${YELLOW}${admin_port}${RESET}"
-    echo -e "${GREEN}用户端口 :${RESET} ${YELLOW}${user_port}${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -207,7 +244,7 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}. 退出${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Emby-In-One 工具箱 Docker Compose 管理面板 
+# DDNS-Go 动态域名解析服务 Docker Compose 独立管理面板 (支持 Host 模式)
 # =================================================================
 
 # 颜色
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="emby-in-one"
-BASE_DIR="/opt/emby-in-one"
+CONTAINER_NAME="ddns-go"
+BASE_DIR="/opt/ddns-go"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONFIG_FILE="$BASE_DIR/config/config.yaml"
 
 # 检测依赖
 check_dependencies() {
@@ -21,38 +20,35 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取容器状态与网络/端口模式
 get_status_info() {
-    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
+        status="${GREEN}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="本地构建 (Local Build)"
-
-        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 8096 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8096/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 兜底获取第一个绑定的端口
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8096"
+        [[ -z "$img_version" ]] && img_version="jeessy/ddns-go:latest"
+        
+        # 检测是否为 host 网络模式
+        local net_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CONTAINER_NAME" 2>/dev/null)
+        if [ "$net_mode" = "host" ]; then
+            port_display="Host 模式共享宿主机 (默认 9876)"
+        else
+            # 动态抓取映射到容器 9876 端口的宿主机实际端口
+            webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9876/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+            [[ -z "$webui_port" ]] && webui_port="9876"
+            port_display="${webui_port} (Bridge 模式)"
+        fi
     else
-        # 容器未安装/未部署时的返回值
         img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
+        port_display="N/A"
     fi
 }
 
@@ -80,135 +76,125 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Emby-In-One
+# 处理绝对路径与相对路径转换
+get_real_path() {
+    local input_path="$1"
+    local default_path="$2"
+    [[ -z "$input_path" ]] && input_path="$default_path"
+
+    if [[ "$input_path" == "./"* ]]; then
+        echo "$BASE_DIR/${input_path#./}"
+    else
+        echo "$input_path"
+    fi
+}
+
+# 部署 DDNS-Go
 install_utils() {
     check_dependencies
     
-    # 彻底杜绝旧文件污染：如果发现没有 .git 目录却有其他残缺文件，直接清理
-    if [ -d "$BASE_DIR" ] && [ ! -d "$BASE_DIR/.git" ]; then
-        echo -e "${YELLOW}检测到不完整的旧目录残留，正在强制净化环境...${RESET}"
-        rm -rf "$BASE_DIR"
-    fi
-
-    # 创建项目基础目录结构
-    mkdir -p "$BASE_DIR"/{config,data}
-
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    # 端口配置
-    echo -ne "${YELLOW}请输入 Emby-In-One 访问端口 (宿主机端口) [默认: 8096]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8096"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
-
-    # 密码配置
-    echo -ne "${YELLOW}请输入首次启动的管理面板初始密码 [默认: admin123]: ${RESET}"
-    read -r admin_pwd
-    [[ -z "$admin_pwd" ]] && admin_pwd="admin123"
-
-    # 1. 克隆或同步源码（【全新升级】：采用临时目录中转法，彻底无视目录非空报错）
-    echo -e "${YELLOW}正在拉取 Emby-In-One 源码仓库...${RESET}"
-    if [ -d "$BASE_DIR/.git" ]; then
-        cd "$BASE_DIR" && git pull
-    else
-        # 克隆到系统的临时目录
-        rm -rf /tmp/emby-in-one-repo
-        if git clone https://github.com/ArizeSky/Emby-In-One.git /tmp/emby-in-one-repo; then
-            # 将克隆下来的所有源码文件强制复制/覆盖到目标目录
-            cp -rT /tmp/emby-in-one-repo/ "$BASE_DIR/"
-            rm -rf /tmp/emby-in-one-repo
-        else
-            echo -e "${RED}错误: GitHub 仓库拉取超时，请检查网络或代理设置！${RESET}"
-            rm -rf /tmp/emby-in-one-repo
-            return
-        fi
-    fi
-
-    # 再次检查关键文件，确保拉取成功
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 源码同步失败，未找到 docker-compose.yml！${RESET}"
-        return
-    fi
-
-    # 2. 动态生成符合要求的 config.yaml 配置文件
-    echo -e "${YELLOW}正在生成初始配置文件 config.yaml...${RESET}"
-    cat <<EOF > "$CONFIG_FILE"
-server:
-  port: 8096
-  name: "Emby-In-One"
-  # trustProxy: true        # 部署在反向代理（Nginx/Caddy 等）后面时设为 true
-
-admin:
-  username: "admin"
-  password: "${admin_pwd}" # 首次启动后自动加密存储
-
-playback:
-  mode: "proxy"
-
-timeouts:
-  api: 30000
-  global: 15000
-  login: 10000
-  healthCheck: 10000
-  healthInterval: 60000
-
-proxies: []
-upstream: []
-EOF
-
-    # 3. 修正 docker-compose.yml 的端口映射以匹配用户输入的端口
-    echo -e "${YELLOW}正在微调 docker-compose.yml 端口映射...${RESET}"
-    sed -i "s/- \"[0-9]*:8096\"/- \"${custom_port}:8096\"/g" "$COMPOSE_FILE" 2>/dev/null
-
-    echo -e "${YELLOW}正在通过 Docker Compose 构建并启动服务...${RESET}"
-    cd "$BASE_DIR" && docker compose build
-    docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待服务初始化 (约3秒)...${RESET}"
-    sleep 3
-
+    mkdir -p "$BASE_DIR"
     DETECT_IP=$(get_public_ip)
 
+    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用标准路径 $BASE_DIR 文件夹进行直挂。${RESET}"
+    
+    echo -ne "${YELLOW}请输入数据本地挂载路径 [默认: $BASE_DIR]: ${RESET}"
+    read -r input_data
+    local real_path_data="${input_data:-$BASE_DIR}"
+    real_path_data=$(get_real_path "$real_path_data" "$BASE_DIR")
+
+    # 预创建物理目录并穿透赋权
+    mkdir -p "$real_path_data"
+    chmod -R 777 "$real_path_data"
+
+    echo -e "\n${CYAN}====== 2. 网络模式配置 (Host / Bridge) ======${RESET}"
+    echo -e "${YELLOW}提示: 强烈推荐 Host 模式，能直通宿主机网络，完美获取本地 IPv6 地址。${RESET}"
+    echo -ne "${GREEN}是否启用 Host 网络模式？(y/n) [默认: y]: ${RESET}"
+    read -r net_choice
+    [[ -z "$net_choice" ]] && net_choice="y"
+
+    local net_block=""
+    local port_block=""
+    local final_port="9876"
+
+    if [[ "$net_choice" == "y" || "$net_choice" == "Y" ]]; then
+        # Host 模式配置
+        net_block="network_mode: \"host\""
+        port_block=""
+        final_port="9876"
+        echo -e "${GREEN}已选择 Host 网络模式（将直接使用宿主机 9876 端口）${RESET}"
+    else
+        # Bridge 模式配置，允许自定端口
+        net_block=""
+        echo -ne "${YELLOW}请输入 DDNS-Go 宿主机 WebUI 访问端口 [默认: 9876]: ${RESET}"
+        read -r custom_port
+        [[ -z "$custom_port" ]] && custom_port="9876"
+        if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+            return
+        fi
+        port_block="ports:
+      - \"${custom_port}:9876\""
+        final_port="$custom_port"
+        echo -e "${GREEN}已选择 Bridge 网络模式（映射端口: ${custom_port}）${RESET}"
+    fi
+
+    # 动态生成纯净版 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成原生直挂版 docker-compose.yml...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  ddns-go:
+    image: jeessy/ddns-go:latest
+    container_name: ${CONTAINER_NAME}
+    restart: always
+    ${net_block}
+    ${port_block}
+    volumes:
+      - ${real_path_data}:/root
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 DDNS-Go...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Emby-In-One 部署成功！      ${RESET}"
+    echo -e "${GREEN}         DDNS-Go 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}客户端连接地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}后台管理面板   : http://${DETECT_IP}:${custom_port}/admin${RESET}"
-    echo -e "${YELLOW}初始管理账号   : admin${RESET}"
-    echo -e "${YELLOW}初始管理密码   : ${admin_pwd}${RESET}"
-    echo -e "${YELLOW}配置文件路径   : $CONFIG_FILE${RESET}"
+    echo -e "${YELLOW}WebUI 管理后台   : http://${DETECT_IP}:${final_port}${RESET}"
+    echo -e "${YELLOW}本地配置挂载路径 : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}配置文件路径     : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Emby-In-One（源码拉取并重新编译构建）
+# 更新 DDNS-Go 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到项目，请先执行选项 1 进行部署！${RESET}"
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新源码并重新构建镜像...${RESET}"
-    cd "$BASE_DIR" && git pull
-    docker compose build
+    echo -e "${YELLOW}正在从远端拉取 DDNS-Go 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新并构建完成！服务已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Emby-In-One
+# 卸载 DDNS-Go
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 Emby-In-One 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您配置的 DNS 服务商 Token 及域名同步列表！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 DDNS-Go 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地数据与核心配置文件？(y/n): ${RESET}"
+            echo -ne "${RED}【高风险】是否同时彻底删除本地全量挂载的域名解析配置？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}项目目录及数据已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有 DDNS-Go 配置文件已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -227,9 +213,8 @@ show_info() {
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}部署工作目录   : ${BASE_DIR}${RESET}"
-    echo -e "${YELLOW}客户端连接地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}后台管理面板   : http://${DETECT_IP}:${webui_port}/admin${RESET}"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}当前网络/端口  : ${port_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -237,10 +222,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Emby-In-One 管理面板 ◈    ${RESET}"
+    echo -e "${GREEN}     ◈  DDNS-Go 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}网络 :${RESET} ${YELLOW}${port_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

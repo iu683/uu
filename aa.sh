@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Sub-Store (HTTP-META) Docker Compose 独立管理面板
+# 2FAuth 2FA双因素令牌管理器 Docker Compose 独立管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="sub-store"
-BASE_DIR="/opt/sub-store"
+CONTAINER_NAME="2fauth"
+BASE_DIR="/opt/2fauth"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -36,8 +36,8 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3001/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3011"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8082"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
@@ -68,6 +68,7 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
+
 # 处理绝对路径与相对路径转换
 get_real_path() {
     local input_path="$1"
@@ -81,98 +82,108 @@ get_real_path() {
     fi
 }
 
-# 部署 Sub-Store
+# 部署 2FAuth
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
+    DETECT_IP=$(get_public_ip)
 
     echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径进行挂载。${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 文件夹。${RESET}"
     
-    # 数据持久化目录
-    echo -ne "${YELLOW}请输入数据持久化挂载路径 [默认: ./data]: ${RESET}"
+    # 路径自定义
+    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
     read -r input_data
     local path_data_raw="${input_data:-./data}"
     local real_path_data=$(get_real_path "$path_data_raw" "./data")
 
-    # 预创建目录
+    # 预创建目录，防止 Docker 因无路径将其误创建为 root 权限文件夹
     mkdir -p "$real_path_data"
 
-    echo -e "\n${CYAN}====== 2. 网络与安全密钥配置 ======${RESET}"
+    echo -e "\n${CYAN}====== 2. 网络端口与访问 URL 配置 ======${RESET}"
     
     # 端口配置
-    echo -ne "${YELLOW}请输入 Sub-Store 前端访问端口 [默认: 3011]: ${RESET}"
+    echo -ne "${YELLOW}请输入 2FAuth 访问端口 [默认: 8082]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3011"
+    [[ -z "$custom_port" ]] && custom_port="8082"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 【自动化安全保障】自动生成一个 20 位的强随机英数字作为前后端通信路径
-    echo -e "${YELLOW}正在自动生成 20 位高强度前后端交互通讯密钥...${RESET}"
-    local random_backend_path=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)
+    # 访问域名/URL配置（关系到静态资源能否正常加载）
+    echo -ne "${YELLOW}请输入外部访问的完整 URL [默认: http://${DETECT_IP}:${custom_port}]: ${RESET}"
+    read -r input_url
+    local app_url="${input_url:-http://${DETECT_IP}:${custom_port}}"
 
-    # 动态生成完美的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
+    # 自动化安全保障：生成高强度 32 位 APP_KEY（此 Key 严禁部署后被轮换变更，否则数据无法解密）
+    echo -e "${YELLOW}正在自动生成高强度 32 位底层数据隔离 APP_KEY...${RESET}"
+    local random_app_key=$(LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 32)
+
+    # 动态生成规范的 docker-compose.yml 配置文件 (将配置全部写死在 compose 内)
+    echo -e "${YELLOW}正在生成原生直挂版 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  sub-store:
-    image: xream/sub-store:http-meta
+  2fauth:
+    image: 2fauth/2fauth:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
-    ports:
-      - "${custom_port}:3001"
     volumes:
-      - ${path_data_raw}:/opt/app/data
+      - ${path_data_raw}:/2fauth
+    ports:
+      - "${custom_port}:8000"
     environment:
-      - SUB_STORE_FRONTEND_BACKEND_PATH=/${random_backend_path}
+      - APP_NAME=我的2FA安全令牌
+      - APP_URL=${app_url}
+      - APP_KEY=${random_app_key}
+      - TZ=Asia/Shanghai
+      - CONTENT_SECURITY_POLICY=true
+      - LOGIN_THROTTLE=5
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Sub-Store...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 2FAuth...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
-    DETECT_IP=$(get_public_ip)
-
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Sub-Store 部署成功！      ${RESET}"
+    echo -e "${GREEN}         2FAuth 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}前端访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}自动生成通讯Path: /${random_backend_path}${RESET}"
-    echo -e "${YELLOW}本地数据路径   : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : ${app_url}${RESET}"
+    echo -e "${YELLOW}数据直挂路径   : ${real_path_data}${RESET}"
     echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${RED}⚠️  警告: 生成的 APP_KEY 已直接写在 docker-compose.yml 中，后续切勿随意修改它，否则已存数据将无法解密！${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Sub-Store 镜像
+# 更新 2FAuth 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Sub-Store 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 2FAuth 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Sub-Store
+# 卸载 2FAuth
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 Sub-Store 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}高危警告: 卸载如果清理数据，将永久丢失您存储的所有两步验证令牌！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 2FAuth 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时彻底删除本地全部订阅节点及缓存数据？(y/n): ${RESET}"
+            echo -ne "${RED}【极高风险】是否同时彻底删除本地全量两步验证数据库及密钥配置？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地配置与订阅缓存已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有令牌数据已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -188,14 +199,14 @@ logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}前端访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
     if [ -f "$COMPOSE_FILE" ]; then
-        local current_path=$(grep -E "SUB_STORE_FRONTEND_BACKEND_PATH=" "$COMPOSE_FILE" | cut -d'=' -f2)
-        echo -e "${YELLOW}当前通信 Path  : ${current_path}${RESET}"
+        local current_url=$(grep -E "\- APP_URL=" "$COMPOSE_FILE" | cut -d'=' -f2)
+        local current_key=$(grep -E "\- APP_KEY=" "$COMPOSE_FILE" | cut -d'=' -f2)
+        echo -e "${YELLOW}配置访问地址   : ${current_url}${RESET}"
+        echo -e "${YELLOW}当前安全密钥   : ${current_key}${RESET}"
     fi
     echo -e "${GREEN}================================${RESET}"
 }
@@ -204,7 +215,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  Sub-Store 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}     ◈  2FAuth 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -214,7 +225,7 @@ menu() {
     echo -e "${GREEN}3. 卸载容器${RESET}"
     echo -e "${GREEN}4. 启动容器${RESET}"
     echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}6. 重举容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"

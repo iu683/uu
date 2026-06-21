@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# EmbyProxy Docker Compose 独立管理面板
+# MiaoMiaoWu (喵喵屋) Docker Compose 独立管理面板
 # =================================================================
 
 # 颜色
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="embyproxy"
-BASE_DIR="/opt/embyproxy"
+CONTAINER_NAME="miaomiaowu"
+BASE_DIR="/opt/miaomiaowu"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -27,6 +26,11 @@ check_dependencies() {
 get_status_info() {
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
+        # 抓取可能存在的健康检查状态
+        health_status=$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER_NAME" 2>/dev/null)
+        if [[ -n "$health_status" ]]; then
+            status="${YELLOW}运行中 (${health_status})${RESET}"
+        fi
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
@@ -37,12 +41,8 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 动态抓取端口，若抓不到则从 .env 文件读取
-        webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        if [[ -z "$webui_port" && -f "$ENV_FILE" ]]; then
-            webui_port=$(grep -E "^PORT=" "$ENV_FILE" | cut -d'=' -f2)
-        fi
-        [[ -z "$webui_port" ]] && webui_port="8787"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8080"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
@@ -74,7 +74,7 @@ get_public_ip() {
 }
 
 
-# 处理路径
+# 处理绝对路径与相对路径转换
 get_real_path() {
     local input_path="$1"
     local default_path="$2"
@@ -87,122 +87,116 @@ get_real_path() {
     fi
 }
 
-# 部署 EmbyProxy
+# 部署 MiaoMiaoWu
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 1. 基础安全与网络配置 ======${RESET}"
+    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用主存储路径下的同级目录挂载。${RESET}"
     
-    # 1. 必须配置的管理员 Token
-    while true; do
-        echo -ne "${YELLOW}请输入后台管理 Token (用于 API 访问和后台登录登录，必填): ${RESET}"
-        read -r admin_token
-        if [[ -n "$admin_token" ]]; then
-            break
-        else
-            echo -e "${RED}错误：Token 不能为空，请重新输入！${RESET}"
-        fi
-    done
+    # 路径 1: 数据持久化目录
+    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
+    read -r input_data
+    local path_data_raw="${input_data:-./data}"
+    local real_path_data=$(get_real_path "$path_data_raw" "./data")
 
-    # 2. 自定义端口
-    echo -ne "${YELLOW}请输入服务监听端口 [默认: 8787]: ${RESET}"
+    # 路径 2: 订阅目录
+    echo -ne "${YELLOW}请输入订阅(subscribes)本地挂载路径 [默认: ./subscribes]: ${RESET}"
+    read -r input_sub
+    local path_sub_raw="${input_sub:-./subscribes}"
+    local real_path_sub=$(get_real_path "$path_sub_raw" "./subscribes")
+
+    # 路径 3: 规则模板目录
+    echo -ne "${YELLOW}请输入规则模板(rule_templates)本地挂载路径 [默认: ./rule_templates]: ${RESET}"
+    read -r input_rule
+    local path_rule_raw="${input_rule:-./rule_templates}"
+    local real_path_rule=$(get_real_path "$path_rule_raw" "./rule_templates")
+
+    # 预创建全部目录防权限或类型错乱
+    mkdir -p "$real_path_data" "$real_path_sub" "$real_path_rule"
+
+    echo -e "\n${CYAN}====== 2. 网络与基础配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入喵喵屋访问端口 [默认: 8080]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8787"
+    [[ -z "$custom_port" ]] && custom_port="8080"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 3. 自定义本地数据路径
-    echo -ne "${YELLOW}请输入本地数据挂载路径 [默认: ./data]: ${RESET}"
-    read -r input_data
-    local path_data_raw="${input_data:-./data}"
-    local real_path_data=$(get_real_path "$path_data_raw" "./data")
-
-    # 预创建目录
-    mkdir -p "$real_path_data"
-
-    # 4. 生成独立环境变量文件 .env
-    echo -e "${YELLOW}正在生成配置文件 .env...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-# 管理员 Token
-ADMIN_TOKEN=${admin_token}
-
-# 监听端口
-PORT=${custom_port}
-
-# SQLite 数据库路径
-DB_PATH=./data/proxy.db
-
-# 系统显示时区
-TZ=Asia/Shanghai
-EOF
-
-    # 5. 生成对应的 docker-compose.yml
-    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
+    # 动态生成完美的含有健康检查的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  app:
-    image: \${EMBYPROXY_IMAGE:-ghcr.io/hkfires/embyproxy:latest}
-    pull_policy: always
+  miaomiaowu:
+    image: ghcr.io/iluobei/miaomiaowu:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
+    user: root
+    environment:
+      - PORT=${custom_port}
+      - DATABASE_PATH=/app/data/traffic.db
+      - LOG_LEVEL=info
     ports:
       - "${custom_port}:${custom_port}"
     volumes:
       - ${path_data_raw}:/app/data
-    environment:
-      PORT: "${custom_port}"
-    env_file:
-      - .env
+      - ${path_sub_raw}:/app/subscribes
+      - ${path_rule_raw}:/app/rule_templates
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:${custom_port}/"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 EmbyProxy...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 MiaoMiaoWu...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}等待容器初始化与首次健康探测 (约5秒)...${RESET}"
+    sleep 5
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       EmbyProxy 部署成功！       ${RESET}"
+    echo -e "${GREEN}         MiaoMiaoWu 部署成功！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}管理登录/服务地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}管理员登录 Token : ${admin_token}${RESET}"
-    echo -e "${YELLOW}本地数据路径     : ${real_path_data}${RESET}"
-    echo -e "${YELLOW}环境配置文件路径 : $ENV_FILE${RESET}"
-    echo -e "${YELLOW}Docker 配置文件 : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}数据存储路径   : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}订阅存储路径   : ${real_path_sub}${RESET}"
+    echo -e "${YELLOW}模板规则路径   : ${real_path_rule}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 EmbyProxy 镜像
+# 更新 MiaoMiaoWu 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 EmbyProxy 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 MiaoMiaoWu 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 EmbyProxy
+# 卸载 MiaoMiaoWu
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 EmbyProxy 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 MiaoMiaoWu 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时彻底删除本地全部配置与本地缓存数据库？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时彻底删除本地全部数据库、下载的订阅以及分流模板？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地数据已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有数据已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -222,11 +216,7 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    if [ -f "$ENV_FILE" ]; then
-        local current_token=$(grep -E "^ADMIN_TOKEN=" "$ENV_FILE" | cut -d'=' -f2)
-        echo -e "${YELLOW}当前管理 Token : ${current_token}${RESET}"
-    fi
+    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -234,12 +224,12 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  EmbyProxy 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}     ◈  MiaoMiaoWu 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动 (自定端口/动态生成Env)${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
     echo -e "${GREEN}4. 启动容器${RESET}"

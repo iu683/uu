@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Magnet Fix (磁力检索与下载系统) Docker Compose 纯净管理脚本
+# Magnet Fix (磁力检索与下载系统) Docker Compose 管理脚本
 # =================================================================
 
 # 颜色定义
@@ -12,7 +12,10 @@ RESET="\033[0m"
 
 INSTALL_DIR="/opt/magnet-fix"
 CONTAINER_NAME="magnet-search"
-WEBUI_PORT="8080"  # Magnet Fix 默认运行端口
+
+# 默认端口配置
+DEFAULT_WEB_PORT="8080"
+DEFAULT_UDP_PORT="6881"
 
 # 检测基础依赖
 check_dependencies() {
@@ -26,15 +29,17 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器当前运行状态
-get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
+# 动态从 docker-compose.yml 实时读取当前配置的端口
+load_current_ports() {
+    if [ -f "$INSTALL_DIR/docker-compose.yml" ]; then
+        # 利用 grep 和 sed 提取当前设置的端口
+        WEBUI_PORT=$(grep -E '[0-9]+:8080' "$INSTALL_DIR/docker-compose.yml" | head -n1 | awk -F'"' '{print $2}' | cut -d':' -f1)
+        UDP_PORT=$(grep -E '[0-9]+:6881/udp' "$INSTALL_DIR/docker-compose.yml" | head -n1 | awk -F'"' '{print $2}' | cut -d':' -f1)
     fi
+    
+    # 兜底默认值
+    : "${WEBUI_PORT:=$DEFAULT_WEB_PORT}"
+    : "${UDP_PORT:=$DEFAULT_UDP_PORT}"
 }
 
 # 获取公网 IP (兼容双栈环境)
@@ -61,14 +66,36 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
+# 动态获取容器当前运行状态
+get_status_info() {
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+}
 
-# 选项 1：一键拉取仓库并选择模式启动
+# 自动分析当前已部署的 Profile 状态
+get_current_profiles() {
+    local profiles=""
+    if [ "$(docker ps -aq -f name=^/qbittorrent$)" ]; then
+        profiles="$profiles --profile with-qb"
+    fi
+    if [ "$(docker ps -aq -f name=^/magnet-mysql$)" ]; then
+        profiles="$profiles --profile with-mysql"
+    fi
+    echo "$profiles"
+}
+
+# 选项 1：一键拉取仓库并支持直接修改端口部署
 deploy_magnet() {
     check_dependencies
     
     if [ ! -d "$INSTALL_DIR" ]; then
         echo -e "${YELLOW}正在从 GitHub 克隆 magnet_fix 源码仓库...${RESET}"
-        git clone https://github.com/Polarisiu/magnet_fix.git "$INSTALL_DIR"
+        git clone https://github.com/poouo/magnet_fix.git "$INSTALL_DIR"
         if [ $? -ne 0 ]; then
             echo -e "${RED}错误: 克隆仓库失败！${RESET}"
             return
@@ -76,6 +103,28 @@ deploy_magnet() {
     fi
 
     cd "$INSTALL_DIR" || return
+    load_current_ports
+
+    # 1. 交互式直接修改 Web 端口
+    echo -e "\n${CYAN}====== ⚙️ 配置磁力站服务端口 ======${RESET}"
+    echo -ne "${GREEN}请输入核心磁力站访问 Web 端口 (当前/默认: ${WEBUI_PORT}): ${RESET}"
+    read -r input_web_port
+    if [[ -n "$input_web_port" ]]; then
+        # 直接使用 sed 精准替换 docker-compose.yml 中包含 :8080 的端口行
+        sed -i -E "s/-[[:space:]]*\"[0-9]+:8080\"/- \"$input_web_port:8080\"/g" docker-compose.yml
+        WEBUI_PORT="$input_web_port"
+    fi
+
+    # 2. 交互式直接修改 UDP 端口
+    echo -ne "${GREEN}请输入磁力检索 UDP 传输端口 (当前/默认: ${UDP_PORT}): ${RESET}"
+    read -r input_udp_port
+    if [[ -n "$input_udp_port" ]]; then
+        # 直接使用 sed 精准替换 docker-compose.yml 中包含 :6881/udp 的端口行
+        sed -i -E "s/-[[:space:]]*\"[0-9]+:6881\/udp\"/- \"$input_udp_port:6881\/udp\"/g" docker-compose.yml
+        UDP_PORT="$input_udp_port"
+    fi
+    
+    echo -e "${GREEN}端口配置已直接写入修改！网页端口: $WEBUI_PORT，UDP端口: $UDP_PORT${RESET}\n"
 
     clear
     echo -e "${CYAN}====== 🚀 选择组合模式启动 Magnet Fix ======${RESET}"
@@ -89,7 +138,7 @@ deploy_magnet() {
     echo -e "\n${YELLOW}正在通过 Docker Compose 构建并拉起容器...${RESET}"
     
     case "$mode_choice" in
-        1) docker compose up -d --build ;;
+        1) docker compose up -d --build magnet-search ;;
         2) docker compose --profile with-qb up -d --build ;;
         3) docker compose --profile with-mysql up -d --build ;;
         4) docker compose --profile with-qb --profile with-mysql up -d --build ;;
@@ -102,27 +151,57 @@ deploy_magnet() {
         echo -e "\n${GREEN}====================================================${RESET}"
         echo -e "${GREEN}     🧲 Magnet Fix 磁力检索系统部署/启动成功！      ${RESET}"
         echo -e "${GREEN}====================================================${RESET}"
-        echo -e "${YELLOW} 页面 / 服务       地址${RESET}"
-        echo -e " 搜索首页:        http://${DETECT_IP}:${WEBUI_PORT}"
-        echo -e " 管理后台:        http://${DETECT_IP}:${WEBUI_PORT}/admin"
-        echo -e " 默认后台密码:    ${RED}admin123${RESET}"
-        [[ "$mode_choice" =~ ^(2|4)$ ]] && echo -e " qBittorrentUI:  http://${DETECT_IP}:18080"
-        [[ "$mode_choice" =~ ^(3|4)$ ]] && echo -e " MySQL 地址:     ${DETECT_IP}:13306"
+        echo -e "${YELLOW} 页面服务         地址${RESET}"
+        echo -e "${YELLOW} 搜索首页:        http://${DETECT_IP}:${WEBUI_PORT}${RESET}"
+        echo -e "${YELLOW} 管理后台:        http://${DETECT_IP}:${WEBUI_PORT}/admin${RESET}"
+        echo -e "${YELLOW} 默认后台密码:${RESET}    ${RED}admin123${RESET}"
+        [[ "$mode_choice" =~ ^(2|4)$ ]] && echo -e "${YELLOW} qBittorrentUI:  http://${DETECT_IP}:18080${RESET}"
+        [[ "$mode_choice" =~ ^(3|4)$ ]] && echo -e "${YELLOW} MySQL 地址:     ${DETECT_IP}:13306${RESET}"
         echo -e "${GREEN}====================================================${RESET}"
     fi
 }
 
 # 选项 2：更新容器
 update_magnet() {
-    if [ -d "$INSTALL_DIR" ]; then
-        echo -e "${YELLOW}正在拉取仓库及镜像更新...${RESET}"
-        cd "$INSTALL_DIR" && git pull
-        docker compose --profile with-qb --profile with-mysql pull
-        docker compose --profile with-qb --profile with-mysql up -d --build
-        echo -e "${GREEN}更新完成！${RESET}"
-    else
-        echo -e "${RED}未检测到安装目录！${RESET}"
+    if [ ! -d "$INSTALL_DIR" ]; then
+        echo -e "${RED}错误: 未检测到安装目录！${RESET}"
+        return
     fi
+
+    cd "$INSTALL_DIR" || return
+    
+    # 临时备份本地已经直接修改过的端口配置
+    load_current_ports
+    
+    echo -e "${YELLOW}正在拉取 Git 源码仓库更新...${RESET}"
+    git pull
+    
+    # 拉取更新后，重新把之前直接修改的端口写回去，防止被仓库源码覆盖
+    sed -i -E "s/-[[:space:]]*\"[0-9]+:8080\"/- \"$WEBUI_PORT:8080\"/g" docker-compose.yml
+    sed -i -E "s/-[[:space:]]*\"[0-9]+:6881\/udp\"/- \"$UDP_PORT:6881\/udp\"/g" docker-compose.yml
+
+    clear
+    echo -e "${CYAN}====== 🔄 请选择需要更新的服务范围 ======${RESET}"
+    echo -e " [1] 仅更新/拉取核心磁力站 (不触动/不唤醒 qB 和 MySQL)"
+    echo -e " [2] 完全更新当前环境中已存在的所有组件 (根据本地已有容器自动匹配)"
+    echo -ne "${GREEN}请选择操作 (1/2): ${RESET}"
+    read -r up_choice
+
+    if [ "$up_choice" = "1" ]; then
+        echo -e "${YELLOW}正在精准更新核心容器...${RESET}"
+        docker compose pull magnet-search
+        docker compose up -d --build magnet-search
+    elif [ "$up_choice" = "2" ]; then
+        local active_profiles=$(get_current_profiles)
+        echo -e "${YELLOW}识别到当前关联组件:${RESET} ${active_profiles:-无(仅核心)}"
+        echo -e "${YELLOW}正在全面更新关联的组件容器...${RESET}"
+        docker compose $active_profiles pull
+        docker compose $active_profiles up -d --build
+    else
+        echo -e "${RED}无效选项，已取消更新。${RESET}"
+        return
+    fi
+    echo -e "${GREEN}更新及重构流程完成！${RESET}"
 }
 
 # 选项 3：彻底卸载清理
@@ -140,16 +219,32 @@ uninstall_magnet() {
     fi
 }
 
+# 群控命令
 start_magnet() {
-    if [ -d "$INSTALL_DIR" ]; then cd "$INSTALL_DIR" && docker compose restart magnet-search && echo -e "${GREEN}容器已启动${RESET}"; fi
+    if [ -d "$INSTALL_DIR" ]; then 
+        cd "$INSTALL_DIR" || return
+        local active_profiles=$(get_current_profiles)
+        docker compose $active_profiles start
+        echo -e "${GREEN}关联容器已全面拉起！${RESET}"
+    fi
 }
 
 stop_magnet() {
-    if [ -d "$INSTALL_DIR" ]; then cd "$INSTALL_DIR" && docker compose stop magnet-search && echo -e "${YELLOW}容器已停止${RESET}"; fi
+    if [ -d "$INSTALL_DIR" ]; then 
+        cd "$INSTALL_DIR" || return
+        local active_profiles=$(get_current_profiles)
+        docker compose $active_profiles stop
+        echo -e "${YELLOW}关联容器已全面停止！${RESET}"
+    fi
 }
 
 restart_magnet() {
-    if [ -d "$INSTALL_DIR" ]; then cd "$INSTALL_DIR" && docker compose restart magnet-search && echo -e "${GREEN}容器已重启${RESET}"; fi
+    if [ -d "$INSTALL_DIR" ]; then 
+        cd "$INSTALL_DIR" || return
+        local active_profiles=$(get_current_profiles)
+        docker compose $active_profiles restart
+        echo -e "${GREEN}关联容器已平滑重启！${RESET}"
+    fi
 }
 
 show_logs() {
@@ -162,11 +257,13 @@ show_logs() {
 
 show_config() {
     if [ -d "$INSTALL_DIR" ]; then
+        load_current_ports
         echo -e "${CYAN}====== 当前环境配置 ======${RESET}"
-        echo -e "${YELLOW}安装路径:${RESET} $INSTALL_DIR"
-        if [ -f "$INSTALL_DIR/docker-compose.yml" ]; then
-            cat "$INSTALL_DIR/docker-compose.yml" | grep -E "image:|ports:"
-        fi
+        echo -e "${YELLOW}安装路径: $INSTALL_DIR${RESET}"
+        local active_profiles=$(get_current_profiles)
+        echo -e "${YELLOW}当前启用的 Profile: ${active_profiles:-仅核心站点}${RESET}"
+        echo -e "${YELLOW}网页映射端口: $WEBUI_PORT${RESET}"
+        echo -e "${YELLOW}UDP 传输端口: $UDP_PORT${RESET}"
     else
         echo -e "${RED}未检测到安装配置。${RESET}"
     fi
@@ -175,12 +272,14 @@ show_config() {
 # 主菜单循环
 menu() {
     clear
+    load_current_ports
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Magnet-Fix 管理面板  ◈ ${RESET}"
+    echo -e "${GREEN}   ◈  Magnet-Fix 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态    :${RESET} $status"
-    echo -e "${GREEN}端口    :${RESET} ${YELLOW}${WEBUI_PORT}${RESET}"
+    echo -e "${GREEN}网页端口:${RESET} ${YELLOW}${WEBUI_PORT}${RESET}"
+    echo -e "${GREEN}UDP 端口:${RESET} ${YELLOW}${UDP_PORT}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

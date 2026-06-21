@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Renewlet (域名订阅提醒) Docker Compose 独立管理面板 - 本地直挂版
+# Uptime Kuma 状态监控面板 Docker Compose 独立管理脚本
 # =================================================================
 
 # 颜色
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="renewlet"
-BASE_DIR="/opt/renewlet"
+CONTAINER_NAME="uptime-kuma"
+BASE_DIR="/opt/uptime-kuma"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -25,22 +24,21 @@ check_dependencies() {
 
 # 动态获取容器状态与映射端口
 get_status_info() {
-    if [ "$(docker ps -q -f name=^/renewlet$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-        health_status=$(docker inspect -f '{{.State.Health.Status}}' "renewlet" 2>/dev/null)
-        [[ -n "$health_status" ]] && status="${YELLOW}运行中 (${health_status})${RESET}"
-    elif [ "$(docker ps -aq -f name=^/renewlet$)" ]; then
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${GREEN}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    if [ "$(docker ps -aq -f name=^/renewlet$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "renewlet" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="louislam/uptime-kuma:2"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "renewlet" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3000"
+        # 动态抓取映射到容器 3001 端口的宿主机实际端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3001/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="13001"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
@@ -85,7 +83,7 @@ get_real_path() {
     fi
 }
 
-# 部署 Renewlet
+# 部署 Uptime Kuma
 install_utils() {
     check_dependencies
     
@@ -93,140 +91,85 @@ install_utils() {
     DETECT_IP=$(get_public_ip)
 
     echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认在同级路径下创建 pb_data 文件夹。${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 文件夹。${RESET}"
     
-    # 本地目录挂载点自定义
-    echo -ne "${YELLOW}请输入数据(pb_data)本地挂载路径 [默认: ./pb_data]: ${RESET}"
+    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
     read -r input_data
-    local path_data_raw="${input_data:-./pb_data}"
-    local real_path_data=$(get_real_path "$path_data_raw" "./pb_data")
+    local path_data_raw="${input_data:-./data}"
+    local real_path_data=$(get_real_path "$path_data_raw" "./data")
 
-    # 预创建本地物理目录，防止 Docker 误将其创建为 root 权限文件夹
+    # 预创建目录并赋予标准权限，防止特定环境下权限受阻
     mkdir -p "$real_path_data"
+    chmod -R 777 "$real_path_data"
 
-    echo -e "\n${CYAN}====== 2. 基础网络配置 ======${RESET}"
-    # 对外端口自定义
-    echo -ne "${YELLOW}请输入 Renewlet 访问端口 [默认: 3000]: ${RESET}"
+    echo -e "\n${CYAN}====== 2. 网络端口与访问配置 ======${RESET}"
+    
+    echo -ne "${YELLOW}请输入 Uptime Kuma 访问端口 [默认: 13001]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
+    [[ -z "$custom_port" ]] && custom_port="13001"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
 
-    # 对外公网或内网 APP_URL
-    echo -ne "${YELLOW}请输入外部访问的完整 URL [默认: http://${DETECT_IP}:${custom_port}]: ${RESET}"
-    read -r input_url
-    local app_url="${input_url:-http://${DETECT_IP}:${custom_port}}"
-
-    echo -e "\n${CYAN}====== 3. 安全与性能配额 ======${RESET}"
-    # 自动生成 32 位 PB 加密密钥
-    echo -e "${YELLOW}正在自动构建 32 位高强度 PocketBase 安全加密密钥...${RESET}"
-    local random_pb_key=$(LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 32)
-
-    # 写入环境变量文件 .env
-    echo -e "${YELLOW}正在生成外部环境配置文件 .env...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-PORT=${custom_port}
-GOMEMLIMIT=128MiB
-MEM_LIMIT=256m
-TZ=Asia/Shanghai
-APP_URL=${app_url}
-RENEWLET_DEMO_MODE=false
-RENEWLET_CUSTOM_HEAD_SCRIPT=""
-PB_ENCRYPTION_KEY=${random_pb_key}
-NOTIFICATION_SCHEDULER_ENABLED=true
-CRON_SECRET=""
-NOTIFICATION_SCHEDULER_CRON="* * * * *"
-NOTIFICATION_CRON_WINDOW_MINUTES=2
-NOTIFICATION_MAX_RETRIES=3
-NOTIFICATION_STALE_SENDING_MINUTES=15
-EOF
-
-    # 动态构建规范的 docker-compose.yml 配置文件 (移除 volumes 声明，直接绑定本地路径)
-    echo -e "${YELLOW}正在生成直挂本地版的 docker-compose.yml...${RESET}"
+    # 动态生成纯净版 docker-compose.yml 配置文件 (无.env，变量全部写死在内)
+    echo -e "${YELLOW}正在生成直挂本地版 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  web:
-    image: ghcr.io/zhiyingzzhou/renewlet:latest
-    container_name: renewlet
-    environment:
-      GOMEMLIMIT: \${GOMEMLIMIT:-128MiB}
-      TZ: \${TZ:-Asia/Shanghai}
-      APP_URL: \${APP_URL:-http://localhost:3000}
-      RENEWLET_DEMO_MODE: \${RENEWLET_DEMO_MODE:-false}
-      RENEWLET_CUSTOM_HEAD_SCRIPT: \${RENEWLET_CUSTOM_HEAD_SCRIPT:-}
-      PB_ENCRYPTION_KEY: \${PB_ENCRYPTION_KEY:-}
-      SMTP_HOST: \${SMTP_HOST:-}
-      SMTP_PORT: \${SMTP_PORT:-587}
-      SMTP_USER: \${SMTP_USER:-}
-      SMTP_PASSWORD: \${SMTP_PASSWORD:-}
-      SMTP_FROM: \${SMTP_FROM:-}
-      SMTP_TLS: \${SMTP_TLS:-false}
-      BACKUPS_CRON: \${BACKUPS_CRON:-}
-      BACKUPS_CRON_MAX_KEEP: \${BACKUPS_CRON_MAX_KEEP:-3}
-      NOTIFICATION_SCHEDULER_ENABLED: \${NOTIFICATION_SCHEDULER_ENABLED:-true}
-      CRON_SECRET: \${CRON_SECRET:-}
-      NOTIFICATION_SCHEDULER_CRON: "\${NOTIFICATION_SCHEDULER_CRON:-* * * * *}"
-      NOTIFICATION_CRON_WINDOW_MINUTES: \${NOTIFICATION_CRON_WINDOW_MINUTES:-2}
-      NOTIFICATION_MAX_RETRIES: \${NOTIFICATION_MAX_RETRIES:-3}
-      NOTIFICATION_STALE_SENDING_MINUTES: \${NOTIFICATION_STALE_SENDING_MINUTES:-15}
-    volumes:
-      - ${path_data_raw}:/pb_data
-    ports:
-      - "\${PORT:-3000}:3000"
-    healthcheck:
-      test: [ "CMD", "/renewlet", "healthcheck" ]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-    mem_limit: \${MEM_LIMIT:-256m}
+  uptime-kuma:
+    image: louislam/uptime-kuma:2
+    container_name: ${CONTAINER_NAME}
     restart: unless-stopped
+    volumes:
+      - ${path_data_raw}:/app/data
+    ports:
+      - "${custom_port}:3001"
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Renewlet...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Uptime Kuma...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化与健康检查预热 (约5秒)...${RESET}"
-    sleep 5
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}         Renewlet 部署成功！      ${RESET}"
+    echo -e "${GREEN}        Uptime Kuma 部署成功！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : ${app_url}${RESET}"
-    echo -e "${YELLOW}设置管理员向导 : ${app_url}/setup${RESET}"
-    echo -e "${YELLOW}数据加密 Key   : ${random_pb_key}${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
     echo -e "${YELLOW}数据直挂路径   : ${real_path_data}${RESET}"
-    echo -e "${YELLOW}环境配置路径   : $ENV_FILE${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 升级镜像
+# 更新 Uptime Kuma 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取 Renewlet 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Uptime Kuma 最新镜像(2.x系列)...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载容器
+# 卸载 Uptime Kuma
 uninstall_utils() {
-    echo -e "${RED}高危警告: 卸载如果清理数据，将永久清空您物理目录下的所有账单和数据库文件！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 Renewlet 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}高危警告: 卸载如果清理数据，将永久丢失您所有的监控项和历史可用性统计报表！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Uptime Kuma 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}【极高风险】是否同时彻底删除本地物理挂载的数据文件夹？(y/n): ${RESET}"
+            echo -ne "${RED}【极高风险】是否同时彻底删除本地全量监控数据库？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地物理数据目录及配置文件已全部销毁。${RESET}"
+                echo -e "${GREEN}本地所有监控历史数据已被彻底销毁。${RESET}"
             fi
         else
-            docker rm -f renewlet 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
@@ -235,17 +178,15 @@ uninstall_utils() {
 start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
 stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
 restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_utils() { docker logs -f renewlet; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
+    DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    if [ -f "$ENV_FILE" ]; then
-        local current_url=$(grep -E "^APP_URL=" "$ENV_FILE" | cut -d'=' -f2)
-        echo -e "${YELLOW}配置访问地址   : ${current_url}${RESET}"
-    fi
+    echo -e "${YELLOW}镜像版本       : ${img_version}${RESET}"
+    echo -e "${YELLOW}面板访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -253,7 +194,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Renewlet 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}   ◈  Uptime Kuma 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"

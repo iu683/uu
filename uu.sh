@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Paperphone-plus - 跨环境（MySQL/Redis 双自适应 + Redis 分区）运维面板
+# Acgfaka Docker Compose 管理面板 (内置库/远程库/缓存自适应三模版)
 # =================================================================
 
 # 颜色定义
@@ -8,17 +8,17 @@ RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
-MAGENTA="\033[35m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/paperphone"
+BASE_DIR="/opt/acgfaka"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/server/.env"
-DEFAULT_BACKUP_DIR="$BASE_DIR/backups"
+DEFAULT_IMAGE="dapiaoliang666/acgfaka"
 
+# 检测依赖环境
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker！${RESET}"; exit 1
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
     fi
 }
 
@@ -27,448 +27,347 @@ get_public_ip() {
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
         for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
         done
     elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
         for url in "https://api64.ipify.org" "https://6.ip.sb"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
         done
     else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
         for url in "https://api.ipify.org" "https://4.ip.sb"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
         for url in "https://api64.ipify.org" "https://6.ip.sb"; do
             ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
     fi
-
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
     echo "127.0.0.1" && return 0
 }
 
+# 动态获取容器整体状态和端口 (采用原生 Docker Inspect 终极技术)
 get_status_info() {
-    local active_id=$(docker ps -q --filter "name=paperphone-plus-client" --filter "status=running" | head -n 1)
-    if [ -n "$active_id" ]; then
-        status="${GREEN}运行中${RESET}"
-        # 动态获取 client 容器映射到宿主机的端口
-        port_display=$(docker port paperphone-plus-client 80 2>/dev/null | cut -d':' -f2)
-        [[ -z "$port_display" ]] && port_display="80"
+    if [ -f "$COMPOSE_FILE" ]; then
+        if [ "$(docker ps -q -f name=acgfaka)" ]; then
+            status="${GREEN}运行中${RESET}"
+            web_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' acgfaka 2>/dev/null)
+        elif [ "$(docker ps -aq -f name=acgfaka)" ]; then
+            status="${YELLOW}已停止${RESET}"
+            web_port=""
+        else
+            status="${RED}未部署${RESET}"
+            web_port=""
+        fi
+        
+        if [ -z "$web_port" ]; then
+            web_port=$(sed -n '/acgfaka:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+            [[ -z "$web_port" ]] && web_port="8000"
+        fi
     else
-        local dead_id=$(docker ps -aq --filter "name=paperphone-plus-client" | head -n 1)
-        if [ -n "$dead_id" ]; then status="${RED}已停止${RESET}"; else status="${RED}未部署${RESET}"; fi
-        port_display="N/A"
+        status="${RED}未初始化${RESET}"
+        web_port="N/A"
     fi
 }
 
-
-
-install_utils() {
+# 部署 Acgfaka
+install_acgfaka() {
     check_dependencies
-    mkdir -p "$BASE_DIR/server"
-    
-    echo -e "${CYAN}====== 1. 数据库与缓存部署模式选择 ======${RESET}"
-    echo -e "${GREEN}1) 内置常规模式${RESET} (本地跑 MySQL 和 Redis 容器)"
-    echo -e "${GREEN}2) 远程数据模式${RESET} (连接外部已有的 MySQL/Redis，跳过本地库)"
-    echo -ne "${YELLOW}请选择模式 [默认 1]: ${RESET}"; read -r db_mode
+    mkdir -p "$BASE_DIR"
+
+    echo -e "${GREEN}=====================================${RESET}"
+    echo -e "${CYAN}====== 数据库/缓存运行模式选择 ======${RESET}"
+    echo -e "${GREEN}=====================================${RESET}"
+    echo -e " 1. 直接部署全新且完整的环境 (包含全新 MySQL 5.7 + Redis)"
+    echo -e " 2. 使用外部已有 MySQL，但在本地部署全新 Redis 缓存"
+    echo -e " 3. 同时使用外部已有 MySQL 和外部已有 Redis"
+    echo -ne "${YELLOW}请选择架构部署模式 [默认: 1]: ${RESET}"
+    read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
-    local db_host="mysql" local redis_host="redis" local db_user="paperphoneplus" local db_pass="changeme"
-    local db_name="paperphoneplus" local db_port="3306" local redis_pass="" local redis_port="6379" local redis_db="0"
-
-    if [ "$db_mode" = "2" ]; then
-        echo -e "\n${CYAN}➜ 请输入远程 MySQL 配置:${RESET}"
-        echo -ne "${YELLOW}远程 MySQL 地址 (Host): ${RESET}"; read -r db_host
-        echo -ne "${YELLOW}远程 MySQL 端口 (Port) [默认 3306]: ${RESET}"; read -r tmp_port; [[ -n "$tmp_port" ]] && db_port="$tmp_port"
-        echo -ne "${YELLOW}远程 MySQL 用户 (User) [默认 paperphoneplus]: ${RESET}"; read -r tmp_user; [[ -n "$tmp_user" ]] && db_user="$tmp_user"
-        echo -ne "${YELLOW}远程 MySQL 密码 (Password): ${RESET}"; read -r db_pass
-        echo -ne "${YELLOW}远程 MySQL 数据库名 (DB Name) [默认 paperphoneplus]: ${RESET}"; read -r tmp_db; [[ -n "$tmp_db" ]] && db_name="$tmp_db"
-
-        echo -e "\n${CYAN}➜ 请输入远程 Redis 配置:${RESET}"
-        echo -ne "${YELLOW}远程 Redis 地址 (Host): ${RESET}"; read -r redis_host
-        echo -ne "${YELLOW}远程 Redis 端口 (Port) [默认 6379]: ${RESET}"; read -r tmp_rport; [[ -n "$tmp_rport" ]] && redis_port="$tmp_rport"
-        echo -ne "${YELLOW}远程 Redis 分区/库编号 (DB Index) [默认 0]: ${RESET}"; read -r tmp_rdb; [[ -n "$tmp_rdb" ]] && redis_db="$tmp_rdb"
-        echo -ne "${YELLOW}远程 Redis 密码 (无密码直接回车): ${RESET}"; read -r redis_pass
+    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Acgfaka Web 访问端口 [默认: 8000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8000"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
     fi
 
-    echo -e "\n${CYAN}====== 2. 安全与基础密钥配置 ======${RESET}"
-    local rand_jwt=$(date +%s | sha256sum | base64 | head -c 32)
-    echo -ne "${YELLOW}请输入前端访问端口 [默认 80]: ${RESET}"; read -r custom_port; [[ -z "$custom_port" ]] && custom_port="80"
-    echo -ne "${YELLOW}请输入后端核心端口 [默认 3000]: ${RESET}"; read -r custom_sport; [[ -z "$custom_sport" ]] && custom_sport="3000"
-    echo -ne "${YELLOW}后台管理密码 [默认 admin123]: ${RESET}"; read -r admin_pass; [[ -z "$admin_pass" ]] && admin_pass="admin123"
+    # 预设自动化环境目录
+    mkdir -p "$BASE_DIR/acgfaka"
 
-    # 写入 .env 文件 (注意：这里的 PORT 是容器内监听端口，保持 3000 即可，外部由 Docker 端口映射改变)
-    cat <<EOF > "$ENV_FILE"
-PORT=3000
-JWT_SECRET="${rand_jwt}"
-JWT_EXPIRES_IN=7d
-DB_HOST=${db_host}
-DB_PORT=${db_port}
-DB_USER=${db_user}
-DB_PASS=${db_pass}
-DB_NAME=${db_name}
-REDIS_HOST=${redis_host}
-REDIS_PORT=${redis_port}
-REDIS_PASS=${redis_pass}
-REDIS_DB=${redis_db}
-ADMIN_PATH=/admin
-ADMIN_PASSWORD=${admin_pass}
-EOF
+    # ------------------ 模式 1：全套本地内置容器化 ------------------
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}正在自动计算生成数据库高强度防破解随机密码...${RESET}"
+        local rand_root_pass=$(openssl rand -hex 12)
+        local rand_user_pass=$(openssl rand -hex 12)
+        local rand_user="acgfaka_user"
+        local rand_db="acgfakadb"
 
-    # 根据部署模式，智能生成 server 的内部依赖块
-    local server_depends=""
-    if [ "$db_mode" = "1" ]; then
-        server_depends=$(cat <<EOF
+        mkdir -p "$BASE_DIR/mysql"
+
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  acgfaka:
+    image: ${DEFAULT_IMAGE}
+    container_name: acgfaka
+    restart: always
+    ports:
+      - "${custom_port}:80"
     depends_on:
       mysql:
         condition: service_healthy
       redis:
-        condition: service_healthy
-EOF
-)
-    fi
+        condition: service_started
+    environment:
+      PHP_OPCACHE_ENABLE: 1
+      PHP_OPCACHE_MEMORY_CONSUMPTION: 128
+      PHP_OPCACHE_MAX_ACCELERATED_FILES: 10000
+      PHP_OPCACHE_REVALIDATE_FREQ: 2
+      PHP_REDIS_HOST: redis
+      PHP_REDIS_PORT: 6379
+      PHP_REDIS_DB: 0
+    volumes:
+      - ${BASE_DIR}/acgfaka:/var/www/html
 
-    # 构造基础双容器架构
-    cat <<EOF > "$COMPOSE_FILE"
+  mysql:
+    image: mysql:5.7
+    container_name: acgfaka-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${rand_root_pass}
+      MYSQL_DATABASE: ${rand_db}
+      MYSQL_USER: ${rand_user}
+      MYSQL_PASSWORD: ${rand_user_pass}
+    volumes:
+      - ${BASE_DIR}/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p${rand_root_pass}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:latest
+    container_name: acgfaka-redis
+    restart: always
+EOF
+
+        echo -e "${YELLOW}正在通过 Docker Compose 部署启动全套 Acgfaka 集群...${RESET}"
+        cd "$BASE_DIR" && docker compose up -d --force-recreate
+        if [ $? -ne 0 ]; then echo -e "${RED}部署失败，请检查 Docker 日志。${RESET}"; return; fi
+
+    # ------------------ 模式 2：外部 MySQL + 本地内置 Redis ------------------
+    elif [[ "$db_mode" == "2" ]]; then
+        echo -e "${CYAN}====== 远程/外部 MySQL 数据库信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 MySQL IP/域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_mysql_host
+        [[ -z "$ext_mysql_host" ]] && ext_mysql_host="127.0.0.1"
+
+        # 回环桥接处理
+        [[ "$ext_mysql_host" == "127.0.0.1" || "$ext_mysql_host" == "localhost" ]] && ext_mysql_host="172.17.0.1"
+        
+        cat << EOF > "$COMPOSE_FILE"
 services:
-  client:
-    container_name: paperphone-plus-client
-    image: facilisvelox/paperphone-plus-client:latest
+  acgfaka:
+    image: ${DEFAULT_IMAGE}
+    container_name: acgfaka
+    restart: always
     ports:
       - "${custom_port}:80"
     depends_on:
-      server:
-        condition: service_healthy
-    restart: unless-stopped
-
-  server:
-    container_name: paperphone-plus-server
-    image: facilisvelox/paperphone-plus-server:latest
-    ports:
-      - "${custom_sport}:3000"
-    env_file:
-      - ./server/.env
+      - redis
     environment:
-      REDIS_DB: \${REDIS_DB:-0}
-${server_depends}
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
-EOF
-
-    # 只有常规模式（db_mode 为 1）下，才会继续在文件尾部追加本地数据库卷
-    if [ "$db_mode" = "1" ]; then
-        cat <<EOF >> "$COMPOSE_FILE"
-
-  mysql:
-    container_name: paperphone-mysql
-    image: mysql:8.0
-    environment:
-      MYSQL_ROOT_PASSWORD: ${db_pass}
-      MYSQL_DATABASE: ${db_name}
-      MYSQL_USER: ${db_user}
-      MYSQL_PASSWORD: ${db_pass}
+      PHP_OPCACHE_ENABLE: 1
+      PHP_OPCACHE_MEMORY_CONSUMPTION: 128
+      PHP_OPCACHE_MAX_ACCELERATED_FILES: 10000
+      PHP_OPCACHE_REVALIDATE_FREQ: 2
+      PHP_REDIS_HOST: redis
+      PHP_REDIS_PORT: 6379
+      PHP_REDIS_DB: 0
     volumes:
-      - mysql_data:/var/lib/mysql
-    ports:
-      - "127.0.0.1:3306:3306"
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
+      - ${BASE_DIR}/acgfaka:/var/www/html
 
   redis:
-    container_name: paperphone-redis
-    image: redis:7-alpine
-    command: >
-      sh -c "if [ -n '${redis_pass}' ]; then
-        redis-server --requirepass '${redis_pass}'
-      else
-        redis-server
-      fi"
-    volumes:
-      - redis_data:/data
-    ports:
-      - "127.0.0.1:6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
-volumes:
-  mysql_data:
-  redis_data:
+    image: redis:latest
+    container_name: acgfaka-redis
+    restart: always
 EOF
-    fi
+        cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}正在通过 Docker Compose 部署并拉起集群...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d
-    echo -e "${GREEN}Paperphone-plus 部署成功！${RESET}"
-
-    # 智能防护获取公网 IP
-    local SERVER_IP
-    if command -v get_public_ip &> /dev/null; then
-        SERVER_IP=$(get_public_ip)
+    # ------------------ 模式 3：外部 MySQL + 外部可含密码 Redis ------------------
     else
-        SERVER_IP=$(hostname -I | awk '{print $1}')
-    fi
+        echo -e "${CYAN}====== 远程/外部 MySQL 配置 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 MySQL IP/域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_mysql_host
+        [[ -z "$ext_mysql_host" ]] && ext_mysql_host="127.0.0.1"
 
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}         Paperphone-plus 部署成功！               ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://${SERVER_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}👑 管理后台: http://${SERVER_IP}:${custom_port}/admin${RESET}"
-    echo -e "${YELLOW}👑 后端地址: http://${SERVER_IP}:${custom_sport}${RESET}"
-    echo -e "${YELLOW}🔑 管理密码: ${admin_pass}${RESET}"
-    echo -e "${YELLOW}📂 数据目录: ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-    
+        echo -e "${CYAN}====== 远程/外部 Redis 配置 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 Redis IP/域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_redis_host
+        [[ -z "$ext_redis_host" ]] && ext_redis_host="127.0.0.1"
 
+        echo -ne "${YELLOW}请输入外部 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r ext_redis_port
+        [[ -z "$ext_redis_port" ]] && ext_redis_port="6379"
 
-trigger_backup() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then echo -e "${RED}错误: 未部署系统！${RESET}"; return; fi
-    
-    echo -ne "${YELLOW}请输入备份保存的绝对路径 [默认: $DEFAULT_BACKUP_DIR]: ${RESET}"
-    read -r backup_dir
-    [[ -z "$backup_dir" ]] && backup_dir="$DEFAULT_BACKUP_DIR"
-    mkdir -p "$backup_dir" && chmod -R 777 "$backup_dir"
-    
-    cd "$BASE_DIR"
-    local timestamp=$(date +%Y%m%d-%H%M%S)
+        # 密码按需配置逻辑
+        echo -e "${GREEN}(提示: 如果外部 Redis 没有设置密码，请直接【回车】跳过)${RESET}"
+        echo -ne "${YELLOW}请输入外部 Redis 密码 [留空表示无密码]: ${RESET}"
+        read -r ext_redis_pass
 
-    # 1. 智能判定 MySQL 是否属于远程模式
-    if grep -q "mysql:" "$COMPOSE_FILE"; then
-        echo -e "${CYAN}[数据库备份] 内置模式：正在热导出本地 MySQL 数据快照...${RESET}"
-        local db_user=$(grep -E "^DB_USER=" "$ENV_FILE" | cut -d'=' -f2)
-        local db_pass=$(grep -E "^DB_PASS=" "$ENV_FILE" | cut -d'=' -f2)
-        local db_name=$(grep -E "^DB_NAME=" "$ENV_FILE" | cut -d'=' -f2)
-        docker exec -e MYSQL_PWD="${db_pass}" paperphone-mysql mysqldump -u "${db_user}" "${db_name}" > "${backup_dir}/paperphone-${timestamp}.sql" 2>/dev/null
-    else
-        echo -e "${CYAN}[数据库备份] ${YELLOW}检测到远程 MySQL 环境，自动跳过本地数据备份。${RESET}"
-    fi
+        # === 统一合并为一个 Redis 数据库号输入 ===
+        echo -ne "${YELLOW}请输入远程 Redis 数据库号 (DB ID) [默认: 0]: ${RESET}"
+        read -r redis_db_cfg
+        [[ -z "$redis_db_cfg" ]] && redis_db_cfg="0"
 
-    # 2. 智能判定 Redis 是否属于远程模式
-    if grep -q "redis:" "$COMPOSE_FILE"; then
-        echo -e "${CYAN}[缓存备份] 内置模式：正在同步本地 Redis 缓存盘...${RESET}"
-        docker exec paperphone-redis redis-cli save 2>/dev/null
-    else
-        echo -e "${CYAN}[缓存备份] ${YELLOW}检测到远程 Redis 环境，自动跳过本地缓存备份。${RESET}"
-    fi
-    
-    echo -e "${CYAN}[物理打包] 正在打包核心环境配置文件资产...${RESET}"
-    tar -czf "${backup_dir}/paperphone-files-${timestamp}.tar.gz" server/.env docker-compose.yml 2>/dev/null
-    echo -e "${GREEN}备份打包成功！保存在: $backup_dir${RESET}"
-}
+        # 回环重定向桥接
+        [[ "$ext_mysql_host" == "127.0.0.1" || "$ext_mysql_host" == "localhost" ]] && ext_mysql_host="172.17.0.1"
+        [[ "$ext_redis_host" == "127.0.0.1" || "$ext_redis_host" == "localhost" ]] && ext_redis_host="172.17.0.1"
 
-restore_utils() {
-    echo -ne "${YELLOW}请输入你的备份文件存放绝对路径 [默认: $DEFAULT_BACKUP_DIR]: ${RESET}"
-    read -r backup_dir
-    [[ -z "$backup_dir" ]] && backup_dir="$DEFAULT_BACKUP_DIR"
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  acgfaka:
+    image: ${DEFAULT_IMAGE}
+    container_name: acgfaka
+    restart: always
+    ports:
+      - "${custom_port}:80"
+    environment:
+      PHP_OPCACHE_ENABLE: 1
+      PHP_OPCACHE_MEMORY_CONSUMPTION: 128
+      PHP_OPCACHE_MAX_ACCELERATED_FILES: 10000
+      PHP_OPCACHE_REVALIDATE_FREQ: 2
+      PHP_REDIS_HOST: ${ext_redis_host}
+      PHP_REDIS_PORT: ${ext_redis_port}
+      PHP_REDIS_DB: ${redis_db_cfg}
+EOF
 
-    if [[ ! -d "$backup_dir" ]]; then echo -e "${RED}错误: 未检测到备份路径 $backup_dir${RESET}"; return; fi
-    clear
-    echo -e "${CYAN}====== 📥 Paperphone-plus 智能全自动恢复面板 ======${RESET}"
-    echo -e "读取路径: $backup_dir"
-    echo -e "----------------------------------------------------"
-    
-    local tar_files=($(ls "$backup_dir" 2>/dev/null | grep -E "paperphone-files-.*\.tar\.gz"))
-    if [ ${#tar_files[@]} -eq 0 ]; then echo -e "${RED}未找到符合条件的 paperphone-files-*.tar.gz 压缩包！${RESET}"; return; fi
-    
-    for i in "${!tar_files[@]}"; do echo -e "${GREEN}[$i]${RESET} 压缩包: ${tar_files[$i]}"; done
-    echo -e "----------------------------------------------------"
-    echo -ne "${YELLOW}请选择要恢复的物理资产包(tar.gz)编号: ${RESET}"
-    read -r tar_idx
-    if [[ -z "$tar_idx" || ! "$tar_idx" =~ ^[0-9]+$ || $tar_idx -ge ${#tar_files[@]} ]]; then return; fi
-    local selected_tar="${backup_dir}/${tar_files[$tar_idx]}"
-
-    echo -ne "\n${RED}警告: 本操作会强行覆盖现有环境配置！确认回灌部署吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then return; fi
-
-    echo -e "${YELLOW}正在安全停止本地业务前端及集群容器...${RESET}"
-    if [ -d "$BASE_DIR" ]; then
-        cd "$BASE_DIR" && docker compose down 2>/dev/null
-    fi
-
-    echo -e "${YELLOW}[智能基建] 检测并全自动创建本地系统主环境主目录: $BASE_DIR ...${RESET}"
-    mkdir -p "$BASE_DIR/server"
-
-    echo -e "${YELLOW}[物理释放] 正在释放回填物理配置文件资产...${RESET}"
-    tar -xzf "$selected_tar" -C "$BASE_DIR/"
-    cd "$BASE_DIR"
-
-    # 3. 智能联动：MySQL 远程环境检测与直跳
-    if ! grep -q "mysql:" "$COMPOSE_FILE"; then
-        echo -e "${CYAN}[智能判定] MySQL 属于【远程数据库模式】，直接跳过本地 MySQL 库灌录。${RESET}"
-    else
-        echo -e "${YELLOW}[库灌录] 检测到内置 MySQL，正在单独拉起本地数据节点准备回灌...${RESET}"
-        local sql_files=($(ls "$backup_dir" 2>/dev/null | grep -E "paperphone-.*\.sql"))
-        if [ ${#sql_files[@]} -gt 0 ]; then
-            docker compose up -d mysql
-            echo -e "${YELLOW}等待本地 MySQL 响应初始化中...${RESET}"
-            sleep 15
-            
-            local db_user=$(grep -E "^DB_USER=" "$ENV_FILE" | cut -d'=' -f2)
-            local db_pass=$(grep -E "^DB_PASS=" "$ENV_FILE" | cut -d'=' -f2)
-            local db_name=$(grep -E "^DB_NAME=" "$ENV_FILE" | cut -d'=' -f2)
-            
-            docker cp "${backup_dir}/${sql_files[0]}" paperphone-mysql:/tmp/restore.sql 2>/dev/null
-            docker exec -i paperphone-mysql sh -c "export MYSQL_PWD='${db_pass}'; mysql -u ${db_user} ${db_name} < /tmp/restore.sql" 2>/dev/null
-            docker exec paperphone-mysql rm -f /tmp/restore.sql 2>/dev/null
-        else
-            echo -e "${YELLOW}未检测到对应数据库 .sql 文件，跳过库回灌。${RESET}"
+        # 如果用户输入了 Redis 密码，则动态追加密码环境变量
+        if [[ -n "$ext_redis_pass" ]]; then
+            echo "      PHP_REDIS_PASSWORD: ${ext_redis_pass}" >> "$COMPOSE_FILE"
         fi
+
+        # 闭合挂载卷配置
+        cat << EOF >> "$COMPOSE_FILE"
+    volumes:
+      - ${BASE_DIR}/acgfaka:/var/www/html
+EOF
+        cd "$BASE_DIR" && docker compose up -d --force-recreate
     fi
 
-    # 4. 智能联动：Redis 远程环境检测与直跳
-    if ! grep -q "redis:" "$COMPOSE_FILE"; then
-        echo -e "${CYAN}[智能判定] Redis 属于【远程缓存模式】，无需本地容器，直接跳过。${RESET}"
+    if [ $? -ne 0 ]; then echo -e "${RED}服务拉起异常。${RESET}"; return; fi
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}             Acgfaka 部署成功！                     ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}访问端点(URL) : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}映射宿主机端口 : ${custom_port}${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}内置库凭证    : 用户:${rand_user} | 密码:${rand_user_pass} | 库名:${rand_db}${RESET}"
+        echo -e "${YELLOW}内置库Host管理 : 直接填 mysql 即可${RESET}"
     else
-        echo -e "${YELLOW}[缓存拉起] 检测到内置缓存拓扑，正在拉起本地 Redis 节点...${RESET}"
-        docker compose up -d redis
+        echo -e "${YELLOW}外部 MySQL 节点: ${ext_mysql_host}${RESET}"
     fi
-
-    echo -e "${YELLOW}正在全量复活整个前端与核心业务节点...${RESET}"
-    docker compose up -d --force-recreate
-    echo -e "${GREEN}🌟 集群资产及业务已完美归位！请刷新页面进行业务验证！${RESET}"
+    
+    if [[ "$db_mode" == "3" ]]; then
+        if [[ -n "$ext_redis_pass" ]]; then
+            echo -e "${YELLOW}外部 Redis 状态: 已连接 -> ${ext_redis_host}:${ext_redis_port} (密码验证开启)${RESET}"
+        else
+            echo -e "${YELLOW}外部 Redis 状态: 已连接 -> ${ext_redis_host}:${ext_redis_port} (无密码模式)${RESET}"
+        fi
+        echo -e "${CYAN}Redis DB 配置  : DB ID: ${redis_db_cfg}${RESET}"
+    fi
+    echo -e "${YELLOW}部署工作路径   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-logs_menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}===================================${RESET}"
-        echo -e "${CYAN}      📋 集群分流实时运行日志审计       ${RESET}"
-        echo -e "${CYAN}===================================${RESET}"
-        echo -e "${GREEN}1. 查看 Client 端 (前端 Nginx 流量日志)${RESET}"
-        echo -e "${GREEN}2. 查看 Server 端 (Rust 后端业务核心日志)${RESET}"
-        echo -e "${GREEN}3. 查看 MySQL (本地数据持久化层日志)${RESET}"
-        echo -e "${GREEN}4. 查看 Redis (本地高频缓存层日志)${RESET}"
-        echo -e "${RED}0. 返回主菜单${RESET}"
-        echo -e "${CYAN}===================================${RESET}"
-        echo -ne "${GREEN}请选择要审计的容器日志编号: ${RESET}"
-        read -r log_choice
-        if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR"; fi
-        case "$log_choice" in
-            1) docker compose logs -f --tail=100 client ;;
-            2) docker compose logs -f --tail=100 server ;;
-            3) docker compose logs -f --tail=100 mysql 2>/dev/null || echo -e "${RED}远程模式未启用内置数据库。${RESET}" ;;
-            4) docker compose logs -f --tail=100 redis 2>/dev/null || echo -e "${RED}远程模式未启用内置缓存。${RESET}" ;;
-            0) break ;;
-            *) echo -e "${RED}选择无效！${RESET}" && sleep 1 ;;
-        esac
-    done
+
+# 更新服务
+update_acgfaka() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在拉取 Acgfaka 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}服务已拉升至最新版本状态！${RESET}"
 }
 
-uninstall_utils() {
-    echo -ne "${YELLOW}确定要彻底卸载并删除 Paperphone-plus 吗？(y/n): ${RESET}"
+# 卸载集群
+uninstall_acgfaka() {
+    echo -ne "${RED}确定要注销并删除 Acgfaka 服务集群吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器集群已安全解除绑架并释放。${RESET}"
-            echo -ne "${YELLOW}是否同时彻底清除宿主机物理配置和核心缓存卷？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已全部终止移除。${RESET}"
+            echo -ne "${RED}是否同步清理掉本地所有源码、配置及内置数据库数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                cd "$BASE_DIR" && docker compose down -v
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}物理痕迹已彻底抹去。${RESET}"
+                echo -e "${GREEN}工作目录及持久化挂载文件已被彻底净化清除。${RESET}"
             fi
+        else
+            docker rm -f acgfaka acgfaka-mysql acgfaka-redis 2>/dev/null
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        echo -e "${GREEN}完全卸载完毕！${RESET}"
     fi
 }
 
-start_utils() { if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}已启动${RESET}"; fi; }
-stop_utils() { if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}已停止${RESET}"; fi; }
-restart_utils() { if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}已重启${RESET}"; fi; }
+# 控制命令
+start_ak() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务集群已正常启动${RESET}"; }
+stop_ak() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务集群已安全暂停${RESET}"; }
+restart_ak() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务集群已完成软重启${RESET}"; }
+logs_ak() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
+# 查看配置信息
 show_info() {
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}Client 端服务状态: $status"
-    echo -e "${YELLOW}默认前端服务端口 : ${port_display}${RESET}"
-    echo -e "--------------------------------"
-    docker ps --format "table {{.Names}}\t{{.Status}}" | grep -E "paperphone"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}当前运行状态   : $status"
+    echo -e "${YELLOW}实际映射端口   : ${web_port}${RESET}"
+    echo -e "${YELLOW}本地项目路径   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-update_utils() {
-    # 1. 核心配置文件健壮性检查
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到集群编排文件 ($COMPOSE_FILE)！${RESET}"
-        echo -e "${YELLOW}请先执行选项 1 部署/启动新实例。${RESET}"
-        return 1
-    fi
-
-    echo -e "${CYAN}===================================${RESET}"
-    echo -e "${CYAN}      🔄 正在滚动拉取并同步最新镜像      ${RESET}"
-    echo -e "${CYAN}===================================${RESET}"
-    
-    cd "$BASE_DIR" || exit 1
-
-    # 2. 执行滚动拉取
-    echo -e "${YELLOW}➜ 正在连接远程仓库拉取最新镜像层...${RESET}"
-    if docker compose pull; then
-        echo -e "${GREEN}✔ 镜像下载/更新完成。${RESET}"
-        
-        # 3. 平滑应用变更（只重启有更新的容器，零停机或极短停机时间）
-        echo -e "${YELLOW}➜ 正在热重载容器集群以应用新镜像...${RESET}"
-        docker compose up -d --remove-orphans
-        echo -e "${GREEN}🌟 集群容器已成功滚动更新！${RESET}"
-    else
-        echo -e "${RED}❌ 镜像拉取失败！请检查网络连接或 GitHub/DockerHub 连通性。${RESET}"
-    fi
-}
-
+# 主菜单
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN} ◈  Paperphone-plus  管理面板  ◈ ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}前端状态 :${RESET} $status"
-    echo -e "${GREEN}活动端口 :${RESET} ${YELLOW}${port_display}${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}       ◈  Acgfaka 管理面板  ◈       ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 当前状态 :${RESET} $status"
+    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 1. 部署启动${RESET}"
-    echo -e "${GREEN} 2. 更新容器${RESET}"
-    echo -e "${GREEN} 3. 卸载容器${RESET}"
-    echo -e "${GREEN} 4. 启动容器${RESET}"
-    echo -e "${GREEN} 5. 停止容器${RESET}"
-    echo -e "${GREEN} 6. 重启容器${RESET}"
+    echo -e "${GREEN} 2. 更新服务${RESET}"
+    echo -e "${GREEN} 3. 卸载服务${RESET}"
+    echo -e "${GREEN} 4. 启动服务${RESET}"
+    echo -e "${GREEN} 5. 停止服务${RESET}"
+    echo -e "${GREEN} 6. 重启服务${RESET}"
     echo -e "${GREEN} 7. 查看日志${RESET}"
-    echo -e "${GREEN} 8. 状态报告${RESET}"
-    echo -e "${GREEN} 9. 备份${RESET}"
-    echo -e "${GREEN}10. 恢复${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -ne "${GREEN}请输入操作代号: ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_utils ;;
-        2) update_utils ;;
-        3) uninstall_utils ;;
-        4) start_utils ;;
-        5) stop_utils ;;
-        6) restart_utils ;;
-        7) logs_menu ;;
+        1) install_acgfaka ;;
+        2) update_acgfaka ;;
+        3) uninstall_acgfaka ;;
+        4) start_ak ;;
+        5) stop_ak ;;
+        6) restart_ak ;;
+        7) logs_ak ;;
         8) show_info ;;
-        9) trigger_backup ;;
-        10) restore_utils ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效代号！${RESET}" ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 

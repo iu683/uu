@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# MiaoMiaoWu (喵喵屋) Docker Compose 独立管理面板
+# wxchat 企业微信通知代理服务 Docker Compose 独立管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="miaomiaowu"
-BASE_DIR="/opt/miaomiaowu"
+CONTAINER_NAME="wxchat"
+BASE_DIR="/opt/wxchat"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -25,12 +25,7 @@ check_dependencies() {
 # 动态获取容器状态与映射端口
 get_status_info() {
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-        # 抓取可能存在的健康检查状态
-        health_status=$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER_NAME" 2>/dev/null)
-        if [[ -n "$health_status" ]]; then
-            status="${YELLOW}运行中 (${health_status})${RESET}"
-        fi
+        status="${GREEN}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
@@ -40,12 +35,14 @@ get_status_info() {
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
-
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8080"
+        
+        # 动态抓取映射到容器 80 端口的宿主机实际端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="15680"
+        port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
+        port_display="N/A"
     fi
 }
 
@@ -74,130 +71,75 @@ get_public_ip() {
 }
 
 
-# 处理绝对路径与相对路径转换
-get_real_path() {
-    local input_path="$1"
-    local default_path="$2"
-    [[ -z "$input_path" ]] && input_path="$default_path"
-
-    if [[ "$input_path" == "./"* ]]; then
-        echo "$BASE_DIR/${input_path#./}"
-    else
-        echo "$input_path"
-    fi
-}
-
-# 部署 MiaoMiaoWu
+# 部署 wxchat
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
+    DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用主存储路径下的同级目录挂载。${RESET}"
+    echo -e "${CYAN}====== 网络端口与配置 ======${RESET}"
     
-    # 路径 1: 数据持久化目录
-    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
-    read -r input_data
-    local path_data_raw="${input_data:-./data}"
-    local real_path_data=$(get_real_path "$path_data_raw" "./data")
-
-    # 路径 2: 订阅目录
-    echo -ne "${YELLOW}请输入订阅(subscribes)本地挂载路径 [默认: ./subscribes]: ${RESET}"
-    read -r input_sub
-    local path_sub_raw="${input_sub:-./subscribes}"
-    local real_path_sub=$(get_real_path "$path_sub_raw" "./subscribes")
-
-    # 路径 3: 规则模板目录
-    echo -ne "${YELLOW}请输入规则模板(rule_templates)本地挂载路径 [默认: ./rule_templates]: ${RESET}"
-    read -r input_rule
-    local path_rule_raw="${input_rule:-./rule_templates}"
-    local real_path_rule=$(get_real_path "$path_rule_raw" "./rule_templates")
-
-    # 预创建全部目录防权限或类型错乱
-    mkdir -p "$real_path_data" "$real_path_sub" "$real_path_rule"
-
-    echo -e "\n${CYAN}====== 2. 网络与基础配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入喵喵屋访问端口 [默认: 8080]: ${RESET}"
+    # 允许自定义宿主机端口
+    echo -ne "${YELLOW}请输入 wxchat 宿主机访问端口 [默认: 15680]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
+    [[ -z "$custom_port" ]] && custom_port="15680"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成完美的含有健康检查的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
+    # 动态生成纯净版 docker-compose.yml 配置文件 (该镜像无需持久化目录)
+    echo -e "${YELLOW}正在生成原生版 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  miaomiaowu:
-    image: ghcr.io/iluobei/miaomiaowu:latest
+  wxchat:
+    image: ddsderek/wxchat:latest
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    user: root
-    environment:
-      - PORT=${custom_port}
-      - DATABASE_PATH=/app/data/traffic.db
-      - LOG_LEVEL=info
+    restart: always
     ports:
-      - "${custom_port}:${custom_port}"
-    volumes:
-      - ${path_data_raw}:/app/data
-      - ${path_sub_raw}:/app/subscribes
-      - ${path_rule_raw}:/app/rule_templates
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:${custom_port}/"]
-      interval: 30s
-      timeout: 3s
-      start_period: 5s
-      retries: 3
+      - "${custom_port}:80"
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 MiaoMiaoWu...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 wxchat...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化与首次健康探测 (约5秒)...${RESET}"
-    sleep 5
-
-    DETECT_IP=$(get_public_ip)
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}         MiaoMiaoWu 部署成功！    ${RESET}"
+    echo -e "${GREEN}          wxchat 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}数据存储路径   : ${real_path_data}${RESET}"
-    echo -e "${YELLOW}订阅存储路径   : ${real_path_sub}${RESET}"
-    echo -e "${YELLOW}模板规则路径   : ${real_path_rule}${RESET}"
-    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}服务/微信代理地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}配置文件路径       : $COMPOSE_FILE${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${RED} 重要后续配置步骤：${RESET}"
+    echo -e "${CYAN}请登录 [企业微信后台]，进入您的自建应用配置，${RESET}"
+    echo -e "${CYAN}在 [可信IP] 配置项中，必须填入当前 VPS 的公网 IP：${RESET}${MAGENTA}${DETECT_IP}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 MiaoMiaoWu 镜像
+# 更新 wxchat 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 MiaoMiaoWu 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 wxchat 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 MiaoMiaoWu
+# 卸载 wxchat
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 MiaoMiaoWu 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 wxchat 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时彻底删除本地全部数据库、下载的订阅以及分流模板？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有数据已彻底清理。${RESET}"
-            fi
+            rm -rf "$BASE_DIR"
+            echo -e "${GREEN}容器已停止，相关配置文件已彻底清理。${RESET}"
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
@@ -216,7 +158,8 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}服务/代理地址   : http://${DETECT_IP}:${port_display}${RESET}"
+    echo -e "${RED}应用可信 IP    : ${DETECT_IP}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -224,10 +167,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  MiaoMiaoWu 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}     ◈  wxchat 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Rhex 论坛系统 Docker Compose 独立管理面板 (生产级备份与升级增强版)
+# Rhex 论坛系统 - 动态灾备与多路日志面板
 # =================================================================
 
 # 颜色
@@ -8,105 +8,129 @@ RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
+MAGENTA="\033[35m"
 RESET="\033[0m"
 
-CONTAINER_WEB="rhex-web"
 BASE_DIR="/opt/rhex"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
+DEFAULT_BACKUP_DIR="$BASE_DIR/backups"
 
-# 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
+        echo -e "${RED}错误: 未检测到 Docker！${RESET}"; exit 1
     fi
 }
 
-# 动态获取核心容器状态与映射端口
 get_status_info() {
-    if [ "$(docker ps -q -f name=^/web$)" ] || [ "$(docker ps -q -f name=^/rhex-web$)" ]; then
-        status="${GREEN}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/web$)" ] || [ "$(docker ps -aq -f name=^/rhex-web$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
-
-    local active_id=$(docker ps -aq -f name=^/web$ || docker ps -aq -f name=^/rhex-web$)
+    local active_id=$(docker ps -q --filter "ancestor=lovedevpanda/rhex" | xargs -I {} docker inspect --format '{{if expr (index .Config.Cmd 2) "==" "start"}}{{.Id}}{{end}}' {} 2>/dev/null | head -n 1)
+    [[ -z "$active_id" ]] && active_id=$(docker ps -q --filter "name=web" --filter "status=running" | head -n 1)
+    
     if [ -n "$active_id" ]; then
-        webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{(index $conf 0).HostPort}}{{end}}' "$active_id" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3000"
+        status="${GREEN}运行中${RESET}"
+        webui_port=$(docker inspect --format='{{range $p, $conf := .NetworkSettings.Ports}}{{(index $conf 0).HostPort}}{{end}}' "$active_id" 2>/dev/null)
+        if [[ -z "$webui_port" || "$webui_port" == "<nil>" ]]; then
+            webui_port=$(grep -E "^PORT=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2)
+            [[ -z "$webui_port" ]] && webui_port="3000"
+        fi
         port_display="${webui_port}"
     else
+        local dead_id=$(docker ps -aq --filter "name=web" | head -n 1)
+        if [ -n "$dead_id" ]; then status="${RED}已停止${RESET}"; else status="${RED}未部署${RESET}"; fi
         port_display="N/A"
     fi
 }
 
-# 获取公网 IP
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
+    local mode=${1:-"auto"}
     local ip=""
-    for url in "https://api.ipify.org" "https://4.ip.sb"; do
-        ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-    done
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Rhex
 install_utils() {
     check_dependencies
-    
-    mkdir -p "$BASE_DIR"
+    mkdir -p "$BASE_DIR/uploads" "$BASE_DIR/addons"
+    chmod -R 777 "$BASE_DIR/uploads" "$BASE_DIR/addons"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 持久化数据与附件目录初始化 ======${RESET}"
-    echo -e "${YELLOW}正在自动创建官方标准挂载目录 (uploads / addons / backups)...${RESET}"
-    mkdir -p "$BASE_DIR/uploads" "$BASE_DIR/addons" "$BASE_DIR/backups"
-    chmod -R 777 "$BASE_DIR/uploads" "$BASE_DIR/addons" "$BASE_DIR/backups"
-    echo -e "${GREEN}宿主机各数据目录初始化完成。${RESET}"
+    echo -e "${CYAN}====== 1. 数据库部署模式选择 ======${RESET}"
+    echo -e "${GREEN}1) 内置常规模式${RESET} (本地创建并运行 Postgres/Redis)"
+    echo -e "${GREEN}2) 远程数据模式${RESET} (跨网络连接外部 RDS/独立数据库)"
+    echo -ne "${YELLOW}请选择模式 [默认 1]: ${RESET}"; read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
+
+    local pg_host="postgres" local redis_host="redis" local pg_user="postgres" local pg_pass="postgres"
+    local pg_db="bbs" local pg_port="5432" local redis_pass="" local redis_port="6379" local redis_db_num="0"
+    local use_redis_url_auth="n"
+
+    if [ "$db_mode" = "2" ]; then
+        echo -e "\n${CYAN}➜ 请输入远程 PostgreSQL 配置:${RESET}"
+        echo -ne "${YELLOW}远程 PostgreSQL 地址 (Host): ${RESET}"; read -r pg_host
+        echo -ne "${YELLOW}远程 PostgreSQL 端口 (Port) [默认 5432]: ${RESET}"; read -r tmp_port; [[ -n "$tmp_port" ]] && pg_port="$tmp_port"
+        echo -ne "${YELLOW}远程 PostgreSQL 用户 (User) [默认 postgres]: ${RESET}"; read -r tmp_user; [[ -n "$tmp_user" ]] && pg_user="$tmp_user"
+        echo -ne "${YELLOW}远程 PostgreSQL 密码 (Password): ${RESET}"; read -r pg_pass
+        echo -ne "${YELLOW}远程 PostgreSQL 数据库名 (DB Name) [默认 bbs]: ${RESET}"; read -r tmp_db; [[ -n "$tmp_db" ]] && pg_db="$tmp_db"
+
+        echo -e "\n${CYAN}➜ 请输入远程 Redis 配置:${RESET}"
+        echo -ne "${YELLOW}远程 Redis 地址 (Host): ${RESET}"; read -r redis_host
+        echo -ne "${YELLOW}远程 Redis 端口 (Port) [默认 6379]: ${RESET}"; read -r tmp_rport; [[ -n "$tmp_rport" ]] && redis_port="$tmp_rport"
+        echo -ne "${YELLOW}远程 Redis 分库编号 (DB) [默认 0]: ${RESET}"; read -r tmp_rdb; [[ -n "$tmp_rdb" ]] && redis_db_num="$tmp_rdb"
+        echo -ne "${YELLOW}远程 Redis 密码 (没有直接回车): ${RESET}"; read -r redis_pass
+        if [[ -n "$redis_pass" ]]; then
+            echo -ne "${YELLOW}是否直接将认证信息写入 REDIS_URL 连接串中？(y/n) [默认 n]: ${RESET}"; read -r use_redis_url_auth
+        fi
+    else
+        redis_pass=$(date +%s%N | sha256sum | base64 | head -c 16)
+    fi
+
+    local redis_url_str=""
+    if [ "$use_redis_url_auth" = "y" ] || [ "$use_redis_url_auth" = "Y" ]; then
+        redis_url_str="redis://:${redis_pass}@${redis_host}:${redis_port}/${redis_db_num}"
+    else
+        redis_url_str="redis://${redis_host}:${redis_port}"
+    fi
 
     echo -e "\n${CYAN}====== 2. 网络端口与站点配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Rhex 论坛前端宿主机访问端口 [默认: 3000]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
-
-    echo -ne "${YELLOW}请输入您的站点公网 URL (例如 https://bbs.rhex.im，可选，没有直接回车): ${RESET}"
-    read -r site_url
+    echo -ne "${YELLOW}请输入 Rhex 前端访问端口 [默认 3000]: ${RESET}"; read -r custom_port; [[ -z "$custom_port" ]] && custom_port="3000"
+    echo -ne "${YELLOW}请输入站点公网 URL (例如 https://bbs.rhex.im, 可选): ${RESET}"; read -r site_url
 
     echo -e "\n${CYAN}====== 3. 管理员初始化配置 (仅首次生效) ======${RESET}"
-    echo -ne "${YELLOW}请输入管理员用户名 [默认: admin]: ${RESET}"
-    read -r admin_user
-    [[ -z "$admin_user" ]] && admin_user="admin"
-
-    echo -ne "${YELLOW}请输入管理员密码 [默认: ChangeMe_123456]: ${RESET}"
-    read -r admin_pass
-    [[ -z "$admin_pass" ]] && admin_pass="ChangeMe_123456"
-
-    echo -ne "${YELLOW}请输入管理员邮箱 [默认: admin@rhex.im]: ${RESET}"
-    read -r admin_email
-    [[ -z "$admin_email" ]] && admin_email="admin@rhex.im"
-
-    echo -ne "${YELLOW}请输入管理员昵称 [默认: 秦始皇]: ${RESET}"
-    read -r admin_nick
-    [[ -z "$admin_nick" ]] && admin_nick="秦始皇"
+    echo -ne "${YELLOW}管理员用户名 [默认 admin]: ${RESET}"; read -r admin_user; [[ -z "$admin_user" ]] && admin_user="admin"
+    echo -ne "${YELLOW}管理员密码 [默认 ChangeMe_123456]: ${RESET}"; read -r admin_pass; [[ -z "$admin_pass" ]] && admin_pass="ChangeMe_123456"
+    echo -ne "${YELLOW}管理员邮箱 [默认 admin@rhex.im]: ${RESET}"; read -r admin_email; [[ -z "$admin_email" ]] && admin_email="admin@rhex.im"
+    echo -ne "${YELLOW}管理员昵称 [默认 秦始皇]: ${RESET}"; read -r admin_nick; [[ -z "$admin_nick" ]] && admin_nick="秦始皇"
 
     local rand_session=$(date +%s | sha256sum | base64 | head -c 32)
     local rand_captcha=$(date +%s%N | sha256sum | base64 | head -c 32)
-    local rand_redis_pass=$(date +%s%N | sha256sum | head -c 16)
 
-    echo -e "${YELLOW}正在生成核心安全环境配置文件 .env...${RESET}"
     cat <<EOF > "$ENV_FILE"
 PORT=${custom_port}
 TZ=Asia/Shanghai
 SESSION_SECRET="${rand_session}"
 CAPTCHA_SECRET_KEY="${rand_captcha}"
-POSTGRES_DB=bbs
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
-POSTGRES_PORT=5432
-REDIS_PORT=6379
-REDIS_PASSWORD="${rand_redis_pass}"
-REDIS_DB=0
+POSTGRES_DB=${pg_db}
+POSTGRES_USER=${pg_user}
+POSTGRES_PASSWORD=${pg_pass}
+POSTGRES_PORT=${pg_port}
+REDIS_PORT=${redis_port}
 REDIS_KEY_PREFIX=rhex
 SEED_ADMIN_USERNAME="${admin_user}"
 SEED_ADMIN_PASSWORD="${admin_pass}"
@@ -119,18 +143,17 @@ BACKGROUND_JOB_RETRY_BASE_MS=5000
 BACKGROUND_JOB_RETRY_MAX_MS=300000
 EOF
 
-    if [[ -n "$site_url" ]]; then
-        cat <<EOF >> "$ENV_FILE"
-SITE_URL="${site_url}"
-APP_URL="${site_url}"
-EOF
+    if [ "$use_redis_url_auth" != "y" ] && [ "$use_redis_url_auth" != "Y" ]; then
+        echo -e "REDIS_PASSWORD=\"${redis_pass}\"\nREDIS_DB=\"${redis_db_num}\"" >> "$ENV_FILE"
+    else
+        echo -e "REDIS_PASSWORD=\"\"\nREDIS_DB=\"\"" >> "$ENV_FILE"
     fi
+    [[ -n "$site_url" ]] && echo -e "SITE_URL=\"${site_url}\"\nAPP_URL=\"${site_url}\"" >> "$ENV_FILE"
 
-    echo -e "${YELLOW}正在生成官方标准带锚点版 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 x-app-environment: &app-environment
-  DATABASE_URL: postgresql://\${POSTGRES_USER:-postgres}:\${POSTGRES_PASSWORD:-postgres}@postgres:5432/\${POSTGRES_DB:-bbs}?schema=public
-  REDIS_URL: redis://redis:6379
+  DATABASE_URL: postgresql://${pg_user}:${pg_pass}@${pg_host}:${pg_port}/${pg_db}?schema=public
+  REDIS_URL: "${redis_url_str}"
   REDIS_PASSWORD: \${REDIS_PASSWORD:-}
   REDIS_DB: \${REDIS_DB:-}
 
@@ -145,6 +168,10 @@ x-app-service: &app-service
     - ./addons:/app/addons
 
 services:
+EOF
+
+    if [ "$db_mode" = "1" ]; then
+        cat <<EOF >> "$COMPOSE_FILE"
   postgres:
     image: postgres:18
     container_name: rhex-postgres
@@ -190,42 +217,20 @@ services:
       timeout: 5s
       retries: 10
       start_period: 5s
+EOF
+    fi
 
+    cat <<EOF >> "$COMPOSE_FILE"
   setup:
     <<: *app-service
     container_name: rhex-setup
     restart: on-failure
     environment: *app-environment
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+EOF
+    [[ "$db_mode" = "1" ]] && echo -e "    depends_on:\n      postgres:\n        condition: service_healthy\n      redis:\n        condition: service_healthy" >> "$COMPOSE_FILE"
+    
+    cat <<EOF >> "$COMPOSE_FILE"
     command: ["pnpm", "run", "setup:prod"]
-
-  postgres-backup:
-    image: postgres:18
-    container_name: rhex-backup
-    profiles:
-      - backup
-    restart: "no"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      POSTGRES_DB: \${POSTGRES_DB:-bbs}
-      POSTGRES_USER: \${POSTGRES_USER:-postgres}
-      PGPASSWORD: \${POSTGRES_PASSWORD:-postgres}
-      TZ: \${TZ:-Asia/Shanghai}
-    volumes:
-      - ./backups:/backups
-    command:
-      - sh
-      - -c
-      - |
-        set -eu
-        mkdir -p /backups
-        pg_dump -h postgres -U "\$\${POSTGRES_USER:-postgres}" -d "\$\${POSTGRES_DB:-bbs}" -Fc -f "/backups/rhex-\$\$(date +%Y%m%d-%H%M%S).dump"
 
   web:
     <<: *app-service
@@ -236,19 +241,25 @@ services:
       <<: *app-environment
       HOSTNAME: \${HOSTNAME:-0.0.0.0}
       PORT: \${PORT:-3000}
+    ports:
+      - "\${PORT:-3000}:\${PORT:-3000}"
+    command: ["pnpm", "run", "start"]
     depends_on:
+      setup:
+        condition: service_completed_successfully
+EOF
+    if [ "$db_mode" = "1" ]; then
+        cat <<EOF >> "$COMPOSE_FILE"
       postgres:
         condition: service_healthy
         restart: true
       redis:
         condition: service_healthy
         restart: true
-      setup:
-        condition: service_completed_successfully
-    ports:
-      - "\${PORT:-3000}:\${PORT:-3000}"
-    command: ["pnpm", "run", "start"]
+EOF
+    fi
 
+    cat <<EOF >> "$COMPOSE_FILE"
   worker:
     <<: *app-service
     container_name: rhex-worker
@@ -257,27 +268,26 @@ services:
     environment:
       <<: *app-environment
       INTERNAL_REVALIDATION_ORIGIN: \${INTERNAL_REVALIDATION_ORIGIN:-http://web:\${PORT:-3000}}
+    command: ["pnpm", "run", "worker"]
     depends_on:
+      setup:
+        condition: service_completed_successfully
+EOF
+    if [ "$db_mode" = "1" ]; then
+        cat <<EOF >> "$COMPOSE_FILE"
       postgres:
         condition: service_healthy
         restart: true
       redis:
         condition: service_healthy
         restart: true
-      setup:
-        condition: service_completed_successfully
-    command: ["pnpm", "run", "worker"]
-
-volumes:
-  postgres_data:
-  redis_data:
 EOF
+    fi
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动官方全集成拓扑结构...${RESET}"
+    [[ "$db_mode" = "1" ]] && echo -e "\nvolumes:\n  postgres_data:\n  redis_data:" >> "$COMPOSE_FILE"
+
+    echo -e "${YELLOW}正在通过 Docker Compose 部署运行拓扑...${RESET}"
     cd "$BASE_DIR" && docker compose up -d
-
-    echo -e "${YELLOW}同步等待健康检查握手与初始化迁移 (约 10 秒)...${RESET}"
-    sleep 10
 
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${GREEN}         Rhex 官方全集成架构 部署成功！              ${RESET}"
@@ -288,82 +298,169 @@ EOF
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 升级镜像与清理孤儿容器
-update_utils() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
-        return
-    fi
-    echo -e "${YELLOW}正在执行生产级升级序列...${RESET}"
-    cd "$BASE_DIR"
-    
-    echo -e "${CYAN}1. 正在拉取远端最新镜像库 (docker compose pull)...${RESET}"
-    docker compose pull
-    
-    echo -e "${CYAN}2. 正在平滑应用新镜像并裁撤孤儿容器 (up -d --remove-orphans)...${RESET}"
-    docker compose up -d --remove-orphans
-    
-    echo -e "${GREEN}升级完成！集群各模块已处于最新状态。${RESET}"
-}
-
-# 复合全量数据备份
+# 动态自定义路径的复合备份
 trigger_backup() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
-        return
-    fi
-    echo -e "${YELLOW}正在启动生产级全链路备份双熔断机制...${RESET}"
+    if [[ ! -f "$COMPOSE_FILE" ]]; then echo -e "${RED}错误: 未部署！${RESET}"; return; fi
+    
+    echo -ne "${YELLOW}请输入备份保存的绝对路径 [默认: $DEFAULT_BACKUP_DIR]: ${RESET}"
+    read -r backup_dir
+    [[ -z "$backup_dir" ]] && backup_dir="$DEFAULT_BACKUP_DIR"
+    mkdir -p "$backup_dir" && chmod -R 777 "$backup_dir"
+    
     cd "$BASE_DIR"
-
-    # 1. 触发数据库 profile 备份
-    echo -e "${CYAN}[步骤 1/2] 调起 profile 备份容器导出数据库 .dump 文件...${RESET}"
-    docker compose --profile backup run --rm postgres-backup
-
-    # 2. 触发核心物理结构打包压缩
-    echo -e "${CYAN}[步骤 2/2] 打包物理文件归档 (uploads/addons/.env/compose)...${RESET}"
-    local file_name="backups/rhex-files-$(date +%Y%m%d-%H%M%S).tar.gz"
-    tar -czf "$file_name" uploads addons .env docker-compose.yml
-
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}               核心资产打包快照成功！                ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}打包归档位置 : $BASE_DIR/$file_name${RESET}"
-    echo -e "${YELLOW}全量备份目录 : $BASE_DIR/backups/${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${CYAN}[步骤 1/2] 正在备份并导出 .dump 数据库快照...${RESET}"
+    local pg_user=$(grep -E "^POSTGRES_USER=" "$ENV_FILE" | cut -d'=' -f2)
+    local pg_pass=$(grep -E "^POSTGRES_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2)
+    local pg_db=$(grep -E "^POSTGRES_DB=" "$ENV_FILE" | cut -d'=' -f2)
+    local pg_host="postgres"
+    if grep -q "DATABASE_URL: postgresql://" "$COMPOSE_FILE"; then
+        pg_host=$(grep "DATABASE_URL:" "$COMPOSE_FILE" | head -n 1 | cut -d'@' -f2 | cut -d':' -f1)
+    fi
+    
+    local timestamp=$(date +%Y%m%d-%H%M%S)
+    
+    if [ "$pg_host" = "postgres" ] || [ "$pg_host" = "127.0.0.1" ]; then
+        docker exec -e PGPASSWORD="${pg_pass}" rhex-postgres pg_dump -U "${pg_user}" -d "${pg_db}" -Fc -f "/var/lib/postgresql/rhex-${timestamp}.dump" 2>/dev/null
+        docker cp rhex-postgres:/var/lib/postgresql/rhex-${timestamp}.dump "${backup_dir}/" 2>/dev/null
+        docker exec rhex-postgres rm -f "/var/lib/postgresql/rhex-${timestamp}.dump" 2>/dev/null
+    else
+        docker run --rm --network=host -v "${backup_dir}:/backups" -e PGPASSWORD="${pg_pass}" postgres:18 pg_dump -h "${pg_host}" -U "${pg_user}" -d "${pg_db}" -Fc -f "/backups/rhex-${timestamp}.dump" 2>/dev/null
+    fi
+    
+    echo -e "${CYAN}[步骤 2/2] 打包网页物理归档...${RESET}"
+    local target_tar="${backup_dir}/rhex-files-${timestamp}.tar.gz"
+    tar -czf "$target_tar" uploads addons .env docker-compose.yml
+    echo -e "${GREEN}全量资产打包成功！位置: $backup_dir${RESET}"
 }
+
+# 动态自定义路径的智能回灌恢复
+restore_utils() {
+    echo -ne "${YELLOW}请输入你的备份文件存放绝对路径 [默认: $DEFAULT_BACKUP_DIR]: ${RESET}"
+    read -r backup_dir
+    [[ -z "$backup_dir" ]] && backup_dir="$DEFAULT_BACKUP_DIR"
+
+    if [[ ! -d "$backup_dir" ]]; then echo -e "${RED}错误: 未检测到备份路径 $backup_dir${RESET}"; return; fi
+    clear
+    echo -e "${CYAN}====== 📥 Rhex 本地常规模式灾备强灌恢复面板 ======${RESET}"
+    echo -e "读取路径: $backup_dir"
+    echo -e "----------------------------------------------------"
+    
+    local tar_files=($(ls "$backup_dir" 2>/dev/null | grep -E "rhex-files-.*\.tar\.gz"))
+    if [ ${#tar_files[@]} -eq 0 ]; then echo -e "${RED}未找到符合条件的 rhex-files-*.tar.gz 压缩包！${RESET}"; return; fi
+    
+    for i in "${!tar_files[@]}"; do echo -e "${GREEN}[$i]${RESET} 压缩包: ${tar_files[$i]}"; done
+    echo -e "----------------------------------------------------"
+    echo -ne "${YELLOW}请选择要恢复的网页物理快照(tar.gz)编号: ${RESET}"
+    read -r tar_idx
+    if [[ -z "$tar_idx" || ! "$tar_idx" =~ ^[0-9]+$ || $tar_idx -ge ${#tar_files[@]} ]]; then return; fi
+    local selected_tar="${backup_dir}/${tar_files[$tar_idx]}"
+
+    echo -e "\n${CYAN}----------------------------------------------------${RESET}"
+    local dump_files=($(ls "$backup_dir" 2>/dev/null | grep -E "rhex-.*\.dump"))
+    if [ ${#dump_files[@]} -eq 0 ]; then
+        echo -e "${RED}未找到任何 .dump 数据库快照！恢复终止。${RESET}"; return
+    else
+        for i in "${!dump_files[@]}"; do echo -e "${CYAN}[$i]${RESET} 帖子数据库: ${dump_files[$i]}"; done
+        echo -e "----------------------------------------------------"
+        echo -ne "${YELLOW}请选择你要恢复灌录的帖子数据 (.dump) 编号: ${RESET}"
+        read -r dump_idx
+    fi
+
+    echo -ne "\n${RED}警告: 本操作会强行覆盖现有本地表结构！确认回灌帖子数据吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then return; fi
+
+    echo -e "${YELLOW}正在安全停止本地业务线前端容器...${RESET}"
+    cd "$BASE_DIR" && docker compose down 2>/dev/null
+
+    echo -e "${YELLOW}[步骤 1/2] 正在回填本地配置文件及文件资产...${RESET}"
+    tar -xzf "$selected_tar" -C "$BASE_DIR/"
+
+    local pg_user=$(grep -E "^POSTGRES_USER=" "$ENV_FILE" | cut -d'=' -f2)
+    local pg_pass=$(grep -E "^POSTGRES_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2)
+    local pg_db=$(grep -E "^POSTGRES_DB=" "$ENV_FILE" | cut -d'=' -f2)
+    local target_dump_name="${dump_files[$dump_idx]}"
+
+    echo -e "${YELLOW}[步骤 2/2] 正在拉起本地独立 Postgres 数据节点进行高权限沙箱回灌...${RESET}"
+    docker compose up -d postgres
+    echo -e "${YELLOW}等待本地库响应初始化中...${RESET}"
+    sleep 6
+
+    docker cp "${backup_dir}/${target_dump_name}" rhex-postgres:/tmp/restore.dump
+    echo -e "${CYAN}正在对本地数据库实施 Clean & Overwrite 帖子恢复...${RESET}"
+    docker exec -e PGPASSWORD="${pg_pass}" rhex-postgres pg_restore -U "${pg_user}" -d "${pg_db}" -c --if-exists /tmp/restore.dump 2>/dev/null
+    docker exec rhex-postgres rm -f /tmp/restore.dump
+
+    echo -e "${YELLOW}正在全面唤醒整个前端 Web 业务和分布式 Worker...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    echo -e "${GREEN}🌟 帖子数据流已完美强灌还原！请刷新本地论坛页面确认！${RESET}"
+}
+
+# 独立的二级日志管理子菜单
+logs_menu() {
+    while true; do
+        clear
+        echo -e "${GREE}===================================${RESET}"
+        echo -e "${GREE}     📋 容器集群分流日志审计面板     ${RESET}"
+        echo -e "${GREE}===================================${RESET}"
+        echo -e "${GREEN}1. 查看 Web 端 (前端流实时运行日志)${RESET}"
+        echo -e "${GREEN}2. 查看 Worker 端 (后台异步任务日志)${RESET}"
+        echo -e "${GREEN}3. 查看 Postgres (本地数据库核心日志)${RESET}"
+        echo -e "${GREEN}4. 查看 Redis (本地高并发缓存日志)${RESET}"
+        echo -e "${GREEN}0. 返回主菜单${RESET}"
+        echo -e "${GREE}===================================${RESET}"
+        echo -ne "${GREEN}请选择要审计的容器日志编号: ${RESET}"
+        read -r log_choice
+        cd "$BASE_DIR"
+        case "$log_choice" in
+            1) docker compose logs -f --tail=100 web ;;
+            2) docker compose logs -f --tail=100 worker ;;
+            3) docker compose logs -f --tail=100 postgres 2>/dev/null || echo -e "${RED}未在此节点找到内置数据库服务。${RESET}" ;;
+            4) docker compose logs -f --tail=100 redis 2>/dev/null || echo -e "${RED}未在此节点找到内置缓存服务。${RESET}" ;;
+            0) break ;;
+            *) echo -e "${RED}选择无效！${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+update_utils() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then echo -e "${RED}错误: 未部署！${RESET}"; return; fi
+    cd "$BASE_DIR" && docker compose pull && docker compose up -d --remove-orphans
+    echo -e "${GREEN}升级完成！${RESET}"
+}
+
 
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久粉碎论坛所有的持久化物理券和用户附件！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除所有容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Rhex吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down -v
-            echo -e "${GREEN}所有运行容器及 Docker 内置卷已彻底移除。${RESET}"
-            echo -ne "${RED}【超高风险】是否连同宿主机上的附件(uploads)与备份(backups)一并碎裂删除？(y/n): ${RESET}"
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时彻底删除本地全部数据库与配置缓存？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}宿主机本地 Rhex 核心资产已全部销毁。${RESET}"
+                echo -e "${GREEN}本地全部配置与缓存已彻底清理。${RESET}"
             fi
+        else
+            docker rm -f "rhex-web" "rhex-worker" "rhex-setup" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}所有服务已激活${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}所有服务已挂起${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}所有服务已重启${RESET}"; }
-logs_utils() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}已重启${RESET}"; }
 
 show_info() {
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}Web端运行状态  : $status"
+    echo -e "${YELLOW}Web端运行状态    : $status"
     echo -e "${YELLOW}当前前端活动端口 : ${port_display}${RESET}"
     echo -e "--------------------------------"
-    echo -e "${CYAN}当前拓扑及健康检查报告:${RESET}"
-    docker ps --format "table {{.Names}}\t{{.Status}}" | grep "rhex"
+    docker ps --format "table {{.Names}}\t{{.Status}}" | grep -E "rhex|postgres|redis"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -371,21 +468,22 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}   ◈  Rhex 官方生产级集群管理面板 ◈   ${RESET}"
+    echo -e "${GREEN}    ◈  Rhex    论坛管理面板 ◈      ${RESET}"
     echo -e "${GREEN}===================================${RESET}"
     echo -e "${GREEN}前端状态 :${RESET} $status"
     echo -e "${GREEN}活动端口 :${RESET} ${YELLOW}${port_display}${RESET}"
     echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}1. 部署启动 (全新导入)${RESET}"
-    echo -e "${GREEN}2. 更新镜像 (拉取并剔除孤儿容器)${RESET}"
-    echo -e "${GREEN}3. 卸载面板 (清理资产)${RESET}"
-    echo -e "${GREEN}4. 激活集群服务${RESET}"
-    echo -e "${GREEN}5. 挂起集群服务${RESET}"
-    echo -e "${GREEN}6. 重启集群服务${RESET}"
-    echo -e "${GREEN}7. 查看拓扑联动日志${RESET}"
-    echo -e "${GREEN}8. 查看健康状态报告${RESET}"
-    echo -e "${GREEN}9. 触发复合全量备份 (Dump + 物理Tar打包)${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN} 1. 部署启动${RESET}"
+    echo -e "${GREEN} 2. 更新容器${RESET}"
+    echo -e "${GREEN} 3. 卸载容器${RESET}"
+    echo -e "${GREEN} 4. 启动容器${RESET}"
+    echo -e "${GREEN} 5. 停止容器${RESET}"
+    echo -e "${GREEN} 6. 重启容器${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 状态报告${RESET}"
+    echo -e "${GREEN} 9. 备份${RESET}"
+    echo -e "${GREEN}10. 恢复${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}===================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
@@ -396,9 +494,10 @@ menu() {
         4) start_utils ;;
         5) stop_utils ;;
         6) restart_utils ;;
-        7) logs_utils ;;
+        7) logs_menu ;;
         8) show_info ;;
         9) trigger_backup ;;
+        10) restore_utils ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Pansou-Web 聚合搜索工具 Docker Compose 管理面板 
+# Kaloscope Docker Compose 智能管理面板
 # =================================================================
 
 # 颜色
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="pansou"
-BASE_DIR="/opt/pansou"
+CONTAINER_NAME="kaloscope"
+BASE_DIR="/opt/kaloscope"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/config.env"
 
 # 检测依赖
 check_dependencies() {
@@ -23,9 +22,8 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、映射端口
+# 动态获取容器状态与映射端口
 get_status_info() {
-    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -34,16 +32,12 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取 Web 端口（容器内部映射到 80 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="34654"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8000"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
@@ -74,121 +68,143 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Pansou-Web
+# 处理绝对路径与相对路径转换
+get_real_path() {
+    local input_path="$1"
+    local default_path="$2"
+    [[ -z "$input_path" ]] && input_path="$default_path"
+
+    if [[ "$input_path" == "./"* ]]; then
+        echo "$BASE_DIR/${input_path#./}"
+    else
+        echo "$input_path"
+    fi
+}
+
+# 部署 Kaloscope
 install_utils() {
     check_dependencies
     
-    # 自动创建持久化数据目录
-    mkdir -p "$BASE_DIR/data"
+    mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将使用默认推荐路径。${RESET}"
     
-    # 1. 端口配置
-    echo -ne "${YELLOW}请输入浏览器访问端口 (宿主机端口) [默认: 34654]: ${RESET}"
+    # 路径 1: 工作区/配置目录
+    echo -ne "${YELLOW}请输入工作区(workspace)挂载路径 [默认: ./workspace]: ${RESET}"
+    read -r input_workspace
+    local path_workspace=$(get_real_path "$input_workspace" "./workspace")
+
+    # 路径 2: 下载目录
+    echo -ne "${YELLOW}请输入下载(downloads)挂载路径 [默认: ./downloads]: ${RESET}"
+    read -r input_downloads
+    local path_downloads=$(get_real_path "$input_downloads" "./downloads")
+
+    # 路径 3: 动漫媒体库目录
+    echo -ne "${YELLOW}请输入动漫(animes)媒体库挂载路径 [默认: ./animes]: ${RESET}"
+    read -r input_animes
+    local path_animes=$(get_real_path "$input_animes" "./animes")
+
+    # 自动创建物理目录并修正群晖/Linux常规权限
+    echo -e "${YELLOW}正在预创建本地挂载目录...${RESET}"
+    for path in "$path_workspace" "$path_downloads" "$path_animes"; do
+        mkdir -p "$path"
+        chown -R 1026:100 "$path" 2>/dev/null  # 匹配 PUID/PGID
+        chmod -R 775 "$path" 2>/dev/null
+    done
+
+    echo -e "\n${CYAN}====== 2. 功能与网络配置 ======${RESET}"
+    
+    # Web 端口
+    echo -ne "${YELLOW}请输入 Kaloscope Web 访问端口 [默认: 8000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="34654"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
+    [[ -z "$custom_port" ]] && custom_port="8000"
+
+    # Aria2 联动开关
+    echo -ne "${YELLOW}是否启用内置 Aria2 下载功能？(y/n) [默认: n]: ${RESET}"
+    read -r aria_choice
+    local enable_aria2="false"
+    local port_mapping="- \"${custom_port}:8000\""
+    
+    if [[ "$aria_choice" == "y" || "$aria_choice" == "Y" ]]; then
+        enable_aria2="true"
+        # 联动开启时，自动追加 6888 的 TCP 和 UDP 端口映射
+        port_mapping="- \"${custom_port}:8000\"
+      - \"6888:6888\"
+      - \"6888:6888/udp\""
+        echo -e "${GREEN}已动态启用 Aria2 及其 6888 监听端口。${RESET}"
     fi
 
-    # 2. 认证账号配置
-    echo -ne "${YELLOW}请输入 Web 认证用户名 [默认: admin]: ${RESET}"
-    read -r custom_user
-    [[ -z "$custom_user" ]] && custom_user="admin"
-    
-    echo -ne "${YELLOW}请输入 Web 认证密码 [默认: admin123]: ${RESET}"
-    read -r custom_pass
-    [[ -z "$custom_pass" ]] && custom_pass="admin123"
-
-    # 3. 动态生成环境变量文件 config.env
-    echo -e "${YELLOW}正在生成独立配置文件 config.env...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-# 插件配置
-ENABLED_PLUGINS=labi,zhizhen,shandian,duoduo,muou,wanou,hunhepan,jikepan,panwiki,pansearch,panta,qupansou,hdr4k,pan666,susu,thepiratebay,xuexizhinan,panyq,ouge,huban,cyg,erxiao,miaoso,fox4k,pianku,clmao,wuji,cldi,xiaozhang,libvio,leijing,xb6v,xys,ddys,hdmoli,clxiong,jutoushe,sdso,xiaoji,xdyh,haisou,bixin,djgou,nyaa,xinjuc,aikanzy,qupanshe,xdpan,discourse,yunsou,ahhhhfs,nsgame,quark4k,quarksoo,sousou,ash,feikuai,kkmao,alupan,ypfxw,mikuclub,daishudj,dyyj,meitizy,jsnoteclub,mizixing,lou1,yiove,zxzj,qingying,kkv
-
-# Telegram频道配置
-CHANNELS=tgsearchers4,Aliyun_4K_Movies,bdbdndn11,yunpanx,bsbdbfjfjff,yp123pan,sbsbsnsqq,yunpanxunlei,tianyifc,BaiduCloudDisk,txtyzy,peccxinpd,gotopan,PanjClub,kkxlzy,baicaoZY,MCPH01,MCPH02,MCPH03,bdwpzhpd,ysxb48,jdjdn1111,yggpan,MCPH086,zaihuayun,Q66Share,ucwpzy,shareAliyun,alyp_1,dianyingshare,Quark_Movies,XiangxiuNBB,ydypzyfx,ucquark,xx123pan,yingshifenxiang123,zyfb123,tyypzhpd,tianyirigeng,cloudtianyi,hdhhd21,Lsp115,oneonefivewpfx,qixingzhenren,taoxgzy,Channel_Shares_115,tyysypzypd,vip115hot,wp123zy,yunpan139,yunpan189,yunpanuc,yydf_hzl,leoziyuan,Q_dongman,yoyokuakeduanju,TG654TG,WFYSFX02,QukanMovie,yeqingjie_GJG666,movielover8888_film3,Baidu_netdisk,D_wusun,FLMdongtianfudi,KaiPanshare,QQZYDAPP,rjyxfx,PikPak_Share_Channel,btzhi,newproductsourcing,cctv1211,duan_ju,QuarkFree,yunpanNB,kkdj001,xxzlzn,pxyunpanxunlei,jxwpzy,kuakedongman,liangxingzhinan,xiangnikanj,solidsexydoll,guoman4K,zdqxm,kduanju,cilidianying,CBduanju,SharePanFilms,dzsgx,BooksRealm,Oscar_4Kmovies,douerpan,baidu_yppan,Q_jilupian,Netdisk_Movies,yunpanquark,ammmziyuan,ciliziyuanku,cili8888,jzmm_123pan,Q_dianying,domgmingapk,dianying4k,q_dianshiju,tgbokee,ucshare,godupan,gokuapan
-EOF
-
-    # 4. 动态生成 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合新规范的 docker-compose.yml 配置文件...${RESET}"
+    # 动态生成完美的 docker-compose.yml
+    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  pansou:
-    image: ghcr.io/fish2018/pansou-web:latest
+  kaloscope:
+    image: kaloscope/kaloscope:latest
     container_name: ${CONTAINER_NAME}
-    ports:
-      - "${custom_port}:80"
-    env_file:
-      - config.env
+    extra_hosts:
+      - host.docker.internal:host-gateway
     environment:
-      - DOMAIN=localhost
-      - PANSOU_PORT=8888
-      - PANSOU_HOST=127.0.0.1
-      - CACHE_PATH=/app/data/cache
-      - LOG_PATH=/app/data/logs
-      - CACHE_MAX_SIZE=100
-      - CACHE_ENABLED=true
-      - CACHE_TTL=60
-      - MAX_CONCURRENCY=200
-      - MAX_PAGES=30
-      - ASYNC_PLUGIN_ENABLED=true
-      - ASYNC_RESPONSE_TIMEOUT=60
-      - ASYNC_MAX_BACKGROUND_WORKERS=20
-      - ASYNC_MAX_BACKGROUND_TASKS=100
-      - ASYNC_CACHE_TTL_HOURS=1
-      - AUTH_ENABLED=true
-      - AUTH_USERS=${custom_user}:${custom_pass}
-      - AUTH_TOKEN_EXPIRY=24
+      - PUID=1026
+      - PGID=100
+      - UMASK=022
+      - TZ=Asia/Shanghai
+      - AUTO_TLS=false
+      - ENABLE_ARIA2=${enable_aria2}
     volumes:
-      - ./data:/app/data
+      - ${path_workspace}:/workspace
+      - ${path_downloads}:/downloads
+      - ${path_animes}:/animes
+    ports:
+      ${port_mapping}
     restart: unless-stopped
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Pansou-Web...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Kaloscope...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}正在等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}等待容器初始化 (约5秒)...${RESET}"
+    sleep 5
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     Pansou-Web 部署成功！       ${RESET}"
+    echo -e "${GREEN}       Kaloscope 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}登录认证账号   : ${custom_user} / ${custom_pass}${RESET}"
-    echo -e "${YELLOW}环境配置文件   : $ENV_FILE${RESET}"
-    echo -e "${YELLOW}Docker 配置文件 : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}Aria2 开启状态 : ${enable_aria2}${RESET}"
+    echo -e "${YELLOW}工作区路径     : ${path_workspace}${RESET}"
+    echo -e "${YELLOW}下载路径       : ${path_downloads}${RESET}"
+    echo -e "${YELLOW}媒体库路径     : ${path_animes}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Pansou-Web 镜像
+# 更新 Kaloscope 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Pansou-Web 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Kaloscope 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Pansou-Web
+# 卸载 Kaloscope
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 Pansou-Web 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Kaloscope 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时彻底删除本地全部配置与持久化搜索缓存数据？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时彻底删除本地主脚本配置目录管理数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}主脚本配置目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -208,7 +224,7 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -216,7 +232,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Pansou-Web 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  Kaloscope 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -229,7 +245,7 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}. 退出${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice

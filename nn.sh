@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Subs-Check 订阅检测工具 Docker Compose 独立管理面板
+# 2FAuth 2FA双因素令牌管理器 Docker Compose 独立管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="subs-check"
-BASE_DIR="/opt/subs-check"
+CONTAINER_NAME="2fauth"
+BASE_DIR="/opt/2fauth"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -27,7 +27,7 @@ get_status_info() {
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
+        status="${RED}已停止/无限重启(检查权限)${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
@@ -36,15 +36,12 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 分别抓取主控端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8199/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        api_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8299/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8199"
-        [[ -z "$api_port" ]] && api_port="8299"
-        port_display="${webui_port} (主) | ${api_port} (辅)"
+        # 动态抓取映射到容器 8000 端口的宿主机实际端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="无法获取"
     else
         img_version="${RED}未安装${RESET}"
-        port_display="N/A"
+        webui_port="N/A"
     fi
 }
 
@@ -86,120 +83,108 @@ get_real_path() {
     fi
 }
 
-# 部署 Subs-Check
+# 部署 2FAuth
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
+    DETECT_IP=$(get_public_ip)
 
     echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用脚本同级路径进行挂载。${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用脚本同级路径下的 data 文件夹。${RESET}"
     
-    # 路径 1: 配置目录
-    echo -ne "${YELLOW}请输入配置(config)本地挂载路径 [默认: ./config]: ${RESET}"
-    read -r input_config
-    local path_config_raw="${input_config:-./config}"
-    local real_path_config=$(get_real_path "$path_config_raw" "./config")
+    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
+    read -r input_data
+    local path_data_raw="${input_data:-./data}"
+    local real_path_data=$(get_real_path "$path_data_raw" "./data")
 
-    # 路径 2: 输出目录
-    echo -ne "${YELLOW}请输入数据输出(output)本地挂载路径 [默认: ./output]: ${RESET}"
-    read -r input_output
-    local path_output_raw="${input_output:-./output}"
-    local real_path_output=$(get_real_path "$path_output_raw" "./output")
-
-    # 预创建目录防权限错乱
-    mkdir -p "$real_path_config" "$real_path_output"
-
-    echo -e "\n${CYAN}====== 2. 网络双端口配置 ======${RESET}"
+    # 预创建物理目录
+    mkdir -p "$real_path_data"
     
-    # 主端口 8199
-    echo -ne "${YELLOW}请输入 Subs-Check 主面板端口 [默认: 8199]: ${RESET}"
-    read -r port_main
-    [[ -z "$port_main" ]] && port_main="8199"
-    
-    # 辅助端口 8299
-    echo -ne "${YELLOW}请输入 Subs-Check /API端口 [默认: 8299]: ${RESET}"
-    read -r port_sub
-    [[ -z "$port_sub" ]] && port_sub="8299"
+    # 【核心修复】将挂载目录权限放开，防止 2FAuth 镜像内的非 root 用户遇到 Permission denied
+    chmod -R 777 "$real_path_data"
 
-    if ! [[ "$port_main" =~ ^[0-9]+$ && "$port_sub" =~ ^[0-9]+$ ]]; then
+    echo -e "\n${CYAN}====== 2. 网络端口与访问 URL 配置 ======${RESET}"
+    
+    echo -ne "${YELLOW}请输入 2FAuth 访问端口 [默认: 8082]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8082"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 【自动化安全保障】自动生成一个 32 位的强随机字符串作为 API_KEY
-    echo -e "${YELLOW}正在自动生成 32 位高强度 API_KEY...${RESET}"
-    local random_api_key=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
+    echo -ne "${YELLOW}请输入外部访问的完整 URL [默认: http://${DETECT_IP}:${custom_port}]: ${RESET}"
+    read -r input_url
+    local app_url="${input_url:-http://${DETECT_IP}:${custom_port}}"
 
-    # 动态生成完美的含有资源控制的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
+    # 自动生成 32 位 APP_KEY
+    echo -e "${YELLOW}正在自动生成高强度 32 位底层数据隔离 APP_KEY...${RESET}"
+    local random_app_key=$(LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 32)
+
+    # 动态生成纯净版 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成直挂本地版 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  subs-check:
-    image: ghcr.io/beck-8/subs-check:latest
+  2fauth:
+    image: 2fauth/2fauth:latest
     container_name: ${CONTAINER_NAME}
-    mem_limit: 500m
+    restart: unless-stopped
     volumes:
-      - ${path_config_raw}:/app/config
-      - ${path_output_raw}:/app/output
+      - ${path_data_raw}:/2fauth
     ports:
-      - "${port_main}:8199"
-      - "${port_sub}:8299"
+      - "${custom_port}:8000"
     environment:
+      - APP_NAME=我的2FA安全令牌
+      - APP_URL=${app_url}
+      - APP_KEY=${random_app_key}
       - TZ=Asia/Shanghai
-      - API_KEY=${random_api_key}
-    restart: always
-    tty: true
-    network_mode: bridge
+      - CONTENT_SECURITY_POLICY=true
+      - LOGIN_THROTTLE=5
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Subs-Check...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 2FAuth...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
-    DETECT_IP=$(get_public_ip)
-
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}         Subs-Check 部署成功！   ${RESET}"
+    echo -e "${GREEN}         2FAuth 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}主面板访问地址 : http://${DETECT_IP}:${port_main}${RESET}"
-    echo -e "${YELLOW}API对接地址    : http://${DETECT_IP}:${port_sub}${RESET}"
-    echo -e "${YELLOW}自动生成API_KEY: ${random_api_key}${RESET}"
-    echo -e "${YELLOW}通用订阅地址   : http://${DETECT_IP}:${port_sub}/download/sub${RESET}"
-    echo -e "${YELLOW}配置挂载路径   : ${real_path_config}${RESET}"
-    echo -e "${YELLOW}输出挂载路径   : ${real_path_output}${RESET}"
-    echo -e "${YELLOW}内存安全配额   : 已锁死最多 500M 突发内存使用${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : ${app_url}${RESET}"
+    echo -e "${YELLOW}数据直挂路径   : ${real_path_data}${RESET}"
     echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${RED}警告: 生成的 APP_KEY 已直接写在 docker-compose.yml 中，后续切勿随意修改它，否则已存数据将无法解密！${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Subs-Check 镜像
+# 更新 2FAuth 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Subs-Check 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 2FAuth 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Subs-Check
+# 卸载 2FAuth
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 Subs-Check 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}高危警告: 卸载如果清理数据，将永久丢失您存储的所有两步验证令牌！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 2FAuth 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时彻底删除本地全部检测缓存及生成的输出配置？(y/n): ${RESET}"
+            echo -ne "${RED}【极高风险】是否同时彻底删除本地全量两步验证数据库及密钥配置？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有数据已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有令牌数据已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -215,14 +200,14 @@ logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}端口分配详情   : ${port_display}${RESET}"
     if [ -f "$COMPOSE_FILE" ]; then
-        local current_key=$(grep -E "API_KEY=" "$COMPOSE_FILE" | cut -d'=' -f2)
-        echo -e "${YELLOW}当前 API_KEY   : ${current_key}${RESET}"
+        local current_url=$(grep -E "\- APP_URL=" "$COMPOSE_FILE" | cut -d'=' -f2)
+        local current_key=$(grep -E "\- APP_KEY=" "$COMPOSE_FILE" | cut -d'=' -f2)
+        echo -e "${YELLOW}配置访问地址   : ${current_url}${RESET}"
+        echo -e "${YELLOW}当前安全密钥   : ${current_key}${RESET}"
     fi
     echo -e "${GREEN}================================${RESET}"
 }
@@ -231,10 +216,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  Subs-Check 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}       ◈  2FAuth 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

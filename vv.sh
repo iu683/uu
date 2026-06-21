@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# ShadowSSH (前后端分离版) Docker Compose 独立管理面板
+# SiYuan Note 思源笔记 Docker Compose 独立管理面板 (增强镜像选择版)
 # =================================================================
 
 # 颜色
@@ -10,9 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-FRONTEND_CONTAINER="shadowssh-frontend"
-BACKEND_CONTAINER="shadowssh-backend"
-BASE_DIR="/opt/shadowssh"
+CONTAINER_NAME="siyuan"
+BASE_DIR="/opt/siyuan"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -23,29 +22,26 @@ check_dependencies() {
     fi
 }
 
-# 动态获取服务状态（双容器组合校验）
+# 动态获取容器状态与映射端口
 get_status_info() {
-    local front_running=$(docker ps -q -f name=^/${FRONTEND_CONTAINER}$)
-    local back_running=$(docker ps -q -f name=^/${BACKEND_CONTAINER}$)
-    
-    if [[ -n "$front_running" && -n "$back_running" ]]; then
-        status="${GREEN}运行中 (前后端均就绪)${RESET}"
-    elif [[ -z "$front_running" && -z "$back_running" ]]; then
-        if [ "$(docker ps -aq -f name=^/${FRONTEND_CONTAINER}$)" ]; then
-            status="${RED}已停止${RESET}"
-        else
-            status="${RED}未部署${RESET}"
-        fi
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${GREEN}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
     else
-        status="${YELLOW}部分运行 (请检查日志)${RESET}"
+        status="${RED}未部署${RESET}"
     fi
 
-    if [ "$(docker ps -aq -f name=^/${FRONTEND_CONTAINER}$)" ]; then
-        # 动态抓取映射到前端 80 端口的宿主机实际端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$FRONTEND_CONTAINER" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="18111"
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="b3log/siyuan:latest"
+        
+        # 动态抓取映射到容器 6806 端口的宿主机实际端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "6806/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="6806"
         port_display="${webui_port}"
     else
+        img_version="${RED}未安装${RESET}"
         port_display="N/A"
     fi
 }
@@ -60,20 +56,19 @@ get_public_ip() {
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
         done
     elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+        for url in "https://api64.ipify.org" "https://6.sb"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
         done
     else
         for url in "https://api.ipify.org" "https://4.ip.sb"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+        for url in "https://api64.ipify.org" "https://6.sb"; do
             ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
     fi
     echo "127.0.0.1" && return 0
 }
-
 
 # 处理绝对路径与相对路径转换
 get_real_path() {
@@ -88,153 +83,144 @@ get_real_path() {
     fi
 }
 
-# 一键部署 ShadowSSH
+# 部署 SiYuan Note
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 后端数据持久化路径 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用脚本同级路径下的 data 文件夹。${RESET}"
-    
-    echo -ne "${YELLOW}请输入后端数据(data)挂载路径 [默认: ./data]: ${RESET}"
-    read -r input_data
-    local path_data_raw="${input_data:-./data}"
-    local real_path_data=$(get_real_path "$path_data_raw" "./data")
+    echo -e "${CYAN}====== 1. 镜像源版本选择 ======${RESET}"
+    echo -e "${GREEN}1). 官方原版镜像 (b3log/siyuan:latest)${RESET}"
+    echo -e "${GREEN}2). 开心解锁版镜像 (apkdv/siyuan-unlock:latest)${RESET}"
+    echo -ne "${YELLOW}请选择要部署的镜像版本 [默认 1]: ${RESET}"
+    read -r img_choice
+    [[ -z "$img_choice" ]] && img_choice="1"
 
-    # 预创建本地目录并赋权
-    echo -e "${YELLOW}正在宿主机预构建后端物理存储目录...${RESET}"
+    local selected_image="b3log/siyuan:latest"
+    if [[ "$img_choice" == "2" ]]; then
+        selected_image="apkdv/siyuan-unlock:latest"
+        echo -e "${GREEN}已选择: 开心解锁版镜像${RESET}\n"
+    else
+        echo -e "${GREEN}已选择: 官方原版镜像${RESET}\n"
+    fi
+
+    echo -e "${CYAN}====== 2. 知识库挂载自定义配置 ======${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用主程序同级路径下的 workspace 文件夹。${RESET}"
+    
+    echo -ne "${YELLOW}请输入笔记数据(workspace)本地挂载路径 [默认: ./workspace]: ${RESET}"
+    read -r input_data
+    local path_data_raw="${input_data:-./workspace}"
+    local real_path_data=$(get_real_path "$path_data_raw" "./workspace")
+
+    # 预创建目录并赋予标准权限
     mkdir -p "$real_path_data"
     chmod -R 777 "$real_path_data"
 
-    echo -e "\n${CYAN}====== 2. Web 前端网络访问端口 ======${RESET}"
+    echo -e "\n${CYAN}====== 3. 安全与访问配置 ======${RESET}"
     
     # 允许自定义宿主机端口
-    echo -ne "${YELLOW}请输入 ShadowSSH 宿主机外部访问端口 [默认: 18111]: ${RESET}"
+    echo -ne "${YELLOW}请输入思源笔记宿主机访问端口 [默认: 6806]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="18111"
+    [[ -z "$custom_port" ]] && custom_port="6806"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成完备的双服务含 IPv6 栈的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在构建原生直挂版双服务复合 docker-compose.yml...${RESET}"
+    # 自定义访问授权码 AuthCode
+    echo -ne "${YELLOW}请设置您的笔记访问授权码(Access Auth Code) [默认: SiyuanPass123]: ${RESET}"
+    read -r auth_code
+    [[ -z "$auth_code" ]] && auth_code="SiyuanPass123"
+
+    # 时区与权限 ID 设定 (从系统环境获取默认值)
+    local current_tz=$(cat /etc/timezone 2>/dev/null || echo "Asia/Shanghai")
+    local current_uid=$(id -u)
+    local current_gid=$(id -g)
+
+    # 动态生成配置文件
+    echo -e "${YELLOW}正在生成思源笔记专用 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  frontend:
-    image: ceocok/shadowssh-frontend:latest
-    pull_policy: always
-    container_name: ${FRONTEND_CONTAINER}
-    restart: unless-stopped
+  main:
+    image: ${selected_image}
+    container_name: ${CONTAINER_NAME}
+    command: ['--workspace=/siyuan/workspace/', '--accessAuthCode=${auth_code}']
     ports:
-      - "${custom_port}:80"
-    depends_on:
-      - backend
-    networks:
-      - shadowssh-network
-
-  backend:
-    image: ceocok/shadowssh-backend:latest
-    pull_policy: always
-    container_name: ${BACKEND_CONTAINER}
+      - "${custom_port}:6806"
+    volumes:
+      - ${real_path_data}:/siyuan/workspace
+      - ./workspace/.dummy_home:/home/siyuan
     restart: unless-stopped
     environment:
-      NODE_ENV: production
-      PORT: 3001
-    volumes:
-      - ${path_data_raw}:/app/data
-    networks:
-      - shadowssh-network
-
-networks:
-  shadowssh-network:
-    driver: bridge
-    name: shadowssh-network
-    enable_ipv6: true
-    ipam:
-      config:
-        - subnet: fd01::/80
-          gateway: fd01::1
+      - TZ=${current_tz}
+      - PUID=${current_uid}
+      - PGID=${current_gid}
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 协同拉起前后端服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 SiYuan...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务联调及容器初始化 (约4秒)...${RESET}"
-    sleep 4
+    echo -e "${YELLOW}等待容器初始化并建立工作区 (约3秒)...${RESET}"
+    sleep 3
 
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}         ShadowSSH 架构群落部署成功！                 ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}Web 访问后台     : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}后端数据库路径   : ${real_path_data}${RESET}"
-    echo -e "${YELLOW}IPv6 独立网络栈  : fd01::/80 (已就绪)${RESET}"
-    echo -e "${YELLOW}配置文件路径     : $COMPOSE_FILE${RESET}"
-    echo -e "${GREEN}----------------------------------------------------${RESET}"
-    echo -e "${CYAN}💡 提示: 系统采用了 always 策略强制拉取最新镜像，以后重启将自动检测最新演进。${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}        思源笔记 部署成功！      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}所用镜像源     : ${selected_image}${RESET}"
+    echo -e "${YELLOW}笔记访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}访问授权码     : ${auth_code}${RESET}"
+    echo -e "${YELLOW}数据直挂路径   : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}运行用户身份   : PUID=${current_uid} / PGID=${current_gid}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新整个应用群镜像
+# 更新 思源笔记 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取前后端双系统最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取思源笔记最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！前后端架构均已切换至最新生产状态。${RESET}"
+    echo -e "${GREEN}更新完成！思源笔记已处于最新版本。${RESET}"
 }
 
-# 卸载整个群落
+# 卸载 思源笔记
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的网络节点配置及后端全量流水账单！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并销毁整个 ShadowSSH 容器集群吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的所有笔记、资产文件以及知识库架构！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除思源笔记容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}服务群落已优雅停止，独立网络栈已安全注销。${RESET}"
-            echo -ne "${RED}【高风险】是否同时彻底删除本地挂载的后端核心 data 文件夹？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${RED}【超高风险】是否同时彻底删除本地全量笔记数据 (workspace 目录)？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有历史核心数据已被彻底清除。${RESET}"
+                echo -e "${GREEN}本地所有思源笔记历史数据已被彻底销毁。${RESET}"
             fi
         else
-            docker rm -f "$FRONTEND_CONTAINER" "$BACKEND_CONTAINER" 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}架构服务群已全面启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}架构服务群已安全挂起${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}架构服务群已完成链式重启${RESET}"; }
-
-# 引导式日志查看
-logs_utils() {
-    echo -e "${CYAN}请选择要查看日志的服务组件:${RESET}"
-    echo -e "1) Web 前端 (${FRONTEND_CONTAINER})"
-    echo -e "2) 核心后端 (${BACKEND_CONTAINER})"
-    echo -ne "请输入序号 [默认 1]: "
-    read -r log_choice
-    if [[ "$log_choice" == "2" ]]; then
-        docker logs -f "$BACKEND_CONTAINER"
-    else
-        docker logs -f "$FRONTEND_CONTAINER"
-    fi
-}
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前群落状态   : $status"
-    echo -e "${YELLOW}服务映射地址   : http://${DETECT_IP}:${port_display}${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}当前活动端口   : ${port_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -242,7 +228,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  ShadowSSH 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  思源笔记 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
@@ -250,9 +236,9 @@ menu() {
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动集群${RESET}"
-    echo -e "${GREEN}5. 停止集群${RESET}"
-    echo -e "${GREEN}6. 重启集群${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"

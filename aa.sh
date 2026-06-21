@@ -55,13 +55,17 @@ get_status_info() {
     local active_id=$(docker ps -q --filter "name=paperphone-plus-client" --filter "status=running" | head -n 1)
     if [ -n "$active_id" ]; then
         status="${GREEN}运行中${RESET}"
-        port_display="80"
+        # 动态获取 client 容器映射到宿主机的端口
+        port_display=$(docker port paperphone-plus-client 80 2>/dev/null | cut -d':' -f2)
+        [[ -z "$port_display" ]] && port_display="80"
     else
         local dead_id=$(docker ps -aq --filter "name=paperphone-plus-client" | head -n 1)
         if [ -n "$dead_id" ]; then status="${RED}已停止${RESET}"; else status="${RED}未部署${RESET}"; fi
         port_display="N/A"
     fi
 }
+
+
 
 install_utils() {
     check_dependencies
@@ -96,7 +100,7 @@ install_utils() {
     echo -ne "${YELLOW}请输入前端访问端口 [默认 80]: ${RESET}"; read -r custom_port; [[ -z "$custom_port" ]] && custom_port="80"
     echo -ne "${YELLOW}后台管理密码 [默认 admin123]: ${RESET}"; read -r admin_pass; [[ -z "$admin_pass" ]] && admin_pass="admin123"
 
-    # 写入 .env 文件 (加入了 REDIS_DB 变量支持)
+    # 写入 .env 文件
     cat <<EOF > "$ENV_FILE"
 PORT=3000
 JWT_SECRET="${rand_jwt}"
@@ -114,7 +118,20 @@ ADMIN_PATH=/admin
 ADMIN_PASSWORD=${admin_pass}
 EOF
 
-    # 构造核心服务拓扑
+    # 根据部署模式，智能生成 server 的内部依赖块，彻底废除不稳定的 sed 逻辑
+    local server_depends=""
+    if [ "$db_mode" = "1" ]; then
+        server_depends=$(cat <<EOF
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+EOF
+)
+    fi
+
+    # 构造基础双容器架构
     cat <<EOF > "$COMPOSE_FILE"
 services:
   client:
@@ -134,9 +151,9 @@ services:
       - "3000:3000"
     env_file:
       - ./server/.env
-    # 注入环境变量到容器，确保 Rust 后端能读取到分区信息
     environment:
       REDIS_DB: \${REDIS_DB:-0}
+${server_depends}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
       interval: 15s
@@ -146,10 +163,8 @@ services:
     restart: unless-stopped
 EOF
 
-    # 只有本地常规模式才会追加本地库容器
+    # 只有常规模式（db_mode 为 1）下，才会继续在文件尾部追加本地数据库卷
     if [ "$db_mode" = "1" ]; then
-        sed -i '/restart: unless-stopped/a\    depends_on:\n      mysql:\n        condition: service_healthy\n      redis:\n        condition: service_healthy' "$COMPOSE_FILE"
-        
         cat <<EOF >> "$COMPOSE_FILE"
 
   mysql:
@@ -202,18 +217,27 @@ EOF
     cd "$BASE_DIR" && docker compose up -d
     echo -e "${GREEN}Paperphone-plus 部署成功！${RESET}"
 
-    SERVER_IP=$(get_public_ip)
+    # 智能防护获取公网 IP。若环境没有 get_public_ip 函数，自适应切回本地公网卡网段
+    local SERVER_IP
+    if command -v get_public_ip &> /dev/null; then
+        SERVER_IP=$(get_public_ip)
+    else
+        SERVER_IP=$(hostname -I | awk '{print $1}')
+    fi
 
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}         Paperphone-plus 部署成功！              ${RESET}"
+    echo -e "${GREEN}         Paperphone-plus 部署成功！               ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}🌐 访问地址: http://${SERVER_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}👑 管理后台: http://${SERVER_IP}:${custom_port}/admin${RESET}"
-    echo -e "${YELLOW}👑 后端地址: http://${SERVER_IP}:3000${RESET}"
+    echo -e "${YELLOW}👑 后端地址: http://${SERVER_IP}:3000${RESET}/admin"
     echo -e "${YELLOW}🔑 管理密码: ${admin_pass}${RESET}"
     echo -e "${YELLOW}📂 数据目录: ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
+    
+
+    
+
 
 trigger_backup() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then echo -e "${RED}错误: 未部署系统！${RESET}"; return; fi
@@ -382,9 +406,31 @@ show_info() {
 }
 
 update_utils() {
-    if [[ ! -f "$BASE_DIR" ]]; then echo -e "${RED}错误: 未部署！${RESET}"; return; fi
-    cd "$BASE_DIR" && docker compose pull && docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！${RESET}"
+    # 1. 核心配置文件健壮性检查
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到集群编排文件 ($COMPOSE_FILE)！${RESET}"
+        echo -e "${YELLOW}请先执行选项 1 部署/启动新实例。${RESET}"
+        return 1
+    fi
+
+    echo -e "${CYAN}===================================${RESET}"
+    echo -e "${CYAN}      🔄 正在滚动拉取并同步最新镜像      ${RESET}"
+    echo -e "${CYAN}===================================${RESET}"
+    
+    cd "$BASE_DIR" || exit 1
+
+    # 2. 执行滚动拉取
+    echo -e "${YELLOW}➜ 正在连接远程仓库拉取最新镜像层...${RESET}"
+    if docker compose pull; then
+        echo -e "${GREEN}✔ 镜像下载/更新完成。${RESET}"
+        
+        # 3. 平滑应用变更（只重启有更新的容器，零停机或极短停机时间）
+        echo -e "${YELLOW}➜ 正在热重载容器集群以应用新镜像...${RESET}"
+        docker compose up -d --remove-orphans
+        echo -e "${GREEN}🌟 集群容器已成功滚动更新！${RESET}"
+    else
+        echo -e "${RED}❌ 镜像拉取失败！请检查网络连接或 GitHub/DockerHub 连通性。${RESET}"
+    fi
 }
 
 menu() {

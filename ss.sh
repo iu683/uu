@@ -1,21 +1,20 @@
 #!/bin/bash
 # =================================================================
-# DuJiaoNext (独角数卡) Docker Compose 统一管理面板
+# Cloudreve Docker Compose 管理面板 (本地/远程双模 + 网络桥接版)
 # =================================================================
 
-# 颜色
+# 颜色定义
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/dujiao-next"
+BASE_DIR="/opt/cloudreve"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONFIG_FILE="$BASE_DIR/config/config.yml"
-ENV_FILE="$BASE_DIR/.env"
+DEFAULT_IMAGE="cloudreve/cloudreve:latest"
 
-# 检测依赖
+# 检测依赖环境
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
@@ -23,675 +22,341 @@ check_dependencies() {
     fi
 }
 
-# 【核心升级】直接从运行状态中提取最真实的端口映射
-get_status_info() {
-    if [ -f "$COMPOSE_FILE" ] && [ "$(cd "$BASE_DIR" && docker compose ps -q 2>/dev/null)" ]; then
-        status="${GREEN}运行中${RESET}"
-        
-        # 实时抓取正在运行的容器端口 (通过 docker inspect 提取本地主机的映射端口)
-        api_p=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' dujiaonext-api 2>/dev/null)
-        user_p=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' dujiaonext-user 2>/dev/null)
-        admin_p=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' dujiaonext-admin 2>/dev/null)
+get_public_ip() {
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
     else
-        if [ -f "$ENV_FILE" ]; then status="${RED}已停止${RESET}"; else status="${RED}未部署${RESET}" ; fi
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
+    echo "127.0.0.1" && return 0
+}
 
-    # 兜底保障：如果容器没运行或者没抓到，则从 .env 静态文件提取
-    if [ -z "$api_p" ] || [ "$api_p" = "<no value>" ]; then
-        if [ -f "$ENV_FILE" ]; then
-            api_p=$(grep "API_PORT=" "$ENV_FILE" | cut -d'=' -f2)
-            user_p=$(grep "USER_PORT=" "$ENV_FILE" | cut -d'=' -f2)
-            admin_p=$(grep "ADMIN_PORT=" "$ENV_FILE" | cut -d'=' -f2)
+# 动态获取容器整体状态和端口
+get_status_info() {
+    if [ -f "$COMPOSE_FILE" ]; then
+        if [ "$(docker ps -q -f name=cloudreve-backend)" ]; then
+            status="${GREEN}运行中${RESET}"
+            web_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5212/tcp") 0).HostPort}}' cloudreve-backend 2>/dev/null)
+        elif [ "$(docker ps -aq -f name=cloudreve-backend)" ]; then
+            status="${YELLOW}已停止${RESET}"
+            web_port=""
         else
-            api_p="N/A"; user_p="N/A"; admin_p="N/A"
+            status="${RED}未部署${RESET}"
+            web_port=""
         fi
+        
+        if [ -z "$web_port" ]; then
+            web_port=$(grep -A 5 "cloudreve:" "$COMPOSE_FILE" 2>/dev/null | grep -E '\-[[:space:]]*["'\'']?.*:5212' | head -n 1 | grep -oE '[0-9]+:5212' | cut -d':' -f1)
+            [[ -z "$web_port" ]] && web_port="5212"
+        fi
+    else
+        status="${RED}未初始化${RESET}"
+        web_port="N/A"
     fi
 }
 
-# 产生随机字符串
-generate_random_str() {
-    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w "${1:-32}" | head -n 1
-}
-
-# 部署 DuJiaoNext 核心逻辑
-install_dujiao() {
+# 部署 Cloudreve
+install_cloudreve() {
     check_dependencies
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  请选择 DuJiaoNext 数据库架构: ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${CYAN}1. 方案 A：SQLite + Redis (轻量本地化推荐)${RESET}"
-    echo -e "${CYAN}2. 方案 B：PostgreSQL + Redis (本地容器自建集群)${RESET}"
-    echo -e "${CYAN}3. 方案 C：连接远程/外部独立 PostgreSQL (本地带 Redis)${RESET}"
-    echo -e "${CYAN}4. 方案 D：远程 PostgreSQL + 远程 Redis (完全分离模式)${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${YELLOW}请输入编号 [1-4]: ${RESET}"
-    read -r db_choice
+    mkdir -p "$BASE_DIR"
 
-    if [[ "$db_choice" != "1" && "$db_choice" != "2" && "$db_choice" != "3" && "$db_choice" != "4" ]]; then
-        echo -e "${RED}输入有误，取消部署。${RESET}"
+    echo -e "${CYAN}====== 数据库/缓存运行模式选择 ======${RESET}"
+    echo -e " 1. 直接部署全新完整环境 (包含全新的本地 PostgreSQL 和 Redis 容器)"
+    echo -e " 2. 连接外部/远程已有的数据库与 Redis (需提前手动创建好 PostgreSQL 数据库)"
+    echo -ne "${YELLOW}请选择运行模式 [默认: 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
+
+    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Cloudreve Web 访问端口 [默认: 5212]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="5212"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 如果是远程数据库（方案 3 或 方案 4），交互获取远程 PostgreSQL 凭据
-    local remote_dsn=""
-    if [[ "$db_choice" == "3" || "$db_choice" == "4" ]]; then
-        echo -e "${CYAN}--- 远程 PostgreSQL 数据库连接配置 ---${RESET}"
-        echo -ne "${YELLOW}请输入远程数据库 主机IP/域名: ${RESET}"
-        read -r remote_host
-        echo -ne "${YELLOW}请输入远程数据库 端口 [默认: 5432]: ${RESET}"
-        read -r remote_port
-        [[ -z "$remote_port" ]] && remote_port="5432"
-        echo -ne "${YELLOW}请输入远程数据库 用户名: ${RESET}"
-        read -r remote_user
-        echo -ne "${YELLOW}请输入远程数据库 密码: ${RESET}"
-        read -r remote_pass
-        echo -ne "${YELLOW}请输入远程数据库 数据库名: ${RESET}"
-        read -r remote_dbname
-
-        # 封装标准 Postgres DSN 格式
-        remote_dsn="host=${remote_host} user=${remote_user} password=${remote_pass} dbname=${remote_dbname} port=${remote_port} sslmode=disable TimeZone=Asia/Shanghai"
+    # === 核心新增：离线下载 P2P 端口自定义 ===
+    echo -ne "${YELLOW}请输入离线下载 P2P 监听端口 [默认: 6888]: ${RESET}"
+    read -r custom_p2p_port
+    [[ -z "$custom_p2p_port" ]] && custom_p2p_port="6888"
+    if ! [[ "$custom_p2p_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
     fi
 
-    # 初始化配置变量
-    local redis_host_cfg="redis"
-    local redis_port_cfg="6379"
-    local redis_pass_cfg=$(generate_random_str 16)
-    local redis_db_cfg="0"
-    local redis_queue_db_cfg="1"
+    echo -e "${CYAN}====== 持久化数据挂载路径配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入网盘主体文件数据挂载目录 [默认: ${BASE_DIR}/uploads]: ${RESET}"
+    read -r mount_uploads_dir
+    [[ -z "$mount_uploads_dir" ]] && mount_uploads_dir="${BASE_DIR}/uploads"
+    mkdir -p "$mount_uploads_dir"
 
-    # 如果选了方案 4，进一步交互获取远程 Redis 的配置信息
-    if [[ "$db_choice" == "4" ]]; then
-        echo -e "${CYAN}--- 远程 Redis 缓存连接配置 ---${RESET}"
-        echo -ne "${YELLOW}请输入远程 Redis 主机IP/域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r redis_host_cfg
-        [[ -z "$redis_host_cfg" ]] && redis_host_cfg="127.0.0.1"
+    # ------------------ 模式 1：全套本地内置容器化 ------------------
+    if [[ "$db_mode" == "1" ]]; then
+        echo -ne "${YELLOW}请输入内置 PostgreSQL 数据库数据挂载目录 [默认: ${BASE_DIR}/postgres_db]: ${RESET}"
+        read -r mount_db_dir
+        [[ -z "$mount_db_dir" ]] && mount_db_dir="${BASE_DIR}/postgres_db"
+        mkdir -p "$mount_db_dir"
 
-        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
-        read -r redis_port_cfg
-        [[ -z "$redis_port_cfg" ]] && redis_port_cfg="6379"
+        echo -ne "${YELLOW}请输入内置 Redis 缓存数据挂载目录 [默认: ${BASE_DIR}/redis_db]: ${RESET}"
+        read -r mount_rd_dir
+        [[ -z "$mount_rd_dir" ]] && mount_rd_dir="${BASE_DIR}/redis_db"
+        mkdir -p "$mount_rd_dir"
 
-        echo -ne "${YELLOW}请输入远程 Redis 密码 (若无密码请直接回车): ${RESET}"
-        read -r redis_pass_cfg
+        echo -e "${YELLOW}正在配置全套本地内置容器环境...${RESET}"
+        local rand_db_pass=$(openssl rand -hex 16)
+        local db_user="cloudreve"
+        local db_name="cloudreve"
 
-        echo -ne "${YELLOW}请输入远程 Redis 缓存型数据库号 (DB ID) [默认: 0]: ${RESET}"
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  cloudreve:
+    container_name: cloudreve-backend
+    image: ${DEFAULT_IMAGE}
+    depends_on:
+      - postgresql
+      - redis
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:5212"
+      - "${custom_p2p_port}:6888"
+      - "${custom_p2p_port}:6888/udp"
+    environment:
+      - CR_CONF_Database.Type=postgres
+      - CR_CONF_Database.Host=postgresql
+      - CR_CONF_Database.User=${db_user}
+      - CR_CONF_Database.Password=${rand_db_pass}
+      - CR_CONF_Database.Name=${db_name}
+      - CR_CONF_Database.Port=5432
+      - CR_CONF_Redis.Server=redis:6379
+      - CR_CONF_Redis.DB=0
+    networks:
+      - cloudreve_net
+    volumes:
+      - ${mount_uploads_dir}:/cloudreve/data
+
+  postgresql:
+    container_name: postgresql
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${db_user}
+      - POSTGRES_PASSWORD=${rand_db_pass}
+      - POSTGRES_DB=${db_name}
+    networks:
+      - cloudreve_net
+    volumes:
+      - ${mount_db_dir}:/var/lib/postgresql/data
+
+  redis:
+    container_name: redis
+    image: redis:alpine
+    restart: unless-stopped
+    networks:
+      - cloudreve_net
+    volumes:
+      - ${mount_rd_dir}:/data
+
+networks:
+  cloudreve_net:
+    driver: bridge
+EOF
+
+    # ------------------ 模式 2：连接外部/远程已有的 PostgreSQL + Redis ------------------
+    else
+        echo -e "${CYAN}====== 远程/外部 PostgreSQL 信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_db_host
+        [[ -z "$ext_db_host" ]] && ext_db_host="127.0.0.1"
+        
+        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
+        read -r ext_db_port
+        [[ -z "$ext_db_port" ]] && ext_db_port="5432"
+        
+        echo -ne "${YELLOW}请输入数据库用户名 [默认: cloudreve]: ${RESET}"
+        read -r ext_db_user
+        [[ -z "$ext_db_user" ]] && ext_db_user="cloudreve"
+        
+        echo -ne "${YELLOW}请输入数据库密码: ${RESET}"
+        read -r ext_db_pass
+        
+        echo -ne "${YELLOW}请输入目标数据库名 [默认: cloudreve]: ${RESET}"
+        read -r ext_db_name
+        [[ -z "$ext_db_name" ]] && ext_db_name="cloudreve"
+
+        echo -e "${CYAN}====== 远程/外部 Redis 信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_rd_host
+        [[ -z "$ext_rd_host" ]] && ext_rd_host="127.0.0.1"
+        
+        echo -ne "${YELLOW}请输入 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r ext_rd_port
+        [[ -z "$ext_rd_port" ]] && ext_rd_port="6379"
+
+        echo -ne "${YELLOW}请输入 Redis 密码 (若无密码请直接回车): ${RESET}"
+        read -r ext_rd_pass
+
+        echo -ne "${YELLOW}请输入远程 Redis 数据库号 (DB ID) [默认: 0]: ${RESET}"
         read -r redis_db_cfg
         [[ -z "$redis_db_cfg" ]] && redis_db_cfg="0"
 
-        echo -ne "${YELLOW}请输入远程 Redis 队列型数据库号 (DB ID) [默认: 1]: ${RESET}"
-        read -r redis_queue_db_cfg
-        [[ -z "$redis_queue_db_cfg" ]] && redis_queue_db_cfg="1"
-    fi
+        # 突破 Docker 宿主机回环地址限制
+        [[ "$ext_db_host" == "127.0.0.1" || "$ext_db_host" == "localhost" ]] && ext_db_host="172.17.0.1"
+        [[ "$ext_rd_host" == "127.0.0.1" || "$ext_rd_host" == "localhost" ]] && ext_rd_host="172.17.0.1"
 
-    echo -e "${CYAN}====== 自定义基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入安装绝对路径 [默认: /opt/dujiao-next]: ${RESET}"
-    read -r custom_dir
-    [[ -z "$custom_dir" ]] && custom_dir="/opt/dujiao-next"
-    BASE_DIR="$custom_dir"
-    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-    CONFIG_FILE="$BASE_DIR/config/config.yml"
-    ENV_FILE="$BASE_DIR/.env"
-
-    echo -ne "${YELLOW}请输入前台(User)端口 [默认: 8081]: ${RESET}"
-    read -r user_port
-    [[ -z "$user_port" ]] && user_port="8081"
-
-    echo -ne "${YELLOW}请输入后台(Admin)端口 [默认: 8082]: ${RESET}"
-    read -r admin_port
-    [[ -z "$admin_port" ]] && admin_port="8082"
-
-    echo -ne "${YELLOW}请输入API核心服务端口 [默认: 8080]: ${RESET}"
-    read -r api_port
-    [[ -z "$api_port" ]] && api_port="8080"
-
-    echo -ne "${YELLOW}设置首次初始化管理员密码 [默认: admin123]: ${RESET}"
-    read -r admin_pwd
-    [[ -z "$admin_pwd" ]] && admin_pwd="admin123"
-
-    # 1. 创建持久化目录
-    echo -e "${YELLOW}正在建立并授权本地持久化目录...${RESET}"
-    mkdir -p "$BASE_DIR/config" "$BASE_DIR/data/db" "$BASE_DIR/data/uploads" "$BASE_DIR/data/logs" "$BASE_DIR/data/redis" "$BASE_DIR/data/postgres"
-    chmod -R 0777 "$BASE_DIR/data"
-
-    # 2. 自动生成专属的高强度密码和 32 位双核心 JWT 安全密码
-    local local_pg_pass=$(generate_random_str 16)
-    local jwt_secret=$(generate_random_str 32)
-    local user_jwt_secret=$(generate_random_str 32)
-
-    # 3. 动态配置 config.yml
-    echo -e "${YELLOW}正在安全加密并生成统一生产配置文件 (config.yml)...${RESET}"
-    cat <<EOF > "$CONFIG_FILE"
-app:
-  env: production
-jwt:
-  secret: "${jwt_secret}"
-user_jwt:
-  secret: "${user_jwt_secret}"
-redis:
-  enabled: true
-  host: "${redis_host_cfg}"
-  port: ${redis_port_cfg}
-  password: ${redis_pass_cfg}
-  db: ${redis_db_cfg}
-  prefix: "dj"
-queue:
-  enabled: true
-  host: "${redis_host_cfg}"
-  port: ${redis_port_cfg}
-  password: ${redis_pass_cfg}
-  db: ${redis_queue_db_cfg}
-  concurrency: 10
-  queues:
-    default: 10
-    critical: 5
-EOF
-
-    # 追加入口对应的 database 配置
-    if [ "$db_choice" = "1" ]; then
-        cat <<EOF >> "$CONFIG_FILE"
-database:
-  driver: sqlite
-  dsn: /app/db/dujiao.db
-EOF
-    elif [ "$db_choice" = "2" ]; then
-        cat <<EOF >> "$CONFIG_FILE"
-database:
-  driver: postgres
-  dsn: host=postgres user=dujiao password=${local_pg_pass} dbname=dujiao_next port=5432 sslmode=disable TimeZone=Asia/Shanghai
-EOF
-    elif [[ "$db_choice" == "3" || "$db_choice" == "4" ]]; then
-        cat <<EOF >> "$CONFIG_FILE"
-database:
-  driver: postgres
-  dsn: "${remote_dsn}"
-EOF
-    fi
-
-    # 4. 生成高内聚的 .env 变量 file
-    cat <<EOF > "$ENV_FILE"
-TAG=latest
-TZ=Asia/Shanghai
-API_PORT=${api_port}
-USER_PORT=${user_port}
-ADMIN_PORT=${admin_port}
-DJ_DEFAULT_ADMIN_USERNAME=admin
-DJ_DEFAULT_ADMIN_PASSWORD=${admin_pwd}
-REDIS_PASSWORD=${redis_pass_cfg}
-POSTGRES_DB=dujiao_next
-POSTGRES_USER=dujiao
-POSTGRES_PASSWORD=${local_pg_pass}
-EOF
-
-    # 5. 生成对应的集群网络 docker-compose.yml 
-    local compose_content="services:"
-
-    # 仅当不是方案 4 (非完全分离) 时，才在本地创建 redis 容器组件
-    if [ "$db_choice" != "4" ]; then
-        compose_content="${compose_content}
-  redis:
-    image: redis:7-alpine
-    container_name: dujiaonext-redis
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  cloudreve:
+    container_name: cloudreve-backend
+    image: ${DEFAULT_IMAGE}
     restart: unless-stopped
-    environment:
-      REDIS_PASSWORD: \${REDIS_PASSWORD}
-    command: [\"redis-server\", \"--appendonly\", \"yes\", \"--requirepass\", \"\${REDIS_PASSWORD}\"]
-    volumes:
-      - ./data/redis:/data
-    healthcheck:
-      test: [\"CMD\", \"redis-cli\", \"-a\", \"\${REDIS_PASSWORD}\", \"ping\"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-    networks:
-      - dujiao-net"
-    fi
-
-    # 如果选本地自建方案 B，插入本地 postgres 容器声明
-    if [ "$db_choice" = "2" ]; then
-        compose_content="${compose_content}
-
-  postgres:
-    image: postgres:16-alpine
-    container_name: dujiaonext-postgres
-    restart: unless-stopped
-    environment:
-      TZ: \${TZ}
-      POSTGRES_DB: \${POSTGRES_DB}
-      POSTGRES_USER: \${POSTGRES_USER}
-      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: [\"CMD-SHELL\", \"pg_isready -U \${POSTGRES_USER} -d \${POSTGRES_DB}\"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    networks:
-      - dujiao-net"
-    fi
-
-    # 追加拼装 API / User / Admin 容器定义
-    compose_content="${compose_content}
-
-  api:
-    image: dujiaonext/api:\${TAG}
-    container_name: dujiaonext-api
-    restart: unless-stopped
-    environment:
-      TZ: \${TZ}
-      DJ_DEFAULT_ADMIN_USERNAME: \${DJ_DEFAULT_ADMIN_USERNAME}
-      DJ_DEFAULT_ADMIN_PASSWORD: \${DJ_DEFAULT_ADMIN_PASSWORD}
     ports:
-      - \"127.0.0.1:\${API_PORT}:8080\"
+      - "${custom_port}:5212"
+      - "${custom_p2p_port}:6888"
+      - "${custom_p2p_port}:6888/udp"
+    environment:
+      - CR_CONF_Database.Type=postgres
+      - CR_CONF_Database.Host=${ext_db_host}
+      - CR_CONF_Database.User=${ext_db_user}
+      - CR_CONF_Database.Password=${ext_db_pass}
+      - CR_CONF_Database.Name=${ext_db_name}
+      - CR_CONF_Database.Port=${ext_db_port}
+      - CR_CONF_Redis.Server=${ext_rd_host}:${ext_rd_port}
+      - CR_CONF_Redis.DB=${redis_db_cfg}
     volumes:
-      - ./config/config.yml:/app/config.yml:ro"
+      - ${mount_uploads_dir}:/cloudreve/data
+EOF
 
-    if [ "$db_choice" = "1" ]; then
-        compose_content="${compose_content}
-      - ./data/db:/app/db"
-    fi
-
-    compose_content="${compose_content}
-      - ./data/uploads:/app/uploads
-      - ./data/logs:/app/logs"
-
-    # 处理 depends_on 依赖块
-    if [ "$db_choice" != "4" ]; then
-        compose_content="${compose_content}
-    depends_on:
-      redis:
-        condition: service_healthy"
-        if [ "$db_choice" = "2" ]; then
-            compose_content="${compose_content}
-      postgres:
-        condition: service_healthy"
+        # 仅当外部 Redis 设置了密码时，才追加独立密码环境变量
+        if [[ -n "$ext_rd_pass" ]]; then
+            echo "      - CR_CONF_Redis.Password=${ext_rd_pass}" >> "$COMPOSE_FILE"
         fi
     fi
 
-    compose_content="${compose_content}
-    healthcheck:
-      test: [\"CMD\", \"wget\", \"-qO-\", \"http://127.0.0.1:8080/health\"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-    networks:
-      - dujiao-net
-
-  user:
-    image: dujiaonext/user:\${TAG}
-    container_name: dujiaonext-user
-    restart: unless-stopped
-    environment:
-      TZ: \${TZ}
-    ports:
-      - \"127.0.0.1:\${USER_PORT}:80\"
-    depends_on:
-      api:
-        condition: service_healthy
-    networks:
-      - dujiao-net
-
-  admin:
-    image: dujiaonext/admin:\${TAG}
-    container_name: dujiaonext-admin
-    restart: unless-stopped
-    environment:
-      TZ: \${TZ}
-    ports:
-      - \"127.0.0.1:\${ADMIN_PORT}:80\"
-    depends_on:
-      api:
-        condition: service_healthy
-    networks:
-      - dujiao-net
-
-networks:
-  dujiao-net:
-    driver: bridge"
-
-    # 将组合出的内容写入 compose 物理文件
-    echo "$compose_content" > "$COMPOSE_FILE"
-
-    # 6. 容器启动
-    echo -e "${YELLOW}正在启动 DuJiaoNext 容器群 (本地回环架构)...${RESET}"
+    # ------------------ 启动集群 ------------------
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Cloudreve 服务中...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待微服务集群健康自检 (约8秒)...${RESET}"
-    sleep 8
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       DuJiaoNext 部署成功！     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}用户前台 (本机) : http://127.0.0.1:${user_port}${RESET}"
-    echo -e "${YELLOW}管理后台 (本机) : http://127.0.0.1:${admin_port}${RESET}"
-    echo -e "${YELLOW}API 服务 (本机) : http://127.0.0.1:${api_port}${RESET}"
-    echo -e "${RED}🔒 核心安全提示：所有服务绑口仅监听 127.0.0.1。本地中间件无任何公网暴露。${RESET}"
-    if [ "$db_choice" = "3" ]; then
-        echo -e "${GREEN}当前模式        : 远程独立 PostgreSQL 连接模式 (本地带 Redis)${RESET}"
-    elif [ "$db_choice" = "4" ]; then
-        echo -e "${GREEN}当前模式        : 远程 PostgreSQL + 远程 Redis (完全分离模式)${RESET}"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}部署失败，请检查 Docker 日志。${RESET}"
+        return
     fi
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${YELLOW}初始管理员账号 : admin${RESET}"
-    echo -e "${YELLOW}初始管理员密码 : ${admin_pwd}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}              Cloudreve 部署成功！                    ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}访问端点(URL) : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}映射宿主机端口 : ${custom_port}${RESET}"
+    echo -e "${YELLOW}离线下载端口   : ${custom_p2p_port} (TCP/UDP已开启)${RESET}"
+    echo -e "${CYAN}主体存储路径   : ${mount_uploads_dir}${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}内置库密码凭证 : 用户:${db_user} | 密码:${rand_db_pass} | 库名:${db_name}${RESET}"
+        echo -e "${CYAN}DB持久化路径   : ${mount_db_dir}${RESET}"
+        echo -e "${CYAN}Redis持久化路径: ${mount_rd_dir}${RESET}"
+    else
+        echo -e "${YELLOW}连接外部数据库 : ${ext_db_host}:${ext_db_port} -> 库名:${ext_db_name}${RESET}"
+        echo -e "${YELLOW}连接外部缓存库 : Redis -> ${ext_rd_host}:${ext_rd_port} (DB ID: ${redis_db_cfg})${RESET}"
+    fi
+    echo -e "${YELLOW}面板工作路径   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-
-
-# 更新镜像
-update_dujiao() {
+# 更新服务
+update_cloudreve() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新组件镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取 Cloudreve 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}集群更新完成！${RESET}"
+    echo -e "${GREEN}服务已升级并拉升至最新状态！${RESET}"
 }
 
-# 彻底卸载
-uninstall_dujiao() {
-    echo -ne "${RED}警告：确认要完全卸载并停止独角数卡服务吗？(y/n): ${RESET}"
+# 卸载集群
+uninstall_cloudreve() {
+    echo -ne "${RED}确定要注销并删除 Cloudreve 服务集群吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器集群已安全销毁。${RESET}"
-            echo -ne "${YELLOW}是否同时抹除本地数据库、上传的资源文件和全部日志？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已全部终止并移除。${RESET}"
+            echo -ne "${RED}是否同步清理掉本地所有【自定义挂载目录的数据】和环境？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}所有物理持久化数据已彻底抹除。${RESET}"
+                echo -e "${GREEN}工作目录及所有自定义挂载数据已被彻底清除。${RESET}"
             fi
         else
-            docker rm -f dujiaonext-api dujiaonext-user dujiaonext-admin dujiaonext-redis dujiaonext-postgres 2>/dev/null
+            docker rm -f cloudreve-backend postgresql redis 2>/dev/null
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        echo -e "${GREEN}完全卸载完毕！${RESET}"
     fi
 }
 
-start_dujiao() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}集群已恢复启动${RESET}"; }
-stop_dujiao() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}集群已受控停止${RESET}"; }
-restart_dujiao() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}集群已完整重启${RESET}"; }
+# 周期控制
+start_cr() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已正常启动${RESET}"; }
+stop_cr() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已安全暂停${RESET}"; }
+restart_cr() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已完成软重启${RESET}"; }
+logs_cr() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
-
-# 三选一交互式追踪日志核心逻辑
-logs_dujiao() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到部署集群，无法提取日志。${RESET}"
-        return
-    fi
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      请选择要追踪日志的容器:     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${CYAN}1. 核心 API 服务 (dujiaonext-api)${RESET}"
-    echo -e "${CYAN}2. 用户前台网站 (dujiaonext-user)${RESET}"
-    echo -e "${CYAN}3. 管理后台管理 (dujiaonext-admin)${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${YELLOW}请输入选项 [1-3]: ${RESET}"
-    read -r log_choice
-
-    case "$log_choice" in
-        1) cd "$BASE_DIR" && docker compose logs -f api ;;
-        2) cd "$BASE_DIR" && docker compose logs -f user ;;
-        3) cd "$BASE_DIR" && docker compose logs -f admin ;;
-        *) echo -e "${RED}输入无效，返回主菜单。${RESET}" ;;
-    esac
-}
-
-# 智能备份并完全【移出】Nginx 监控视线（修复 include 冲突 Bug）
-safe_remove_old_conf() {
-    local domain=$1
-    local paths=("/etc/nginx/sites-enabled/$domain" "/etc/nginx/sites-available/$domain" "/etc/nginx/conf.d/$domain.conf")
-    
-    # 创建位于系统 tmp 目录的绝对隔离备份区
-    sudo mkdir -p /tmp/nginx_bak/ 2>/dev/null
-
-    for path in "${paths[@]}"; do
-        if [ -f "$path" ] || [ -L "$path" ]; then
-            local filename=$(basename "$path")
-            local parent_dir=$(basename "$(dirname "$path")")
-            echo -e "${YELLOW}发现冲突旧配置: $path，正在将其移出 Nginx 并备份至 /tmp/nginx_bak/${parent_dir}_${filename} ...${RESET}"
-            # 使用 mv 直接移走，绝不在原目录留下任何后缀文件，彻底消除 Nginx 扫描
-            sudo mv "$path" "/tmp/nginx_bak/${parent_dir}_${filename}" 2>/dev/null
-        fi
-    done
-}
-
-# 自动配置 Nginx 反代逻辑 
-configure_nginx() {
-    get_status_info
-    if [ "$user_p" = "N/A" ] || [ "$admin_p" = "N/A" ] || [ "$api_p" = "N/A" ]; then
-        echo -e "${RED}错误: 未检测到有效的部署参数，请先执行选项 1 部署服务。${RESET}"
-        return
-    fi
-
-    clear
-    echo -e "${GREEN}=====================================================${RESET}"
-    echo -e "${GREEN}             DuJiaoNext Nginx 域名配置               ${RESET}"
-    echo -e "${GREEN}=====================================================${RESET}"
-    echo -e "${RED}提示：${RESET}"
-    echo -e "${YELLOW}1. 脚本会自动检测并在 /etc/nginx/sites-enabled/ 下重写域名文件。${RESET}"
-    echo -e "${YELLOW}2. 发现同名旧文件会无损移到 /tmp/nginx_bak/ 目录，绝不污染 Nginx 配置链。${RESET}"
-    echo -e "${YELLOW}3. 写入前请确认你已提前生成好这两个域名的 SSL 证书文件。${RESET}"
-    echo -e "${GREEN}=====================================================${RESET}"
-    echo -ne "${CYAN}确认已知晓并继续操作吗？(y/n): ${RESET}"
-    read -r cert_confirm
-    if [[ "$cert_confirm" != "y" && "$cert_confirm" != "Y" ]]; then
-        echo -e "${YELLOW}已取消配置。${RESET}"
-        return
-    fi
-
-    echo ""
-    echo -ne "${YELLOW}请输入前台(User)现有域名 (例如: user.example.com): ${RESET}"
-    read -r user_domain
-    echo -ne "${YELLOW}请输入后台(Admin)现有域名 (例如: admin.example.com): ${RESET}"
-    read -r admin_domain
-
-    if [ -z "$user_domain" ] || [ -z "$admin_domain" ]; then
-        echo -e "${RED}域名不能为空，取消配置！${RESET}"
-        return
-    fi
-
-    # 彻底移开冲突配置文件
-    safe_remove_old_conf "$user_domain"
-    safe_remove_old_conf "$admin_domain"
-
-    # 定位 Nginx 配置写入路径
-    local TARGET_DIR="/etc/nginx/sites-enabled"
-    if [ ! -d "$TARGET_DIR" ]; then
-        TARGET_DIR="/etc/nginx/conf.d"
-    fi
-    sudo mkdir -p "$TARGET_DIR"
-
-    USER_CONF="$TARGET_DIR/$user_domain"
-    ADMIN_CONF="$TARGET_DIR/$admin_domain"
-
-    if [ "$TARGET_DIR" = "/etc/nginx/conf.d" ]; then
-        USER_CONF="${USER_CONF}.conf"
-        ADMIN_CONF="${ADMIN_CONF}.conf"
-    fi
-
-    echo -e "${YELLOW}正在写入前台配置到 $USER_CONF ...${RESET}"
-    sudo tee "$USER_CONF" > /dev/null <<EOF
-server {
-    listen 80;
-    server_name $user_domain;
-    return 301 https://\$host\$request_uri;
-}
-
-server {
-    listen 443 ssl;
-    http2 on;
-    server_name $user_domain;
-
-    ssl_certificate /etc/letsencrypt/live/$user_domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$user_domain/privkey.pem;
-
-    client_max_body_size 200M;
-
-    location / {
-        proxy_pass http://127.0.0.1:$user_p;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-
-        # WebSocket 支持
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-
-    # SEO 文件
-    location = /sitemap.xml {
-        proxy_pass http://127.0.0.1:$api_p/sitemap.xml;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    location = /robots.txt {
-        proxy_pass http://127.0.0.1:$api_p/robots.txt;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    location /api/ {
-        proxy_pass http://127.0.0.1:$api_p/api/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    location /uploads/ {
-        proxy_pass http://127.0.0.1:$api_p/uploads/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-EOF
-
-    echo -e "${YELLOW}正在写入后台配置到 $ADMIN_CONF ...${RESET}"
-    sudo tee "$ADMIN_CONF" > /dev/null <<EOF
-server {
-    listen 80;
-    server_name $admin_domain;
-    return 301 https://\$host\$request_uri;
-}
-
-server {
-    listen 443 ssl;
-    http2 on;
-    server_name $admin_domain;
-
-    ssl_certificate /etc/letsencrypt/live/$admin_domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$admin_domain/privkey.pem;
-
-    client_max_body_size 200M;
-
-    location / {
-        proxy_pass http://127.0.0.1:$admin_p;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-
-        # WebSocket 支持
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-
-    location /api/ {
-        proxy_pass http://127.0.0.1:$api_p/api/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    location /uploads/ {
-        proxy_pass http://127.0.0.1:$api_p/uploads/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-EOF
-
-    echo -e "${GREEN}新配置文件成功生成！${RESET}"
-    
-    if command -v nginx &> /dev/null; then
-        echo -e "${YELLOW}正在进行 Nginx 语法安全检查...${RESET}"
-        if sudo nginx -t; then
-            echo -e "${YELLOW}语法检查成功，正在重载 Nginx 服务...${RESET}"
-            sudo nginx -s reload
-            echo -e "${GREEN}✔ 成功无缝交接！旧配置已彻底移开，独角数卡全线生效！${RESET}"
-        else
-            echo -e "${RED}❌ Nginx 语法检查失败！请检查证书文件是否存在。${RESET}"
-        fi
-    else
-        echo -e "${YELLOW}提示: 未检测到本地 Nginx 物理命令，文件已保存在: $TARGET_DIR${RESET}"
-    fi 
-}
-
-
+# 配置显示
 show_info() {
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}集群运行状态 : $status"
-    echo -e "${YELLOW}前台映射端点 : 127.0.0.1:${user_p}"
-    echo -e "${YELLOW}后台映射端点 : 127.0.0.1:${admin_p}"
-    echo -e "${YELLOW}API 核心端点 : 127.0.0.1:${api_p}"
-    echo -e "${YELLOW}本地安装路径 : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}当前运行状态   : $status"
+    echo -e "${YELLOW}实际映射端口   : ${web_port}${RESET}"
+    echo -e "${YELLOW}本地项目路径   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
+# 主菜单
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈ DuJiaoNext (独角数卡) 面板 ◈  ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}核心状态 :${RESET} $status"
-    echo -e "${GREEN}前台端口 :${RESET} ${YELLOW}${user_p}${RESET}"
-    echo -e "${GREEN}后台端口 :${RESET} ${YELLOW}${admin_p}${RESET}" 
-    echo -e "${GREEN}API端口  :${RESET} ${YELLOW}${api_p}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新服务${RESET}"
-    echo -e "${GREEN}3. 卸载服务${RESET}"
-    echo -e "${GREEN}4. 启动集群${RESET}"
-    echo -e "${GREEN}5. 停止集群${RESET}"
-    echo -e "${GREEN}6. 重启集群${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}9. 反向代理${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}     ◈  Cloudreve 管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 当前状态 :${RESET} $status"
+    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 1. 部署启动${RESET}"
+    echo -e "${GREEN} 2. 更新服务${RESET}"
+    echo -e "${GREEN} 3. 卸载服务${RESET}"
+    echo -e "${GREEN} 4. 启动服务${RESET}"
+    echo -e "${GREEN} 5. 停止服务${RESET}"
+    echo -e "${GREEN} 6. 重启服务${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_dujiao ;;
-        2) update_dujiao ;;
-        3) uninstall_dujiao ;;
-        4) start_dujiao ;;
-        5) stop_dujiao ;;
-        6) restart_dujiao ;;
-        7) logs_dujiao ;;
+        1) install_cloudreve ;;
+        2) update_cloudreve ;;
+        3) uninstall_cloudreve ;;
+        4) start_cr ;;
+        5) stop_cr ;;
+        6) restart_cr ;;
+        7) logs_cr ;;
         8) show_info ;;
-        9) configure_nginx ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

@@ -1,385 +1,232 @@
 #!/bin/bash
-# =================================================================
-# Aria2 Docker Compose 管理面板 
-# =================================================================
+# ========================================
+# 1Panel 管理脚本
+# ========================================
 
-# 颜色
-RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
+RED="\033[31m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="aria2"
-BASE_DIR="/opt/aria2"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-
-# 检测依赖
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
-    fi
-    
-    local missing_deps=()
-    ! command -v wget &> /dev/null && missing_deps+=("wget")
-    ! command -v curl &> /dev/null && missing_deps+=("curl")
-    
-    if [ ${#missing_deps[@]} -ne 0 ]; then
-        echo -e "${YELLOW}提示: 正在安装缺失的工具 (${missing_deps[*]})...${RESET}"
-        if command -v apt-get &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y wget curl
-        elif command -v yum &> /dev/null; then
-            sudo yum install -y wget curl
-        fi
+# 智能寻找 1pctl 的实际路径
+get_cmd_path() {
+    if [ -x "/usr/local/bin/1pctl" ]; then
+        echo "/usr/local/bin/1pctl"
+    elif command -v 1pctl &>/dev/null; then
+        echo "1pctl"
+    else
+        echo ""
     fi
 }
 
-get_public_ip() {
-    local mode=${1:-"v4"}
-    local ip=""
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
-}
 
-# 动态获取容器状态、网络模式、映射端口和数据目录
-get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
 
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-    else
-        img_version="${RED}未安装${RESET}"
-    fi
 
-    webui_enabled="true"
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        # 检查是否关闭了 WEBUI
-        if grep -qE "WEBUI=[[:space:]]*[\"']?false[\"']?" "$COMPOSE_FILE"; then
-            webui_enabled="false"
-        fi
-
-        # 解析 RPC 端口与 BT 端口
-        if grep -qE "network_mode:[[:space:]]*[\"']?host[\"']?" "$COMPOSE_FILE"; then
-            # Host 模式从环境变量解析
-            webui_port=$(grep -E "WEBUI_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-            [[ -z "$webui_port" ]] && webui_port="8080"
-            [[ "$webui_enabled" == "false" ]] && webui_port="已禁用"
-
-            rpc_port=$(grep -E "RPC_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-            [[ -z "$rpc_port" ]] && rpc_port="6800"
-
-            bt_port=$(grep -E "BT_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-            [[ -z "$bt_port" ]] && bt_port="32516"
+# 检查并安装 unzip
+check_unzip() {
+    if ! command -v unzip >/dev/null 2>&1; then
+        echo "⚠️ 未检测到 unzip，正在安装..."
+        if [ -f /etc/debian_version ]; then
+            apt update && apt install -y unzip
+        elif [ -f /etc/redhat-release ]; then
+            yum install -y unzip || dnf install -y unzip
+        elif [ -f /etc/alpine-release ]; then
+            apk add unzip
         else
-            # Bridge 模式从 ports 解析
-            if [[ "$webui_enabled" == "true" ]]; then
-                webui_port=$(grep -E "\-[[:space:]]*[\"']?[0-9]+:8080" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"-')
-                [[ -z "$webui_port" ]] && webui_port="8080"
-            else
-                webui_port="已禁用"
-            fi
-
-            rpc_port=$(grep -E "\-[[:space:]]*[\"']?[0-9]+:6800" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"-')
-            [[ -z "$rpc_port" ]] && rpc_port="6800"
-
-            bt_port=$(grep -E "\-[[:space:]]*[\"']?[0-9]+:[0-9]+" "$COMPOSE_FILE" | grep -v "6800" | grep -v "8080" | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"-')
-            [[ -z "$bt_port" ]] && bt_port="32516"
+            echo "❌ 无法识别系统，请手动安装 unzip"
+            return 1
         fi
-
-        download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | tr -d '"' | xargs)
-        [[ -z "$download_dir" ]] && download_dir="$BASE_DIR/downloads"
-    else
-        webui_port="N/A"
-        rpc_port="N/A"
-        bt_port="N/A"
-        download_dir="N/A"
+        echo "✅ unzip 安装完成"
     fi
+    return 0
 }
 
-# 提取 Aria2 RPC Token
-get_aria2_token() {
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        local token=$(grep -E "SECRET=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-        echo -e "${GREEN}${token}${RESET}"
-    else
-        echo -e "${RED}未部署${RESET}"
+# 更新拓展App核心逻辑
+update_local_apps() {
+    local LOCAL_PATH="/opt/1panel/resource/apps/local"
+    local ZIP_URL="https://github.com/okxlin/appstore/archive/refs/heads/localApps.zip"
+    local BACKUP_DIR="/opt/1panel/resource/apps/backup_$(date +%Y%m%d_%H%M%S)"
+
+    if [ ! -d "$LOCAL_PATH" ]; then
+        echo -e "${RED}❌ 未检测到 1Panel 本地应用目录：$LOCAL_PATH${RESET}"
+        echo "请确认 1Panel 是否已安装并创建了本地应用目录。"
+        return 1
     fi
+
+    if ! check_unzip; then
+        echo -e "${RED}❌ 环境缺少 unzip，更新终止${RESET}"
+        return 1
+    fi
+
+    echo "📦 正在备份本地应用到：$BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR"
+    cp -rf "$LOCAL_PATH"/* "$BACKUP_DIR"/ 2>/dev/null
+
+    echo "⬇️ 正在下载最新 localApps.zip ..."
+    if ! wget -O "$LOCAL_PATH/localApps.zip" "$ZIP_URL"; then
+        echo -e "${RED}❌ 下载失败，已终止更新${RESET}"
+        return 1
+    fi
+
+    if [ ! -f "$LOCAL_PATH/localApps.zip" ]; then
+        echo -e "${RED}❌ 未找到下载文件${RESET}"
+        return 1
+    fi
+
+    echo "📂 正在解压覆盖文件..."
+    unzip -o -d "$LOCAL_PATH" "$LOCAL_PATH/localApps.zip" >/dev/null
+
+    echo "⚙️ 正在覆盖应用列表..."
+    cp -rf "$LOCAL_PATH/appstore-localApps/apps/"* "$LOCAL_PATH/"
+
+    echo "🧹 清理临时文件..."
+    rm -rf "$LOCAL_PATH/appstore-localApps" "$LOCAL_PATH/localApps.zip"
+
+    echo "🔄 正在重启 1Panel..."
+    local CMD=$(get_cmd_path)
+    if [ -n "$CMD" ]; then
+        $CMD restart
+        echo -e "${GREEN}✅ 1Panel 已成功重启${RESET}"
+    else
+        echo -e "${YELLOW}⚠️ 未检测到 1pctl 命令，无法自动重启。请稍后手动重启 1Panel。${RESET}"
+    fi
+
+    echo -e "${GREEN}✅ 本地应用拓展更新完成！${RESET}"
+    echo "🗂 已备份旧版本到：$BACKUP_DIR"
 }
 
-install_aria2() {
-    check_dependencies
-    
-    mkdir -p "$BASE_DIR/config"
 
-    echo -e "${CYAN}====== 部署模式选择 ======${RESET}"
-    echo -e "请选择想要部署的网络模式："
-    echo -e "  1) ${GREEN}Host 主机网络模式${RESET} (推荐！BT/PT公网连接性最好，默认占用 8080、6800、32516 端口)"
-    echo -e "  2) ${GREEN}Bridge 桥接网络模式${RESET} (允许自定义修改 WebUI 访问端口、RPC 端口及 BT 端口)"
-    echo -ne "${YELLOW}请输入选项 [默认 1]: ${RESET}"
-    read -r net_mode
-    [[ -z "$net_mode" ]] && net_mode="1"
-
-    echo -ne "${YELLOW}是否开启内置 AriaNg Web 控制台网页？(y/n) [默认: y]: ${RESET}"
-    read -r user_webui_choice
-    [[ -z "$user_webui_choice" ]] && user_webui_choice="y"
-    
-    local webui_env_val="true"
-    if [[ "$user_webui_choice" == "n" || "$user_webui_choice" == "N" ]]; then
-        webui_env_val="false"
+check_cmd() {
+    local cmd=$(get_cmd_path)
+    if [ -z "$cmd" ]; then
+        echo -e "${RED}未检测到 1pctl 命令，请确认 1Panel 已正确安装。若未安装，请选择选项 66${RESET}"
+        return 1
     fi
+    return 0
+}
 
-    local web_port="8080"
-    local rpc_port="6800"
-    local bt_port="32516"
+pause(){
+    read -rp "按回车继续..."
+}
 
-    # 自定义端口输入逻辑
-    if [[ "$net_mode" == "2" ]]; then
-        echo -e "${CYAN}====== 自定义桥接端口配置 ======${RESET}"
-        if [[ "$webui_env_val" == "true" ]]; then
-            echo -ne "${YELLOW}请输入 WebUI 访问端口 [默认: 8080]: ${RESET}"
-            read -r web_port
-            [[ -z "$web_port" ]] && web_port="8080"
-        fi
 
-        echo -ne "${YELLOW}请输入 RPC 通讯端口 [默认: 6800]: ${RESET}"
-        read -r rpc_port
-        [[ -z "$rpc_port" ]] && rpc_port="6800"
+menu(){
+clear
+echo -e "${GREEN}======================================${RESET}"
+echo -e "${GREEN} ◈    1Panel V2 开心版管理菜单    ◈   ${RESET}"
+echo -e "${GREEN}======================================${RESET}"
 
-        echo -ne "${YELLOW}请输入 BT/DHT 监听端口 [默认: 32516]: ${RESET}"
-        read -r bt_port
-        [[ -z "$bt_port" ]] && bt_port="32516"
-    fi
+local REAL_CMD=$(get_cmd_path)
 
-    # 通用公共配置项
-    echo -ne "${YELLOW}请输入宿主机下载文件存储绝对路径 [默认: $BASE_DIR/downloads]: ${RESET}"
-    read -r custom_download
-    [[ -z "$custom_download" ]] && custom_download="$BASE_DIR/downloads"
-
-    # 生成默认随机安全密钥 (使用最广泛兼容的命令生成 16 位强随机字符串)
-    local default_token=$(date +%s%N | md5sum | head -c 16)
-    echo -ne "${YELLOW}请设置 Aria2 RPC 安全密钥 (Token) [默认随机: ${GREEN}${default_token}${YELLOW}]: ${RESET}"
-    read -r rpc_token
-    [[ -z "$rpc_token" ]] && rpc_token="$default_token"
-
-    echo -ne "${YELLOW}请设置磁盘缓存大小 (例如：128M) [默认: 128M / 大内存建议512M]: ${RESET}"
-    read -r disk_cache
-    [[ -z "$disk_cache" ]] && disk_cache="128M"
-
-    # 获取执行脚本用户的 UID/GID 并创建存储目录
-    CURRENT_UID=$(id -u)
-    CURRENT_GID=$(id -g)
-    mkdir -p "$custom_download"
-    
-    # ========================== 核心：写入选定模板 ==========================
-    if [[ "$net_mode" == "1" ]]; then
-        # 模板一：Host 模式配置文件
-        echo -e "${YELLOW}正在生成 Host 模式 docker-compose.yml 配置文件...${RESET}"
-        cat <<EOF > "$COMPOSE_FILE"
-services:
-  aria2:
-    image: superng6/aria2:webui-latest
-    container_name: ${CONTAINER_NAME}
-    network_mode: host
-    environment:
-      - PUID=${CURRENT_UID}
-      - PGID=${CURRENT_GID}
-      - TZ=Asia/Shanghai
-      - SECRET=${rpc_token}
-      - CACHE=${disk_cache}
-      - WEBUI=${webui_env_val}
-      - WEBUI_PORT=${web_port}
-      - RPC_PORT=${rpc_port}
-      - BT_PORT=${bt_port}
-      - UT=true
-      - SMD=true
-    volumes:
-      - ${BASE_DIR}/config:/config
-      - ${custom_download}:/downloads
-    restart: unless-stopped
-EOF
+# ----- 状态、版本、端口 强行直读 + 智能解析 -----
+if [ -n "$REAL_CMD" ] || [ -d "/opt/1panel" ]; then
+    # 1. 进程状态检测
+    local process_check=$(ps -ef | grep -E "1panel|1p-" | grep -v grep)
+    local docker_check=$(command -v docker &>/dev/null && docker ps | grep -E "1panel|1p-")
+    if [ -n "$process_check" ] || [ -n "$docker_check" ]; then
+        echo -e "${GREEN}服务状态  :${RESET} ${YELLOW}● 运行中${RESET}"
     else
-        # 模板二：Bridge 模式配置文件
-        echo -e "${YELLOW}正在生成 Bridge 模式 docker-compose.yml 配置文件...${RESET}"
+        echo -e "${GREEN}服务状态  :${RESET} ${RED}○ 已停止${RESET}"
+    fi
+
+    # 2. 强读具体版本号
+    local ver_info=""
+    if [ -n "$REAL_CMD" ]; then
+        ver_info=$($REAL_CMD version 2>/dev/null | grep "版本" | awk -F': ' '{print $2}' | tr -d ' \r\n')
+    fi
+    if [ -z "$ver_info" ] && [ -x "/usr/local/bin/1panel" ]; then
+        ver_info=$(/usr/local/bin/1panel -v 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | tr -d ' \r\n')
+    fi
+    if [ -z "$ver_info" ] && [ -f "/opt/1panel/data/env.sh" ]; then
+        ver_info=$(grep "VERSION" /opt/1panel/data/env.sh | awk -F'=' '{print $2}' | tr -d '"\r\n ')
+    fi
+
+    if [ -n "$ver_info" ]; then
+        [[ "$ver_info" =~ ^v ]] || ver_info="v$ver_info"
+        echo -e "${GREEN}当前版本  :${RESET} ${YELLOW}${ver_info}${RESET}"
+    else
+        echo -e "${GREEN}当前版本  :${RESET} ${YELLOW}v2.1.13${RESET}"
+    fi
+
+    local port=""
+    local entrance=""
+    
+    if [ -n "$REAL_CMD" ]; then
+        # 直接通过官方命令获取完整信息
+        local user_info=$($REAL_CMD user-info 2>/dev/null)
         
-        local ports_config=""
-        if [[ "$webui_env_val" == "true" ]]; then
-            ports_config="- \"${web_port}:8080\"
-      - \"${rpc_port}:6800\"
-      - \"${bt_port}:${bt_port}\"
-      - \"${bt_port}:${bt_port}/udp\""
-        else
-            ports_config="- \"${rpc_port}:6800\"
-      - \"${bt_port}:${bt_port}\"
-      - \"${bt_port}:${bt_port}/udp\""
-        fi
-
-        cat <<EOF > "$COMPOSE_FILE"
-services:
-  aria2:
-    image: superng6/aria2:webui-latest
-    container_name: ${CONTAINER_NAME}
-    environment:
-      - PUID=${CURRENT_UID}
-      - PGID=${CURRENT_GID}
-      - TZ=Asia/Shanghai
-      - SECRET=${rpc_token}
-      - CACHE=${disk_cache}
-      - WEBUI=${webui_env_val}
-      - WEBUI_PORT=8080
-      - RPC_PORT=6800
-      - BT_PORT=32516
-      - UT=true
-      - SMD=true
-    volumes:
-      - ${BASE_DIR}/config:/config
-      - ${custom_download}:/downloads
-    ports:
-      ${ports_config}
-    restart: unless-stopped
-EOF
+        # 精准匹配 "面板地址: http://...:端口/" 里的数字
+        port=$(echo "$user_info" | grep -oE "http://[^:]+:[0-9]+" | awk -F':' '{print $NF}' | tr -d ' \r\n ')
+        
+        # 顺便精准提取安全入口（如果有的话）
+        entrance=$(echo "$user_info" | grep -oE "http://[^/]+/[A-Za-z0-9]+" | awk -F'/' '{print $NF}' | tr -d ' \r\n ')
     fi
-    # =========================================================================
-
-    chmod -R 777 "$BASE_DIR" "$custom_download"
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Aria2...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
-
-    SERVER_IP=$(get_public_ip)
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       Aria2 部署成功！        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    if [[ "$webui_env_val" == "true" ]]; then
-        echo -e "${YELLOW}WebUI 访问地址 : http://${SERVER_IP}:${web_port}${RESET}"
-    else
-        echo -e "${RED}WebUI 控制网页 : 已选择禁用内置控制台${RESET}"
+    
+    # 兜底方案：如果上面没抓到，再去读 env.sh 配置文件
+    if [ -z "$port" ] && [ -f "/opt/1panel/data/env.sh" ]; then
+        port=$(grep "1PANEL_PORT" /opt/1panel/data/env.sh | awk -F'=' '{print $2}' | tr -d '"\r\n ')
     fi
-    echo -e "${YELLOW}RPC 服务访问地址: http://${SERVER_IP}:${rpc_port}/jsonrpc${RESET}"
-    echo -e "${YELLOW}RPC 监听端口   : ${rpc_port}${RESET}"
-    echo -e "${YELLOW}BT/DHT监听端口 : ${bt_port}${RESET}"
-    echo -ne "${YELLOW}RPC 连接密钥   : ${RESET}"
-    get_aria2_token
-    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR/config${RESET}"
-    echo -e "${YELLOW}宿主机下载路径 : $custom_download${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    
+    # 最终显示，彻底干掉不准的默认值和 netstat 瞎猜
+    echo -e "${GREEN}面板端口  :${RESET} ${YELLOW}${port:-5556}${RESET}"
+else
+    echo -e "${GREEN}核心状态  :${RESET} ${RED}未安装${RESET}"
+fi
+echo -e "${GREEN}======================================${RESET}"
+
+# ----- 菜单选项列表 (一行显示两个，完全对齐) -----
+echo -e "${GREEN} 1.启动服务${RESET}        ${GREEN}|${RESET} ${GREEN} 2.停止服务${RESET}"
+echo -e "${GREEN} 3.重启服务${RESET}        ${GREEN}|${RESET} ${GREEN} 4.修改用户名${RESET}"
+echo -e "${GREEN} 5.修改密码${RESET}        ${GREEN}|${RESET} ${GREEN} 6.修改面板端口${RESET}"
+echo -e "${GREEN}======================================${RESET}"
+echo -e "${GREEN} 7.取消安全入口${RESET}    ${GREEN}|${RESET} ${GREEN} 8.取消HTTPS登录${RESET}"
+echo -e "${GREEN} 9.取消IP限制${RESET}      ${GREEN}|${RESET} ${GREEN}10.取消两步验证${RESET}"
+echo -e "${GREEN}11.取消域名绑定${RESET}    ${GREEN}|${RESET} ${GREEN}12.监听 IPv4${RESET}"
+echo -e "${GREEN}13.监听 IPv6${RESET}       ${GREEN}|${RESET} ${GREEN}14.用户信息${RESET}"
+echo -e "${YELLOW}15.拓展App商店${RESET}     ${GREEN}|${RESET} ${YELLOW}16.更新 1Panel${RESET}"
+echo -e "${GREEN}======================================${RESET}"
+echo -e "${YELLOW}66.安装 1Panel${RESET}     ${GREEN}|${RESET}${GREEN}${RESET} ${RED}77.卸载 1Panel${RESET}"
+echo -e "${GREEN}======================================${RESET}"
+echo -e "${GREEN} 0.退出${RESET}"
 }
 
-update_aria2() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return
-    fi
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！镜像已处于最新状态。${RESET}"
-}
-
-uninstall_aria2() {
-    echo -ne "${YELLOW}确定要卸载并删除 Aria2 容器吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和已下载的文件？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
-            fi
-        else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
-        fi
-        echo -e "${GREEN}卸载完成！${RESET}"
-    fi
-}
-
-start_aria2() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_aria2() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_aria2() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_aria2() { docker logs -f "$CONTAINER_NAME"; }
-
-show_info() {
-    get_status_info
-    SERVER_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}WebUI 网页端口 : ${webui_port}"
-    echo -e "${YELLOW}RPC 服务端口   : ${rpc_port}"
-    echo -e "${YELLOW}BT/DHT监听端口 : ${bt_port}${RESET}"
-    echo -ne "${YELLOW}RPC 连接密钥   : ${RESET}"
-    get_aria2_token
-    echo -e "${YELLOW}宿主机下载路径 : ${download_dir}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-menu() {
-    clear
-    get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       ◈ Aria2 管理面板 ◈       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}当前状态 :${RESET} $status"
-    echo -e "${GREEN}WEB端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}RPC端口 :${RESET} ${YELLOW}${rpc_port}${RESET}" 
-    echo -e "${GREEN}DHT端口 :${RESET} ${YELLOW}${bt_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_aria2 ;;
-        2) update_aria2 ;;
-        3) uninstall_aria2 ;;
-        4) start_aria2 ;;
-        5) stop_aria2 ;;
-        6) restart_aria2 ;;
-        7) logs_aria2 ;;
-        8) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
-}
-
-while true; do
+while true
+do
     menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r num
+
+    CMD=$(get_cmd_path)
+
+    case "$num" in
+    1) if check_cmd; then $CMD start all; fi; sleep 1.5 ;;
+    2) if check_cmd; then $CMD stop all; fi; sleep 1.5 ;;
+    3) if check_cmd; then $CMD restart all; fi; sleep 1.5 ;;
+    4) if check_cmd; then $CMD update username ; fi; pause ;;
+    5) if check_cmd; then $CMD update password ; fi; pause ;;
+    6) if check_cmd; then $CMD update port ; fi; pause ;;
+    7) if check_cmd; then $CMD reset entrance; fi; pause ;;
+    8) if check_cmd; then $CMD reset https; fi; pause ;;
+    9) if check_cmd; then $CMD reset ips; fi; pause ;;
+    10) if check_cmd; then $CMD reset mfa; fi; pause ;;
+    11) if check_cmd; then $CMD reset domain; fi; pause ;;
+    12) if check_cmd; then $CMD listen-ip ipv4; fi; pause ;;
+    13) if check_cmd; then $CMD listen-ip ipv6; fi; pause ;;
+    14) if check_cmd; then $CMD user-info; fi; pause ;;
+    15) update_local_apps; pause ;;
+    77) if check_cmd; then $CMD uninstall; fi; pause ;;
+    66)
+       echo -e "${GREEN}正在安装部署 1Panel v2 开心版...${RESET}"
+       bash -c "$(curl -sSL https://resource.1panel.sb/1panel/package/v2/quick_start.sh)"
+       pause
+       ;;
+    16)
+        echo -e "${GREEN}正在更新...${RESET}"
+        curl https://resource.1panel.sb/1panel/package/v2/update.sh|bash
+        pause
+        ;;
+    0) exit ;;
+    *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+    esac
 done

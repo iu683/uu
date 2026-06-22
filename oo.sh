@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# EasyImg 图床服务 Docker Compose 管理面板 
+# Enclosed 密文分享服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,9 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="easyimg"
+CONTAINER_NAME="enclosed"
 # 默认主配置目录
-DEFAULT_BASE_DIR="/opt/easyimg"
+DEFAULT_BASE_DIR="/opt/enclosed"
 
 # 检测依赖
 check_dependencies() {
@@ -39,26 +39,24 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取 WebUI 端口 (EasyImg 容器内监听的是 3000)
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 从容器状态提取 WebUI 端口 (Enclosed 容器内监听的是 8787)
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8787/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8092"
+        [[ -z "$webui_port" ]] && webui_port="8787"
 
         # 动态提取自定义挂载路径
-        custom_db_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/db"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        custom_uploads_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/uploads"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        custom_data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/.data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
         
-        # 通过 db 所在目录来定位 docker-compose.yml 的存放位置
-        if [[ -n "$custom_db_dir" ]]; then
-            BASE_DIR=$(dirname "$custom_db_dir")
+        # 定位 docker-compose.yml 的存放位置
+        if [[ -n "$custom_data_dir" ]]; then
+            BASE_DIR=$(dirname "$custom_data_dir")
         fi
     fi
     
     # 兜底路径
     [[ -z "$BASE_DIR" || "$BASE_DIR" == "." ]] && BASE_DIR="$DEFAULT_BASE_DIR"
     COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-    [[ -z "$custom_db_dir" ]] && custom_db_dir="$BASE_DIR/db"
-    [[ -z "$custom_uploads_dir" ]] && custom_uploads_dir="$BASE_DIR/uploads"
+    [[ -z "$custom_data_dir" ]] && custom_data_dir="$BASE_DIR/data"
 }
 
 # 获取公网 IP (兼容双栈环境)
@@ -85,16 +83,16 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 EasyImg
-install_easyimg() {
+# 部署 Enclosed
+install_enclosed() {
     check_dependencies
     
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
     # 1. 端口配置
-    echo -ne "${YELLOW}请输入 EasyImg 访问端口 [默认: 8092]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Enclosed 访问端口 [默认: 8787]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8092"
+    [[ -z "$custom_port" ]] && custom_port="8787"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
@@ -107,44 +105,32 @@ install_easyimg() {
     BASE_DIR="$input_base"
     COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
-    # 3. 自定义 db 目录
-    echo -ne "${YELLOW}请输入【数据库(db)】宿主机存储绝对路径 [默认: $BASE_DIR/db]: ${RESET}"
-    read -r input_db
-    [[ -z "$input_db" ]] && input_db="$BASE_DIR/db"
-    custom_db_dir="$input_db"
-
-    # 4. 自定义 uploads 目录
-    echo -ne "${YELLOW}请输入【上传数据(uploads)】宿主机存储绝对路径 [默认: $BASE_DIR/uploads]: ${RESET}"
-    read -r input_uploads
-    [[ -z "$input_uploads" ]] && input_uploads="$BASE_DIR/uploads"
-    custom_uploads_dir="$input_uploads"
+    # 3. 自定义数据目录
+    echo -ne "${YELLOW}请输入【加密数据(data)】宿主机存储绝对路径 [默认: $BASE_DIR/data]: ${RESET}"
+    read -r input_data
+    [[ -z "$input_data" ]] && input_data="$BASE_DIR/data"
+    custom_data_dir="$input_data"
     
     # 创建所有用户自定义的目录并赋权
     mkdir -p "$BASE_DIR"
-    mkdir -p "$custom_db_dir"
-    mkdir -p "$custom_uploads_dir"
-    chmod -R 777 "$BASE_DIR" "$custom_db_dir" "$custom_uploads_dir"
+    mkdir -p "$custom_data_dir"
+    chmod -R 777 "$BASE_DIR" "$custom_data_dir"
 
-    # 生成 docker-compose.yml 配置文件
+    # 生成 docker-compose.yml 配置文件 (已将命名卷优化为绝对路径挂载)
     echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  easyimg:
-    image: ghcr.io/chaos-zhu/easyimg:latest
+  enclosed:
+    image: corentinth/enclosed
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
     ports:
-      - "${custom_port}:3000"
+      - "${custom_port}:8787"
     volumes:
-      - ${custom_db_dir}:/app/db
-      - ${custom_uploads_dir}:/app/uploads
-    environment:
-      - NODE_ENV=production
-      - HOST=0.0.0.0
-      - PORT=3000
+      - ${custom_data_dir}:/app/.data
+    restart: unless-stopped
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 EasyImg 图床服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Enclosed 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
@@ -152,48 +138,41 @@ EOF
 
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      EasyImg 部署成功！       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}数据库挂载路径 : $custom_db_dir${RESET}"
-    echo -e "${YELLOW}图片上传路径   : $custom_uploads_dir${RESET}"
-    echo -e "${RED}--------------------------------${RESET}"
-    echo -e "${RED}默认管理账户密码：${RESET}"
-    echo -e "${YELLOW}用户名：easyimg${RESET}"
-    echo -e "${YELLOW}密  码：easyimg${RESET}"
-    echo -e "${RED}请务必在首次登录后立即修改！${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${GREEN}              Enclosed 部署成功！                   ${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${YELLOW}数据目录路径 ：$custom_data_dir${RESET}"
+    echo -e "${YELLOW}服务访问地址 ：http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
 }
 
-# 更新 EasyImg 镜像
-update_easyimg() {
+# 更新镜像
+update_enclosed() {
     get_status_info
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 EasyImg 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Enclosed 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 EasyImg
-uninstall_easyimg() {
+# 卸载容器
+uninstall_enclosed() {
     get_status_info
-    echo -ne "${YELLOW}确定要卸载并删除 EasyImg 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Enclosed 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有自定义的数据库和图片数据？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有自定义的加密数据和配置文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                rm -rf "$custom_db_dir"
-                rm -rf "$custom_uploads_dir"
+                rm -rf "$custom_data_dir"
                 echo -e "${GREEN}所有自定义数据目录已彻底清理。${RESET}"
             fi
         else
@@ -203,28 +182,27 @@ uninstall_easyimg() {
     fi
 }
 
-start_easyimg() { get_status_info && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_easyimg() { get_status_info && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_easyimg() { get_status_info && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_easyimg() { docker logs -f "$CONTAINER_NAME"; }
+start_enclosed() { get_status_info && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_enclosed() { get_status_info && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_enclosed() { get_status_info && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_enclosed() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
     DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}数据库挂载路径 : ${custom_db_dir}"
-    echo -e "${YELLOW}图片上传路径   : ${custom_uploads_dir}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}数据目录路径 : ${custom_data_dir}${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  EasyImg 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}   ◈  Enclosed 密文管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -242,13 +220,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_easyimg ;;
-        2) update_easyimg ;;
-        3) uninstall_easyimg ;;
-        4) start_easyimg ;;
-        5) stop_easyimg ;;
-        6) restart_easyimg ;;
-        7) logs_easyimg ;;
+        1) install_enclosed ;;
+        2) update_enclosed ;;
+        3) uninstall_enclosed ;;
+        4) start_enclosed ;;
+        5) stop_enclosed ;;
+        6) restart_enclosed ;;
+        7) logs_enclosed ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

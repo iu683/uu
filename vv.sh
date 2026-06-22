@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# uPay 支付服务 Docker Compose 管理面板 
+# Random Image API 专属 Docker Compose 管理面板
 # =================================================================
 
 # 颜色
@@ -10,9 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="upay_pro"
-BASE_DIR="/opt/upay"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+CONTAINER_NAME="random-image-api"
+# 默认主配置目录
+DEFAULT_BASE_DIR="/opt/random-image-api"
 
 # 检测依赖
 check_dependencies() {
@@ -33,24 +33,30 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
+    # 2. 如果容器存在，从容器状态中动态提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取 Web 端口（根据绑定的端口动态获取）
-        webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8090"
+        # 从容器状态提取 WebUI 端口 (容器内监听的是 3007)
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3007/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3007"
 
-        # 从容器状态提取外部卷映射路径
-        data_dir="使用 Docker 外部数据卷 (upay_logs, upay_db)"
-    else
-        # 容器未安装/未部署时的返回值
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-        data_dir="N/A"
+        # 动态提取自定义挂载路径
+        custom_data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        
+        # 定位 docker-compose.yml 的存放位置
+        if [[ -n "$custom_data_dir" ]]; then
+            BASE_DIR=$(dirname "$custom_data_dir")
+        fi
     fi
+    
+    # 兜底路径
+    [[ -z "$BASE_DIR" || "$BASE_DIR" == "." ]] && BASE_DIR="$DEFAULT_BASE_DIR"
+    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+    [[ -z "$custom_data_dir" ]] && custom_data_dir="$BASE_DIR/data"
 }
 
 # 获取公网 IP (兼容双栈环境)
@@ -77,117 +83,115 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 检查环境是否已经部署
-check_compose_exists() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return 1
-    fi
-    return 0
-}
-
-# 部署 uPay
-install_upay() {
+# 部署 Random Image API
+install_api() {
     check_dependencies
     
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 系统架构检测与参数配置 ======${RESET}"
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    # 自动识别系统架构并选择镜像 Tag
-    local arch
-    arch=$(uname -m)
-    local image_tag="wangergou111/upay:latest"
-    
-    if [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
-        image_tag="wangergou111/upay:latest-arm64"
-        echo -e "${GREEN}检测到当前机器为 ARM64 架构，自动选择镜像: ${image_tag}${RESET}"
-    else
-        echo -e "${GREEN}检测到当前机器为 AMD64 架构，自动选择镜像: ${image_tag}${RESET}"
-    fi
-
-    echo -ne "${YELLOW}请输入 uPay 访问端口 (宿主机端口) [默认: 8090]: ${RESET}"
+    # 1. 端口配置
+    echo -ne "${YELLOW}请输入服务访问端口 [默认: 3007]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8090"
+    [[ -z "$custom_port" ]] && custom_port="3007"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 1. 自动创建依赖的 Docker 外部数据卷（如果不存在的话）
-    echo -e "${YELLOW}正在检查并创建 Docker 外部数据卷...${RESET}"
-    docker volume inspect upay_logs &>/dev/null || docker volume create upay_logs
-    docker volume inspect upay_db &>/dev/null || docker volume create upay_db
+    # 2. 主脚本与 Compose 存放目录
+    echo -ne "${YELLOW}请输入面板配置文件存放路径 [默认: $DEFAULT_BASE_DIR]: ${RESET}"
+    read -r input_base
+    [[ -z "$input_base" ]] && input_base="$DEFAULT_BASE_DIR"
+    BASE_DIR="$input_base"
+    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
-    # 2. 动态生成符合要求的 docker-compose.yml 配置文件
+    # 3. 自定义 data 目录
+    echo -ne "${YELLOW}请输入【系统数据(data)】宿主机存储绝对路径 [默认: $BASE_DIR/data]: ${RESET}"
+    read -r input_data
+    [[ -z "$input_data" ]] && input_data="$BASE_DIR/data"
+    custom_data_dir="$input_data"
+
+    # 4. 环境变量配置
+    echo -ne "${YELLOW}请输入 Lsky Pro API 地址 (LSKY_API_URL): ${RESET}"
+    read -r lsky_url
+    
+    echo -ne "${YELLOW}请输入 Lsky Pro Token (LSKY_TOKEN): ${RESET}"
+    read -r lsky_token
+    
+    echo -ne "${YELLOW}请输入网页自定义标题 (CUSTOM_TITLE) [默认: 随机图片API]: ${RESET}"
+    read -r custom_title
+    [[ -z "$custom_title" ]] && custom_title="随机图片API"
+    
+    # 创建所有用户自定义的目录并赋权
+    mkdir -p "$BASE_DIR"
+    mkdir -p "$custom_data_dir"
+    chmod -R 777 "$BASE_DIR" "$custom_data_dir"
+
+    # 生成 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  upay:
+  random-image-api:
+    image: libyte/random-image-api:latest
     container_name: ${CONTAINER_NAME}
-    image: ${image_tag}
-    restart: always
+    restart: unless-stopped
     ports:
-      - "${custom_port}:8090"
+      - "${custom_port}:3007"
+    environment:
+      - LSKY_API_URL=${lsky_url}
+      - LSKY_TOKEN=${lsky_token}
+      - CUSTOM_TITLE=${custom_title}
     volumes:
-      - upay_logs:/app/logs
-      - upay_db:/app/DBS
-
-volumes:
-  upay_logs:
-    external: true
-    name: upay_logs
-  upay_db:
-    external: true
-    name: upay_db
+      - ${custom_data_dir}:/app/data
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 uPay 服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Random Image API 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
-    local detect_ip
-    detect_ip=$(get_public_ip)
+    DETECT_IP=$(get_public_ip)
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}         uPay 部署成功！        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${detect_ip}:${custom_port}${RESET}"
-    echo -e "${YELLOW}外部卷1 (日志) : upay_logs${RESET}"
-    echo -e "${YELLOW}外部卷2 (数据) : upay_db${RESET}"
-    echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${GREEN}常用的快捷接口文档提示：${RESET}"
-    echo -e "${YELLOW}1. 创建订单 (POST) : http://${detect_ip}:${custom_port}/api/create_order${RESET}"
-    echo -e "${YELLOW}2. 查询状态 (GET)  : http://${detect_ip}:${custom_port}/pay/check-status/{trade_id}${RESET}"
-    echo -e "${YELLOW}3. 支付收银台(GET) : http://${detect_ip}:${custom_port}/pay/checkout-counter/{trade_id}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${GREEN}              Random Image API 部署成功！            ${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${YELLOW}数据目录路径 ：$custom_data_dir${RESET}"
+    echo -e "${CYAN}服务访问预览 ：${RESET}"
+    echo -e "${GREEN}1. 主页预览  : http://${DETECT_IP}:${custom_port}/  - 好看图片页面${RESET}"
+    echo -e "${GREEN}2. 直接图片  : http://${DETECT_IP}:${custom_port}/api  - 纯图片，刷新换图${RESET}"
+    echo -e "${GREEN}3. JSON 数据 : http://${DETECT_IP}:${custom_port}/?format=json  - 程序调用${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
 }
 
-# 更新 uPay 镜像
-update_upay() {
-    check_compose_exists || return
-    echo -e "${YELLOW}正在从远端拉取 uPay 最新镜像...${RESET}"
+# 更新镜像
+update_api() {
+    get_status_info
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取 Random Image API 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 uPay
-uninstall_upay() {
-    echo -ne "${YELLOW}确定要卸载并删除 uPay 容器吗？(y/n): ${RESET}"
+# 卸载容器
+uninstall_api() {
+    get_status_info
+    echo -ne "${YELLOW}确定要卸载并删除 Random Image API 容器吗？(y/n): ${RESET}"
     read -r confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地 Compose 配置和 Docker 外部存储数据卷？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有自定义的数据和配置文件吗？(y/n): ${RESET}"
             read -r clean_data
-            if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                docker volume rm upay_logs upay_db 2>/dev/null
-                echo -e "${GREEN}配置路径与 Docker 外部卷 (upay_logs, upay_db) 已彻底清理。${RESET}"
+                rm -rf "$custom_data_dir"
+                echo -e "${GREEN}所有自定义数据目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -196,49 +200,30 @@ uninstall_upay() {
     fi
 }
 
-start_upay() { 
-    check_compose_exists || return
-    cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"
-}
-
-stop_upay() { 
-    check_compose_exists || return
-    cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"
-}
-
-restart_upay() { 
-    check_compose_exists || return
-    cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"
-}
-
-logs_upay() { 
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        docker logs -f "$CONTAINER_NAME"
-    else
-        echo -e "${RED}错误: 容器不存在，无法查看日志！${RESET}"
-    fi
-}
+start_api() { get_status_info && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_api() { get_status_info && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_api() { get_status_info && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_api() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    local detect_ip="127.0.0.1"
-    if [[ "$webui_port" != "N/A" ]]; then
-        detect_ip=$(get_public_ip)
-    fi
-    
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${detect_ip}:${webui_port}${RESET}"
-    echo -e "${YELLOW}存储数据目录   : ${data_dir}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
+    echo -e "${YELLOW}数据目录路径 : ${custom_data_dir}${RESET}"
+    echo -e "${CYAN}接口访问地址 ：${RESET}"
+    echo -e "${GREEN}主页预览  : http://${DETECT_IP}:${webui_port}/${RESET}"
+    echo -e "${GREEN}直接图片  : http://${DETECT_IP}:${webui_port}/api${RESET}"
+    echo -e "${GREEN}JSON 数据 : http://${DETECT_IP}:${webui_port}/?format=json${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      ◈  uPay 管理面板  ◈        ${RESET}"
+    echo -e "${GREEN} ◈  Random Image API 管理面板 ◈ ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -256,20 +241,19 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_upay ;;
-        2) update_upay ;;
-        3) uninstall_upay ;;
-        4) start_upay ;;
-        5) stop_upay ;;
-        6) restart_upay ;;
-        7) logs_upay ;;
+        1) install_api ;;
+        2) update_api ;;
+        3) uninstall_api ;;
+        4) start_api ;;
+        5) stop_api ;;
+        6) restart_api ;;
+        7) logs_api ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 
-# 主循环
 while true; do
     menu
     echo -ne "${YELLOW}按回车键继续...${RESET}"

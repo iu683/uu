@@ -1,20 +1,21 @@
 #!/bin/bash
 # =================================================================
-# Cloudreve Docker Compose 管理面板 (本地/远程双模 + 网络桥接版)
+# 015 临时文件/文本分享平台 Docker Compose 管理面板 (支持本地/远程 Redis)
 # =================================================================
 
-# 颜色定义
+# 颜色
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/cloudreve"
+CONTAINER_NAME="015-app"
+BASE_DIR="/opt/015"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-DEFAULT_IMAGE="cloudreve/cloudreve:latest"
+CONFIG_FILE="$BASE_DIR/config.yaml"
 
-# 检测依赖环境
+# 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
@@ -22,6 +23,54 @@ check_dependencies() {
     fi
 }
 
+# 生成随机密钥的辅助函数
+generate_random_secret() {
+    if command -v openssl &> /dev/null; then
+        openssl_rand=$(openssl rand -hex 16 2>/dev/null)
+        if [[ -n "$openssl_rand" ]]; then
+            echo "$openssl_rand"
+            return 0
+        fi
+    fi
+    echo "sec_$(date +%s)_$((RANDOM % 10000))"
+}
+
+# 动态获取容器状态、映射端口和数据目录
+get_status_info() {
+    # 1. 检查核心 Web 容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${GREEN}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取核心镜像版本
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 80 端口）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 兜底获取第一个绑定的端口
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8080"
+
+        # 从容器状态提取挂载的数据路径
+        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/upload"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/uploads"
+    else
+        # 容器未安装/未部署时的返回值
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        data_dir="N/A"
+    fi
+}
+
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
     local mode=${1:-"auto"}
     local ip=""
@@ -45,151 +94,42 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器整体状态和端口
-get_status_info() {
-    if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=cloudreve-backend)" ]; then
-            status="${GREEN}运行中${RESET}"
-            web_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5212/tcp") 0).HostPort}}' cloudreve-backend 2>/dev/null)
-        elif [ "$(docker ps -aq -f name=cloudreve-backend)" ]; then
-            status="${YELLOW}已停止${RESET}"
-            web_port=""
-        else
-            status="${RED}未部署${RESET}"
-            web_port=""
-        fi
-        
-        if [ -z "$web_port" ]; then
-            web_port=$(grep -A 5 "cloudreve:" "$COMPOSE_FILE" 2>/dev/null | grep -E '\-[[:space:]]*["'\'']?.*:5212' | head -n 1 | grep -oE '[0-9]+:5212' | cut -d':' -f1)
-            [[ -z "$web_port" ]] && web_port="5212"
-        fi
-    else
-        status="${RED}未初始化${RESET}"
-        web_port="N/A"
-    fi
-}
-
-# 部署 Cloudreve
-install_cloudreve() {
+# 部署 015 平台
+install_translate() {
     check_dependencies
+    
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 数据库/缓存运行模式选择 ======${RESET}"
-    echo -e " 1. 直接部署全新完整环境 (包含全新的本地 PostgreSQL 和 Redis 容器)"
-    echo -e " 2. 连接外部/远程已有的数据库与 Redis (需提前手动创建好 PostgreSQL 数据库)"
+    echo -e "${CYAN}====== Redis 运行模式选择 ======${RESET}"
+    echo -e " 1. 直接部署全新完整环境 (包含全新的本地 Redis 容器)"
+    echo -e " 2. 连接外部/远程已有的 Redis 缓存服务"
     echo -ne "${YELLOW}请选择运行模式 [默认: 1]: ${RESET}"
-    read -r db_mode
-    [[ -z "$db_mode" ]] && db_mode="1"
+    read -r redis_mode
+    [[ -z "$redis_mode" ]] && redis_mode="1"
 
     echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Cloudreve Web 访问端口 [默认: 5212]: ${RESET}"
+    
+    echo -ne "${YELLOW}请输入 015 访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="5212"
+    [[ -z "$custom_port" ]] && custom_port="8080"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -ne "${YELLOW}请输入离线下载 P2P 监听端口 [默认: 6888]: ${RESET}"
-    read -r custom_p2p_port
-    [[ -z "$custom_p2p_port" ]] && custom_p2p_port="6888"
-    if ! [[ "$custom_p2p_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
+    echo -ne "${YELLOW}请输入文件上传存储的宿主机绝对路径 [默认: $BASE_DIR/uploads]: ${RESET}"
+    read -r custom_data
+    [[ -z "$custom_data" ]] && custom_data="$BASE_DIR/uploads"
 
-    echo -e "${CYAN}====== 持久化数据挂载路径配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入网盘主体文件数据挂载目录 [默认: ${BASE_DIR}/uploads]: ${RESET}"
-    read -r mount_uploads_dir
-    [[ -z "$mount_uploads_dir" ]] && mount_uploads_dir="${BASE_DIR}/uploads"
-    mkdir -p "$mount_uploads_dir"
+    # 创建所需的宿主机目录并赋权
+    mkdir -p "$custom_data"
+    chmod -R 777 "$BASE_DIR" "$custom_data"
 
-    # ------------------ 模式 1：全套本地内置容器化 ------------------
-    if [[ "$db_mode" == "1" ]]; then
-        echo -ne "${YELLOW}请输入内置 PostgreSQL 数据库数据挂载目录 [默认: ${BASE_DIR}/postgres_db]: ${RESET}"
-        read -r mount_db_dir
-        [[ -z "$mount_db_dir" ]] && mount_db_dir="${BASE_DIR}/postgres_db"
-        mkdir -p "$mount_db_dir"
+    # 初始化默认的 Redis 连接 URL 变量
+    local redis_url="redis://015-redis:6379/0"
 
-        echo -e "${YELLOW}正在配置全套本地内置容器环境 (Redis 将在纯内存中运行)...${RESET}"
-        local rand_db_pass=$(openssl rand -hex 16)
-        local db_user="cloudreve"
-        local db_name="cloudreve"
-
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  cloudreve:
-    container_name: cloudreve-backend
-    image: ${DEFAULT_IMAGE}
-    depends_on:
-      - postgresql
-      - redis
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:5212"
-      - "${custom_p2p_port}:6888"
-      - "${custom_p2p_port}:6888/udp"
-    environment:
-      - CR_CONF_Database.Type=postgres
-      - CR_CONF_Database.Host=postgresql
-      - CR_CONF_Database.User=${db_user}
-      - CR_CONF_Database.Password=${rand_db_pass}
-      - CR_CONF_Database.Name=${db_name}
-      - CR_CONF_Database.Port=5432
-      - CR_CONF_Redis.Server=redis:6379
-      - CR_CONF_Redis.DB=0
-    networks:
-      - cloudreve_net
-    volumes:
-      - ${mount_uploads_dir}:/cloudreve/data
-
-  postgresql:
-    container_name: postgresql
-    image: postgres:17-alpine
-    restart: unless-stopped
-    environment:
-      - POSTGRES_USER=${db_user}
-      - POSTGRES_PASSWORD=${rand_db_pass}
-      - POSTGRES_DB=${db_name}
-    networks:
-      - cloudreve_net
-    volumes:
-      - ${mount_db_dir}:/var/lib/postgresql/data
-
-  redis:
-    container_name: redis
-    image: redis:alpine
-    restart: unless-stopped
-    networks:
-      - cloudreve_net
-
-networks:
-  cloudreve_net:
-    driver: bridge
-EOF
-
-    # ------------------ 模式 2：连接外部/远程已有的 PostgreSQL + Redis ------------------
-    else
-        echo -e "${CYAN}====== 远程/外部 PostgreSQL 信息输入 ======${RESET}"
-        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r ext_db_host
-        [[ -z "$ext_db_host" ]] && ext_db_host="127.0.0.1"
-        
-        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
-        read -r ext_db_port
-        [[ -z "$ext_db_port" ]] && ext_db_port="5432"
-        
-        echo -ne "${YELLOW}请输入数据库用户名 [默认: cloudreve]: ${RESET}"
-        read -r ext_db_user
-        [[ -z "$ext_db_user" ]] && ext_db_user="cloudreve"
-        
-        echo -ne "${YELLOW}请输入数据库密码: ${RESET}"
-        read -r ext_db_pass
-        
-        echo -ne "${YELLOW}请输入目标数据库名 [默认: cloudreve]: ${RESET}"
-        read -r ext_db_name
-        [[ -z "$ext_db_name" ]] && ext_db_name="cloudreve"
-
+    # ------------------ 模式 2：处理外部/远程 Redis 参数 ------------------
+    if [[ "$redis_mode" == "2" ]]; then
         echo -e "${CYAN}====== 远程/外部 Redis 信息输入 ======${RESET}"
         echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
         read -r ext_rd_host
@@ -206,146 +146,217 @@ EOF
         read -r redis_db_cfg
         [[ -z "$redis_db_cfg" ]] && redis_db_cfg="0"
 
-        [[ "$ext_db_host" == "127.0.0.1" || "$ext_db_host" == "localhost" ]] && ext_db_host="172.17.0.1"
+        # 如果连的是本地宿主机的 Redis，将其转换为 Docker 默认网桥网关 IP
         [[ "$ext_rd_host" == "127.0.0.1" || "$ext_rd_host" == "localhost" ]] && ext_rd_host="172.17.0.1"
 
-        cat << EOF > "$COMPOSE_FILE"
-services:
-  cloudreve:
-    container_name: cloudreve-backend
-    image: ${DEFAULT_IMAGE}
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:5212"
-      - "${custom_p2p_port}:6888"
-      - "${custom_p2p_port}:6888/udp"
-    environment:
-      - CR_CONF_Database.Type=postgres
-      - CR_CONF_Database.Host=${ext_db_host}
-      - CR_CONF_Database.User=${ext_db_user}
-      - CR_CONF_Database.Password=${ext_db_pass}
-      - CR_CONF_Database.Name=${ext_db_name}
-      - CR_CONF_Database.Port=${ext_db_port}
-      - CR_CONF_Redis.Server=${ext_rd_host}:${ext_rd_port}
-      - CR_CONF_Redis.DB=${redis_db_cfg}
-    volumes:
-      - ${mount_uploads_dir}:/cloudreve/data
-EOF
-
+        # 根据是否有密码，组合出官方标准的 redis:// 协议连接串
         if [[ -n "$ext_rd_pass" ]]; then
-            echo "      - CR_CONF_Redis.Password=${ext_rd_pass}" >> "$COMPOSE_FILE"
+            redis_url="redis://:${ext_rd_pass}@${ext_rd_host}:${ext_rd_port}/${redis_db_cfg}"
+        else
+            redis_url="redis://${ext_rd_host}:${ext_rd_port}/${redis_db_cfg}"
         fi
     fi
 
-    # ------------------ 启动集群 ------------------
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Cloudreve 服务中...${RESET}"
+    # 获取动态公网 IP
+    DETECT_IP=$(get_public_ip)
+    
+    # 生成随机且高安全性的 Secret 和 Salt
+    RAND_SECRET=$(generate_random_secret)
+    RAND_SALT=$(generate_random_secret)
+
+    # 1. 动态生成符合要求的 config.yaml 配置文件
+    echo -e "${YELLOW}正在生成系统配套的 config.yaml 配置文件...${RESET}"
+    cat <<EOF > "$CONFIG_FILE"
+share:
+    # 自动生成的下载jwt secret令牌，有效期1小时
+    download_secret: ${RAND_SECRET}
+    # 颁发的下载token的窗口期，默认12小时
+    download_window: 12
+    # 自动生成的密码加盐
+    password_salt: ${RAND_SALT}
+
+upload:
+    # 上传文件保存路径（容器内部固定为 /upload，与 compose 卷相对应）
+    path: /upload
+    # 实例最大上传容量
+    maximum: 100GiB
+
+redis:
+    # Redis 连接地址（已支持动态注入）
+    url: ${redis_url}
+
+features:
+    file-share:
+        enabled: true
+    text-share:
+        enabled: true
+    file-image-compress:
+        enabled: true
+    file-image-convert:
+        enabled: true
+
+site:
+    # 动态绑定的访问域名/URL
+    url: http://${DETECT_IP}:${custom_port}
+    title:
+        'en': '015'
+    desc:
+        'en': '015 is an open-source temporary file sharing platform project that supports uploading, downloading, and sharing files and text.'
+    icon: '/logo.png'
+    bg_url: 'https://img.fudaoyuan.icu/api/1/random/?scale_min=1.5&webp=true&md=false&format=302'
+
+about:
+    bg_url: 'https://files.mastodon.social/site_uploads/files/000/000/001/@1x/57c12f441d083cde.png'
+    content:
+        'zh': |
+            ### 015 临时文件分享平台
+            欢迎使用本站分享文件或文本。
+        'en': |
+            ### 015 Temporary Share Platform
+            Welcome to share files or texts here.
+    email: admin@domain.com
+    name: admin
+    url: 'http://${DETECT_IP}:${custom_port}'
+    avatar: ''
+EOF
+
+    # 2. 动态生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    
+    # 基础 App 和 Worker 模板配置
+    local compose_content="services:
+  app:
+    image: fudaoyuanicu/015-app:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    volumes:
+      - ${custom_data}:/upload
+      - ${CONFIG_FILE}:/app/config.yaml
+    ports:
+      - \"${custom_port}:80\"
+
+  worker:
+    image: fudaoyuanicu/015-worker:latest
+    container_name: 015-worker
+    restart: unless-stopped
+    volumes:
+      - ${custom_data}:/upload
+      - ${CONFIG_FILE}:/app/config.yaml
+    depends_on:
+      - app"
+
+    # 如果是模式 1 (内置 Redis)，则在 compose 模板中追加内置 redis 服务和依赖关系
+    if [[ "$redis_mode" == "1" ]]; then
+        compose_content="${compose_content}
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: 015-redis
+    restart: unless-stopped"
+    fi
+
+    # 写入最终的 docker-compose.yml
+    echo "$compose_content" > "$COMPOSE_FILE"
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 015 分享平台群组...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}部署失败，请检查 Docker 日志。${RESET}"
-        return
-    fi
+    echo -e "${YELLOW}等待服务容器初始化群组 (约3秒)...${RESET}"
+    sleep 3
 
-    DETECT_IP=$(get_public_ip)
-
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}              Cloudreve 部署成功！                    ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}访问端点(URL) : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}映射宿主机端口 : ${custom_port}${RESET}"
-    echo -e "${YELLOW}离线下载端口   : ${custom_p2p_port} (TCP/UDP已开启)${RESET}"
-    echo -e "${CYAN}主体存储路径   : ${mount_uploads_dir}${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}内置库密码凭证 : 用户:${db_user} | 密码:${rand_db_pass} | 库名:${db_name}${RESET}"
-        echo -e "${CYAN}DB持久化路径   : ${mount_db_dir}${RESET}"
-        echo -e "${CYAN}Redis持久化   : 纯内存运行 (无宿主机挂载)${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}       015 分享平台 部署成功！      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}宿主机存储路径 : $custom_data${RESET}"
+    if [[ "$redis_mode" == "1" ]]; then
+        echo -e "${CYAN}Redis 运行状态 : 容器内置独立运行 (015-redis)${RESET}"
     else
-        echo -e "${YELLOW}连接外部数据库 : ${ext_db_host}:${ext_db_port} -> 库名:${ext_db_name}${RESET}"
-        echo -e "${YELLOW}连接外部缓存库 : Redis -> ${ext_rd_host}:${ext_rd_port} (DB ID: ${redis_db_cfg})${RESET}"
+        echo -e "${CYAN}Redis 运行状态 : 成功桥接外部远程服务 -> ${ext_rd_host}:${ext_rd_port} (DB: ${redis_db_cfg})${RESET}"
     fi
-    echo -e "${YELLOW}面板工作路径   : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}提示: 安全混淆密钥(Secret/Salt)已在 config.yaml 中为您全自动生成。${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新服务
-update_cloudreve() {
+# 更新 015 群组镜像
+update_translate() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取 Cloudreve 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 015 各组件的最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}服务已升级并拉升至最新状态！${RESET}"
+    echo -e "${GREEN}更新完成！所有关联容器已处于最新状态。${RESET}"
 }
 
-# 卸载集群
-uninstall_cloudreve() {
-    echo -ne "${RED}确定要注销并删除 Cloudreve 服务集群吗？(y/n): ${RESET}"
+# 卸载 015 平台
+uninstall_translate() {
+    echo -ne "${YELLOW}确定要卸载并删除 015 容器环境吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已全部终止并移除。${RESET}"
-            echo -ne "${RED}是否同步清理掉本地所有【自定义挂载目录的数据】和环境？(y/n): ${RESET}"
+            echo -e "${GREEN}容器集群已停止并安全移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和上传的缓存文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}工作目录及所有自定义挂载数据已被彻底清除。${RESET}"
+                echo -e "${GREEN}主配置与数据目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f cloudreve-backend postgresql redis 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" 015-worker 015-redis 2>/dev/null
         fi
-        echo -e "${GREEN}完全卸载完毕！${RESET}"
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 周期控制
-start_cr() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已正常启动${RESET}"; }
-stop_cr() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已安全暂停${RESET}"; }
-restart_cr() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已完成软重启${RESET}"; }
-logs_cr() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}所有服务已启动${RESET}"; }
+stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}所有服务已停止${RESET}"; }
+restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}所有服务已重启${RESET}"; }
+logs_translate() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
-# 配置显示
 show_info() {
     get_status_info
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}当前运行状态   : $status"
-    echo -e "${YELLOW}实际映射端口   : ${web_port}${RESET}"
-    echo -e "${YELLOW}本地项目路径   : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    local DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}核心镜像       : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 主菜单
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}      ◈  Cloudreve 管理面板  ◈      ${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 当前状态 :${RESET} $status"
-    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 1. 部署启动${RESET}"
-    echo -e "${GREEN} 2. 更新服务${RESET}"
-    echo -e "${GREEN} 3. 卸载服务${RESET}"
-    echo -e "${GREEN} 4. 启动服务${RESET}"
-    echo -e "${GREEN} 5. 停止服务${RESET}"
-    echo -e "${GREEN} 6. 重启服务${RESET}"
-    echo -e "${GREEN} 7. 查看日志${RESET}"
-    echo -e "${GREEN} 8. 查看配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}  ◈   015 分享平台管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_cloudreve ;;
-        2) update_cloudreve ;;
-        3) uninstall_cloudreve ;;
-        4) start_cr ;;
-        5) stop_cr ;;
-        6) restart_cr ;;
-        7) logs_cr ;;
+        1) install_translate ;;
+        2) update_translate ;;
+        3) uninstall_translate ;;
+        4) start_translate ;;
+        5) stop_translate ;;
+        6) restart_translate ;;
+        7) logs_translate ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# fakabot 发卡机器人 (双容器高阶版 + 端口动态定制 + 智能配置) 管理面板
+# EasyImage 图床服务 Docker Compose 管理面板 (支持子目录自定义)
 # =================================================================
 
 # 颜色
@@ -10,11 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/fakabot"
-SRC_DIR="$BASE_DIR"
-CONFIG_FILE="$BASE_DIR/config.json"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-REPO_URL="https://github.com/yanguo888/fakabot.git"
+CONTAINER_NAME="easyimage"
+# 默认主配置目录
+DEFAULT_BASE_DIR="/opt/easyimage"
 
 # 检测依赖
 check_dependencies() {
@@ -22,34 +20,50 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态获取服务状态
+# 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    local bot_run=$(docker ps -q -f name=^/fakabot$ -f status=running)
-    local redis_run=$(docker ps -q -f name=^/fakabot-redis$ -f status=running)
-
-    if [[ -n "$bot_run" && -n "$redis_run" ]]; then
-        status="${GREEN}运行中 (机器人与 Redis 均健康)${RESET}"
-        # 抓取 58001 端口对应的宿主机实际映射端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "58001/tcp") 0).HostPort}}' fakabot 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="58001"
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
     else
-        if [ -d "$SRC_DIR/.git" ]; then
-            status="${RED}已停止或健康检查未通过${RESET}"
-        else
-            status="${RED}未部署${RESET}"
-        fi
-        webui_port="N/A"
+        status="${RED}未部署${RESET}"
     fi
+
+    # 2. 如果容器存在，从容器状态中动态提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        # 从容器状态提取 WebUI 端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="5589"
+
+        # 动态提取挂载路径
+        custom_config_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/web/config"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        custom_i_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/web/i"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        
+        # 通过 config 所在目录来定位 docker-compose.yml 的存放位置
+        if [[ -n "$custom_config_dir" ]]; then
+            BASE_DIR=$(dirname "$custom_config_dir")
+        fi
+    fi
+    
+    # 兜底路径
+    [[ -z "$BASE_DIR" || "$BASE_DIR" == "." ]] && BASE_DIR="$DEFAULT_BASE_DIR"
+    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+    [[ -z "$custom_config_dir" ]] && custom_config_dir="$BASE_DIR/config"
+    [[ -z "$custom_i_dir" ]] && custom_i_dir="$BASE_DIR/i"
 }
 
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local mode=${1:-"auto"}
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -71,237 +85,150 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署与引导
-install_fakabot() {
+# 部署 EasyImage
+install_easyimage() {
     check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    # 1. 克隆官方仓库
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "\n${YELLOW}正在从 GitHub 远程仓库克隆 fakabot 最新源码...${RESET}"
-        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
-        if [ $? -eq 0 ]; then
-            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
-            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
-            rm -rf "$SRC_DIR/tmp_repo"
-        else
-            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
-            exit 1
-        fi
-    else
-        echo -e "\n${GREEN}检测到本地已存在源码，正在同步最新代码...${RESET}"
-        cd "$SRC_DIR" && git pull
-    fi
-
-    cd "$SRC_DIR"
-
-    # 2. 智能配置引导
-    echo -e "\n${CYAN}====== 🛠️  fakabot 智能配置引导 ======${RESET}"
     
-    echo -ne "${YELLOW}1. 请输入你的 Telegram BOT_TOKEN: ${RESET}"
-    read -r tg_token
-    while [[ -z "$tg_token" ]]; do
-        echo -ne "${RED}Token 不能为空，请重新输入: ${RESET}"
-        read -r tg_token
-    done
-
-    echo -ne "${YELLOW}2. 请输入你的 Admin Telegram ID: ${RESET}"
-    read -r tg_admin_id
-    while [[ -z "$tg_admin_id" ]]; do
-        echo -ne "${RED}Admin ID 不能为空，请重新输入: ${RESET}"
-        read -r tg_admin_id
-    done
-
-    echo -ne "${YELLOW}3. 请输入 Web 服务的宿主机端口 1 [默认: 58001]: ${RESET}"
-    read -r port_1
-    [[ -z "$port_1" ]] && port_1="58001"
-
-    echo -ne "${YELLOW}4. 请输入 Web 服务的宿主机端口 2 [默认: 58002]: ${RESET}"
-    read -r port_2
-    [[ -z "$port_2" ]] && port_2="58002"
-
-    echo -ne "${YELLOW}5. 端口映射模式: 1.仅本地访问(127.0.0.1) 2.开启外网直接访问(0.0.0.0) [默认 1]: ${RESET}"
-    read -r bind_mode
-    if [[ "$bind_mode" == "2" ]]; then
-        bind_ip="0.0.0.0"
-    else
-        bind_ip="127.0.0.1"
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    # 1. 端口配置
+    echo -ne "${YELLOW}请输入 EasyImage 访问端口 [默认: 5589]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="5589"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
     fi
 
-    # 3. 自动生成标准 config.json
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "\n${YELLOW}正在为您初始化生成标准的 config.json...${RESET}"
-        cat <<EOF > "$CONFIG_FILE"
-{
-  "BOT_TOKEN": "${tg_token}",
-  "ADMIN_ID": ${tg_admin_id},
-  "DOMAIN": "http://${bind_ip}:${port_1}",
-  "ORDER_TIMEOUT_SECONDS": 3600,
-  "PAYMENTS": {},
-  "START": {
-    "cover_url": "https://img.example/start-cover.jpg",
-    "title": "欢迎选购",
-    "intro": "这里是商店简介或活动文案。"
-  },
-  "SHOW_QR": true,
-  "PRODUCTS": []
-}
-EOF
-    fi
+    # 2. 主脚本与 Compose 存放目录
+    echo -ne "${YELLOW}请输入面板配置文件存放路径 [默认: $DEFAULT_BASE_DIR]: ${RESET}"
+    read -r input_base
+    [[ -z "$input_base" ]] && input_base="$DEFAULT_BASE_DIR"
+    BASE_DIR="$input_base"
+    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
-    # 创建必要的本地挂载数据文件夹，并赋予足够权限
-    mkdir -p "$BASE_DIR/data"
-    chmod -R 777 "$BASE_DIR/data"
+    # 3. 自定义 Config 目录
+    echo -ne "${YELLOW}请输入【配置文件(config)】宿主机存储绝对路径 [默认: $BASE_DIR/config]: ${RESET}"
+    read -r input_config
+    [[ -z "$input_config" ]] && input_config="$BASE_DIR/config"
+    custom_config_dir="$input_config"
 
-    # 4. 原汁原味生成带你自定义端口的 docker-compose.yml
-    echo -e "${YELLOW}正在完美对齐并构建高级版 docker-compose.yml...${RESET}"
+    # 4. 自定义 图片 目录
+    echo -ne "${YELLOW}请输入【图片数据(i)】宿主机存储绝对路径 [默认: $BASE_DIR/i]: ${RESET}"
+    read -r input_i
+    [[ -z "$input_i" ]] && input_i="$BASE_DIR/i"
+    custom_i_dir="$input_i"
+    
+    # 创建所有用户自定义的目录并赋权
+    mkdir -p "$BASE_DIR"
+    mkdir -p "$custom_config_dir"
+    mkdir -p "$custom_i_dir"
+    chmod -R 777 "$BASE_DIR" "$custom_config_dir" "$custom_i_dir"
+
+    # 生成 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
-services:
-  redis:
-    image: redis:7-alpine
-    container_name: fakabot-redis
-    restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
-    volumes:
-      - redis_data:/data
-    networks:
-      - fakabot_network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "2"
+version: '3.8'
 
-  sp_shop_bot:
-    build: .
-    container_name: fakabot
-    restart: unless-stopped
+services:
+  easyimage:
+    image: ddsderek/easyimage:latest
+    container_name: ${CONTAINER_NAME}
+    ports:
+      - "${custom_port}:80"
     environment:
       - TZ=Asia/Shanghai
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-    user: "0:0"
-    ports:
-      - "${bind_ip}:${port_1}:58001"
-      - "${bind_ip}:${port_2}:58002"
+      - PUID=1000
+      - PGID=1000
+      - DEBUG=false
     volumes:
-      - ./config.json:/app/config.json:ro
-      - ./data:/app/data
-    networks:
-      - fakabot_network
-    depends_on:
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://127.0.0.1:58001/health\", timeout=3).read().strip()==b\"ok\" else 1)'"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
-    stop_grace_period: 20s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-networks:
-  fakabot_network:
-    driver: bridge
-
-volumes:
-  redis_data:
-    driver: local
+      - ${custom_config_dir}:/app/web/config
+      - ${custom_i_dir}:/app/web/i
+    restart: unless-stopped
 EOF
 
-    # 5. 原生一键拉起并编译
-    echo -e "\n${YELLOW}正在通过原厂参数本地现场编译 Build 整个双容器集群...${RESET}"
-    docker compose up -d --build
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 EasyImage 图床服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}高级健康检查预热中，请等待集群完全上线 (约 12 秒)...${RESET}"
-    sleep 12
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
 
-    get_status_info
     DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}        fakabot 高级版集群本地编译构建成功！        ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}绑定 IP 模式   : ${bind_ip} (${bind_mode})${RESET}"
-    echo -e "${YELLOW}健康服务端口 1 : ${port_1}${RESET}"
-    echo -e "${YELLOW}业务通知端口 2 : ${port_2}${RESET}"
-    if [[ "$bind_ip" == "127.0.0.1" ]]; then
-        echo -e "${CYAN}💡 提示：当前端口绑定在本地，安全级别高，请使用 Nginx 等进行反代。${RESET}"
-    else
-        echo -e "${YELLOW}外网直连地址   : http://${DETECT_IP}:${port_1}/health${RESET}"
-    fi
-    echo -e "${GREEN}====================================================${RESET}"
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     EasyImage 部署成功！      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}Config 挂载路径: $custom_config_dir${RESET}"
+    echo -e "${YELLOW}图片 i 挂载路径 : $custom_i_dir${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 高级：直接在面板里调用本地编辑器修改配置文件
-edit_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}错误: 配置文件不存在，请先执行选项 1 部署！${RESET}"
+# 更新 EasyImage 镜像
+update_easyimage() {
+    get_status_info
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${CYAN}正在为你唤醒本地文本编辑器 (修改完后按 Ctrl+X 然后选 Y 保存退出)...${RESET}"
-    sleep 1
-    nano "$CONFIG_FILE" || vi "$CONFIG_FILE"
-    echo -e "${YELLOW}检测到配置文件变更，正在热重启机器人集群...${RESET}"
-    cd "$SRC_DIR" && docker compose restart sp_shop_bot
-    echo -e "${GREEN}配置已成功热生效！${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 EasyImage 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 更新代码并重新 Build
-update_fakabot() {
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
-        return
-    fi
-    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
-    cd "$SRC_DIR" && git pull
-    echo -e "${YELLOW}正在严格按照依赖顺序重编机器人镜像...${RESET}"
-    docker compose up -d --build --remove-orphans
-    echo -e "${GREEN}高阶集群源码更新并重编完成！${RESET}"
-}
-
-# 彻底卸载
-uninstall_fakabot() {
-    echo -ne "${RED}确定要停止并卸载整个 fakabot 集群吗？(y/n): ${RESET}"
+# 卸载 EasyImage
+uninstall_easyimage() {
+    get_status_info
+    echo -ne "${YELLOW}确定要卸载并删除 EasyImage 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -d "$SRC_DIR/.git" ]; then
-            cd "$SRC_DIR" && docker compose down -v
-            echo -e "${GREEN}机器人与 Redis 容器、专属隔离网络、内部 Volume 卷均已安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同步清理本地克隆的【全部源码和商品卡密配置】？(y/n): ${RESET}"
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有自定义的配置文件和图片数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}所有物理数据已被彻底清除！${RESET}"
-                exit 0
+                rm -rf "$custom_config_dir"
+                rm -rf "$custom_i_dir"
+                echo -e "${GREEN}所有自定义数据目录已彻底清理。${RESET}"
             fi
+        else
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_fakabot() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}高阶集群已全面拉起${RESET}"; }
-stop_fakabot() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}高阶集群已安全停止${RESET}"; }
-restart_fakabot() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}高阶集群已完成平滑重启${RESET}"; }
-logs_fakabot() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
+start_easyimage() { get_status_info && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_easyimage() { get_status_info && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_easyimage() { get_status_info && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_easyimage() { docker logs -f "$CONTAINER_NAME"; }
+
+show_info() {
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}Config 挂载路径: ${custom_config_dir}"
+    echo -e "${YELLOW}图片 i 挂载路径 : ${custom_i_dir}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}  ◈  fakabot 发卡机器人管理面板  ◈ ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}服务状态 :${RESET} $status"
-    echo -e "${GREEN}健康端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    ◈  EasyImage 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}配置 :${RESET} ${CYAN}${custom_config_dir}${RESET}"
+    echo -e "${GREEN}图片 :${RESET} ${CYAN}${custom_i_dir}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -309,20 +236,20 @@ menu() {
     echo -e "${GREEN}5. 停止容器${RESET}"
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 快捷编辑商品和支付${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_fakabot ;;
-        2) update_fakabot ;;
-        3) uninstall_fakabot ;;
-        4) start_fakabot ;;
-        5) stop_fakabot ;;
-        6) restart_fakabot ;;
-        7) logs_fakabot ;;
-        8) edit_config ;;
+        1) install_easyimage ;;
+        2) update_easyimage ;;
+        3) uninstall_easyimage ;;
+        4) start_easyimage ;;
+        5) stop_easyimage ;;
+        6) restart_easyimage ;;
+        7) logs_easyimage ;;
+        8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

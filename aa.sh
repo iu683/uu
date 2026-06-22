@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# 015 临时文件/文本分享平台 Docker Compose 管理面板 (支持本地/远程 Redis)
+# ACG-FAKA 发卡系统 (官方原生 Clone + 环境变量 Build) 自动化管理面板
 # =================================================================
 
 # 颜色
@@ -10,10 +10,11 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="015-app"
-BASE_DIR="/opt/015"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONFIG_FILE="$BASE_DIR/config.yaml"
+APP_NAME="acg-faka-app"
+BASE_DIR="/opt/acg-faka"
+# 直接将面板和源码放在一起，完全遵循官方根目录结构
+SRC_DIR="$BASE_DIR" 
+REPO_URL="https://github.com/lizhipay/acg-faka.git"
 
 # 检测依赖
 check_dependencies() {
@@ -21,332 +22,179 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-}
-
-# 生成随机密钥的辅助函数
-generate_random_secret() {
-    if command -v openssl &> /dev/null; then
-        openssl_rand=$(openssl rand -hex 16 2>/dev/null)
-        if [[ -n "$openssl_rand" ]]; then
-            echo "$openssl_rand"
-            return 0
-        fi
+    if ! command -v git &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
+        exit 1
     fi
-    echo "sec_$(date +%s)_$((RANDOM % 10000))"
 }
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取服务端口与运行状态
 get_status_info() {
-    # 1. 检查核心 Web 容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${GREEN}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
+    # 官方默认生成的容器名可能是 acg-faka-app 或 acg-faka_app_1，这里通过 image 标签动态精准抓取
+    local container_id=$(docker ps -q -f "ancestor=acg-faka-app" -f "status=running" 2>/dev/null)
+    [[ -z "$container_id" ]] && container_id=$(docker ps -q -f "name=app" -f "status=running" 2>/dev/null)
 
-    # 2. 如果容器存在，从容器状态中提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取核心镜像版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 80 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 兜底获取第一个绑定的端口
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+    if [[ -n "$container_id" ]]; then
+        status="${GREEN}运行中 (官方集群已就绪)${RESET}"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port="8080"
-
-        # 从容器状态提取挂载的数据路径
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/upload"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/uploads"
     else
-        # 容器未安装/未部署时的返回值
-        img_version="${RED}未安装${RESET}"
+        if [ -d "$SRC_DIR/.git" ]; then
+            status="${RED}已停止${RESET}"
+        else
+            status="${RED}未部署${RESET}"
+        fi
         webui_port="N/A"
-        data_dir="N/A"
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
+# 获取公网 IP
 get_public_ip() {
-    local mode=${1:-"auto"}
     local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
+    for url in "https://api.ipify.org" "https://4.ip.sb"; do
+        ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+    done
     echo "127.0.0.1" && return 0
 }
 
-# 部署 015 平台
+# 部署核心逻辑
 install_translate() {
     check_dependencies
-    
-    mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== Redis 运行模式选择 ======${RESET}"
-    echo -e " 1. 直接部署全新完整环境 (包含全新的本地 Redis 容器)"
-    echo -e " 2. 连接外部/远程已有的 Redis 缓存服务"
-    echo -ne "${YELLOW}请选择运行模式 [默认: 1]: ${RESET}"
-    read -r redis_mode
-    [[ -z "$redis_mode" ]] && redis_mode="1"
-
-    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入 015 访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
+    echo -e "${CYAN}====== 1. 端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 ACG-FAKA 映射端口 (对应 ACG_HTTP_PORT) [默认: 8080]: ${RESET}"
     read -r custom_port
     [[ -z "$custom_port" ]] && custom_port="8080"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
 
-    echo -ne "${YELLOW}请输入文件上传存储的宿主机绝对路径 [默认: $BASE_DIR/uploads]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="$BASE_DIR/uploads"
-
-    # 创建所需的宿主机目录并赋权
-    mkdir -p "$custom_data"
-    chmod -R 777 "$BASE_DIR" "$custom_data"
-
-    # 初始化默认的 Redis 连接 URL 变量
-    local redis_url="redis://015-redis:6379/0"
-
-    # ------------------ 模式 2：处理外部/远程 Redis 参数 ------------------
-    if [[ "$redis_mode" == "2" ]]; then
-        echo -e "${CYAN}====== 远程/外部 Redis 信息输入 ======${RESET}"
-        echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r ext_rd_host
-        [[ -z "$ext_rd_host" ]] && ext_rd_host="127.0.0.1"
-        
-        echo -ne "${YELLOW}请输入 Redis 端口 [默认: 6379]: ${RESET}"
-        read -r ext_rd_port
-        [[ -z "$ext_rd_port" ]] && ext_rd_port="6379"
-
-        echo -ne "${YELLOW}请输入 Redis 密码 (若无密码请直接回车): ${RESET}"
-        read -r ext_rd_pass
-
-        echo -ne "${YELLOW}请输入远程 Redis 数据库号 (DB ID) [默认: 0]: ${RESET}"
-        read -r redis_db_cfg
-        [[ -z "$redis_db_cfg" ]] && redis_db_cfg="0"
-
-        # 如果连的是本地宿主机的 Redis，将其转换为 Docker 默认网桥网关 IP
-        [[ "$ext_rd_host" == "127.0.0.1" || "$ext_rd_host" == "localhost" ]] && ext_rd_host="172.17.0.1"
-
-        # 根据是否有密码，组合出官方标准的 redis:// 协议连接串
-        if [[ -n "$ext_rd_pass" ]]; then
-            redis_url="redis://:${ext_rd_pass}@${ext_rd_host}:${ext_rd_port}/${redis_db_cfg}"
+    # 克隆官方仓库到当前工作目录
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "\n${YELLOW}正在克隆官方 GitHub 仓库...${RESET}"
+        # 允许在空目录或仅有本脚本的目录下克隆
+        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
+        if [ $? -eq 0 ]; then
+            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
+            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
+            rm -rf "$SRC_DIR/tmp_repo"
         else
-            redis_url="redis://${ext_rd_host}:${ext_rd_port}/${redis_db_cfg}"
+            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
+            exit 1
         fi
-    fi
-
-    # 获取动态公网 IP
-    DETECT_IP=$(get_public_ip)
-    
-    # 生成随机且高安全性的 Secret 和 Salt
-    RAND_SECRET=$(generate_random_secret)
-    RAND_SALT=$(generate_random_secret)
-
-    # 1. 动态生成符合要求的 config.yaml 配置文件
-    echo -e "${YELLOW}正在生成系统配套的 config.yaml 配置文件...${RESET}"
-    cat <<EOF > "$CONFIG_FILE"
-share:
-    # 自动生成的下载jwt secret令牌，有效期1小时
-    download_secret: ${RAND_SECRET}
-    # 颁发的下载token的窗口期，默认12小时
-    download_window: 12
-    # 自动生成的密码加盐
-    password_salt: ${RAND_SALT}
-
-upload:
-    # 上传文件保存路径（容器内部固定为 /upload，与 compose 卷相对应）
-    path: /upload
-    # 实例最大上传容量
-    maximum: 100GiB
-
-redis:
-    # Redis 连接地址（已支持动态注入）
-    url: ${redis_url}
-
-features:
-    file-share:
-        enabled: true
-    text-share:
-        enabled: true
-    file-image-compress:
-        enabled: true
-    file-image-convert:
-        enabled: true
-
-site:
-    # 动态绑定的访问域名/URL
-    url: http://${DETECT_IP}:${custom_port}
-    title:
-        'en': '015'
-    desc:
-        'en': '015 is an open-source temporary file sharing platform project that supports uploading, downloading, and sharing files and text.'
-    icon: '/logo.png'
-    bg_url: 'https://img.fudaoyuan.icu/api/1/random/?scale_min=1.5&webp=true&md=false&format=302'
-
-about:
-    bg_url: 'https://files.mastodon.social/site_uploads/files/000/000/001/@1x/57c12f441d083cde.png'
-    content:
-        'zh': |
-            ### 015 临时文件分享平台
-            欢迎使用本站分享文件或文本。
-        'en': |
-            ### 015 Temporary Share Platform
-            Welcome to share files or texts here.
-    email: admin@domain.com
-    name: admin
-    url: 'http://${DETECT_IP}:${custom_port}'
-    avatar: ''
-EOF
-
-    # 2. 动态生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
-    
-    # 基础 App 和 Worker 模板配置
-    local compose_content="services:
-  app:
-    image: fudaoyuanicu/015-app:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    volumes:
-      - ${custom_data}:/upload
-      - ${CONFIG_FILE}:/app/config.yaml
-    ports:
-      - \"${custom_port}:80\"
-
-  worker:
-    image: fudaoyuanicu/015-worker:latest
-    container_name: 015-worker
-    restart: unless-stopped
-    volumes:
-      - ${custom_data}:/upload
-      - ${CONFIG_FILE}:/app/config.yaml
-    depends_on:
-      - app"
-
-    # 如果是模式 1 (内置 Redis)，则在 compose 模板中追加内置 redis 服务和依赖关系
-    if [[ "$redis_mode" == "1" ]]; then
-        compose_content="${compose_content}
-      - redis
-
-  redis:
-    image: redis:7-alpine
-    container_name: 015-redis
-    restart: unless-stopped"
-    fi
-
-    # 写入最终的 docker-compose.yml
-    echo "$compose_content" > "$COMPOSE_FILE"
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 015 分享平台群组...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待服务容器初始化群组 (约3秒)...${RESET}"
-    sleep 3
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       015 分享平台 部署成功！      ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}宿主机存储路径 : $custom_data${RESET}"
-    if [[ "$redis_mode" == "1" ]]; then
-        echo -e "${CYAN}Redis 运行状态 : 容器内置独立运行 (015-redis)${RESET}"
     else
-        echo -e "${CYAN}Redis 运行状态 : 成功桥接外部远程服务 -> ${ext_rd_host}:${ext_rd_port} (DB: ${redis_db_cfg})${RESET}"
+        echo -e "\n${GREEN}检测到本地已存在官方仓库，正在同步最新代码...${RESET}"
+        cd "$SRC_DIR" && git pull
     fi
-    echo -e "${YELLOW}提示: 安全混淆密钥(Secret/Salt)已在 config.yaml 中为您全自动生成。${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+
+    # 回到仓库根目录
+    cd "$SRC_DIR"
+
+    # 官方提到的赋权逻辑优化（提前预热防止挂载后被锁）
+    echo -e "${YELLOW}正在预热修复官方提及的持久化目录写权限...${RESET}"
+    mkdir -p assets/cache app/Plugin app/Pay app/View/User/Theme kernel/Install runtime
+    chmod -R 777 assets/cache app/Plugin app/Pay app/View/User/Theme kernel/Install runtime
+
+    # 完美对齐官方启动命令：ACG_HTTP_PORT=xxxx docker compose up -d --build
+    echo -e "\n${YELLOW}正在执行官方原生编译启动命令...${RESET}"
+    ACG_HTTP_PORT=$custom_port docker compose up -d --build
+
+    echo -e "${YELLOW}正在等待容器集群 Build 编译并拉起服务 (约 5 秒)...${RESET}"
+    sleep 5
+
+    # 再次调用官方给出的修复（补充跑一次权限，确保万无一失）
+    chmod -R 777 assets/cache app/Plugin app/Pay app/View/User/Theme kernel/Install runtime 2>/dev/null
+
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}        ACG-FAKA 官方原生集群编译并启动成功！        ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}默认访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}后台管理地址 : http://${DETECT_IP}:${custom_port}/admin${RESET}"
+    echo -e "${YELLOW}仓库所在路径 : ${SRC_DIR}${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    echo -e "${CYAN}📝 首次安装页面填写指南（严格遵照官方）：${RESET}"
+    echo -e "   - 数据库地址 : ${GREEN}mysql${RESET}"
+    echo -e "   - 数据库名称 : ${GREEN}acg_faka${RESET}"
+    echo -e "   - 数据库账号 : ${GREEN}acg${RESET}"
+    echo -e "   - 数据库密码 : ${GREEN}acg_password${RESET}"
+    echo -e "   - 数据库前缀 : ${GREEN}acg_${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新 015 群组镜像
+# 原生更新：拉取代码 + 重新 Build
 update_translate() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 015 各组件的最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！所有关联容器已处于最新状态。${RESET}"
+    get_status_info
+    local current_port=$webui_port
+    [[ "$current_port" == "N/A" ]] && current_port="8080"
+
+    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
+    cd "$SRC_DIR" && git pull
+    
+    echo -e "${YELLOW}正在使用官方命令重编镜像并热更新...${RESET}"
+    ACG_HTTP_PORT=$current_port docker compose up -d --build --remove-orphans
+    echo -e "${GREEN}官方集群更新并重编完成！${RESET}"
 }
 
-# 卸载 015 平台
+# 彻底卸载
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 015 容器环境吗？(y/n): ${RESET}"
+    echo -ne "${RED}确定要停止并卸载 ACG-FAKA 官方容器集群吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器集群已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和上传的缓存文件？(y/n): ${RESET}"
+        if [ -d "$SRC_DIR/.git" ]; then
+            cd "$SRC_DIR" && docker compose down
+            echo -e "${GREEN}官方容器与网络已被安全停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同步连根拔除本地克隆的【全部源码、卡密、商品及数据库文件】？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}主配置与数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有源码与持久化数据已被彻底清除！${RESET}"
+                exit 0
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 015-worker 015-redis 2>/dev/null
+            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}所有服务已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}所有服务已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}所有服务已重启${RESET}"; }
-logs_translate() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+# 基于官方 Compose 文件的生命周期联动
+start_translate() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}原生集群已全面启动${RESET}"; }
+stop_translate() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}原生集群已安全停止${RESET}"; }
+restart_translate() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}原生集群已平滑重启${RESET}"; }
+logs_translate() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
 
 show_info() {
     get_status_info
     local DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}核心镜像       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}集群运行状态     : $status"
+    echo -e "${YELLOW}前端访问地址     : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}后台管理地址     : http://${DETECT_IP}:${webui_port}/admin${RESET}"
+    echo -e "${YELLOW}部署管理模式     : 官方原生指令驱动 (ACG_HTTP_PORT 注入)${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈   015 分享平台管理面板  ◈    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}   ◈  ACG-FAKA 原生指令面板  ◈     ${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}集群状态 :${RESET} $status"
+    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}1. 部署启动 (Clone + Env Build)${RESET}"
+    echo -e "${GREEN}2. 更新集群 (Pull + Env Build)${RESET}"
+    echo -e "${GREEN}3. 卸载集群服务${RESET}"
+    echo -e "${GREEN}4. 启动集群容器${RESET}"
+    echo -e "${GREEN}5. 停止集群容器${RESET}"
+    echo -e "${GREEN}6. 重启集群容器${RESET}"
+    echo -e "${GREEN}7. 查看原生日志${RESET}"
+    echo -e "${GREEN}8. 查看配置状态${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in

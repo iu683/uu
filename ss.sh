@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# fakabot 发卡机器人 (支持本地/远程 Redis 自由切换版) 自动化管理面板
+# Mozilla Send (双模智选 + 远程分区号版) Docker Compose 管理面板
 # =================================================================
 
 # 颜色
@@ -10,11 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/fakabot"
-SRC_DIR="$BASE_DIR"
-CONFIG_FILE="$BASE_DIR/config.json"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-REPO_URL="https://github.com/yanguo888/fakabot.git"
+CONTAINER_NAME="send"
+REDIS_CONTAINER_NAME="send_redis"
+DEFAULT_BASE_DIR="/opt/send"
 
 # 检测依赖
 check_dependencies() {
@@ -22,27 +20,34 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态获取服务状态
+# 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    local bot_run=$(docker ps -q -f name=^/fakabot$ -f status=running)
-    if [[ -n "$bot_run" ]]; then
-        status="${GREEN}运行中 (机器人已在线)${RESET}"
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "58001/tcp") 0).HostPort}}' fakabot 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="58001"
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
     else
-        if [ -d "$SRC_DIR/.git" ]; then
-            status="${RED}已停止或健康检查未通过${RESET}"
-        else
-            status="${RED}未部署${RESET}"
-        fi
-        webui_port="N/A"
+        status="${RED}未部署${RESET}"
     fi
+
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "1443/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="1443"
+
+        custom_uploads_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/uploads"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        if [[ -n "$custom_uploads_dir" ]]; then
+            BASE_DIR=$(dirname "$custom_uploads_dir")
+        fi
+    fi
+    
+    [[ -z "$BASE_DIR" || "$BASE_DIR" == "." ]] && BASE_DIR="$DEFAULT_BASE_DIR"
+    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+    [[ -z "$custom_uploads_dir" ]] && custom_uploads_dir="$BASE_DIR/uploads"
 }
 
 get_public_ip() {
@@ -68,298 +73,229 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署与引导
-install_fakabot() {
+# 部署 Send
+install_send() {
     check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    # 1. 克隆官方仓库
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "\n${YELLOW}正在从 GitHub 远程仓库克隆 fakabot 最新源码...${RESET}"
-        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
-        if [ $? -eq 0 ]; then
-            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
-            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
-            rm -rf "$SRC_DIR/tmp_repo"
-        else
-            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
-            exit 1
-        fi
-    else
-        echo -e "\n${GREEN}检测到本地已存在源码，正在同步最新代码...${RESET}"
-        cd "$SRC_DIR" && git pull
-    fi
-
-    cd "$SRC_DIR"
-
-    # 2. 智能配置引导
-    echo -e "\n${CYAN}====== 🛠️  fakabot 基础参数引导 ======${RESET}"
-    echo -ne "${YELLOW}1. 请输入你的 Telegram BOT_TOKEN: ${RESET}"
-    read -r tg_token
-    while [[ -z "$tg_token" ]]; do
-        echo -ne "${RED}Token 不能为空，请重新输入: ${RESET}"
-        read -r tg_token
-    done
-
-    echo -ne "${YELLOW}2. 请输入你的 Admin Telegram ID: ${RESET}"
-    read -r tg_admin_id
-    while [[ -z "$tg_admin_id" ]]; do
-        echo -ne "${RED}Admin ID 不能为空，请重新输入: ${RESET}"
-        read -r tg_admin_id
-    done
-
-    echo -ne "${YELLOW}3. 请输入 Web 服务的宿主机端口 1 [默认: 58001]: ${RESET}"
-    read -r port_1
-    [[ -z "$port_1" ]] && port_1="58001"
-
-    echo -ne "${YELLOW}4. 请输入 Web 服务的宿主机端口 2 [默认: 58002]: ${RESET}"
-    read -r port_2
-    [[ -z "$port_2" ]] && port_2="58002"
-
-    echo -ne "${YELLOW}5. 端口外网映射模式: 1.仅本地访问(127.0.0.1) 2.外网直接访问(0.0.0.0) [默认 1]: ${RESET}"
-    read -r bind_mode
-    if [[ "$bind_mode" == "2" ]]; then bind_ip="0.0.0.0"; else bind_ip="127.0.0.1"; fi
-
-    # 3. Redis 模式选择
-    echo -e "\n${CYAN}====== ⚡ Redis 缓存配置引导 ======${RESET}"
-    echo -ne "${YELLOW}请选择 Redis 部署模式: 1.本地 Docker 自动创建 2.使用远程/外部 Redis [默认 1]: ${RESET}"
-    read -r redis_mode
-
-    if [[ "$redis_mode" == "2" ]]; then
-        # 远程 Redis 逻辑
-        echo -ne "${YELLOW}➡️ 请输入远程 Redis 的 IP 地址/域名: ${RESET}"
-        read -r redis_host
-        echo -ne "${YELLOW}➡️ 请输入远程 Redis 的端口号 [默认: 6379]: ${RESET}"
-        read -r redis_port
-        [[ -z "$redis_port" ]] && redis_port="6379"
-        echo -ne "${YELLOW}➡️ 请输入远程 Redis 的连接密码 (若无请留空直接回车): ${RESET}"
-        read -r redis_password
-        echo -ne "${YELLOW}➡️ 请输入使用的 Redis 数据库编号 (DB ID) [默认: 0]: ${RESET}"
-        read -r redis_db
-        [[ -z "$redis_db" ]] && redis_db="0"
-    else
-        # 本地 Redis 默认逻辑
-        redis_host="redis"
-        redis_port="6379"
-        redis_password=""
-        redis_db="0"
-    fi
-
-    # 4. 自动生成标准 config.json
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "\n${YELLOW}正在为您初始化生成标准的 config.json...${RESET}"
-        cat <<EOF > "$CONFIG_FILE"
-{
-  "BOT_TOKEN": "${tg_token}",
-  "ADMIN_ID": ${tg_admin_id},
-  "DOMAIN": "http://${bind_ip}:${port_1}",
-  "ORDER_TIMEOUT_SECONDS": 3600,
-  "PAYMENTS": {},
-  "START": {
-    "cover_url": "https://img.example/start-cover.jpg",
-    "title": "欢迎选购",
-    "intro": "这里是商店简介或活动文案。"
-  },
-  "SHOW_QR": true,
-  "PRODUCTS": []
-}
-EOF
-    fi
-
-    mkdir -p "$BASE_DIR/data"
-    chmod -R 777 "$BASE_DIR/data"
-
-    # 5. 动态渲染构建不同模式下的 docker-compose.yml
-    echo -e "${YELLOW}正在动态渲染构建符合您网络架构的 docker-compose.yml...${RESET}"
     
-    if [[ "$redis_mode" == "2" ]]; then
-        # 【远程 Redis 拓扑模板】没有本地 redis 模块，移除了 depends_on 和 本地隔离网络限制
-        cat <<EOF > "$COMPOSE_FILE"
-services:
-  sp_shop_bot:
-    build: .
-    container_name: fakabot
-    restart: unless-stopped
-    environment:
-      - TZ=Asia/Shanghai
-      - REDIS_HOST=${redis_host}
-      - REDIS_PORT=${redis_port}
-      - REDIS_PASSWORD=${redis_password}
-      - REDIS_DB=${redis_db}
-    user: "0:0"
-    ports:
-      - "${bind_ip}:${port_1}:58001"
-      - "${bind_ip}:${port_2}:58002"
-    volumes:
-      - ./config.json:/app/config.json:ro
-      - ./data:/app/data
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://127.0.0.1:58001/health\", timeout=3).read().strip()==b\"ok\" else 1)'"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
-    stop_grace_period: 20s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-EOF
-    else
-        # 【本地 Redis 拓扑模板】保持原装双容器健康检查联动
-        cat <<EOF > "$COMPOSE_FILE"
-services:
-  redis:
-    image: redis:7-alpine
-    container_name: fakabot-redis
-    restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
-    volumes:
-      - redis_data:/data
-    networks:
-      - fakabot_network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "2"
+    echo -e "${CYAN}====== 1. 基础环境参数配置 ======${RESET}"
+    
+    # 1. 端口配置
+    echo -ne "${YELLOW}请输入 Send 访问端口 [默认: 1443]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="1443"
 
-  sp_shop_bot:
-    build: .
-    container_name: fakabot
-    restart: unless-stopped
+    # 2. 存放目录
+    echo -ne "${YELLOW}请输入面板配置文件存放路径 [默认: $DEFAULT_BASE_DIR]: ${RESET}"
+    read -r input_base
+    [[ -z "$input_base" ]] && input_base="$DEFAULT_BASE_DIR"
+    BASE_DIR="$input_base"
+    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+
+    # 3. 自定义上传路径
+    echo -ne "${YELLOW}请输入【文件上传(uploads)】宿主机存储绝对路径 [默认: $BASE_DIR/uploads]: ${RESET}"
+    read -r input_uploads
+    [[ -z "$input_uploads" ]] && input_uploads="$BASE_DIR/uploads"
+    custom_uploads_dir="$input_uploads"
+
+    # 4. 业务环境变量
+    DETECT_IP=$(get_public_ip)
+    echo -ne "${YELLOW}请输入 Send 的外部访问域名/IP (BASE_URL) [默认: http://$DETECT_IP:$custom_port]: ${RESET}"
+    read -r custom_domain
+    [[ -z "$custom_domain" ]] && custom_domain="http://$DETECT_IP:$custom_port"
+
+    echo -ne "${YELLOW}请输入单文件最大限制 (单位字节，默认 2.5GB = 2684354560): ${RESET}"
+    read -r max_size
+    [[ -z "$max_size" ]] && max_size="2684354560"
+
+    # 5. 选择 Redis 模式
+    echo -e "\n${CYAN}====== 2. Redis 运行模式选择 ======${RESET}"
+    echo -e "${GREEN}1. 本地模式 ${RESET}(自动拉取并部署一个全新的本地 Redis 容器)"
+    echo -e "${GREEN}2. 远程模式 ${RESET}(连接你现有的外部/其它服务器的 Redis 数据库，支持指定分区号)"
+    echo -ne "${YELLOW}请选择 Redis 模式 [1 或 2, 默认 1]: ${RESET}"
+    read -r redis_mode
+    [[ -z "$redis_mode" ]] && redis_mode="1"
+
+    # 创建基础目录
+    mkdir -p "$BASE_DIR"
+    mkdir -p "$custom_uploads_dir"
+    chmod -R 777 "$BASE_DIR" "$custom_uploads_dir"
+
+    if [[ "$redis_mode" == "1" ]]; then
+        # 本地模式
+        local custom_redis_dir="$BASE_DIR/redis_data"
+        mkdir -p "$custom_redis_dir" && chmod -R 777 "$custom_redis_dir"
+        
+        echo -e "${YELLOW}正在生成 [本地 Redis 容器版] docker-compose.yml...${RESET}"
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  send:
+    image: registry.gitlab.com/timvisee/send:latest
+    container_name: ${CONTAINER_NAME}
+    depends_on:
+      - redis
+    ports:
+      - "${custom_port}:1443"
     environment:
-      - TZ=Asia/Shanghai
+      - NODE_ENV=production
+      - PORT=1443
+      - BASE_URL=${custom_domain}
+      - MAX_FILE_SIZE=${max_size}
+      - REDIS_ENABLED=true
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-    user: "0:0"
-    ports:
-      - "${bind_ip}:${port_1}:58001"
-      - "${bind_ip}:${port_2}:58002"
     volumes:
-      - ./config.json:/app/config.json:ro
-      - ./data:/app/data
-    networks:
-      - fakabot_network
-    depends_on:
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://127.0.0.1:58001/health\", timeout=3).read().strip()==b\"ok\" else 1)'"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
-    stop_grace_period: 20s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - ${custom_uploads_dir}:/uploads
+    restart: unless-stopped
 
-networks:
-  fakabot_network:
-    driver: bridge
-
-volumes:
-  redis_data:
-    driver: local
+  redis:
+    image: redis:latest
+    container_name: ${REDIS_CONTAINER_NAME}
+    volumes:
+      - ${custom_redis_dir}:/data
+    restart: unless-stopped
 EOF
-    fi
-
-    # 6. 原生一键拉起并编译
-    echo -e "\n${YELLOW}正在拉起 Docker 现场编译整个集群环境...${RESET}"
-    cd "$SRC_DIR"
-    docker compose up -d --build
-
-    echo -e "${YELLOW}等待集群健康检查确认上线 (约 8 秒)...${RESET}"
-    sleep 8
-
-    get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}        fakabot 集群智能切换部署全部成功！           ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    if [[ "$redis_mode" == "2" ]]; then
-        echo -e "${CYAN}Redis 连接模式 : ➡️ 远程 Redis 模式群 [独立外接]${RESET}"
-        echo -e "${YELLOW}远程目标主机   : ${redis_host}:${redis_port} (DB: ${redis_db})${RESET}"
+        redis_info_str="内置本地 Redis 容器"
     else
-        echo -e "${CYAN}Redis 连接模式 : 🏠 本地容器沙盒模式 [自动依赖]${RESET}"
+        # 远程模式 (加入了分区号支持)
+        echo -e "\n${CYAN}---> 请输入远程连接参数:${RESET}"
+        echo -ne "${YELLOW}▶ 远程 Redis 服务器 IP 或 域名: ${RESET}"
+        read -r remote_redis_host
+        echo -ne "${YELLOW}▶ 远程 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r remote_redis_port
+        [[ -z "$remote_redis_port" ]] && remote_redis_port="6379"
+        echo -ne "${YELLOW}▶ 远程 Redis 连接密码 (无密码请直接敲回车): ${RESET}"
+        read -r remote_redis_pass
+        echo -ne "${YELLOW}▶ 远程 Redis 分区号 (DB Index) [默认: 0]: ${RESET}"
+        read -r remote_redis_db
+        [[ -z "$remote_redis_db" ]] && remote_redis_db="0"
+
+        # 智能拼接带分区号的 URL 字符串
+        if [[ -n "$remote_redis_pass" ]]; then
+            redis_url="redis://:${remote_redis_pass}@${remote_redis_host}:${remote_redis_port}/${remote_redis_db}"
+        else
+            redis_url="redis://${remote_redis_host}:${remote_redis_port}/${remote_redis_db}"
+        fi
+
+        echo -e "${YELLOW}正在生成 [连接外部远程 Redis(分区:${remote_redis_db}) 版] docker-compose.yml...${RESET}"
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  send:
+    image: registry.gitlab.com/timvisee/send:latest
+    container_name: ${CONTAINER_NAME}
+    ports:
+      - "${custom_port}:1443"
+    environment:
+      - NODE_ENV=production
+      - PORT=1443
+      - BASE_URL=${custom_domain}
+      - MAX_FILE_SIZE=${max_size}
+      - REDIS_ENABLED=true
+      - REDIS_URL=${redis_url}
+    volumes:
+      - ${custom_uploads_dir}:/uploads
+    restart: unless-stopped
+EOF
+        redis_info_str="外部远程 Redis (${remote_redis_host}:${remote_redis_port} / 分区: ${remote_redis_db})"
     fi
-    echo -e "${YELLOW}健康服务端口 1 : ${port_1}${RESET}"
-    echo -e "${YELLOW}业务通知端口 2 : ${port_2}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待服务联调初始化 (约3秒)...${RESET}"
+    sleep 3
+
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${GREEN}                  Send 部署成功！                    ${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${YELLOW}文件存储路径 ：$custom_uploads_dir${RESET}"
+    echo -e "${YELLOW}Redis 运行模式：$redis_info_str${RESET}"
+    echo -e "${YELLOW}服务访问地址 ：$custom_domain${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
 }
 
-# 高级：直接在面板里调用本地编辑器修改配置文件
-edit_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${RED}错误: 配置文件不存在！${RESET}"; return; fi
-    nano "$CONFIG_FILE" || vi "$CONFIG_FILE"
-    cd "$SRC_DIR" && docker compose restart sp_shop_bot
-    echo -e "${GREEN}配置已成功热生效！${RESET}"
+# 更新镜像
+update_send() {
+    get_status_info
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！${RESET}"
 }
 
-# 更新代码
-update_fakabot() {
-    if [ ! -d "$SRC_DIR/.git" ]; then echo -e "${RED}错误: 未检测到克隆的仓库！${RESET}"; return; fi
-    cd "$SRC_DIR" && git pull && docker compose up -d --build --remove-orphans
-    echo -e "${GREEN}集群源码更新并重编完成！${RESET}"
-}
-
-# 彻底卸载
-uninstall_fakabot() {
-    echo -ne "${RED}确定要停止并卸载整个 fakabot 集群吗？(y/n): ${RESET}"
+# 卸载服务
+uninstall_send() {
+    get_status_info
+    echo -ne "${YELLOW}确定要卸载并删除 Send 相关容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        cd "$SRC_DIR" && docker compose down -v
-        echo -ne "${YELLOW}是否同步清理本地克隆的【全部源码和商品卡密配置】？(y/n): ${RESET}"
-        read -r clean_data
-        [[ "$clean_data" == "y" || "$clean_data" == "Y" ]] && rm -rf "$BASE_DIR" && echo -e "${GREEN}所有物理数据已被彻底清除！${RESET}" && exit 0
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}服务已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地所有上传的文件和配置数据？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                rm -rf "$custom_uploads_dir"
+                echo -e "${GREEN}本地自定义存储目录已彻底清理。${RESET}"
+            fi
+        else
+            docker rm -f "$CONTAINER_NAME" "$REDIS_CONTAINER_NAME" 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_fakabot() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}集群已拉起${RESET}"; }
-stop_fakabot() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}集群已停止${RESET}"; }
-restart_fakabot() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}集群已完成平滑重启${RESET}"; }
-logs_fakabot() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
+start_send() { get_status_info && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_send() { get_status_info && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_send() { get_status_info && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_send() { docker logs -f "$CONTAINER_NAME"; }
+
+show_info() {
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}核心镜像     : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}本地存储路径 : ${custom_uploads_dir}${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
+}
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}  ◈  fakabot 发卡机器人管理面板  ◈ ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}服务状态 :${RESET} $status"
-    echo -e "${GREEN}核心端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}  ◈  Mozilla Send 管理面板 ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}存储 :${RESET} ${CYAN}${custom_uploads_dir}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}2. 更新服务${RESET}"
+    echo -e "${GREEN}3. 卸载服务${RESET}"
+    echo -e "${GREEN}4. 启动服务${RESET}"
+    echo -e "${GREEN}5. 停止服务${RESET}"
+    echo -e "${GREEN}6. 重启服务${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 快捷编辑商品和支付${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_fakabot ;;
-        2) update_fakabot ;;
-        3) uninstall_fakabot ;;
-        4) start_translate ;; 
-        4) start_fakabot ;;
-        5) stop_fakabot ;;
-        6) restart_fakabot ;;
-        7) logs_fakabot ;;
-        8) edit_config ;;
+        1) install_send ;;
+        2) update_send ;;
+        3) uninstall_send ;;
+        4) start_send ;;
+        5) stop_send ;;
+        6) restart_send ;;
+        7) logs_send ;;
+        8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

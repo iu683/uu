@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Forgejo Git 自托管服务 Docker Compose 管理面板 
+# magic-resume 简历生成器 (源码克隆 + 端口定制 + 现场 Build) 管理面板
 # =================================================================
 
 # 颜色
@@ -10,9 +10,12 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="forgejo"
-BASE_DIR="/opt/forgejo"
+APP_NAME="magic-resume-web"
+BASE_DIR="/opt/magic-resume"
+SRC_DIR="$BASE_DIR"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+# 使用 HTTPS 链接克隆，比 SSH (git@github.com...) 兼容性更好，免去配置 SSH Key 的麻烦
+REPO_URL="https://github.com/JOYCEQL/magic-resume.git"
 
 # 检测依赖
 check_dependencies() {
@@ -20,48 +23,33 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
+    if ! command -v git &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
+        exit 1
+    fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取服务端口与运行状态
 get_status_info() {
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
+    local container_id=$(docker ps -q -f "name=web" -f "status=running" 2>/dev/null)
+    [[ -z "$container_id" ]] && container_id=$(docker ps -q -f "ancestor=magic-resume-web" -f "status=running" 2>/dev/null)
 
-    # 2. 如果容器存在，从容器状态中提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 动态提取 Web 端口（容器内 3000）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+    if [[ -n "$container_id" ]]; then
+        status="${GREEN}运行中 (容器已就绪)${RESET}"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port="3000"
-
-        # 动态提取 SSH 端口（容器内 22）
-        ssh_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "22/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$ssh_port" ]] && ssh_port="222"
-
-        # 从容器状态提取数据目录
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="/opt/forgejo/forgejo"
     else
-        # 容器未安装/未部署时的返回值
-        img_version="${RED}未安装${RESET}"
+        if [ -d "$SRC_DIR/.git" ]; then
+            status="${RED}已停止${RESET}"
+        else
+            status="${RED}未部署${RESET}"
+        fi
         webui_port="N/A"
-        ssh_port="N/A"
-        data_dir="N/A"
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"}
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -83,140 +71,134 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Forgejo
-install_forgejo() {
+
+# 部署与现场编译
+install_resume() {
     check_dependencies
-    
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    # 动态获取当前用户的 UID 和 GID
-    current_uid=$(id -u)
-    current_gid=$(id -g)
+    echo -e "${CYAN}====== 端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 magic-resume 网页端访问映射端口 [默认: 3000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3000"
 
-    echo -ne "${YELLOW}请输入 Forgejo Web 访问端口 [默认: 3000]: ${RESET}"
-    read -r custom_web_port
-    [[ -z "$custom_web_port" ]] && custom_web_port="3000"
+    # 克隆官方仓库到当前工作目录
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "\n${YELLOW}正在从 GitHub 远程仓库克隆官方最新源码...${RESET}"
+        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
+        if [ $? -eq 0 ]; then
+            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
+            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
+            rm -rf "$SRC_DIR/tmp_repo"
+        else
+            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
+            exit 1
+        fi
+    else
+        echo -e "\n${GREEN}检测到本地已存在官方仓库，正在同步最新代码...${RESET}"
+        cd "$SRC_DIR" && git pull
+    fi
 
-    echo -ne "${YELLOW}请输入 Forgejo SSH 映射端口 [默认: 222]: ${RESET}"
-    read -r custom_ssh_port
-    [[ -z "$custom_ssh_port" ]] && custom_ssh_port="222"
+    # 回到仓库根目录
+    cd "$SRC_DIR"
 
-    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/forgejo/forgejo]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="/opt/forgejo/forgejo"
-
-    # 1. 创建所需的宿主机目录并赋予正确权限
-    mkdir -p "$custom_data"
-    chown -R "$current_uid":"$current_gid" "$custom_data" 2>/dev/null
-    chmod -R 775 "$custom_data"
-
-    # 2. 动态生成包含独立 networks 的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合官方 standards 的 docker-compose.yml 配置文件...${RESET}"
+    # 动态注入并覆盖生成带自定义端口的 docker-compose.yml
+    echo -e "${YELLOW}正在注入端口参数并生成配置...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
-networks:
-  forgejo:
-    external: false
-
 services:
-  server:
-    image: codeberg.org/forgejo/forgejo:14
-    container_name: ${CONTAINER_NAME}
-    environment:
-      - USER_UID=${current_uid}
-      - USER_GID=${current_gid}
-    restart: always
-    networks:
-      - forgejo
-    volumes:
-      - ${custom_data}:/data
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${APP_NAME}
     ports:
-      - "${custom_web_port}:3000"
-      - "${custom_ssh_port}:22"
+      - "${custom_port}:3000"
+    environment:
+      - NODE_ENV=production
+    restart: always
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Forgejo 服务...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    # 完美对齐官方启动命令并开始 build
+    echo -e "\n${YELLOW}正在拉起 Docker 现场编译 (Node.js 编译较慢，请耐心等待)...${RESET}"
+    docker compose up -d --build
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}正在等待容器集群 Build 编译完成 (约 5 秒)...${RESET}"
+    sleep 5
 
+    get_status_info
     DETECT_IP=$(get_public_ip)
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       Forgejo 部署成功！       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}Web 访问地址   : http://${DETECT_IP}:${custom_web_port}${RESET}"
-    echo -e "${YELLOW}SSH 克隆地址   : ssh://git@${DETECT_IP}:${custom_ssh_port}/[用户名]/[仓库].git${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
-    echo -e "${YELLOW}提示: 首次在浏览器打开时，请在配置页面将“SSH 端口”修改为 ${custom_ssh_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}        magic-resume 官方源码编译并启动成功！        ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}默认访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}源码及工作区 : ${SRC_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新 Forgejo 镜像
-update_forgejo() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+# 更新代码并重新 Build
+update_resume() {
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Forgejo 最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！Forgejo 已处于最新状态。${RESET}"
+    get_status_info
+    local current_port=$webui_port
+    [[ "$current_port" == "N/A" ]] && current_port="3000"
+
+    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
+    cd "$SRC_DIR" && git pull
+    
+    echo -e "${YELLOW}正在重新编译前端镜像并热更新...${RESET}"
+    docker compose up -d --build --remove-orphans
+    echo -e "${GREEN}集群源码更新并重编完成！${RESET}"
 }
 
-# 卸载 Forgejo
-uninstall_forgejo() {
-    echo -ne "${YELLOW}确定要卸载并删除 Forgejo 容器及网络吗？(y/n): ${RESET}"
+# 彻底卸载
+uninstall_resume() {
+    echo -ne "${RED}确定要停止并卸载 magic-resume 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器与网络已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除代码仓库和所有 Git 数据？(y/n): ${RESET}"
+        if [ -d "$SRC_DIR/.git" ]; then
+            cd "$SRC_DIR" && docker compose down --rmi local
+            echo -e "${GREEN}容器与临时编译镜像已被安全移除。${RESET}"
+            echo -ne "${YELLOW}是否同步清理本地克隆的【全部源码和配置文件】？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                rm -rf "$custom_data" 2>/dev/null
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有源码已被彻底清除！${RESET}"
+                exit 0
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_forgejo() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
-stop_forgejo() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
-restart_forgejo() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
-logs_forgejo() { docker logs -f "$CONTAINER_NAME"; }
+# 控制逻辑
+start_resume() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}服务已全面启动${RESET}"; }
+stop_resume() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}服务已安全停止${RESET}"; }
+restart_resume() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}服务已平滑重启${RESET}"; }
+logs_resume() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
 
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}Web 访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}SSH 映射端口   : ${ssh_port}${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    local DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}服务运行状态     : $status"
+    echo -e "${YELLOW}前端访问地址     : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}部署管理模式     : 源码 Clone + 本地 Dockerfile 编译${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  Forgejo 管理面板  ◈    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}Web  :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}SSH  :${RESET} ${YELLOW}${ssh_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}   ◈  magic-resume 简历面板  ◈    ${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}服务状态 :${RESET} $status"
+    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -226,17 +208,17 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_forgejo ;;
-        2) update_forgejo ;;
-        3) uninstall_forgejo ;;
-        4) start_forgejo ;;
-        5) stop_forgejo ;;
-        6) restart_forgejo ;;
-        7) logs_forgejo ;;
+        1) install_resume ;;
+        2) update_resume ;;
+        3) uninstall_resume ;;
+        4) start_resume ;;
+        5) stop_resume ;;
+        6) restart_resume ;;
+        7) logs_resume ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

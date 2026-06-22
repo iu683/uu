@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# FileCodeBox 文件快递柜 Docker Compose 管理面板 (支持目录自定义)
+# MCSManager 游戏面板 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,9 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="filecodebox"
-# 默认主配置目录
-DEFAULT_BASE_DIR="/opt/filecodebox"
+WEB_CONTAINER="mcsmanager-web"
+DAEMON_CONTAINER="mcsmanager-daemon"
+BASE_DIR="/opt/mcsmanager"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
 check_dependencies() {
@@ -22,52 +23,32 @@ check_dependencies() {
     fi
 }
 
-# 获取系统 CPU 核心数作为 WORKERS 默认值
-get_cpu_cores() {
-    local cores=4
-    if command -v nproc &> /dev/null; then
-        cores=$(nproc)
-    elif [ -f /proc/cpuinfo ]; then
-        cores=$(grep -c ^processor /proc/cpuinfo)
-    fi
-    echo "$cores"
-}
-
 # 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
+    # 1. 检查 Web 和 Daemon 状态
+    if [ "$(docker ps -q -f name=^/${WEB_CONTAINER}$)" ] && [ "$(docker ps -q -f name=^/${DAEMON_CONTAINER}$)" ]; then
+        status="${YELLOW}运行中 (双端正常)${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${WEB_CONTAINER}$)" ] || [ "$(docker ps -aq -f name=^/${DAEMON_CONTAINER}$)" ]; then
+        status="${RED}异常/部分停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中动态提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 从容器状态提取 WebUI 端口 (FileCodeBox 默认是 12345)
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "12345/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="12345"
-
-        # 动态提取自定义挂载路径
-        custom_data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        
-        # 定位 docker-compose.yml 的存放位置
-        if [[ -n "$custom_data_dir" ]]; then
-            BASE_DIR=$(dirname "$custom_data_dir")
-        fi
+    # 2. 如果 Web 容器存在，提取 Web 端口
+    if [ "$(docker ps -aq -f name=^/${WEB_CONTAINER}$)" ]; then
+        web_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "23333/tcp") 0).HostPort}}' "$WEB_CONTAINER" 2>/dev/null)
+        [[ -z "$web_port" ]] && web_port="23333"
+    else
+        web_port="N/A"
     fi
-    
-    # 兜底路径
-    [[ -z "$BASE_DIR" || "$BASE_DIR" == "." ]] && BASE_DIR="$DEFAULT_BASE_DIR"
-    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-    [[ -z "$custom_data_dir" ]] && custom_data_dir="$BASE_DIR/data"
+
+    # 3. 如果 Daemon 容器存在，提取 Daemon 端口
+    if [ "$(docker ps -aq -f name=^/${DAEMON_CONTAINER}$)" ]; then
+        daemon_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "24444/tcp") 0).HostPort}}' "$DAEMON_CONTAINER" 2>/dev/null)
+        [[ -z "$daemon_port" ]] && daemon_port="24444"
+    else
+        daemon_port="N/A"
+    fi
 }
 
 # 获取公网 IP (兼容双栈环境)
@@ -94,148 +75,159 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 FileCodeBox
-install_filecodebox() {
+# 部署 MCSManager
+install_mcsm() {
     check_dependencies
     
+    mkdir -p "$BASE_DIR"
+
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    # 1. 端口配置
-    echo -ne "${YELLOW}请输入 FileCodeBox 访问端口 [默认: 12345]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="12345"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
+    echo -ne "${YELLOW}请输入 MCSManager 网页访问端口 [默认: 23333]: ${RESET}"
+    read -r custom_web_port
+    [[ -z "$custom_web_port" ]] && custom_web_port="23333"
 
-    # 2. 主脚本与 Compose 存放目录
-    echo -ne "${YELLOW}请输入面板配置文件存放路径 [默认: $DEFAULT_BASE_DIR]: ${RESET}"
-    read -r input_base
-    [[ -z "$input_base" ]] && input_base="$DEFAULT_BASE_DIR"
-    BASE_DIR="$input_base"
+    echo -ne "${YELLOW}请输入 MCSManager 守护进程端口 [默认: 24444]: ${RESET}"
+    read -r custom_daemon_port
+    [[ -z "$custom_daemon_port" ]] && custom_daemon_port="24444"
+
+    echo -ne "${YELLOW}请输入 MCSManager 数据安装绝对路径 [默认: /opt/mcsmanager]: ${RESET}"
+    read -r custom_path
+    [[ -z "$custom_path" ]] && custom_path="/opt/mcsmanager"
+
+    # 更新全局基础目录定义
+    BASE_DIR="$custom_path"
     COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
-    # 3. 自定义 data 目录
-    echo -ne "${YELLOW}请输入【系统数据(data)】宿主机存储绝对路径 [默认: $BASE_DIR/data]: ${RESET}"
-    read -r input_data
-    [[ -z "$input_data" ]] && input_data="$BASE_DIR/data"
-    custom_data_dir="$input_data"
+    # 1. 创建所需的宿主机目录
+    mkdir -p "$BASE_DIR/web/data" "$BASE_DIR/web/logs" "$BASE_DIR/daemon/data" "$BASE_DIR/daemon/logs"
+    chmod -R 777 "$BASE_DIR"
 
-    # 4. 环境变量配置
-    local default_workers=$(get_cpu_cores)
-    echo -ne "${YELLOW}请输入工作进程数 WORKERS (建议设为 CPU 核心数) [默认: $default_workers]: ${RESET}"
-    read -r custom_workers
-    [[ -z "$custom_workers" ]] && custom_workers="$default_workers"
-
-    echo -ne "${YELLOW}请输入日志级别 LOG_LEVEL (info/debug/warn/error) [默认: info]: ${RESET}"
-    read -r custom_log
-    [[ -z "$custom_log" ]] && custom_log="info"
-    
-    # 创建所有用户自定义的目录并赋权
-    mkdir -p "$BASE_DIR"
-    mkdir -p "$custom_data_dir"
-    chmod -R 777 "$BASE_DIR" "$custom_data_dir"
-
-    # 生成 docker-compose.yml 配置文件
+    # 2. 动态生成 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  filecodebox:
-    image: lanol/filecodebox:latest
-    container_name: ${CONTAINER_NAME}
+  web:
+    image: githubyumao/mcsmanager-web:latest
+    container_name: ${WEB_CONTAINER}
     restart: unless-stopped
     ports:
-      - "${custom_port}:12345"
-    environment:
-      - WORKERS=${custom_workers}
-      - LOG_LEVEL=${custom_log}
+      - "${custom_web_port}:23333"
     volumes:
-      - ${custom_data_dir}:/app/data
+      - /etc/localtime:/etc/localtime:ro
+      - ${BASE_DIR}/web/data:/opt/mcsmanager/web/data
+      - ${BASE_DIR}/web/logs:/opt/mcsmanager/web/logs
+
+  daemon:
+    image: githubyumao/mcsmanager-daemon:latest
+    container_name: ${DAEMON_CONTAINER}
+    restart: unless-stopped
+    ports:
+      - "${custom_daemon_port}:24444"
+    environment:
+      - MCSM_DOCKER_WORKSPACE_PATH=${BASE_DIR}/daemon/data/InstanceData
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ${BASE_DIR}/daemon/data:/opt/mcsmanager/daemon/data
+      - ${BASE_DIR}/daemon/logs:/opt/mcsmanager/daemon/logs
+      - /var/run/docker.sock:/var/run/docker.sock
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 FileCodeBox 服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 MCSManager 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}等待容器初始化并生成密钥 (约5秒)...${RESET}"
+    sleep 5
 
-    DETECT_IP=$(get_public_ip)
-
-    echo -e "${GREEN}=====================================================${RESET}"
-    echo -e "${GREEN}             FileCodeBox 部署成功！                  ${RESET}"
-    echo -e "${GREEN}=====================================================${RESET}"
-    echo -e "${YELLOW}数据挂载路径 ：$custom_data_dir${RESET}"
-    echo -e "${YELLOW}工作进程数量 ：$custom_workers (Workers)${RESET}"
-    echo -e "${YELLOW}取件柜主页   ：http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${RED}-----------------------------------------------------${RESET}"
-    echo -e "${RED}  管理后台指南：${RESET}"
-    echo -e "${YELLOW}1. 首次访问上述主页，按照提示完成【站点初始化】并设置管理密码。${RESET}"
-    echo -e "${YELLOW}2. 随后访问后台：http://${DETECT_IP}:${custom_port}/#/admin 并输入该密码登录。${RESET}"
-    echo -e "${GREEN}=====================================================${RESET}"
+    show_info
 }
 
-# 更新镜像
-update_filecodebox() {
-    get_status_info
+# 更新 MCSManager 镜像
+update_mcsm() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 FileCodeBox 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 MCSManager 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载容器
-uninstall_filecodebox() {
-    get_status_info
-    echo -ne "${YELLOW}确定要卸载并删除 FileCodeBox 容器吗？(y/n): ${RESET}"
+# 卸载 MCSManager
+uninstall_mcsm() {
+    echo -ne "${YELLOW}确定要卸载并删除 MCSManager 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有文件柜中的数据、文件和配置文件？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有游戏实例数据、配置文件和日志？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                rm -rf "$custom_data_dir"
-                echo -e "${GREEN}所有自定义数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}安装目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            docker rm -f "$WEB_CONTAINER" "$DAEMON_CONTAINER" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_filecodebox() { get_status_info && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_filecodebox() { get_status_info && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_filecodebox() { get_status_info && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_filecodebox() { docker logs -f "$CONTAINER_NAME"; }
+start_mcsm() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_mcsm() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_mcsm() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_mcsm() {
+    echo -e "${CYAN}1. 查看 Web 端日志${RESET}"
+    echo -e "${CYAN}2. 查看 Daemon 端日志${RESET}"
+    echo -ne "${YELLOW}请选择要查看的日志 [1-2]: ${RESET}"
+    read -r log_choice
+    if [[ "$log_choice" == "2" ]]; then
+        docker logs -f "$DAEMON_CONTAINER"
+    else
+        docker logs -f "$WEB_CONTAINER"
+    fi
+}
 
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}=====================================================${RESET}"
-    echo -e "${YELLOW}当前状态     : $status"
-    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
-    echo -e "${YELLOW}数据目录路径 : ${custom_data_dir}${RESET}"
-    echo -e "${YELLOW}取件柜主页   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}管理后台     : http://${DETECT_IP}:${webui_port}/#/admin${RESET}"
-    echo -e "${GREEN}=====================================================${RESET}"
+    local current_ip=$(get_public_ip)
+    
+    # 自动尝试提取守护进程密钥
+    local daemon_key="未生成 (请先启动容器)"
+    local key_file="$BASE_DIR/daemon/data/Config/global.json"
+    if [[ -f "$key_file" ]]; then
+        # 通过 grep 和 sed 简单提取 json 中的 key 值，无需依赖 jq
+        local extracted_key=$(grep -o '"key":[^,]*' "$key_file" | head -n 1 | sed 's/"key"://' | sed 's/"//g' | tr -d '[:space:]')
+        [[ -n "$extracted_key" ]] && daemon_key="$extracted_key"
+    fi
+
+    echo -e "${GREEN}================================================================${RESET}"
+    echo -e "${GREEN}                       MCSManager 配置信息                      ${RESET}"
+    echo -e "${GREEN}================================================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}网页访问地址   : http://${current_ip}:${web_port}${RESET}"
+    echo -e "${YELLOW}守护进程节点IP : ${current_ip}${RESET}"
+    echo -e "${YELLOW}守护进程端口   : ${daemon_port}${RESET}"
+    echo -e "${RED}守护进程密钥   : ${daemon_key}${RESET}"
+    echo -e "${YELLOW}宿主机安装路径 : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}================================================================${RESET}"
+    echo -e "${CYAN}💡 节点连接向导：${RESET}"
+    echo -e " 进网页 -> 点击「节点」 -> 「新增节点」 -> 填入上方公网IP、端口(${daemon_port})及密钥。"
+    echo -e "${GREEN}================================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈  FileCodeBox 快递柜管理面板 ◈   ${RESET}"
+    echo -e "${GREEN}    ◈  MCSManager 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}状态     :${RESET} $status"
+    echo -e "${GREEN}网页端口 :${RESET} ${YELLOW}${web_port}${RESET}"   
+    echo -e "${GREEN}守护端口 :${RESET} ${YELLOW}${daemon_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -244,19 +236,19 @@ menu() {
     echo -e "${GREEN}5. 停止容器${RESET}"
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}8. 查看配置与连接密钥${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_filecodebox ;;
-        2) update_filecodebox ;;
-        3) uninstall_filecodebox ;;
-        4) start_filecodebox ;;
-        5) stop_filecodebox ;;
-        6) restart_filecodebox ;;
-        7) logs_filecodebox ;;
+        1) install_mcsm ;;
+        2) update_mcsm ;;
+        3) uninstall_mcsm ;;
+        4) start_mcsm ;;
+        5) stop_mcsm ;;
+        6) restart_mcsm ;;
+        7) logs_mcsm ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

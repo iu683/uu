@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# 015 临时文件/文本分享平台 Docker Compose 管理面板 (支持本地/远程 Redis)
+# qBittorrent Docker Compose 管理面板 (支持 Host/Bridge 双模式)
 # =================================================================
 
 # 颜色
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="015-app"
-BASE_DIR="/opt/015"
+CONTAINER_NAME="qbittorrent"
+BASE_DIR="/opt/qbittorrent"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONFIG_FILE="$BASE_DIR/config.yaml"
 
 # 检测依赖
 check_dependencies() {
@@ -23,276 +22,251 @@ check_dependencies() {
     fi
 }
 
-# 生成随机密钥的辅助函数
-generate_random_secret() {
-    if command -v openssl &> /dev/null; then
-        openssl_rand=$(openssl rand -hex 16 2>/dev/null)
-        if [[ -n "$openssl_rand" ]]; then
-            echo "$openssl_rand"
-            return 0
-        fi
-    fi
-    echo "sec_$(date +%s)_$((RANDOM % 10000))"
-}
-
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取容器状态、镜像版本、映射端口和下载目录
 get_status_info() {
+    # 1. 容器运行状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${GREEN}运行中${RESET}"
+        status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}已停止${RESET}"
+        status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
+    # 2. 精准匹配修复：完美剥离特定格式，只留纯版本号
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        img_version=$(docker inspect -f '{{ index .Config.Labels "build_version" }}' "$CONTAINER_NAME" 2>/dev/null | sed 's/Linuxserver.io version:- //g' | awk '{print $1}')
         [[ -z "$img_version" ]] && img_version="已安装"
-
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8080"
-
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/upload"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/uploads"
     else
         img_version="${RED}未安装${RESET}"
+    fi
+
+    # 3. 自适应解析 Compose 文件
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        # 检测网络模式是否为 host
+        is_host=$(grep -E "network_mode:[[:space:]]*[\"']*host[\"']*" "$COMPOSE_FILE")
+
+        # 直接抓取官方环境变量 WEBUI_PORT=xxxx
+        webui_port=$(grep -E "WEBUI_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
+        # 如果不是 host 模式且没抓到环境变量，则降级兼容原有的端口映射格式抓取
+        if [[ -z "$webui_port" ]]; then
+            webui_port=$(grep -E "\-[[:space:]]+[0-9]+:[0-9]+" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d ' -')
+        fi
+        [[ -z "$webui_port" ]] && webui_port="8080"
+
+        # 直接抓取官方环境变量 TORRENTING_PORT=xxxx
+        torrent_port=$(grep -E "TORRENTING_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
+        if [[ -z "$torrent_port" ]]; then
+            torrent_port=$(grep -E "\-[[:space:]]+[0-9]+:[0-9]+" "$COMPOSE_FILE" | tail -n 1 | awk -F ':' '{print $1}' | tr -d ' -')
+        fi
+        [[ -z "$torrent_port" ]] && torrent_port="6881"
+
+        # 标记 host 模式后缀提示
+        if [[ -n "$is_host" ]]; then
+            webui_port="${webui_port} (Host模式)"
+            torrent_port="${torrent_port} (Host模式)"
+        fi
+
+        # 优化下载目录抓取
+        download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | tr -d '"' | xargs)
+        [[ -z "$download_dir" ]] && download_dir="/opt/qbittorrent/downloads"
+    else
         webui_port="N/A"
-        data_dir="N/A"
+        torrent_port="N/A"
+        download_dir="N/A"
     fi
 }
 
-# 获取公网 IP
+# 提取 Docker 容器内的 WebUI 临时密码
+get_qb_password() {
+    if [ ! "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        echo -e "${RED}容器未部署${RESET}"
+        return
+    fi
+    
+    local log_pass
+    log_pass=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -iE "temporary password|session:" | tail -n 1 | sed 's/\r//g' | awk '{print $NF}' | tr -d '[:space:].')
+    
+    if [[ -n "$log_pass" && ! "$log_pass" =~ "session:" && ! "$log_pass" =~ "password" ]]; then
+        echo -e "${GREEN}${log_pass}${RESET}"
+    else
+        echo -e "${YELLOW}未探测到初始随机密码（可能已被你修改，或日志已被冲刷）${RESET}"
+    fi
+}
+
 get_public_ip() {
     local mode=${1:-"auto"}
     local ip=""
-    for url in "https://api.ipify.org" "https://4.ip.sb"; do
-        ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-    done
-    echo "127.0.0.1" && return 0
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 1
 }
 
-# 部署 015 平台
-install_translate() {
+install_qbittorrent() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== Redis 运行模式选择 ======${RESET}"
-    echo -e " 1. 直接部署全新完整环境 (包含全新的本地 Redis 容器)"
-    echo -e " 2. 连接外部/远程已有的 Redis 缓存服务"
-    echo -ne "${YELLOW}请选择运行模式 [默认: 1]: ${RESET}"
-    read -r redis_mode
-    [[ -z "$redis_mode" ]] && redis_mode="1"
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    # 新增：选择网络模式
+    echo -e "${YELLOW}请选择网络模式:${RESET}"
+    echo -e "  1) Port Mapping (端口映射/Bridge 模式，更安全，端口可自定义)"
+    echo -e "  2) Host Mode (主机模式，IPv6 支持更好，性能略高，使用组件原生端口)"
+    echo -ne "${YELLOW}请选择 [默认 1]: ${RESET}"
+    read -r net_choice
+    [[ -z "$net_choice" ]] && net_choice="1"
 
-    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 015 访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
+    echo -ne "${YELLOW}请输入 WebUI 访问端口 [默认: 8080]: ${RESET}"
     read -r custom_port
     [[ -z "$custom_port" ]] && custom_port="8080"
-
-    echo -ne "${YELLOW}请输入文件上传存储的宿主机绝对路径 [默认: $BASE_DIR/uploads]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="$BASE_DIR/uploads"
-
-    mkdir -p "$custom_data"
-    chmod -R 777 "$BASE_DIR" "$custom_data"
-
-    local redis_url="redis://015-redis:6379/0"
-
-    if [[ "$redis_mode" == "2" ]]; then
-        echo -e "${CYAN}====== 远程/外部 Redis 信息输入 ======${RESET}"
-        echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r ext_rd_host
-        [[ -z "$ext_rd_host" ]] && ext_rd_host="127.0.0.1"
-        
-        echo -ne "${YELLOW}请输入 Redis 端口 [默认: 6379]: ${RESET}"
-        read -r ext_rd_port
-        [[ -z "$ext_rd_port" ]] && ext_rd_port="6379"
-
-        echo -ne "${YELLOW}请输入 Redis 密码 (若无密码请直接回车): ${RESET}"
-        read -r ext_rd_pass
-
-        echo -ne "${YELLOW}请输入远程 Redis 数据库号 (DB ID) [默认: 0]: ${RESET}"
-        read -r redis_db_cfg
-        [[ -z "$redis_db_cfg" ]] && redis_db_cfg="0"
-
-        [[ "$ext_rd_host" == "127.0.0.1" || "$ext_rd_host" == "localhost" ]] && ext_rd_host="172.17.0.1"
-
-        if [[ -n "$ext_rd_pass" ]]; then
-            redis_url="redis://:${ext_rd_pass}@${ext_rd_host}:${ext_rd_port}/${redis_db_cfg}"
-        else
-            redis_url="redis://${ext_rd_host}:${ext_rd_port}/${redis_db_cfg}"
-        fi
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
     fi
 
-    DETECT_IP=$(get_public_ip)
-    RAND_SECRET=$(generate_random_secret)
-    RAND_SALT=$(generate_random_secret)
+    echo -ne "${YELLOW}请输入 Torrent 传输端口 [默认: 6881]: ${RESET}"
+    read -r custom_p2p_port
+    [[ -z "$custom_p2p_port" ]] && custom_p2p_port="6881"
 
-    echo -e "${YELLOW}正在生成系统配套的 config.yaml 配置文件...${RESET}"
-    cat <<EOF > "$CONFIG_FILE"
-share:
-    download_secret: ${RAND_SECRET}
-    download_window: 12
-    password_salt: ${RAND_SALT}
+    echo -ne "${YELLOW}请输入宿主机下载绝对路径 [默认: /opt/qbittorrent/downloads]: ${RESET}"
+    read -r custom_download
+    [[ -z "$custom_download" ]] && custom_download="/opt/qbittorrent/downloads"
 
-upload:
-    path: /upload
-    maximum: 100GiB
-
-redis:
-    url: ${redis_url}
-
-features:
-    file-share:
-        enabled: true
-    text-share:
-        enabled: true
-    file-image-compress:
-        enabled: true
-    file-image-convert:
-        enabled: true
-
-site:
-    url: http://${DETECT_IP}:${custom_port}
-    title:
-        'en': '015'
-    desc:
-        'en': '015 is an open-source temporary file sharing platform project.'
-    icon: '/logo.png'
-    bg_url: 'https://img.fudaoyuan.icu/api/1/random/?scale_min=1.5&webp=true&md=false&format=302'
-
-about:
-    bg_url: 'https://files.mastodon.social/site_uploads/files/000/000/001/@1x/57c12f441d083cde.png'
-    content:
-        'zh': |
-            ### 015 临时文件分享平台
-            欢迎使用本站分享文件或文本。
-        'en': |
-            ### 015 Temporary Share Platform
-            Welcome to share files or texts here.
-    email: admin@domain.com
-    name: admin
-    url: 'http://${DETECT_IP}:${custom_port}'
-    avatar: ''
-EOF
+    mkdir -p "$BASE_DIR/config" "$custom_download"
+    chmod -R 777 "$BASE_DIR/config" "$custom_download"
 
     echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     
-    # 构建基础模板 (添加了工作区配置文件挂载和 CONFIG_PATH 环境变量修复 Viper 报错)
-    local compose_content="services:
-  app:
-    image: fudaoyuanicu/015-app:latest
+    # 根据网络模式动态拼装 docker-compose.yml
+    if [[ "$net_choice" == "2" ]]; then
+        # Host 模式配置文件
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
+    network_mode: host
     environment:
-      - CONFIG_PATH=/app/config.yaml
+      - PUID=$(id -u)
+      - PGID=$(id -g)
+      - TZ=Asia/Shanghai
+      - WEBUI_PORT=${custom_port}
+      - TORRENTING_PORT=${custom_p2p_port}
     volumes:
-      - ${custom_data}:/upload
-      - ${CONFIG_FILE}:/app/config.yaml
-      - ${CONFIG_FILE}:/config.yaml
-    ports:
-      - \"${custom_port}:80\""
-
-    if [[ "$redis_mode" == "1" ]]; then
-        compose_content="${compose_content}
-    depends_on:
-      redis:
-        condition: service_started"
-    fi
-
-    compose_content="${compose_content}
-
-  worker:
-    image: fudaoyuanicu/015-worker:latest
-    container_name: 015-worker
+      - ${BASE_DIR}/config:/config
+      - ${custom_download}:/downloads
+    stop_grace_period: 10s
     restart: unless-stopped
-    environment:
-      - CONFIG_PATH=/app/config.yaml
-    volumes:
-      - ${custom_data}:/upload
-      - ${CONFIG_FILE}:/app/config.yaml
-      - ${CONFIG_FILE}:/config.yaml
-    depends_on:
-      app:
-        condition: service_started"
-
-    if [[ "$redis_mode" == "1" ]]; then
-        compose_content="${compose_content}
-      redis:
-        condition: service_started
-
-  redis:
-    image: redis:7-alpine
-    container_name: 015-redis
-    restart: unless-stopped
-    command: redis-server --bind 0.0.0.0"
-    fi
-
-    echo "$compose_content" > "$COMPOSE_FILE"
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 015 分享平台群组...${RESET}"
-    cd "$BASE_DIR" && docker compose down && docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待服务容器初始化群组 (约5秒)...${RESET}"
-    sleep 5
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       015 分享平台 部署成功！      ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}宿主机存储路径 : $custom_data${RESET}"
-    if [[ "$redis_mode" == "1" ]]; then
-        echo -e "${CYAN}Redis 运行状态 : 容器内置独立运行 (015-redis)${RESET}"
+EOF
     else
-        echo -e "${CYAN}Redis 运行状态 : 成功桥接外部远程服务 -> ${ext_rd_host}:${ext_rd_port}${RESET}"
+        # Bridge 端口映射模式配置文件
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: ${CONTAINER_NAME}
+    environment:
+      - PUID=$(id -u)
+      - PGID=$(id -g)
+      - TZ=Asia/Shanghai
+      - WEBUI_PORT=${custom_port}
+      - TORRENTING_PORT=${custom_p2p_port}
+    volumes:
+      - ${BASE_DIR}/config:/config
+      - ${custom_download}:/downloads
+    ports:
+      - ${custom_port}:${custom_port}
+      - ${custom_p2p_port}:${custom_p2p_port}
+      - ${custom_p2p_port}:${custom_p2p_port}/udp
+    stop_grace_period: 10s
+    restart: unless-stopped
+EOF
     fi
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 qBittorrent...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器初始化并同步密码日志 (约10秒)...${RESET}"
+    sleep 10
+
+    SHOW_IP=$(get_public_ip)
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    qBittorrent  部署成功！    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${SHOW_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}默认用户名     : admin${RESET}"
+    echo -ne "${YELLOW}初始临时密码   : ${RESET}"
+    get_qb_password
+    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR/config${RESET}"
+    echo -e "${YELLOW}宿主机下载路径 : $custom_download${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-update_translate() {
+update_qbittorrent() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 015 各组件的最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 linuxserver 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
+    
+    echo -e "${YELLOW}正在应用更新并重启容器...${RESET}"
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！所有关联容器已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 015 容器环境吗？(y/n): ${RESET}"
+uninstall_qbittorrent() {
+    echo -ne "${YELLOW}确定要卸载并删除 qBittorrent 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器集群已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和上传的缓存文件？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和下载的数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}主配置与数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 015-worker 015-redis 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}所有服务已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}所有服务已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}所有服务已重启${RESET}"; }
-logs_translate() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+start_qb() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_qb() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_qb() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_qb() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    local DETECT_IP=$(get_public_ip)
+    SHOW_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}核心镜像       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
+    echo -e "${YELLOW}镜像版本       : ${img_version}${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${SHOW_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}P2P 传输端口   : ${torrent_port} (TCP/UDP)${RESET}"
+    echo -e "${YELLOW}宿主机下载路径 : ${download_dir}${RESET}"
+    echo -ne "${YELLOW}初始密码探测   : ${RESET}"
+    get_qb_password
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -300,10 +274,11 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   015 分享平台管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}      qBittorrent 管理面板       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}版本 :${RESET} ${YELLOW}${img_version}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}   ${GREEN}P2P端口 :${RESET} ${YELLOW}${torrent_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -318,13 +293,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
+        1) install_qbittorrent ;;
+        2) update_qbittorrent ;;
+        3) uninstall_qbittorrent ;;
+        4) start_qb ;;
+        5) stop_qb ;;
+        6) restart_qb ;;
+        7) logs_qb ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

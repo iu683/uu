@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# ConvertX 文件转换工具 Docker Compose 管理面板 
+# EasySub 订阅管理服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,9 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="convertx"
-# 默认主配置目录
-DEFAULT_BASE_DIR="/opt/convertx"
+CONTAINER_NAME="easysub"
+BASE_DIR="/opt/easysub"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
 check_dependencies() {
@@ -33,30 +33,27 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中动态提取信息
+    # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取 WebUI 端口 (ConvertX 容器内监听的是 3000)
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 8000 端口）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 兜底获取第一个绑定的端口
         [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="10000"
+        [[ -z "$webui_port" ]] && webui_port="8842"
 
-        # 动态提取自定义挂载路径
-        custom_data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        
-        # 定位 docker-compose.yml 的存放位置
-        if [[ -n "$custom_data_dir" ]]; then
-            BASE_DIR=$(dirname "$custom_data_dir")
-        fi
+        # 从容器状态提取数据目录（挂载路径）
+        data_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$data_dir" ]] && data_dir="/opt/easysub/data"
+    else
+        # 容器未安装/未部署时的返回值
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        data_dir="N/A"
     fi
-    
-    # 兜底路径
-    [[ -z "$BASE_DIR" || "$BASE_DIR" == "." ]] && BASE_DIR="$DEFAULT_BASE_DIR"
-    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-    [[ -z "$custom_data_dir" ]] && custom_data_dir="$BASE_DIR/data"
 }
 
 # 获取公网 IP (兼容双栈环境)
@@ -83,79 +80,62 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 ConvertX
-install_convertx() {
+# 部署 EasySub
+install_easysub() {
     check_dependencies
     
+    mkdir -p "$BASE_DIR"
+
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    # 1. 端口配置
-    echo -ne "${YELLOW}请输入 ConvertX 访问端口 [默认: 10000]: ${RESET}"
+    echo -ne "${YELLOW}请输入 EasySub 访问端口 (宿主机端口) [默认: 8842]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="10000"
+    [[ -z "$custom_port" ]] && custom_port="8842"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 2. 主脚本与 Compose 存放目录
-    echo -ne "${YELLOW}请输入面板配置文件存放路径 [默认: $DEFAULT_BASE_DIR]: ${RESET}"
-    read -r input_base
-    [[ -z "$input_base" ]] && input_base="$DEFAULT_BASE_DIR"
-    BASE_DIR="$input_base"
-    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/easysub/data]: ${RESET}"
+    read -r custom_data
+    [[ -z "$custom_data" ]] && custom_data="/opt/easysub/data"
 
-    # 3. 自定义 data 目录
-    echo -ne "${YELLOW}请输入【系统数据与缓存(data)】宿主机存储绝对路径 [默认: $BASE_DIR/data]: ${RESET}"
-    read -r input_data
-    [[ -z "$input_data" ]] && input_data="$BASE_DIR/data"
-    custom_data_dir="$input_data"
+    # 自动生成随机的安全 JWT Secret
+    if command -v openssl &> /dev/null; then
+        jwt_secret=$(openssl rand -hex 32)
+    else
+        jwt_secret="easysub_random_secret_$(date +%s%N)"
+    fi
 
-    # 4. 环境变量配置
-    echo -ne "${YELLOW}是否开放新用户注册？(true/false) [默认: false]: ${RESET}"
-    read -r reg_allowed
-    [[ -z "$reg_allowed" ]] && reg_allowed="false"
+    # 1. 创建所需的宿主机目录
+    mkdir -p "$custom_data"
+    chmod -R 777 "$BASE_DIR" "$custom_data"
 
-    # 自动生成随机密钥作为兜底
-    local auto_jwt=$(date +%s | sha256sum | base64 | head -c 32)
-    echo -ne "${YELLOW}请输入 JWT 密钥 (密文签名用) [默认: 随机生成]: ${RESET}"
-    read -r jwt_secret
-    [[ -z "$jwt_secret" ]] && jwt_secret="$auto_jwt"
-
-    echo -ne "${YELLOW}是否允许免登录匿名转换？(true/false) [默认: true]: ${RESET}"
-    read -r allow_unauth
-    [[ -z "$allow_unauth" ]] && allow_unauth="true"
-
-    echo -ne "${YELLOW}旧文件自动清理周期（小时，设为0禁用） [默认: 24]: ${RESET}"
-    read -r auto_delete
-    [[ -z "$auto_delete" ]] && auto_delete="24"
-    
-    # 创建所有用户自定义的目录并赋权
-    mkdir -p "$BASE_DIR"
-    mkdir -p "$custom_data_dir"
-    chmod -R 777 "$BASE_DIR" "$custom_data_dir"
-
-    # 生成 docker-compose.yml 配置文件
+    # 2. 动态生成符合要求的 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  convertx:
-    image: ghcr.io/c4illin/convertx
+  app:
+    image: suyijun8182/easysub:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
-    ports:
-      - "${custom_port}:3000"
     environment:
-      - ACCOUNT_REGISTRATION=${reg_allowed}
-      - JWT_SECRET=${jwt_secret}
-      - HTTP_ALLOWED=true
-      - ALLOW_UNAUTHENTICATED=${allow_unauth}
-      - AUTO_DELETE_EVERY_N_HOURS=${auto_delete}
+      JWT_SECRET: ${jwt_secret}
+      TZ: Asia/Shanghai
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: admin123          # 首次初始化后请在网页里修改密码
+      ADMIN_EMAIL: admin@example.com
+      REMINDER_SCAN_TIME: "09:00"       # 每天扫描到期订阅、发送提醒的时间
+      EXCHANGE_API_BASE: USD
+      EXCHANGE_API_URL: https://open.er-api.com/v6/latest/
+      TELEGRAM_BOT_TOKEN: ""            # 可留空，后续在网页「设置」里配置
     volumes:
-      - ${custom_data_dir}:/app/data
+      - ${custom_data}:/app/data        # 持久化数据
+    ports:
+      - "${custom_port}:8000"
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 ConvertX 服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 EasySub 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
@@ -163,43 +143,41 @@ EOF
 
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${GREEN}=====================================================${RESET}"
-    echo -e "${GREEN}              ConvertX 部署成功！                   ${RESET}"
-    echo -e "${GREEN}=====================================================${RESET}"
-    echo -e "${YELLOW}数据挂载路径 ：$custom_data_dir${RESET}"
-    echo -e "${YELLOW}自动清理周期 ：每 ${auto_delete} 小时清理一次旧缓存${RESET}"
-    echo -e "${YELLOW}服务访问地址 ：http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}      EasySub 部署成功！      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}默认管理员账号 : admin${RESET}"
+    echo -e "${YELLOW}默认管理员密码 : admin123 (进入网页后请立即修改！)${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新镜像
-update_convertx() {
-    get_status_info
+# 更新 EasySub 镜像
+update_easysub() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 ConvertX 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 EasySub 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载容器
-uninstall_convertx() {
-    get_status_info
-    echo -ne "${YELLOW}确定要卸载并删除 ConvertX 容器吗？(y/n): ${RESET}"
+# 卸载 EasySub
+uninstall_easysub() {
+    echo -ne "${YELLOW}确定要卸载并删除 EasySub 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有转换数据、缓存以及配置文件？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和数据目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                rm -rf "$custom_data_dir"
-                echo -e "${GREEN}所有自定义数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -208,27 +186,27 @@ uninstall_convertx() {
     fi
 }
 
-start_convertx() { get_status_info && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_convertx() { get_status_info && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_convertx() { get_status_info && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_convertx() { docker logs -f "$CONTAINER_NAME"; }
+start_easysub() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_easysub() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_easysub() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_easysub() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}=====================================================${RESET}"
-    echo -e "${YELLOW}当前状态     : $status"
-    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}数据目录路径 : ${custom_data_dir}${RESET}"
-    echo -e "${GREEN}=====================================================${RESET}"
+    local current_ip=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${current_ip}:${webui_port}${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈  ConvertX 转换工具管理面板 ◈   ${RESET}"
+    echo -e "${GREEN}    ◈  EasySub 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -246,13 +224,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_convertx ;;
-        2) update_convertx ;;
-        3) uninstall_convertx ;;
-        4) start_convertx ;;
-        5) stop_convertx ;;
-        6) restart_convertx ;;
-        7) logs_convertx ;;
+        1) install_easysub ;;
+        2) update_easysub ;;
+        3) uninstall_easysub ;;
+        4) start_easysub ;;
+        5) stop_easysub ;;
+        6) restart_easysub ;;
+        7) logs_easysub ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

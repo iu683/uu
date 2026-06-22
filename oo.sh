@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Cloudreve Docker Compose 管理面板 (本地/远程双模 + 高精端口版)
+# Cloudreve Docker Compose 管理面板 (本地/远程双模 + 网络桥接版)
 # =================================================================
 
 # 颜色定义
@@ -23,7 +23,7 @@ check_dependencies() {
 }
 
 get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local mode=${1:-"auto"}
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -45,7 +45,7 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器整体状态和端口 (采用原生 Docker Inspect 技术)
+# 动态获取容器整体状态和端口
 get_status_info() {
     if [ -f "$COMPOSE_FILE" ]; then
         if [ "$(docker ps -q -f name=cloudreve-backend)" ]; then
@@ -75,8 +75,8 @@ install_cloudreve() {
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 数据库/缓存运行模式选择 ======${RESET}"
-    echo -e " 1. 直接部署全新完整环境 (包含全新的本地 PostgreSQL 和 Redis 容器)"
-    echo -e " 2. 连接外部/远程已有的数据库与 Redis (需提前手动创建好 PostgreSQL 数据库)"
+    echo -e "${GREEN} 1. 直接部署全新完整环境 (包含全新的本地 PostgreSQL 和 Redis 容器)${RESET}"
+    echo -e "${GREEN} 2. 连接外部/远程已有的数据库与 Redis (需提前手动创建好 PostgreSQL 数据库)${RESET}"
     echo -ne "${YELLOW}请选择运行模式 [默认: 1]: ${RESET}"
     read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
@@ -90,7 +90,14 @@ install_cloudreve() {
         return
     fi
 
-    # === 核心新增：本地挂载目录自定义路径机制 ===
+    echo -ne "${YELLOW}请输入离线下载 P2P 监听端口 [默认: 6888]: ${RESET}"
+    read -r custom_p2p_port
+    [[ -z "$custom_p2p_port" ]] && custom_p2p_port="6888"
+    if ! [[ "$custom_p2p_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
+
     echo -e "${CYAN}====== 持久化数据挂载路径配置 ======${RESET}"
     echo -ne "${YELLOW}请输入网盘主体文件数据挂载目录 [默认: ${BASE_DIR}/uploads]: ${RESET}"
     read -r mount_uploads_dir
@@ -104,12 +111,7 @@ install_cloudreve() {
         [[ -z "$mount_db_dir" ]] && mount_db_dir="${BASE_DIR}/postgres_db"
         mkdir -p "$mount_db_dir"
 
-        echo -ne "${YELLOW}请输入内置 Redis 缓存数据挂载目录 [默认: ${BASE_DIR}/redis_db]: ${RESET}"
-        read -r mount_rd_dir
-        [[ -z "$mount_rd_dir" ]] && mount_rd_dir="${BASE_DIR}/redis_db"
-        mkdir -p "$mount_rd_dir"
-
-        echo -e "${YELLOW}正在配置全套本地内置容器环境...${RESET}"
+        echo -e "${YELLOW}正在配置全套本地内置容器环境 (Redis 将在纯内存中运行)...${RESET}"
         local rand_db_pass=$(openssl rand -hex 16)
         local db_user="cloudreve"
         local db_name="cloudreve"
@@ -125,8 +127,8 @@ services:
     restart: unless-stopped
     ports:
       - "${custom_port}:5212"
-      - "6888:6888"
-      - "6888:6888/udp"
+      - "${custom_p2p_port}:6888"
+      - "${custom_p2p_port}:6888/udp"
     environment:
       - CR_CONF_Database.Type=postgres
       - CR_CONF_Database.Host=postgresql
@@ -136,6 +138,8 @@ services:
       - CR_CONF_Database.Port=5432
       - CR_CONF_Redis.Server=redis:6379
       - CR_CONF_Redis.DB=0
+    networks:
+      - cloudreve_net
     volumes:
       - ${mount_uploads_dir}:/cloudreve/data
 
@@ -147,6 +151,8 @@ services:
       - POSTGRES_USER=${db_user}
       - POSTGRES_PASSWORD=${rand_db_pass}
       - POSTGRES_DB=${db_name}
+    networks:
+      - cloudreve_net
     volumes:
       - ${mount_db_dir}:/var/lib/postgresql/data
 
@@ -154,8 +160,12 @@ services:
     container_name: redis
     image: redis:alpine
     restart: unless-stopped
-    volumes:
-      - ${mount_rd_dir}:/data
+    networks:
+      - cloudreve_net
+
+networks:
+  cloudreve_net:
+    driver: bridge
 EOF
 
     # ------------------ 模式 2：连接外部/远程已有的 PostgreSQL + Redis ------------------
@@ -192,14 +202,27 @@ EOF
         echo -ne "${YELLOW}请输入 Redis 密码 (若无密码请直接回车): ${RESET}"
         read -r ext_rd_pass
 
-        # 外部 Redis 数据库号配置
         echo -ne "${YELLOW}请输入远程 Redis 数据库号 (DB ID) [默认: 0]: ${RESET}"
         read -r redis_db_cfg
         [[ -z "$redis_db_cfg" ]] && redis_db_cfg="0"
 
-        # 突破 Docker 宿主机回环地址限制
         [[ "$ext_db_host" == "127.0.0.1" || "$ext_db_host" == "localhost" ]] && ext_db_host="172.17.0.1"
         [[ "$ext_rd_host" == "127.0.0.1" || "$ext_rd_host" == "localhost" ]] && ext_rd_host="172.17.0.1"
+
+        # 动态构建环境块，完美支持可选的密码字段
+        local env_block="      - CR_CONF_Database.Type=postgres
+      - CR_CONF_Database.Host=${ext_db_host}
+      - CR_CONF_Database.User=${ext_db_user}
+      - CR_CONF_Database.Password=${ext_db_pass}
+      - CR_CONF_Database.Name=${ext_db_name}
+      - CR_CONF_Database.Port=${ext_db_port}
+      - CR_CONF_Redis.Server=${ext_rd_host}:${ext_rd_port}
+      - CR_CONF_Redis.DB=${redis_db_cfg}"
+
+        if [[ -n "$ext_rd_pass" ]]; then
+            env_block="${env_block}
+      - CR_CONF_Redis.Password=${ext_rd_pass}"
+        fi
 
         cat << EOF > "$COMPOSE_FILE"
 services:
@@ -209,25 +232,13 @@ services:
     restart: unless-stopped
     ports:
       - "${custom_port}:5212"
-      - "6888:6888"
-      - "6888:6888/udp"
+      - "${custom_p2p_port}:6888"
+      - "${custom_p2p_port}:6888/udp"
     environment:
-      - CR_CONF_Database.Type=postgres
-      - CR_CONF_Database.Host=${ext_db_host}
-      - CR_CONF_Database.User=${ext_db_user}
-      - CR_CONF_Database.Password=${ext_db_pass}
-      - CR_CONF_Database.Name=${ext_db_name}
-      - CR_CONF_Database.Port=${ext_db_port}
-      - CR_CONF_Redis.Server=${ext_rd_host}:${ext_rd_port}
-      - CR_CONF_Redis.DB=${redis_db_cfg}
+$(echo "$env_block")
     volumes:
       - ${mount_uploads_dir}:/cloudreve/data
 EOF
-
-        # 仅当外部 Redis 设置了密码时，才追加独立密码环境变量
-        if [[ -n "$ext_rd_pass" ]]; then
-            echo "      - CR_CONF_Redis.Password=${ext_rd_pass}" >> "$COMPOSE_FILE"
-        fi
     fi
 
     # ------------------ 启动集群 ------------------
@@ -244,14 +255,14 @@ EOF
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${GREEN}              Cloudreve 部署成功！                    ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}访问端点(URL) : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}访问端点(URL)  : http://${DETECT_IP}:${custom_port}${RESET}"
     echo -e "${YELLOW}映射宿主机端口 : ${custom_port}${RESET}"
-    echo -e "${YELLOW}离线下载端口   : 6888 (TCP/UDP已开启)${RESET}"
+    echo -e "${YELLOW}离线下载端口   : ${custom_p2p_port} (TCP/UDP已开启)${RESET}"
     echo -e "${CYAN}主体存储路径   : ${mount_uploads_dir}${RESET}"
     if [[ "$db_mode" == "1" ]]; then
         echo -e "${YELLOW}内置库密码凭证 : 用户:${db_user} | 密码:${rand_db_pass} | 库名:${db_name}${RESET}"
         echo -e "${CYAN}DB持久化路径   : ${mount_db_dir}${RESET}"
-        echo -e "${CYAN}Redis持久化路径: ${mount_rd_dir}${RESET}"
+        echo -e "${CYAN}Redis持久化   : 纯内存运行 (无宿主机挂载)${RESET}"
     else
         echo -e "${YELLOW}连接外部数据库 : ${ext_db_host}:${ext_db_port} -> 库名:${ext_db_name}${RESET}"
         echo -e "${YELLOW}连接外部缓存库 : Redis -> ${ext_rd_host}:${ext_rd_port} (DB ID: ${redis_db_cfg})${RESET}"
@@ -278,16 +289,11 @@ uninstall_cloudreve() {
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            # 解析原挂载目录以便在完全清理时提供一键删除
-            local old_uploads=$(grep -A 10 "cloudreve:" "$COMPOSE_FILE" 2>/dev/null | grep -E '\-[[:space:]]*/.*/.*:/cloudreve/data' | awk -F ':' '{print $1}' | tr -d '[:space:]-')
-            
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已全部终止并移除。${RESET}"
             echo -ne "${RED}是否同步清理掉本地所有【自定义挂载目录的数据】和环境？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                # 如果从配置文件中拿到了真实路径，就予以彻底清理
-                [[ -n "$old_uploads" && -d "$old_uploads" ]] && rm -rf "$old_uploads" && echo -e "${YELLOW}已清除核心网盘文件:${old_uploads}${RESET}"
                 rm -rf "$BASE_DIR"
                 echo -e "${GREEN}工作目录及所有自定义挂载数据已被彻底清除。${RESET}"
             fi

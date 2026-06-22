@@ -1,20 +1,20 @@
 #!/bin/bash
 # =================================================================
-# MediaStationGo 工具箱 Docker Compose 多模式管理面板 
+# Cloudreve Docker Compose 管理面板 (本地/远程双模 + 高精端口版)
 # =================================================================
 
-# 颜色
+# 颜色定义
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="mediastation-go"
-BASE_DIR="/opt/mediastation_go"
+BASE_DIR="/opt/cloudreve"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+DEFAULT_IMAGE="cloudreve/cloudreve:latest"
 
-# 检测依赖
+# 检测依赖环境
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
@@ -22,36 +22,8 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
-get_status_info() {
-    # 1. 检查主容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
-
-    # 2. 如果容器存在，从容器状态中提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 从容器状态提取 Web 端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="18080"
-    else
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-    fi
-}
-
-# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"}
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -73,363 +45,305 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 MediaStationGo
-install_utils() {
-    check_dependencies
-    
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 如果路径不存在，将自动创建。可以直接回车使用默认值。${RESET}"
-    
-    # 路径 1: 运行数据
-    echo -ne "${YELLOW}请输入运行数据目录 [默认: ./data]: ${RESET}"
-    read -r path_data
-    [[ -z "$path_data" ]] && path_data="./data"
-
-    # 路径 2: 缓存目录
-    echo -ne "${YELLOW}请输入缓存目录 [默认: ./cache]: ${RESET}"
-    read -r path_cache
-    [[ -z "$path_cache" ]] && path_cache="./cache"
-
-    # 路径 3: 媒体库目录
-    echo -ne "${YELLOW}请输入媒体库真实路径 [默认:./Media]: ${RESET}"
-    read -r path_media
-    [[ -z "$path_media" ]] && path_media="./Media"
-
-    # 路径 4: 下载目录
-    echo -ne "${YELLOW}请输入下载库真实路径 [默认:./Downloads]: ${RESET}"
-    read -r path_downloads
-    [[ -z "$path_downloads" ]] && path_downloads="./Downloads"
-
-    # 预创建目录（如果是相对路径如 ./data 则在 $BASE_DIR 下创建）
-    [[ "$path_data" == "./"* ]] && mkdir -p "$BASE_DIR/${path_data#./}" || mkdir -p "$path_data"
-    [[ "$path_cache" == "./"* ]] && mkdir -p "$BASE_DIR/${path_cache#./}" || mkdir -p "$path_cache"
-    [[ "$path_media" == "./"* ]] && mkdir -p "$BASE_DIR/${path_media#./}" || mkdir -p "$path_media"
-    [[ "$path_downloads" == "./"* ]] && mkdir -p "$BASE_DIR/${path_downloads#./}" || mkdir -p "$path_downloads"
-
-    echo -e "\n${CYAN}====== 2. 架构模式选择 ======${RESET}"
-    echo -e "${GREEN}1.${RESET} 本地 PostgreSQL (轻量推荐)"
-    echo -e "${GREEN}2.${RESET} 本地 PostgreSQL + 本地 Redis (多用户高并发推荐)"
-    echo -e "${GREEN}3.${RESET} 远程/外部 PostgreSQL (免建库模式)"
-    echo -e "${GREEN}4.${RESET} 远程 PostgreSQL + 远程 Redis (完全分离模式)"
-    echo -ne "${YELLOW}请选择模式编号 [默认: 1]: ${RESET}"
-    read -r mode_choice
-    [[ -z "$mode_choice" ]] && mode_choice="1"
-
-    echo -e "\n${CYAN}====== 3. 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 18080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="18080"
-
-    # 初始化变量
-    local depends_block=""
-    local redis_env=""
-    local db_dsn="postgres://mediastation:mediastation@postgres:5432/mediastation?sslmode=disable"
-    local extra_services=""
-
-    # 模式判断与参数拼装
-    if [[ "$mode_choice" == "1" ]]; then
-        mkdir -p "$BASE_DIR/postgres"
-        docker pull postgres:16-alpine
-        depends_block="depends_on:
-      postgres:
-        condition: service_healthy"
-        extra_services="  postgres:
-    image: postgres:16-alpine
-    pull_policy: never
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: mediastation
-      POSTGRES_USER: mediastation
-      POSTGRES_PASSWORD: mediastation
-      TZ: Asia/Shanghai
-    volumes:
-      - ./postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U mediastation -d mediastation\"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    logging:
-      driver: json-file
-      options:
-        max-size: \"10m\"
-        max-file: \"3\""
-
-    elif [[ "$mode_choice" == "2" ]]; then
-        mkdir -p "$BASE_DIR/postgres" "$BASE_DIR/redis"
-        docker pull postgres:16-alpine
-        docker pull redis:7-alpine
-        depends_block="depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy"
-        redis_env="MEDIASTATION_CACHE_REDIS_URL: redis://redis:6379/0"
-        extra_services="  postgres:
-    image: postgres:16-alpine
-    pull_policy: never
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: mediastation
-      POSTGRES_USER: mediastation
-      POSTGRES_PASSWORD: mediastation
-      TZ: Asia/Shanghai
-    volumes:
-      - ./postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U mediastation -d mediastation\"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    logging:
-      driver: json-file
-      options:
-        max-size: \"10m\"
-        max-file: \"3\"
-
-  redis:
-    image: redis:7-alpine
-    pull_policy: never
-    restart: unless-stopped
-    command:
-      - redis-server
-      - --appendonly
-      - \"yes\"
-      - --maxmemory
-      - 256mb
-      - --maxmemory-policy
-      - allkeys-lru
-    volumes:
-      - ./redis:/data
-    healthcheck:
-      test: [\"CMD\", \"redis-cli\", \"ping\"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    logging:
-      driver: json-file
-      options:
-        max-size: \"10m\"
-        max-file: \"3\""
-
-    elif [[ "$mode_choice" == "3" || "$mode_choice" == "4" ]]; then
-        echo -e "\n${CYAN}====== 远程/外部 PostgreSQL 信息输入 ======${RESET}"
-        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r ext_host
-        [[ -z "$ext_host" ]] && ext_host="127.0.0.1"
-        
-        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
-        read -r ext_port
-        [[ -z "$ext_port" ]] && ext_port="5432"
-        
-        echo -ne "${YELLOW}请输入数据库用户名 [默认: MediaStationGo]: ${RESET}"
-        read -r ext_user
-        [[ -z "$ext_user" ]] && ext_user="MediaStationGo"
-        
-        echo -ne "${YELLOW}请输入数据库密码 (必填): ${RESET}"
-        read -r ext_pass
-        if [[ -z "$ext_pass" ]]; then
-            echo -e "${RED}错误: 密码不能为空！${RESET}"
-            return
+# 动态获取容器整体状态和端口 (采用原生 Docker Inspect 技术)
+get_status_info() {
+    if [ -f "$COMPOSE_FILE" ]; then
+        if [ "$(docker ps -q -f name=cloudreve-backend)" ]; then
+            status="${GREEN}运行中${RESET}"
+            web_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5212/tcp") 0).HostPort}}' cloudreve-backend 2>/dev/null)
+        elif [ "$(docker ps -aq -f name=cloudreve-backend)" ]; then
+            status="${YELLOW}已停止${RESET}"
+            web_port=""
+        else
+            status="${RED}未部署${RESET}"
+            web_port=""
         fi
         
-        echo -ne "${YELLOW}请输入目标数据库名 [默认: MediaStationGo]: ${RESET}"
-        read -r ext_dbname
-        [[ -z "$ext_dbname" ]] && ext_dbname="MediaStationGo"
-
-        # 拼接成 DSN 字符串
-        db_dsn="postgres://${ext_user}:${ext_pass}@${ext_host}:${ext_port}/${ext_dbname}?sslmode=disable"
-
-        # 如果选了第 4 种模式，进一步索要远程 Redis 的配置信息
-        if [[ "$mode_choice" == "4" ]]; then
-            echo -e "\n${CYAN}====== 远程/外部 Redis 信息输入 ======${RESET}"
-            echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
-            read -r redis_host
-            [[ -z "$redis_host" ]] && redis_host="127.0.0.1"
-
-            echo -ne "${YELLOW}请输入 Redis 端口 [默认: 6379]: ${RESET}"
-            read -r redis_port
-            [[ -z "$redis_port" ]] && redis_port="6379"
-
-            echo -ne "${YELLOW}请输入 Redis 密码 (没有请直接回车): ${RESET}"
-            read -r redis_pass
-
-            echo -ne "${YELLOW}请输入 Redis 数据库号 (DB ID) [默认: 0]: ${RESET}"
-            read -r redis_db
-            [[ -z "$redis_db" ]] && redis_db="0"
-
-            # 组装 Redis 环境变量 URL
-            if [[ -n "$redis_pass" ]]; then
-                redis_env="MEDIASTATION_CACHE_REDIS_URL: redis://:${redis_pass}@${redis_host}:${redis_port}/${redis_db}"
-            else
-                redis_env="MEDIASTATION_CACHE_REDIS_URL: redis://${redis_host}:${redis_port}/${redis_db}"
-            fi
+        if [ -z "$web_port" ]; then
+            web_port=$(grep -A 5 "cloudreve:" "$COMPOSE_FILE" 2>/dev/null | grep -E '\-[[:space:]]*["'\'']?.*:5212' | head -n 1 | grep -oE '[0-9]+:5212' | cut -d':' -f1)
+            [[ -z "$web_port" ]] && web_port="5212"
         fi
     else
-        echo -e "${RED}错误: 无效的选择！${RESET}"
+        status="${RED}未初始化${RESET}"
+        web_port="N/A"
+    fi
+}
+
+# 部署 Cloudreve
+install_cloudreve() {
+    check_dependencies
+    mkdir -p "$BASE_DIR"
+
+    echo -e "${CYAN}====== 数据库/缓存运行模式选择 ======${RESET}"
+    echo -e " 1. 直接部署全新完整环境 (包含全新的本地 PostgreSQL 和 Redis 容器)"
+    echo -e " 2. 连接外部/远程已有的数据库与 Redis (需提前手动创建好 PostgreSQL 数据库)"
+    echo -ne "${YELLOW}请选择运行模式 [默认: 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
+
+    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Cloudreve Web 访问端口 [默认: 5212]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="5212"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  mediastation-go:
-    image: ghcr.io/shukebta/mediastation-go:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    init: true
-    ${depends_block}
-    ports:
-      - "${custom_port}:8080"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ${path_data}:/data
-      - ${path_cache}:/cache
-      - ${path_media}:/media
-      - ${path_downloads}:/downloads
-    environment:
-      TZ: Asia/Shanghai
-      PUID: "1000"
-      PGID: "1000"
-      MEDIASTATION_APP_HOST: 0.0.0.0
-      MEDIASTATION_APP_PORT: 8080
-      MEDIASTATION_APP_WEB_DIR: /app/web/dist
-      MEDIASTATION_APP_DATA_DIR: /data
-      MEDIASTATION_LOGGING_LEVEL: warn
-      MEDIASTATION_LOGGING_FORMAT: console
-      MEDIASTATION_LOGGING_OUTPUT_PATH: /data/logs
-      MEDIASTATION_DATABASE_TYPE: postgres
-      MEDIASTATION_DATABASE_DSN: "${db_dsn}"
-      ${redis_env}
-      MEDIASTATION_DATABASE_DB_PATH: /data/mediastation.db
-      MEDIASTATION_CACHE_CACHE_DIR: /cache
-      MEDIASTATION_MEDIA_DIR: ${path_media}
-      MEDIASTATION_MEDIA_CONTAINER_DIR: /media
-      MEDIASTATION_DOWNLOAD_DIR: ${path_downloads}
-      MEDIASTATION_DOWNLOAD_CONTAINER_DIR: /downloads
-      MEDIASTATION_TRANSCODER_ENABLED: "true"
-      MEDIASTATION_TRANSCODER_HARDWARE_ACCEL: "false"
-      MEDIASTATION_TRANSCODER_REALTIME: "true"
-      MEDIASTATION_TRANSCODER_THREADS: "2"
-      MEDIASTATION_TRANSCODER_MAX_CONCURRENT: "1"
-      MEDIASTATION_TRANSCODER_IDLE_TIMEOUT_SECONDS: "120"
-    healthcheck:
-      test: ["CMD-SHELL", "busybox wget -qO- http://127.0.0.1:8080/api/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    # === 核心新增：本地挂载目录自定义路径机制 ===
+    echo -e "${CYAN}====== 持久化数据挂载路径配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入网盘主体文件数据挂载目录 [默认: ${BASE_DIR}/uploads]: ${RESET}"
+    read -r mount_uploads_dir
+    [[ -z "$mount_uploads_dir" ]] && mount_uploads_dir="${BASE_DIR}/uploads"
+    mkdir -p "$mount_uploads_dir"
 
-${extra_services}
+    # ------------------ 模式 1：全套本地内置容器化 ------------------
+    if [[ "$db_mode" == "1" ]]; then
+        echo -ne "${YELLOW}请输入内置 PostgreSQL 数据库数据挂载目录 [默认: ${BASE_DIR}/postgres_db]: ${RESET}"
+        read -r mount_db_dir
+        [[ -z "$mount_db_dir" ]] && mount_db_dir="${BASE_DIR}/postgres_db"
+        mkdir -p "$mount_db_dir"
+
+        echo -ne "${YELLOW}请输入内置 Redis 缓存数据挂载目录 [默认: ${BASE_DIR}/redis_db]: ${RESET}"
+        read -r mount_rd_dir
+        [[ -z "$mount_rd_dir" ]] && mount_rd_dir="${BASE_DIR}/redis_db"
+        mkdir -p "$mount_rd_dir"
+
+        echo -e "${YELLOW}正在配置全套本地内置容器环境...${RESET}"
+        local rand_db_pass=$(openssl rand -hex 16)
+        local db_user="cloudreve"
+        local db_name="cloudreve"
+
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  cloudreve:
+    container_name: cloudreve-backend
+    image: ${DEFAULT_IMAGE}
+    depends_on:
+      - postgresql
+      - redis
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:5212"
+      - "6888:6888"
+      - "6888:6888/udp"
+    environment:
+      - CR_CONF_Database.Type=postgres
+      - CR_CONF_Database.Host=postgresql
+      - CR_CONF_Database.User=${db_user}
+      - CR_CONF_Database.Password=${rand_db_pass}
+      - CR_CONF_Database.Name=${db_name}
+      - CR_CONF_Database.Port=5432
+      - CR_CONF_Redis.Server=redis:6379
+      - CR_CONF_Redis.DB=0
+    volumes:
+      - ${mount_uploads_dir}:/cloudreve/data
+
+  postgresql:
+    container_name: postgresql
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${db_user}
+      - POSTGRES_PASSWORD=${rand_db_pass}
+      - POSTGRES_DB=${db_name}
+    volumes:
+      - ${mount_db_dir}:/var/lib/postgresql/data
+
+  redis:
+    container_name: redis
+    image: redis:alpine
+    restart: unless-stopped
+    volumes:
+      - ${mount_rd_dir}:/data
 EOF
 
-    echo -e "${YELLOW}正在启动 Docker 容器集群...${RESET}"
+    # ------------------ 模式 2：连接外部/远程已有的 PostgreSQL + Redis ------------------
+    else
+        echo -e "${CYAN}====== 远程/外部 PostgreSQL 信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_db_host
+        [[ -z "$ext_db_host" ]] && ext_db_host="127.0.0.1"
+        
+        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
+        read -r ext_db_port
+        [[ -z "$ext_db_port" ]] && ext_db_port="5432"
+        
+        echo -ne "${YELLOW}请输入数据库用户名 [默认: cloudreve]: ${RESET}"
+        read -r ext_db_user
+        [[ -z "$ext_db_user" ]] && ext_db_user="cloudreve"
+        
+        echo -ne "${YELLOW}请输入数据库密码: ${RESET}"
+        read -r ext_db_pass
+        
+        echo -ne "${YELLOW}请输入目标数据库名 [默认: cloudreve]: ${RESET}"
+        read -r ext_db_name
+        [[ -z "$ext_db_name" ]] && ext_db_name="cloudreve"
+
+        echo -e "${CYAN}====== 远程/外部 Redis 信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_rd_host
+        [[ -z "$ext_rd_host" ]] && ext_rd_host="127.0.0.1"
+        
+        echo -ne "${YELLOW}请输入 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r ext_rd_port
+        [[ -z "$ext_rd_port" ]] && ext_rd_port="6379"
+
+        echo -ne "${YELLOW}请输入 Redis 密码 (若无密码请直接回车): ${RESET}"
+        read -r ext_rd_pass
+
+        # 外部 Redis 数据库号配置
+        echo -ne "${YELLOW}请输入远程 Redis 数据库号 (DB ID) [默认: 0]: ${RESET}"
+        read -r redis_db_cfg
+        [[ -z "$redis_db_cfg" ]] && redis_db_cfg="0"
+
+        # 突破 Docker 宿主机回环地址限制
+        [[ "$ext_db_host" == "127.0.0.1" || "$ext_db_host" == "localhost" ]] && ext_db_host="172.17.0.1"
+        [[ "$ext_rd_host" == "127.0.0.1" || "$ext_rd_host" == "localhost" ]] && ext_rd_host="172.17.0.1"
+
+        cat << EOF > "$COMPOSE_FILE"
+services:
+  cloudreve:
+    container_name: cloudreve-backend
+    image: ${DEFAULT_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:5212"
+      - "6888:6888"
+      - "6888:6888/udp"
+    environment:
+      - CR_CONF_Database.Type=postgres
+      - CR_CONF_Database.Host=${ext_db_host}
+      - CR_CONF_Database.User=${ext_db_user}
+      - CR_CONF_Database.Password=${ext_db_pass}
+      - CR_CONF_Database.Name=${ext_db_name}
+      - CR_CONF_Database.Port=${ext_db_port}
+      - CR_CONF_Redis.Server=${ext_rd_host}:${ext_rd_port}
+      - CR_CONF_Redis.DB=${redis_db_cfg}
+    volumes:
+      - ${mount_uploads_dir}:/cloudreve/data
+EOF
+
+        # 仅当外部 Redis 设置了密码时，才追加独立密码环境变量
+        if [[ -n "$ext_rd_pass" ]]; then
+            echo "      - CR_CONF_Redis.Password=${ext_rd_pass}" >> "$COMPOSE_FILE"
+        fi
+    fi
+
+    # ------------------ 启动集群 ------------------
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Cloudreve 服务中...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务初始化完成 (约5秒)...${RESET}"
-    sleep 5
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}部署失败，请检查 Docker 日志。${RESET}"
+        return
+    fi
 
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    MediaStationGo 部署成功！    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前模式       : 模式 ${mode_choice}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}默认账号/密码  : admin/admin123${RESET}"
-    echo -e "${YELLOW}运行数据路径   : ${path_data}${RESET}"
-    echo -e "${YELLOW}影视媒体路径   : ${path_media}${RESET}"
-    echo -e "${YELLOW}配置文件存储   : $COMPOSE_FILE${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}              Cloudreve 部署成功！                    ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}访问端点(URL) : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}映射宿主机端口 : ${custom_port}${RESET}"
+    echo -e "${YELLOW}离线下载端口   : 6888 (TCP/UDP已开启)${RESET}"
+    echo -e "${CYAN}主体存储路径   : ${mount_uploads_dir}${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}内置库密码凭证 : 用户:${db_user} | 密码:${rand_db_pass} | 库名:${db_name}${RESET}"
+        echo -e "${CYAN}DB持久化路径   : ${mount_db_dir}${RESET}"
+        echo -e "${CYAN}Redis持久化路径: ${mount_rd_dir}${RESET}"
+    else
+        echo -e "${YELLOW}连接外部数据库 : ${ext_db_host}:${ext_db_port} -> 库名:${ext_db_name}${RESET}"
+        echo -e "${YELLOW}连接外部缓存库 : Redis -> ${ext_rd_host}:${ext_rd_port} (DB ID: ${redis_db_cfg})${RESET}"
+    fi
+    echo -e "${YELLOW}面板工作路径   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新
-update_utils() {
+# 更新服务
+update_cloudreve() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在更新 MediaStationGo 镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull mediastation-go
+    echo -e "${YELLOW}正在拉取 Cloudreve 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！${RESET}"
+    echo -e "${GREEN}服务已升级并拉升至最新状态！${RESET}"
 }
 
-# 卸载
-uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 MediaStationGo 服务集群吗？(y/n): ${RESET}"
+# 卸载集群
+uninstall_cloudreve() {
+    echo -ne "${RED}确定要注销并删除 Cloudreve 服务集群吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
+            # 解析原挂载目录以便在完全清理时提供一键删除
+            local old_uploads=$(grep -A 10 "cloudreve:" "$COMPOSE_FILE" 2>/dev/null | grep -E '\-[[:space:]]*/.*/.*:/cloudreve/data' | awk -F ':' '{print $1}' | tr -d '[:space:]-')
+            
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时清理脚本主配置目录 (不会主动删除独立媒体库)？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已全部终止并移除。${RESET}"
+            echo -ne "${RED}是否同步清理掉本地所有【自定义挂载目录的数据】和环境？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                # 如果从配置文件中拿到了真实路径，就予以彻底清理
+                [[ -n "$old_uploads" && -d "$old_uploads" ]] && rm -rf "$old_uploads" && echo -e "${YELLOW}已清除核心网盘文件:${old_uploads}${RESET}"
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据彻底清理。${RESET}"
+                echo -e "${GREEN}工作目录及所有自定义挂载数据已被彻底清除。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            docker rm -f cloudreve-backend postgresql redis 2>/dev/null
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        echo -e "${GREEN}完全卸载完毕！${RESET}"
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务集群已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务集群已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务集群已重启${RESET}"; }
-logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+# 周期控制
+start_cr() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已正常启动${RESET}"; }
+stop_cr() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已安全暂停${RESET}"; }
+restart_cr() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已完成软重启${RESET}"; }
+logs_cr() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
+# 配置显示
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}默认管理账号   : admin / admin123${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}当前运行状态   : $status"
+    echo -e "${YELLOW}实际映射端口   : ${web_port}${RESET}"
+    echo -e "${YELLOW}本地项目路径   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
+# 主菜单
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈  MediaStationGo 媒体面板  ◈  ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}     ◈  Cloudreve 管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 当前状态 :${RESET} $status"
+    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 1. 部署启动${RESET}"
+    echo -e "${GREEN} 2. 更新服务${RESET}"
+    echo -e "${GREEN} 3. 卸载服务${RESET}"
+    echo -e "${GREEN} 4. 启动服务${RESET}"
+    echo -e "${GREEN} 5. 停止服务${RESET}"
+    echo -e "${GREEN} 6. 重启服务${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_utils ;;
-        2) update_utils ;;
-        3) uninstall_utils ;;
-        4) start_utils ;;
-        5) stop_utils ;;
-        6) restart_utils ;;
-        7) logs_utils ;;
+        1) install_cloudreve ;;
+        2) update_cloudreve ;;
+        3) uninstall_cloudreve ;;
+        4) start_cr ;;
+        5) stop_cr ;;
+        6) restart_cr ;;
+        7) logs_cr ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

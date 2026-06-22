@@ -1,27 +1,30 @@
 #!/bin/bash
 # =================================================================
-# Forgejo Git 服务 Docker Compose 管理面板 (含宿主机22端口直通版)
+# Moe-Counter 萌萌计数器 Docker Compose 管理面板 
 # =================================================================
 
+# 颜色
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="forgejo"
-BASE_DIR="/opt/forgejo"
+CONTAINER_NAME="moe-counter"
+BASE_DIR="/opt/moe-counter"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-SHELL_PROXY="/usr/local/bin/forgejo-shell"
 
+# 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker！${RESET}"
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
 }
 
+# 动态获取容器状态、映射端口和数据目录
 get_status_info() {
+    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -30,18 +33,23 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
+    # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        # 从容器状态提取 WebUI 端口（根据绑定的端口动态获取）
+        webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port="3000"
-        ssh_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "22/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$ssh_port" ]] && ssh_port="222"
+
+        # 从容器状态提取数据目录（挂载路径）
         data_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="/opt/forgejo/forgejo"
+        [[ -z "$data_dir" ]] && data_dir="/opt/moe-counter/data"
     else
+        # 容器未安装/未部署时的返回值
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        ssh_port="N/A"
         data_dir="N/A"
     fi
 }
@@ -69,140 +77,98 @@ get_public_ip() {
     fi
     echo "127.0.0.1" && return 0
 }
-# 部署服务
-install_forgejo() {
+
+# 检查环境是否已经部署
+check_compose_exists() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return 1
+    fi
+    return 0
+}
+
+# 部署 Moe-Counter
+install_moe() {
     check_dependencies
+    
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    current_uid=$(id -u)
-    current_gid=$(id -g)
-    [[ "$current_uid" = "0" ]] && current_uid=1000 && current_gid=1000
-
-    echo -ne "${YELLOW}请输入 Forgejo Web 访问端口 [默认: 3000]: ${RESET}"
-    read -r custom_web_port
-    [[ -z "$custom_web_port" ]] && custom_web_port="3000"
-
-    echo -ne "${YELLOW}请输入 Forgejo 容器独立 SSH 映射端口 [默认: 222]: ${RESET}"
-    read -r custom_ssh_port
-    [[ -z "$custom_ssh_port" ]] && custom_ssh_port="222"
-
-    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/forgejo/forgejo]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="/opt/forgejo/forgejo"
-
-    mkdir -p "$custom_data"
-    chmod -R 775 "$custom_data"
-
-    cat <<EOF > "$COMPOSE_FILE"
-networks:
-  forgejo:
-    external: false
-
-services:
-  server:
-    image: codeberg.org/forgejo/forgejo:15
-    container_name: ${CONTAINER_NAME}
-    environment:
-      - USER_UID=${current_uid}
-      - USER_GID=${current_gid}
-    restart: always
-    networks:
-      - forgejo
-    volumes:
-      - ${custom_data}:/data
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
-    ports:
-      - "${custom_web_port}:3000"
-      - "${custom_ssh_port}:22"
-EOF
-
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-    sleep 3
-    DETECT_IP=$(get_public_ip)
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Firefox (jlesage) 部署成功！ ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}Web 浏览器访问地址: http://${DETECT_IP}:${custom_web_port}${RESET}"
-    echo -e "${YELLOW}VNC 客户端连接地址: ${DETECT_IP}:${custom_vnc_port}${RESET}"
-    echo -e "${YELLOW}访问/连接密码     : $vnc_pwd${RESET}"
-    echo -e "${YELLOW}宿主机数据路径    : $custom_data${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-# 🚀 你的踩坑点解决方案：一键配置宿主机 22 端口直通容器
-setup_ssh_passthrough() {
-    get_status_info
-    if [ "$status" != "${YELLOW}运行中${RESET}" ]; then
-        echo -e "${RED}错误: Forgejo 容器未运行，请先部署或启动它！${RESET}"
-        return
-    fi
-
-    echo -e "${CYAN}====== 开始配置宿主机 22 端口 SSH 直通 ======${RESET}"
     
-    # 1. 检查或创建宿主机 git 用户
-    if ! id "git" &>/dev/null; then
-        echo -e "${YELLOW}正在创建宿主机 git 用户...${RESET}"
-        sudo useradd -m -s /bin/bash git
-    fi
-
-    # 2. 创建 shell 代理脚本
-    echo -e "${YELLOW}正在创建 Shell 代理脚本: ${SHELL_PROXY}...${RESET}"
-    sudo tee "$SHELL_PROXY" > /dev/null << 'EOF'
-#!/bin/sh
-/usr/bin/docker exec -i -u git --env SSH_ORIGINAL_COMMAND="$SSH_ORIGINAL_COMMAND" forgejo sh "$@"
-EOF
-    sudo chmod +x "$SHELL_PROXY"
-
-    # 3. 修改 git 用户的登录 shell
-    echo -e "${YELLOW}修改 git 用户的登录 Shell 为代理脚本...${RESET}"
-    sudo usermod -s "$SHELL_PROXY" git
-
-    # 4. 修改宿主机 sshd_config
-    if ! sudo grep -q "Match User git" /etc/ssh/sshd_config; then
-        echo -e "${YELLOW}正在配置宿主机 /etc/ssh/sshd_config...${RESET}"
-        sudo tee -a /etc/ssh/sshd_config > /dev/null << EOF
-
-# Forgejo SSH Passthrough
-Match User git
-    AuthorizedKeysCommandUser git
-    AuthorizedKeysCommand /usr/bin/docker exec -i -u git forgejo /usr/local/bin/forgejo keys -c /data/gitea/conf/app.ini -e git -u %u -t %t -k %k
-EOF
-        echo -e "${YELLOW}正在重启宿主机 sshd 服务...${RESET}"
-        sudo systemctl restart sshd
-        echo -e "${GREEN}🎉 22 端口 SSH 直通配置完成！${RESET}"
-    else
-        echo -e "${CYAN}提示: /etc/ssh/sshd_config 中已存在相关配置，跳过修改。${RESET}"
-    fi
-}
-
-# 更新 Forgejo 镜像
-update_forgejo() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+    echo -ne "${YELLOW}请输入 Moe-Counter 访问端口 (宿主机端口) [默认: 3000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3000"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Forgejo 最新镜像...${RESET}"
+
+    echo -ne "${YELLOW}请输入宿主机缓存数据存储绝对路径 [默认: /opt/moe-counter/data]: ${RESET}"
+    read -r custom_data
+    [[ -z "$custom_data" ]] && custom_data="/opt/moe-counter/data"
+
+    # 1. 创建所需的宿主机目录
+    mkdir -p "$custom_data"
+    chmod -R 777 "$BASE_DIR" "$custom_data"
+
+    # 2. 动态生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  moe-counter:
+    image: ghcr.io/journey-ad/moe-counter:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:${custom_port}"
+    volumes:
+      - ${custom_data}:/app/data
+    environment:
+      - APP_PORT=${custom_port}
+      - DB_TYPE=sqlite
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Moe-Counter 服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
+
+    local detect_ip
+    detect_ip=$(get_public_ip)
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}      Moe-Counter 部署成功！      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${detect_ip}:${custom_port}${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
+    echo -e "${YELLOW}提示: 部署完成后，你可以通过访问上述地址体验计数器服务。${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+# 更新 Moe-Counter 镜像
+update_moe() {
+    check_compose_exists || return
+    echo -e "${YELLOW}正在从远端拉取 Moe-Counter 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！Forgejo 已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Forgejo
-uninstall_forgejo() {
-    echo -ne "${YELLOW}确定要卸载并删除 Forgejo 容器及网络吗？(y/n): ${RESET}"
+# 卸载 Moe-Counter
+uninstall_moe() {
+    echo -ne "${YELLOW}确定要卸载并删除 Moe-Counter 容器吗？(y/n): ${RESET}"
     read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器与网络已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除代码仓库和所有 Git 数据？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和缓存数据？(y/n): ${RESET}"
             read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+            if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
+                get_status_info
                 rm -rf "$BASE_DIR"
-                rm -rf "$custom_data" 2>/dev/null
+                [[ "$data_dir" != "N/A" ]] && rm -rf "$data_dir"
                 echo -e "${GREEN}数据目录已彻底清理。${RESET}"
             fi
         else
@@ -212,34 +178,52 @@ uninstall_forgejo() {
     fi
 }
 
-start_forgejo() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
-stop_forgejo() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
-restart_forgejo() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
-logs_forgejo() { docker logs -f "$CONTAINER_NAME"; }
+start_moe() { 
+    check_compose_exists || return
+    cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"
+}
 
+stop_moe() { 
+    check_compose_exists || return
+    cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"
+}
+
+restart_moe() { 
+    check_compose_exists || return
+    cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"
+}
+
+logs_moe() { 
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        docker logs -f "$CONTAINER_NAME"
+    else
+        echo -e "${RED}错误: 容器不存在，无法查看日志！${RESET}"
+    fi
+}
 
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
+    local detect_ip="127.0.0.1"
+    if [[ "$webui_port" != "N/A" ]]; then
+        detect_ip=$(get_public_ip)
+    fi
+    
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}Web 访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}SSH 映射端口   : ${ssh_port}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${detect_ip}:${webui_port}${RESET}"
     echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
-
 
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  Forgejo 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  Moe-Counter 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}Web  :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}SSH  :${RESET} ${YELLOW}${ssh_port}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -249,26 +233,25 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}9. 配置宿主机22端口SSH直通${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_forgejo ;;
-        2) update_forgejo ;;
-        3) uninstall_forgejo ;;
-        4) start_forgejo ;;
-        5) stop_forgejo ;;
-        6) restart_forgejo ;;
-        7) logs_forgejo ;;
+        1) install_moe ;;
+        2) update_moe ;;
+        3) uninstall_moe ;;
+        4) start_moe ;;
+        5) stop_moe ;;
+        6) restart_moe ;;
+        7) logs_moe ;;
         8) show_info ;;
-        9) setup_ssh_passthrough ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 
+# 主循环
 while true; do
     menu
     echo -ne "${YELLOW}按回车键继续...${RESET}"

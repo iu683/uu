@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Aria2 Docker Compose 管理面板 
+# DBX 数据服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="aria2"
-BASE_DIR="/opt/aria2"
+CONTAINER_NAME="dbx"
+BASE_DIR="/opt/dbx"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -20,24 +20,47 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    
-    local missing_deps=()
-    ! command -v wget &> /dev/null && missing_deps+=("wget")
-    ! command -v curl &> /dev/null && missing_deps+=("curl")
-    
-    if [ ${#missing_deps[@]} -ne 0 ]; then
-        echo -e "${YELLOW}提示: 正在安装缺失的工具 (${missing_deps[*]})...${RESET}"
-        if command -v apt-get &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y wget curl
-        elif command -v yum &> /dev/null; then
-            sudo yum install -y wget curl
-        fi
+}
+
+# 动态获取容器状态、映射端口和数据目录
+get_status_info() {
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 4224 端口）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "4224/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 兜底获取第一个绑定的端口
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="4224"
+
+        # 从容器状态提取数据目录（挂载路径）
+        data_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$data_dir" ]] && data_dir="/opt/dbx/data"
+    else
+        # 容器未安装/未部署时的返回值
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        data_dir="N/A"
     fi
 }
 
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"v4"}
+    local mode=${1:-"auto"}
     local ip=""
+    
     if [[ "$mode" == "v4" ]]; then
         for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
@@ -57,258 +80,91 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器状态、网络模式、映射端口和数据目录
-get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
-
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-    else
-        img_version="${RED}未安装${RESET}"
-    fi
-
-    webui_enabled="true"
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        # 检查是否关闭了 WEBUI
-        if grep -qE "WEBUI=[[:space:]]*[\"']?false[\"']?" "$COMPOSE_FILE"; then
-            webui_enabled="false"
-        fi
-
-        # 解析 RPC 端口与 BT 端口
-        if grep -qE "network_mode:[[:space:]]*[\"']?host[\"']?" "$COMPOSE_FILE"; then
-            # Host 模式从环境变量解析
-            webui_port=$(grep -E "WEBUI_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-            [[ -z "$webui_port" ]] && webui_port="8080"
-            [[ "$webui_enabled" == "false" ]] && webui_port="已禁用"
-
-            rpc_port=$(grep -E "RPC_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-            [[ -z "$rpc_port" ]] && rpc_port="6800"
-
-            bt_port=$(grep -E "BT_PORT=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-            [[ -z "$bt_port" ]] && bt_port="32516"
-        else
-            # Bridge 模式从 ports 解析
-            if [[ "$webui_enabled" == "true" ]]; then
-                webui_port=$(grep -E "\-[[:space:]]*[\"']?[0-9]+:8080" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"-')
-                [[ -z "$webui_port" ]] && webui_port="8080"
-            else
-                webui_port="已禁用"
-            fi
-
-            rpc_port=$(grep -E "\-[[:space:]]*[\"']?[0-9]+:6800" "$COMPOSE_FILE" | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"-')
-            [[ -z "$rpc_port" ]] && rpc_port="6800"
-
-            bt_port=$(grep -E "\-[[:space:]]*[\"']?[0-9]+:[0-9]+" "$COMPOSE_FILE" | grep -v "6800" | grep -v "8080" | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"-')
-            [[ -z "$bt_port" ]] && bt_port="32516"
-        fi
-
-        download_dir=$(grep -E -- "- .+/downloads" "$COMPOSE_FILE" | awk -F ':' '{print $1}' | sed 's/- //g' | tr -d '"' | xargs)
-        [[ -z "$download_dir" ]] && download_dir="$BASE_DIR/downloads"
-    else
-        webui_port="N/A"
-        rpc_port="N/A"
-        bt_port="N/A"
-        download_dir="N/A"
-    fi
-}
-
-# 提取 Aria2 RPC Token
-get_aria2_token() {
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        local token=$(grep -E "SECRET=" "$COMPOSE_FILE" | awk -F '=' '{print $2}' | tr -d '[:space:]"')
-        echo -e "${GREEN}${token}${RESET}"
-    else
-        echo -e "${RED}未部署${RESET}"
-    fi
-}
-
-install_aria2() {
+# 部署 DBX
+install_dbx() {
     check_dependencies
     
-    mkdir -p "$BASE_DIR/config"
+    mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 部署模式选择 ======${RESET}"
-    echo -e "请选择想要部署的网络模式："
-    echo -e "  1) ${GREEN}Host 主机网络模式${RESET} (推荐！BT/PT公网连接性最好，默认占用 8080、6800、32516 端口)"
-    echo -e "  2) ${GREEN}Bridge 桥接网络模式${RESET} (允许自定义修改 WebUI 访问端口、RPC 端口及 BT 端口)"
-    echo -ne "${YELLOW}请输入选项 [默认 1]: ${RESET}"
-    read -r net_mode
-    [[ -z "$net_mode" ]] && net_mode="1"
-
-    echo -ne "${YELLOW}是否开启内置 AriaNg Web 控制台网页？(y/n) [默认: y]: ${RESET}"
-    read -r user_webui_choice
-    [[ -z "$user_webui_choice" ]] && user_webui_choice="y"
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    local webui_env_val="true"
-    if [[ "$user_webui_choice" == "n" || "$user_webui_choice" == "N" ]]; then
-        webui_env_val="false"
+    echo -ne "${YELLOW}请输入 DBX 访问端口 (宿主机端口) [默认: 4224]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="4224"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
     fi
 
-    local web_port="8080"
-    local rpc_port="6800"
-    local bt_port="32516"
+    # 随机生成12位密码作为默认值
+    local rand_pass=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12)
+    echo -ne "${YELLOW}请输入 DBX 连接密码 (DBX_PASSWORD) [默认: 随机生成]: ${RESET}"
+    read -r custom_pass
+    [[ -z "$custom_pass" ]] && custom_pass="$rand_pass"
 
-    # 自定义端口输入逻辑
-    if [[ "$net_mode" == "2" ]]; then
-        echo -e "${CYAN}====== 自定义桥接端口配置 ======${RESET}"
-        if [[ "$webui_env_val" == "true" ]]; then
-            echo -ne "${YELLOW}请输入 WebUI 访问端口 [默认: 8080]: ${RESET}"
-            read -r web_port
-            [[ -z "$web_port" ]] && web_port="8080"
-        fi
+    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/dbx/data]: ${RESET}"
+    read -r custom_data
+    [[ -z "$custom_data" ]] && custom_data="/opt/dbx/data"
 
-        echo -ne "${YELLOW}请输入 RPC 通讯端口 [默认: 6800]: ${RESET}"
-        read -r rpc_port
-        [[ -z "$rpc_port" ]] && rpc_port="6800"
+    # 1. 创建所需的宿主机目录
+    mkdir -p "$custom_data"
+    chmod -R 777 "$BASE_DIR" "$custom_data"
 
-        echo -ne "${YELLOW}请输入 BT/DHT 监听端口 [默认: 32516]: ${RESET}"
-        read -r bt_port
-        [[ -z "$bt_port" ]] && bt_port="32516"
-    fi
-
-    # 通用公共配置项
-    echo -ne "${YELLOW}请输入宿主机下载文件存储绝对路径 [默认: $BASE_DIR/downloads]: ${RESET}"
-    read -r custom_download
-    [[ -z "$custom_download" ]] && custom_download="$BASE_DIR/downloads"
-
-    # 生成默认随机安全密钥 (使用最广泛兼容的命令生成 16 位强随机字符串)
-    local default_token=$(date +%s%N | md5sum | head -c 16)
-    echo -ne "${YELLOW}请设置 Aria2 RPC 安全密钥 (Token) [默认随机: ${GREEN}${default_token}${YELLOW}]: ${RESET}"
-    read -r rpc_token
-    [[ -z "$rpc_token" ]] && rpc_token="$default_token"
-
-    echo -ne "${YELLOW}请设置磁盘缓存大小 (例如：128M) [默认: 128M / 大内存建议512M]: ${RESET}"
-    read -r disk_cache
-    [[ -z "$disk_cache" ]] && disk_cache="128M"
-
-    # 获取执行脚本用户的 UID/GID 并创建存储目录
-    CURRENT_UID=$(id -u)
-    CURRENT_GID=$(id -g)
-    mkdir -p "$custom_download"
-    
-    # ========================== 核心：写入选定模板 ==========================
-    if [[ "$net_mode" == "1" ]]; then
-        # 模板一：Host 模式配置文件
-        echo -e "${YELLOW}正在生成 Host 模式 docker-compose.yml 配置文件...${RESET}"
-        cat <<EOF > "$COMPOSE_FILE"
+    # 2. 动态生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
 services:
-  aria2:
-    image: superng6/aria2:webui-latest
+  dbx:
     container_name: ${CONTAINER_NAME}
-    network_mode: host
-    environment:
-      - PUID=${CURRENT_UID}
-      - PGID=${CURRENT_GID}
-      - TZ=Asia/Shanghai
-      - SECRET=${rpc_token}
-      - CACHE=${disk_cache}
-      - WEBUI=${webui_env_val}
-      - WEBUI_PORT=${web_port}
-      - RPC_PORT=${rpc_port}
-      - BT_PORT=${bt_port}
-      - UT=true
-      - SMD=true
-    volumes:
-      - ${BASE_DIR}/config:/config
-      - ${custom_download}:/downloads
+    image: t8y2/dbx:latest
     restart: unless-stopped
-EOF
-    else
-        # 模板二：Bridge 模式配置文件
-        echo -e "${YELLOW}正在生成 Bridge 模式 docker-compose.yml 配置文件...${RESET}"
-        
-        local ports_config=""
-        if [[ "$webui_env_val" == "true" ]]; then
-            ports_config="- \"${web_port}:8080\"
-      - \"${rpc_port}:6800\"
-      - \"${bt_port}:${bt_port}\"
-      - \"${bt_port}:${bt_port}/udp\""
-        else
-            ports_config="- \"${rpc_port}:6800\"
-      - \"${bt_port}:${bt_port}\"
-      - \"${bt_port}:${bt_port}/udp\""
-        fi
-
-        cat <<EOF > "$COMPOSE_FILE"
-services:
-  aria2:
-    image: superng6/aria2:webui-latest
-    container_name: ${CONTAINER_NAME}
-    environment:
-      - PUID=${CURRENT_UID}
-      - PGID=${CURRENT_GID}
-      - TZ=Asia/Shanghai
-      - SECRET=${rpc_token}
-      - CACHE=${disk_cache}
-      - WEBUI=${webui_env_val}
-      - WEBUI_PORT=8080
-      - RPC_PORT=6800
-      - BT_PORT=32516
-      - UT=true
-      - SMD=true
-    volumes:
-      - ${BASE_DIR}/config:/config
-      - ${custom_download}:/downloads
     ports:
-      ${ports_config}
-    restart: unless-stopped
+      - "${custom_port}:4224"
+    environment:
+      - DBX_PASSWORD=${custom_pass}
+    volumes:
+      - ${custom_data}:/app/data
 EOF
-    fi
-    # =========================================================================
 
-    chmod -R 777 "$BASE_DIR" "$custom_download"
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Aria2...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 DBX 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
-    SERVER_IP=$(get_public_ip)
+    DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       Aria2 部署成功！        ${RESET}"
+    echo -e "${GREEN}        DBX 部署成功！          ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    if [[ "$webui_env_val" == "true" ]]; then
-        echo -e "${YELLOW}WebUI 访问地址 : http://${SERVER_IP}:${web_port}${RESET}"
-    else
-        echo -e "${RED}WebUI 控制网页 : 已选择禁用内置控制台${RESET}"
-    fi
-    echo -e "${YELLOW}RPC 服务访问地址: http://${SERVER_IP}:${rpc_port}/jsonrpc${RESET}"
-    echo -e "${YELLOW}RPC 监听端口   : ${rpc_port}${RESET}"
-    echo -e "${YELLOW}BT/DHT监听端口 : ${bt_port}${RESET}"
-    echo -ne "${YELLOW}RPC 连接密钥   : ${RESET}"
-    get_aria2_token
-    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR/config${RESET}"
-    echo -e "${YELLOW}宿主机下载路径 : $custom_download${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}管理密码 (密)  : ${custom_pass}${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
+    echo -e "${YELLOW}提示: 你可以直接访问该端口或使用客户端连接 DBX 服务。${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-update_aria2() {
+# 更新 DBX 镜像
+update_dbx() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
+    echo -e "${YELLOW}正在从远端拉取 DBX 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！镜像已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-uninstall_aria2() {
-    echo -ne "${YELLOW}确定要卸载并删除 Aria2 容器吗？(y/n): ${RESET}"
+# 卸载 DBX
+uninstall_dbx() {
+    echo -ne "${YELLOW}确定要卸载并删除 DBX 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和已下载的文件？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
@@ -321,23 +177,19 @@ uninstall_aria2() {
     fi
 }
 
-start_aria2() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_aria2() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_aria2() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_aria2() { docker logs -f "$CONTAINER_NAME"; }
+start_dbx() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_dbx() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_dbx() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_dbx() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    SERVER_IP=$(get_public_ip)
+    DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}WebUI 网页端口 : ${webui_port}"
-    echo -e "${YELLOW}RPC 服务端口   : ${rpc_port}"
-    echo -e "${YELLOW}BT/DHT监听端口 : ${bt_port}${RESET}"
-    echo -ne "${YELLOW}RPC 连接密钥   : ${RESET}"
-    get_aria2_token
-    echo -e "${YELLOW}宿主机下载路径 : ${download_dir}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -345,10 +197,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       ◈ Aria2 管理面板 ◈       ${RESET}"
+    echo -e "${GREEN}      ◈  DBX 服务管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}当前状态 :${RESET} $status"
-    echo -e "${GREEN}网页端口 :${RESET} ${YELLOW}${webui_port}${RESET} | ${GREEN}RPC 端口 :${RESET} ${YELLOW}${rpc_port}${RESET} | ${GREEN}BT 端口 :${RESET} ${YELLOW}${bt_port}${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -363,13 +215,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_aria2 ;;
-        2) update_aria2 ;;
-        3) uninstall_aria2 ;;
-        4) start_aria2 ;;
-        5) stop_aria2 ;;
-        6) restart_aria2 ;;
-        7) logs_aria2 ;;
+        1) install_dbx ;;
+        2) update_dbx ;;
+        3) uninstall_dbx ;;
+        4) start_dbx ;;
+        5) stop_dbx ;;
+        6) restart_dbx ;;
+        7) logs_dbx ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

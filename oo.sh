@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# MIMO-2API (官方原生 Clone + 环境变量 Build) 自动化管理面板
+# Model-Status 模型状态服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,11 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="mimo-2api"
-BASE_DIR="/opt/mimo-2api"
-# 直接将面板和源码放在一起
-SRC_DIR="$BASE_DIR" 
-REPO_URL="https://github.com/rong6/mimo-2api.git"
+CONTAINER_NAME="model-status"
+BASE_DIR="/opt/model-status"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -22,40 +21,45 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态获取服务端口与运行状态
+# 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    # 优先从根目录的 .env 文件中读取之前自定义过的端口
-    if [ -f "$SRC_DIR/.env" ]; then
-        webui_port=$(grep "MIMO_PORT=" "$SRC_DIR/.env" | cut -d'=' -f2)
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
     fi
 
-    local container_id=$(docker ps -q -f "name=mimo-2api" -f "status=running" 2>/dev/null)
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
 
-    if [[ -n "$container_id" ]]; then
-        status="${GREEN}运行中${RESET}"
-        # 如果 .env 没读到，降级使用 docker inspect 抓取
-        if [[ -z "$webui_port" ]]; then
-            webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8090/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
-            [[ -z "$webui_port" ]] && webui_port="8090"
-        fi
+        # 从容器状态提取内部暴露端口绑定的宿主机端口（容器内部默认监听的是 3000 端口）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 兜底获取第一个绑定的端口
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
+
+        # 从容器状态提取数据目录（挂载路径）
+        data_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$data_dir" ]] && data_dir="/opt/model-status/data"
     else
-        if [ -d "$SRC_DIR/.git" ]; then
-            status="${RED}已停止${RESET}"
-        else
-            status="${RED}未部署${RESET}"
-        fi
-        [[ -z "$webui_port" ]] && webui_port="N/A"
+        # 容器未安装/未部署时的返回值
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        data_dir="N/A"
     fi
 }
 
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local mode=${1:-"auto"}
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -77,152 +81,157 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署核心逻辑
-install_translate() {
-    check_dependencies
-
-    echo -e "${CYAN}====== 1. 端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 MIMO-2API 映射端口 (对应 MIMO_PORT) [默认: 8090]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8090"
-
-    echo -e "\n${CYAN}====== 2. 参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入你的MIMO Cookie (例如 serviceToken=xxx; userId=xxx): ${RESET}"
-    read -r custom_cookie
-    echo -ne "${YELLOW}请输入你的 API Key (用于鉴权的 secret-key): ${RESET}"
-    read -r custom_apikey
-
-    # 克隆官方仓库到当前工作目录
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "\n${YELLOW}正在克隆官方 GitHub 仓库...${RESET}"
-        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
-        if [ $? -eq 0 ]; then
-            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
-            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
-            rm -rf "$SRC_DIR/tmp_repo"
-        else
-            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
-            exit 1
-        fi
+# 生成随机密钥的辅助函数
+generate_secret() {
+    if command -v openssl &> /dev/null; then
+        openssl rand -hex 16
     else
-        echo -e "\n${GREEN}检测到本地已存在官方仓库，正在同步最新代码...${RESET}"
-        cd "$SRC_DIR" && git pull
+        echo "session-secret-$(date +%s)"
     fi
-
-    # 回到仓库根目录
-    cd "$SRC_DIR"
-
-    # 动态写入适配支持自定义端口与自定义启动命令参数的 docker-compose.yml
-    cat <<EOF > docker-compose.yml
-
-services:
-  mimo-2api:
-    build: .
-    image: mimo-2api
-    container_name: mimo-2api
-    ports:
-      - "\${MIMO_PORT:-8090}:8090"
-    restart: unless-stopped
-    command:
-      - "-cookie"
-      - "$custom_cookie"
-      - "-apikey"
-      - "$custom_apikey"
-      - "-save"
-EOF
-
-    # 将自定义端口写入持久化环境文件
-    if [ -f ".env" ]; then
-        sed -i '/^MIMO_PORT=/d' .env
-        echo "MIMO_PORT=$custom_port" >> .env
-    else
-        echo "MIMO_PORT=$custom_port" > .env
-    fi
-
-    # 执行集群编译启动
-    echo -e "\n${YELLOW}正在执行原生编译启动命令...${RESET}"
-    MIMO_PORT=$custom_port docker compose up -d --build
-
-    echo -e "${YELLOW}正在等待容器集群 Build 编译并拉起服务 (约 5 秒)...${RESET}"
-    sleep 5
-
-    get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}        MIMO-2API 编译并启动成功！                  ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}项目所在路径 : ${SRC_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 原生更新：拉取代码 + 重新 Build
-update_translate() {
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
+# 部署 Model-Status
+install_model_status() {
+    check_dependencies
+    
+    mkdir -p "$BASE_DIR"
+
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    echo -ne "${YELLOW}请输入 Model-Status 访问端口 (宿主机端口) [默认: 3000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3000"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
-    get_status_info
-    local current_port=$webui_port
-    [[ "$current_port" == "N/A" || -z "$current_port" ]] && current_port="8090"
 
-    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
-    cd "$SRC_DIR" && git pull
-    
-    if [ -f ".env" ]; then
-        sed -i '/^MIMO_PORT=/d' .env
-        echo "MIMO_PORT=$current_port" >> .env
-    fi
+    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/model-status/data]: ${RESET}"
+    read -r custom_data
+    [[ -z "$custom_data" ]] && custom_data="/opt/model-status/data"
 
-    echo -e "${YELLOW}正在使用原自定义端口 [$current_port] 重编镜像并热更新...${RESET}"
-    MIMO_PORT=$current_port docker compose up -d --build --remove-orphans
-    echo -e "${GREEN}集群更新并重编完成！${RESET}"
+    echo -ne "${YELLOW}请输入管理员初始化用户名 [默认: admin]: ${RESET}"
+    read -r admin_user
+    [[ -z "$admin_user" ]] && admin_user="admin"
+
+    echo -ne "${YELLOW}请输入管理员初始化密码 [默认: change-me]: ${RESET}"
+    read -r admin_pass
+    [[ -z "$admin_pass" ]] && admin_pass="change-me"
+
+    # 生成随机 Session 密钥保证安全
+    auto_secret=$(generate_secret)
+
+    # 1. 创建所需的宿主机目录
+    mkdir -p "$custom_data"
+    chmod -R 777 "$BASE_DIR" "$custom_data"
+
+    # 2. 动态生成符合规范的 .env 环境变量文件
+    echo -e "${YELLOW}正在生成环境变量配置文件 (.env)...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+WEB_ORIGIN=http://localhost:${custom_port}
+ADMIN_USERNAME=${admin_user}
+ADMIN_PASSWORD=${admin_pass}
+SESSION_SECRET=${auto_secret}
+EOF
+
+    # 3. 动态生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  model-status:
+    image: ghcr.io/wiziscool/model-status:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    volumes:
+      - ${custom_data}:/app/data
+    ports:
+      - "${custom_port}:3000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3000
+      - WEB_ORIGIN=\${WEB_ORIGIN}
+      - DATABASE_FILE=/app/data/model-status.db
+      - ADMIN_BOOTSTRAP_USERNAME=\${ADMIN_USERNAME}
+      - ADMIN_BOOTSTRAP_PASSWORD=\${ADMIN_PASSWORD}
+      - SESSION_SECRET=\${SESSION_SECRET}
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Model-Status 服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    Model-Status 部署成功！      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
+    echo -e "${YELLOW}初始管理员账号 : $admin_user${RESET}"
+    echo -e "${YELLOW}初始管理员密码 : $admin_pass${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 彻底卸载
-uninstall_translate() {
-    echo -ne "${RED}确定要停止并卸载 MIMO-2API 容器集群吗？(y/n): ${RESET}"
+# 更新 Model-Status 镜像
+update_model_status() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取 Model-Status 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+}
+
+# 卸载 Model-Status
+uninstall_model_status() {
+    echo -ne "${YELLOW}确定要卸载并删除 Model-Status 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -d "$SRC_DIR/.git" ]; then
-            cd "$SRC_DIR" && docker compose down
-            echo -e "${GREEN}容器与网络已被安全停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同步连根拔除本地克隆的【全部源码及环境配置】？(y/n): ${RESET}"
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件、环境变量和数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有源码与持久化数据已被彻底清除！${RESET}"
+                echo -e "${GREEN}所有数据和配置目录已彻底清理。${RESET}"
             fi
         else
-            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 联动生命周期
-start_translate() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}集群已全面启动${RESET}"; }
-stop_translate() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}集群已安全停止${RESET}"; }
-restart_translate() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}集群已平滑重启${RESET}"; }
-logs_translate() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
+start_model_status() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_model_status() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_model_status() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_model_status() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    local DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}集群运行状态     : $status"
-    echo -e "${YELLOW}服务访问地址     : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}   ◈  MIMO-2API 自动化管理面板  ◈    ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}  ◈  Model-Status 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -232,17 +241,17 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
+        1) install_model_status ;;
+        2) update_model_status ;;
+        3) uninstall_model_status ;;
+        4) start_model_status ;;
+        5) stop_model_status ;;
+        6) restart_model_status ;;
+        7) logs_model_status ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

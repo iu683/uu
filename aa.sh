@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# grok2api Docker Compose 管理面板 
+# gemini-business2api Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="grok2api"
-BASE_DIR="/opt/grok2api"
+CONTAINER_NAME="gemini-business2api"
+BASE_DIR="/opt/gemini-business2api"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -45,6 +45,7 @@ get_public_ip() {
     fi
     echo "127.0.0.1" && return 0
 }
+
 # 动态获取容器状态
 get_status_info() {
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -56,242 +57,234 @@ get_status_info() {
     fi
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 读取映射端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8000"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "7860/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="7860"
     else
         webui_port="N/A"
     fi
 }
 
-# 部署 grok2api
-install_grok2api() {
+# 部署服务
+install_gemini() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    # 1. 宿主机映射端口
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机 Host Port) [默认: 8000]: ${RESET}"
+    # 1. 配置管理后台登录密码 ADMIN_KEY (回车默认纯随机，无 sk-)
+    echo -ne "${YELLOW}请输入后台管理密码 ADMIN_KEY [直接回车自动生成随机密码]: ${RESET}"
+    read -r custom_admin_key
+    if [[ -z "$custom_admin_key" ]]; then
+        custom_admin_key="$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)"
+        echo -e "${GREEN} -> 已自动生成后台密码: $custom_admin_key${RESET}"
+    fi
+
+    # 2. 宿主机映射主端口
+    echo -ne "${YELLOW}请输入主服务访问端口 (PORT) [默认: 7860]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8000"
+    [[ -z "$custom_port" ]] && custom_port="7860"
 
-    # 2. 数据与日志存储路径
-    echo -ne "${YELLOW}请输入数据与日志宿主机存放绝对基准路径 [默认: /opt/grok2api]: ${RESET}"
+    # 3. 宿主机映射 Worker 健康端口
+    echo -ne "${YELLOW}请输入刷新 Worker 健康端口 (REFRESH_HEALTH_PORT) [默认: 8080]: ${RESET}"
+    read -r custom_worker_port
+    [[ -z "$custom_worker_port" ]] && custom_worker_port="8080"
+
+    # 4. 数据存放基准路径
+    echo -ne "${YELLOW}请输入数据存放绝对基准路径 [默认: /opt/gemini-business2api]: ${RESET}"
     read -r custom_path
-    [[ -z "$custom_path" ]] && custom_path="/opt/grok2api"
+    [[ -z "$custom_path" ]] && custom_path="/opt/gemini-business2api"
 
-    # 创建子目录并赋权
-    mkdir -p "$custom_path/data" "$custom_path/logs"
+    # 定义子挂载目录
+    local path_data="$custom_path/data"
+
+    # 【防挂载死锁修复】检查并清理残留的坏文件
+    if [ -e "$path_data" ] && [ ! -d "$path_data" ]; then
+        echo -e "${RED}警告: 检测到路径 $path_data 被普通文件占用，正在强行清理...${RESET}"
+        rm -rf "$path_data"
+    fi
+    mkdir -p "$path_data"
     chmod -R 777 "$custom_path" 2>/dev/null
 
-    # 3. 高级可选服务询问 (回车默认不开启)
-    echo -ne "${YELLOW}是否启用 CF 自动刷新功能 (Flaresolverr)？(y/n) [默认: n]: ${RESET}"
-    read -r enable_cf
-    [[ -z "$enable_cf" ]] && enable_cf="n"
+    # 5. 是否同时启用 refresh-worker 刷新组件
+    echo -ne "${YELLOW}是否同步启动定时刷新 Worker 组件 (refresh-worker)？(y/n) [默认: n]: ${RESET}"
+    read -r enable_worker
+    [[ -z "$enable_worker" ]] && enable_worker="n"
 
-    echo -ne "${YELLOW}是否启用 Warp 落地代理防止 IP 变脏？(y/n) [默认: n]: ${RESET}"
-    read -r enable_warp
-    [[ -z "$enable_warp" ]] && enable_warp="n"
-
-    # 开始组织 docker-compose.yml 文本
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml...${RESET}"
-    
-    # 写入 compose 头部及主服务
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  grok2api:
-    container_name: grok2api
-    image: ghcr.io/chenyme/grok2api:latest
-    ports:
-      - "\${HOST_PORT:-8000}:\${SERVER_PORT:-8000}"
-    environment:
-      TZ: Asia/Shanghai
-      LOG_LEVEL: \${LOG_LEVEL:-INFO}
-      SERVER_HOST: \${SERVER_HOST:-0.0.0.0}
-      SERVER_PORT: \${SERVER_PORT:-8000}
-      SERVER_WORKERS: \${SERVER_WORKERS:-1}
-      ACCOUNT_STORAGE: \${ACCOUNT_STORAGE:-local}
-      ACCOUNT_LOCAL_PATH: \${ACCOUNT_LOCAL_PATH:-data/accounts.db}
-      ACCOUNT_REDIS_URL: \${ACCOUNT_REDIS_URL:-}
-      ACCOUNT_MYSQL_URL: \${ACCOUNT_MYSQL_URL:-}
-      ACCOUNT_POSTGRESQL_URL: \${ACCOUNT_POSTGRESQL_URL:-}
-EOF
-
-    # 处理 grok2api 服务内部针对 CF 的环境变量注释
-    if [[ "$enable_cf" == "y" || "$enable_cf" == "Y" ]]; then
-        cat <<EOF >> "$COMPOSE_FILE"
-      FLARESOLVERR_URL: http://flaresolverr:8191
-      CF_REFRESH_INTERVAL: "600"
-      CF_TIMEOUT: "60"
-EOF
-    else
-        cat <<EOF >> "$COMPOSE_FILE"
-      # FLARESOLVERR_URL: http://flaresolverr:8191
-      # CF_REFRESH_INTERVAL: "600"
-      # CF_TIMEOUT: "60"
-EOF
-    fi
-
-    # 写入主服务的卷挂载和重启策略
-    cat <<EOF >> "$COMPOSE_FILE"
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-    restart: unless-stopped
-EOF
-
-    # 附加可选服务 1: Warp
-    if [[ "$enable_warp" == "y" || "$enable_warp" == "Y" ]]; then
-        cat <<EOF >> "$COMPOSE_FILE"
-
-  warp:
-    container_name: warp
-    image: caomingjun/warp:latest
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:1080:1080"
-    environment:
-      - WARP_SLEEP=2
-    cap_add:
-      - NET_ADMIN
-EOF
-    fi
-
-    # 附加可选服务 2: Flaresolverr
-    if [[ "$enable_cf" == "y" || "$enable_cf" == "Y" ]]; then
-        cat <<EOF >> "$COMPOSE_FILE"
-
-  flaresolverr:
-    container_name: flaresolverr
-    image: ghcr.io/flaresolverr/flaresolverr:latest
-    ports:
-      - "127.0.0.1:8191:8191"
-    environment:
-      TZ: Asia/Shanghai
-      LOG_LEVEL: info
-    restart: unless-stopped
-EOF
-    fi
-
-
-    # 开始组织并生成环境配置文件 .env
-    echo -e "${YELLOW}正在生成配对的 .env 配置文件...${RESET}"
+    # 组织并生成环境配置文件 .env
+    echo -e "${YELLOW}正在生成配套的 .env 配置文件...${RESET}"
     cat <<EOF > "$ENV_FILE"
 # ==================== 基础运行 ====================
-TZ=Asia/Shanghai
-LOG_LEVEL=INFO
-LOG_FILE_ENABLED=true
-ACCOUNT_SYNC_INTERVAL=30
+ADMIN_KEY=${custom_admin_key}
+PORT=${custom_port}
 
-# ==================== Web 服务 / Docker Compose ====================
-SERVER_HOST=0.0.0.0
-SERVER_PORT=8000
-SERVER_WORKERS=1
+# ==================== 存储覆盖 ====================
+# SQLITE_PATH=./data/data.db
 
-# Docker Compose 宿主机映射端口
-HOST_PORT=${custom_port}
-
-# ==================== 账号存储（启动期） ====================
-ACCOUNT_STORAGE=local
-
-# ==================== 可选：本地数据 / 日志目录 ====================
-DATA_DIR=${custom_path}/data
-LOG_DIR=${custom_path}/logs
+# ==================== Worker 刷新组件配置 ====================
+REFRESH_WORKER_IMAGE=cooooookk/gemini-refresh-worker:latest
+REFRESH_HEALTH_PORT=${custom_worker_port}
 EOF
 
+    # 纠正本地 compose 相对目录内的数据流，软链接至用户自定义路径
+    if [ "$custom_path" != "$BASE_DIR" ]; then
+        rm -rf "$BASE_DIR/data"
+        ln -sf "$path_data" "$BASE_DIR/data"
+    fi
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 grok2api 服务集群...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    # 生成标准的 docker-compose.yml 文件
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  gemini-api:
+    image: cooooookk/gemini-business2api:latest
+    container_name: gemini-business2api
+    restart: unless-stopped
+    ports:
+      - "\${PORT:-7860}:7860"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-    echo -e "${YELLOW}等待服务初始化 (约5秒)...${RESET}"
+  refresh-worker:
+    image: \${REFRESH_WORKER_IMAGE:-cooooookk/gemini-refresh-worker:latest}
+    container_name: gemini-refresh-worker
+    restart: unless-stopped
+    profiles:
+      - refresh
+    depends_on:
+      gemini-api:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      SQLITE_PATH: /app/data/data.db
+      HEALTH_PORT: \${REFRESH_HEALTH_PORT:-8080}
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "\${REFRESH_HEALTH_PORT:-8080}:\${REFRESH_HEALTH_PORT:-8080}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:\${HEALTH_PORT:-8080}/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动服务...${RESET}"
+    cd "$BASE_DIR"
+    if [[ "$enable_worker" == "y" || "$enable_worker" == "Y" ]]; then
+        docker compose --profile refresh up -d --force-recreate
+    else
+        docker compose up -d --force-recreate
+    fi
+
+    echo -e "${YELLOW}等待服务初始化并执行健康检查 (约5秒)...${RESET}"
     sleep 5
 
     local current_ip
     current_ip=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        grok2api 部署成功！       ${RESET}"
+    echo -e "${GREEN}    gemini-business2api 部署成功！${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址     : http://${current_ip}:${custom_port}${RESET}"
-    echo -e "${YELLOW}数据存储路径     : $custom_path/data${RESET}"
-    echo -e "${YELLOW}日志存储路径     : $custom_path/logs${RESET}"
+    echo -e "${YELLOW}后台管理地址   : http://${current_ip}:${custom_port}${RESET}"
+    echo -e "${YELLOW}管理登录密码   : ${custom_admin_key}${RESET}"
+    echo -e "${YELLOW}数据本地存放路径 : $path_data${RESET}"
     echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${CYAN}💡 功能开启状态：${RESET}"
-    echo -e "${YELLOW}CF 盾自动刷新服务 : $([ "$enable_cf" = "y" ] && echo -e "${GREEN}已开启${RESET}" || echo -e "${RED}未开启${RESET}")${RESET}"
-    echo -e "${YELLOW}Warp 落地代理服务 : $([ "$enable_warp" = "y" ] && echo -e "${GREEN}开(请至config.toml配置socks5://warp:1080)${RESET}" || echo -e "${RED}未开启${RESET}")${RESET}"
+    echo -e "${CYAN}💡 组件开启状态：${RESET}"
+    echo -e "${YELLOW}定时刷新 Worker组件 : $([ "$enable_worker" = "y" ] && echo -e "${GREEN}已同步开启 (端口: $custom_worker_port)${RESET}" || echo -e "${RED}未开启 (仅运行主服务)${RESET}")${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
 # 更新镜像
-update_grok2api() {
+update_gemini() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新服务集群镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
+    echo -e "${YELLOW}正在从远端拉取最新服务镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose --profile refresh pull
+    # 根据现有的容器判断是否带有 profile 重启
+    if [ "$(docker ps -aq -f name=^/gemini-refresh-worker$)" ]; then
+        docker compose --profile refresh up -d --remove-orphans
+    else
+        docker compose up -d --remove-orphans
+    fi
     echo -e "${GREEN}集群更新完成！组件均已处于最新状态。${RESET}"
 }
 
-# 卸载集群
-uninstall_grok2api() {
-    echo -ne "${YELLOW}确定要卸载并删除 grok2api 容器集群吗？(y/n): ${RESET}"
+# 卸载服务
+uninstall_gemini() {
+    echo -ne "${YELLOW}确定要卸载并删除 gemini-business2api 容器集群吗？(y/n): ${RESET}"
     read -r confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器集群已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地存储的所有账号数据库和配置日志？(y/n): ${RESET}"
+            cd "$BASE_DIR" && docker compose --profile refresh down
+            echo -e "${GREEN}容器已停止并安全移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地存储的所有数据库和凭证数据？(y/n): ${RESET}"
             read -r clean_data
             if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
-                # 从 .env 提取路径安全清理
-                local real_data
-                real_data=$(grep DATA_DIR "$ENV_FILE" | cut -d'=' -f2)
                 rm -rf "$BASE_DIR"
-                if [[ -n "$real_data" && -d "$(dirname "$real_data")" ]]; then
-                    rm -rf "$(dirname "$real_data")"
+                if [ -d "/opt/gemini-business2api/data" ]; then
+                    rm -rf "/opt/gemini-business2api/data"
                 fi
-                echo -e "${GREEN}所有数据资产和配置文件已彻底清理。${RESET}"
+                echo -e "${GREEN}数据资产和配置文件已彻底清理。${RESET}"
             fi
         else
-            docker rm -f grok2api warp flaresolverr 2>/dev/null
+            docker rm -f gemini-business2api gemini-refresh-worker 2>/dev/null
             echo -e "${GREEN}独立容器已强行清除。${RESET}"
         fi
         echo -e "${GREEN}卸载彻底完成！${RESET}"
     fi
 }
 
-start_grok2api() { 
+start_gemini() { 
     if [ -f "$COMPOSE_FILE" ]; then
-        cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}集群服务已启动${RESET}"
+        cd "$BASE_DIR" && docker compose --profile refresh start && echo -e "${GREEN}服务集群已全部拉起启动${RESET}"
     else
         echo -e "${RED}错误: 未检测到配置，无法启动。${RESET}"
     fi
 }
 
-stop_grok2api() { 
+stop_gemini() { 
     if [ -f "$COMPOSE_FILE" ]; then
-        cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}集群服务已挂起停止${RESET}"
+        cd "$BASE_DIR" && docker compose --profile refresh stop && echo -e "${YELLOW}服务集群已全面停止挂起${RESET}"
     else
         echo -e "${RED}错误: 未检测到配置，无法停止。${RESET}"
     fi
 }
 
-restart_grok2api() { 
+restart_gemini() { 
     if [ -f "$COMPOSE_FILE" ]; then
-        cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}集群服务已成功重启${RESET}"
+        cd "$BASE_DIR" && docker compose --profile refresh restart && echo -e "${GREEN}服务集群已成功完成重启${RESET}"
     else
         echo -e "${RED}错误: 未检测到配置，无法重启。${RESET}"
     fi
 }
 
-logs_grok2api() { 
+logs_gemini() { 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         docker logs -f "$CONTAINER_NAME"
     else
-        echo -e "${RED}错误: 主业务容器不存在，无法追踪日志。${RESET}"
+        echo -e "${RED}错误: 主容器不存在，无法追踪日志。${RESET}"
     fi
 }
 
@@ -303,14 +296,12 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}主服务状态     : $status"
     if [[ "$webui_port" == "N/A" ]]; then
-        echo -e "${YELLOW}API 访问地址   : N/A${RESET}"
+        echo -e "${YELLOW}后台管理地址   : N/A${RESET}"
     else
-        echo -e "${YELLOW}API 访问地址   : http://${current_ip}:${webui_port}${RESET}"
+        echo -e "${YELLOW}后台管理地址   : http://${current_ip}:${webui_port}${RESET}"
     fi
     echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${CYAN}📂 运行配置文件分布情况：${RESET}"
-    echo -e "${YELLOW}Docker Compose 结构文件 : $COMPOSE_FILE${RESET}"
-    echo -e "${YELLOW}底层环境变量映射文件    : $ENV_FILE${RESET}"
+    echo -e "${YELLOW}管理登录密码   : ${custom_admin_key}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -318,10 +309,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  grok2api 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN} ◈ gemini-business2api 管理面板 ◈ ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}主服务状态 :${RESET} $status"
+    echo -e "${GREEN}主访问端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -336,13 +327,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_grok2api ;;
-        2) update_grok2api ;;
-        3) uninstall_grok2api ;;
-        4) start_grok2api ;;
-        5) stop_grok2api ;;
-        6) restart_grok2api ;;
-        7) logs_grok2api ;;
+        1) install_gemini ;;
+        2) update_gemini ;;
+        3) uninstall_gemini ;;
+        4) start_gemini ;;
+        5) stop_gemini ;;
+        6) restart_gemini ;;
+        7) logs_gemini ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

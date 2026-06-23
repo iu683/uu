@@ -6,45 +6,25 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 RESET='\033[0m'
 
-# 自定义配置文件路径
-ENV_FILE="$HOME/.codex_custom_env"
-
-# 【双重保险】自动检测官方的独立安装路径，并强行打入当前脚本的 PATH
-export PATH="$HOME/.local/bin:/root/.local/bin:$HOME/.codex/packages/standalone/releases/0.142.0-x86_64-unknown-linux-musl:$PATH"
-
-# 自动刷新和导出自定义 API 环境配置（让主面板状态100%同步）
-refresh_env() {
-    if [ -f "$ENV_FILE" ]; then
-        source "$ENV_FILE"
-        [ -n "$CODEX_BASE_URL" ] && export CODEX_BASE_URL="$CODEX_BASE_URL"
-        [ -n "$OPENAI_BASE_URL" ] && export OPENAI_BASE_URL="$OPENAI_BASE_URL"
-        [ -n "$OPENAI_API_KEY" ] && export OPENAI_API_KEY="$OPENAI_API_KEY"
-        [ -n "$CODEX_API_KEY" ] && export CODEX_API_KEY="$CODEX_API_KEY"
-        [ -n "$CODEX_MODEL" ] && export CODEX_MODEL="$CODEX_MODEL"
-        [ -n "$CODEX_SUBAGENT_MODEL" ] && export CODEX_SUBAGENT_MODEL="$CODEX_SUBAGENT_MODEL"
-    fi
-}
-
-# 首次和循环时加载环境
-refresh_env
-
 # 获取状态与版本信息
 get_status() {
-    if command -v codex &> /dev/null; then
+    if command -v gemini &> /dev/null; then
         status="${GREEN}已安装${RESET}"
-        version_info=$(codex -v 2>/dev/null || codex --version 2>/dev/null | head -n 1)
+        version_info=$(gemini --version 2>/dev/null | head -n 1)
         [ -z "$version_info" ] && version_info="已就绪"
-        codex_version="${YELLOW}${version_info}${RESET}"
+        gemini_version="${YELLOW}${version_info}${RESET}"
     else
         status="${RED}未安装${RESET}"
-        codex_version="${RED}-${RESET}"
+        gemini_version="${RED}-${RESET}"
     fi
 
-    # 检查是否配置了自定义 API
-    if [ -n "$CODEX_BASE_URL" ] || [ -n "$OPENAI_BASE_URL" ]; then
-        api_status="${YELLOW}自定义中转${RESET}"
+    # 检查当前配置的模型
+    if command -v gemini &> /dev/null; then
+        current_model=$(gemini config get model 2>/dev/null)
+        [ -z "$current_model" ] && current_model="未设置"
+        api_status="${GREEN}${current_model}${RESET}"
     else
-        api_status="${GREEN}官方默认${RESET}"
+        api_status="${RED}-${RESET}"
     fi
 }
 
@@ -53,194 +33,191 @@ show_menu() {
     clear
     get_status
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈    Codex CLI 管理面板   ◈    ${RESET}"
+    echo -e "${GREEN}  ◈  Gemini CLI  管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} $codex_version"
-    echo -e "${GREEN}API  :${RESET} $api_status"
+    echo -e "${GREEN}版本 :${RESET} $gemini_version"
+    echo -e "${GREEN}模型 :${RESET} $api_status"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 当前目录启动${RESET}"
-    echo -e "${GREEN}3. 指定路径启动${RESET}"
-    echo -e "${GREEN}4. 登录/切换账户${RESET}"
-    echo -e "${GREEN}5. 设置自定义API模型/中转${RESET}"
-    echo -e "${GREEN}6. 更新${RESET}"
-    echo -e "${GREEN}7. 卸载${RESET}"
+    echo -e "${GREEN}2. 配置API密钥${RESET}"
+    echo -e "${GREEN}3. 调整模型与核心参数${RESET}"
+    echo -e "${GREEN}4. 查看配置列表${RESET}"
+    echo -e "${GREEN}5. 运行帮助命令${RESET}"
+    echo -e "${GREEN}6. 卸载${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
 }
 
-# 1. 安装
-install_codex() {
-    echo -e "\n${YELLOW}正在通过官方安装 Codex...${RESET}"
-    curl -fsSL https://chatgpt.com/codex/install.sh | bash
-    
-    echo -e "\n${YELLOW}正在检查环境并自动修复 PATH...${RESET}"
-    local shell_config=""
-    if [ -n "$ZSH_VERSION" ] || [ -f "$HOME/.zshrc" ]; then
-        shell_config="$HOME/.zshrc"
-    else
-        shell_config="$HOME/.bashrc"
-    fi
-
-    if ! grep -q '\.local/bin' "$shell_config" 2>/dev/null; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$shell_config"
-        echo -e "${GREEN}✔ 已自动将 ~/.local/bin 写入 $shell_config${RESET}"
-    else
-        echo -e "${GREEN}✔ 配置文件中已存在 PATH 记录，无需重复添加。${RESET}"
-    fi
-
-    export PATH="$HOME/.local/bin:$PATH"
-    echo -e "${GREEN}安装与修复完成！${RESET}"
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 2. 当前目录启动
-start_current() {
-    if command -v codex &> /dev/null; then
-        echo -e "\n${GREEN}正在当前目录启动 Codex...${RESET}"
-        refresh_env
-        codex
-    else
-        echo -e "\n${RED}未检测到 codex 命令，请先执行安装！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 3. 指定路径启动
-start_path() {
-    echo -e "\n"
-    echo -ne "${GREEN}请输入你的项目绝对路径: ${RESET}"
-    read target_path
-    if [ -d "$target_path" ]; then
-        echo -e "${GREEN}正在切换到 $target_path 并启动 Codex...${RESET}"
-        refresh_env
-        cd "$target_path" && codex
-    else
-        echo -e "${RED}路径不存在，请检查后重试！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 4. 登录
-login_codex() {
-    if command -v codex &> /dev/null; then
-        echo -e "\n${YELLOW}正在启动远程/无头设备专属登录程序...${RESET}"
-        refresh_env
-        # 自动追加 --device-auth 参数，防止在 Linux 服务器上卡死
-        codex login --device-auth || codex login || codex
-    else
-        echo -e "\n${RED}未检测到已安装的 Codex。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 5. 配置高级自定义 API 模型路径和 Key
-config_custom_api() {
-    echo -e "\n${GREEN}================================${RESET}"
-    echo -e "${GREEN}      自定义 API 配置管理       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}当前保存的 Base URL:${RESET} ${YELLOW}${CODEX_BASE_URL:-${OPENAI_BASE_URL:-官方默认}}${RESET}"
-    echo -e "${GREEN}当前保存的主模型:${RESET}    ${YELLOW}${CODEX_MODEL:-默认 (gpt-4o)}${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${GREEN}1. 快捷设置中转 / 代理模型配置${RESET}"
-    echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
-    echo -e "${GREEN}0. 返回主菜单${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read api_choice
-
-    case $api_choice in
-        1)
-            echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关:${RESET}"
-            echo -ne "   (例如: https://api.openai.com/v1 或你的AI代理地址)\n   地址: "
-            read input_url
-            
-            echo -e "\n${YELLOW}2/4. 请输入你的 API Key / Token:${RESET}"
-            echo -ne "   秘钥: "
-            read input_key
-            
-            echo -e "\n${YELLOW}3/4. 请输入你想指定的主核心模型:${RESET}"
-            echo -ne "   (直接回车默认使用: gpt-4o)\n   模型名: "
-            read input_model
-            [ -z "$input_model" ] && input_model="gpt-4o"
-
-            echo -e "\n${YELLOW}4/4. 请输入你想指定的子代理 (Subagent) 模型:${RESET}"
-            echo -ne "   (直接回车默认使用: gpt-4o-mini)\n   模型名: "
-            read input_submodel
-            [ -z "$input_submodel" ] && input_submodel="gpt-4o-mini"
-
-            if [ -n "$input_url" ] && [ -n "$input_key" ]; then
-                # 写入本地持久化环境配置文件，全量覆盖注入
-                echo "export CODEX_BASE_URL=\"$input_url\"" > "$ENV_FILE"
-                echo "export OPENAI_BASE_URL=\"$input_url\"" >> "$ENV_FILE"
-                echo "export OPENAI_API_KEY=\"$input_key\"" >> "$ENV_FILE"
-                echo "export CODEX_API_KEY=\"$input_key\"" >> "$ENV_FILE"
-                echo "export CODEX_MODEL=\"$input_model\"" >> "$ENV_FILE"
-                echo "export CODEX_SUBAGENT_MODEL=\"$input_submodel\"" >> "$ENV_FILE"
-                
-                # 触发即时生效
-                refresh_env
-                echo -e "\n${GREEN}✔ 恭喜！高级多模型变量已成功保存。启动时将全面生效。${RESET}"
-            else
-                echo -e "${RED}输入不能为空，取消设置。${RESET}"
+# 1. 安装 (集成 Node.js v24 自动配置)
+install_gemini() {
+    echo -e "\n${YELLOW}[1/3] 正在检测 Node.js 环境...${RESET}"
+    if ! command -v node &> /dev/null; then
+        echo -e "${YELLOW}未检测到 Node.js，正在通过 NodeSource 配置 Node.js v24 源...${RESET}"
+        
+        # 确保系统有 curl
+        if ! command -v curl &> /dev/null; then
+            echo -e "${YELLOW}检测到缺少 curl，正在尝试安装...${RESET}"
+            if command -v apt-get &> /dev/null; then
+                apt-get update && apt-get install -y curl
+            elif command -v dnf &> /dev/null; then
+                dnf install -y curl
+            elif command -v yum &> /dev/null; then
+                yum install -y curl
             fi
-            ;;
-        2)
-            if [ -f "$ENV_FILE" ]; then
-                rm -f "$ENV_FILE"
-                # 全量取消变量定义
-                unset CODEX_BASE_URL OPENAI_BASE_URL OPENAI_API_KEY CODEX_API_KEY CODEX_MODEL CODEX_SUBAGENT_MODEL
-                echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复官方默认配置。${RESET}"
-            else
-                echo -e "${YELLOW}当前本来就是官方默认配置。${RESET}"
-            fi
-            ;;
-        *)
+        fi
+
+        # 执行 NodeSource v24 脚本
+        curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+        
+        # 根据包管理器执行安装
+        if command -v apt-get &> /dev/null; then
+            echo -e "${YELLOW}正在通过 apt 安装 nodejs...${RESET}"
+            apt-get install -y nodejs
+        elif command -v dnf &> /dev/null; then
+            echo -e "${YELLOW}正在通过 dnf 安装 nodejs...${RESET}"
+            dnf install -y nodejs
+        elif command -v yum &> /dev/null; then
+            echo -e "${YELLOW}正在通过 yum 安装 nodejs...${RESET}"
+            yum install -y nodejs
+        else
+            echo -e "${RED}❌ 未能识别系统包管理器，请手动运行：apt/dnf install -y nodejs${RESET}"
+            echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
             return
-            ;;
-    esac
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 6. 更新
-update_codex() {
-    echo -e "\n${YELLOW}正在更新 Codex...${RESET}"
-    if command -v codex &> /dev/null; then
-        codex update || curl -fsSL https://chatgpt.com/codex/install.sh | bash
+        fi
+    fi
+    
+    # 再次确认 Node 版本
+    if command -v node &> /dev/null; then
+        echo -e "${GREEN}✔ Node.js 已就绪，版本: $(node --version)${RESET}"
+        echo -e "${GREEN}✔ npm 版本: $(npm --version)${RESET}"
     else
-        echo -e "${RED}未检测到已安装的 Codex，无法更新。${RESET}"
+        echo -e "${RED}❌ Node.js 安装失败，请检查网络或系统权限。${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+        return
+    fi
+
+    echo -e "\n${YELLOW}[2/3] 正在通过 npm 全局安装 @google/gemini-cli...${RESET}"
+    npm install -g @google/gemini-cli
+
+    echo -e "\n${YELLOW}[3/3] 验证安装状态...${RESET}"
+    if command -v gemini &> /dev/null; then
+        echo -e "\n${GREEN}✔ Gemini CLI 成功部署并激活！${RESET}"
+        echo -e "${YELLOW}$(gemini --version)${RESET}"
+    else
+        echo -e "\n${RED}❌ Gemini CLI 全局安装成功但命令未找到，可能需要将 npm 全局 bin 目录加入到 PATH 中。${RESET}"
     fi
     echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
-# 7. 整合卸载
-uninstall_codex_flow() {
+# 2. 配置 API 密钥
+config_api_key() {
+    if ! command -v gemini &> /dev/null; then
+        echo -e "\n${RED}❌ 请先执行选项 1 安装 Gemini CLI！${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+        return
+    fi
+
+    echo -e "\n${YELLOW}请输入你的 Gemini API 密钥 (API Key):${RESET}"
+    echo -ne " Key: "
+    read input_key
+
+    if [ -n "$input_key" ]; then
+        gemini config set api-key "$input_key"
+        echo -e "\n${GREEN}✔ API 密钥配置成功！验证结果如下：${RESET}"
+        echo -ne "当前生效 Key: "
+        gemini config get api-key
+    else
+        echo -e "${RED}输入不能为空，取消设置。${RESET}"
+    fi
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+}
+
+# 3. 调整参数
+config_params() {
+    if ! command -v gemini &> /dev/null; then
+        echo -e "\n${RED}❌ 请先执行选项 1 安装 Gemini CLI！${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+        return
+    fi
+
+    echo -e "\n${GREEN}================================${RESET}"
+    echo -e "${GREEN}       Gemini 参数快速调整       ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    
+    # 1. 模型设置
+    echo -e "${YELLOW}1/3. 请输入默认模型名称 (直接回车默认: gemini-pro):${RESET}"
+    echo -ne " 模型名: "
+    read input_model
+    [ -z "$input_model" ] && input_model="gemini-pro"
+    gemini config set model "$input_model"
+
+    # 2. 创造性设置
+    echo -e "\n${YELLOW}2/3. 请输入创造性参数 temperature (0.0 ~ 2.0，直接回车默认: 0.7):${RESET}"
+    echo -ne " Temperature: "
+    read input_temp
+    [ -z "$input_temp" ] && input_temp="0.7"
+    gemini config set temperature "$input_temp"
+
+    # 3. 最大长度设置
+    echo -e "\n${YELLOW}3/3. 请输入最大输出长度 maxTokens (直接回车默认: 2000):${RESET}"
+    echo -ne " MaxTokens: "
+    read input_tokens
+    [ -z "$input_tokens" ] && input_tokens="2000"
+    gemini config set maxTokens "$input_tokens"
+
+    echo -e "\n${GREEN}✔ 参数修改成功！${RESET}"
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+}
+
+# 4. 查看配置列表
+view_config() {
+    if ! command -v gemini &> /dev/null; then
+        echo -e "\n${RED}❌ 请先执行选项 1 安装 Gemini CLI！${RESET}"
+    else
+        echo -e "\n${YELLOW}--- 当前 Gemini CLI 完整配置列表 ---${RESET}"
+        gemini config list
+        echo -e "${YELLOW}-----------------------------------${RESET}"
+    fi
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+}
+
+# 5. 帮助命令
+show_help() {
+    if ! command -v gemini &> /dev/null; then
+        echo -e "\n${RED}❌ 请先执行选项 1 安装 Gemini CLI！${RESET}"
+    else
+        echo -e "\n${YELLOW}--- gemini --help 输出 ---${RESET}"
+        gemini --help
+        echo -e "${YELLOW}--------------------------${RESET}"
+    fi
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+}
+
+# 6. 整合卸载（包含配置与环境清理）
+uninstall_gemini_flow() {
     echo -e "\n${RED}准备进入卸载流程...${RESET}"
-    echo -ne "${RED}确定要卸载 Codex 主程序吗？(y/n): ${RESET}"
+    echo -ne "${RED}确定要卸载 Gemini CLI 主程序吗？(y/n): ${RESET}"
     read ans
     if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
-        # 第一步：卸载程序
-        echo -e "${YELLOW}[步骤 1/2] 正在删除主程序可执行文件...${RESET}"
-        rm -f ~/.local/bin/codex
-        rm -rf ~/.local/share/codex
-        echo -e "${GREEN}✔ 主程序卸载成功。${RESET}"
+        # 第一步：卸载 CLI 主程序
+        echo -e "${YELLOW}[步骤 1/3] 正在通过 npm 卸载全局 @google/gemini-cli...${RESET}"
+        npm uninstall -g @google/gemini-cli
+        echo -e "${GREEN}✔ 主程序卸载指令执行完毕。${RESET}"
         
-        # 第二步：清除配置文件
-        echo -e "\n${RED}[步骤 2/2] 是否需要连同配置文件、历史记录、自定义API设置一起清除？${RESET}"
-        echo -e "${RED}注意：此操作不可逆，清除后所有本地历史将永久丢失！${RESET}"
+        # 第二步：清除本地配置
+        echo -e "\n${RED}[步骤 2/3] 是否需要连同 Gemini CLI 的本地配置文件与历史缓存一起清除？${RESET}"
+        echo -e "${RED}注意：通常包含全局密钥和自定义的模型配置。${RESET}"
         echo -ne "${RED}是否清除配置文件？(y/n): ${RESET}"
         read ans_config
         if [ "$ans_config" = "y" ] || [ "$ans_config" = "Y" ]; then
-            echo -e "${YELLOW}正在清除全局、本地及API配置文件...${RESET}"
-            rm -rf ~/.codex
-            rm -f ~/.codex.json
-            rm -rf .codex
-            rm -f "$ENV_FILE"
-            echo -e "${GREEN}✔ 配置文件清除完毕，所有数据已彻底干净！${RESET}"
+            echo -e "${YELLOW}正在清理本地存储目录 ~/.gemini 及相关隐藏配置文件...${RESET}"
+            rm -rf "$HOME/.gemini"
+            rm -rf "$HOME/.config/gemini" 2>/dev/null
+            echo -e "${GREEN}✔ 配置文件与本地缓存已彻底清除。${RESET}"
         else
-            echo -e "${YELLOW}已保留配置文件。你可以随时重新安装并恢复使用。${RESET}"
+            echo -e "${YELLOW}已保留本地配置文件。${RESET}"
         fi
     else
         echo "已取消卸载操作。"
@@ -253,13 +230,12 @@ while true; do
     show_menu
     read choice
     case $choice in
-        1) install_codex ;;
-        2) start_current ;;
-        3) start_path ;;
-        4) login_codex ;;
-        5) config_custom_api ;;
-        6) update_codex ;;
-        7) uninstall_codex_flow ;;
+        1) install_gemini ;;
+        2) config_api_key ;;
+        3) config_params ;;
+        4) view_config ;;
+        5) show_help ;;
+        6) uninstall_gemini_flow ;;
         0) clear; exit 0 ;;
         *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
     esac

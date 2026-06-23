@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# BAIDUCHAT2API (官方原生 Clone + 环境变量 Build) 自动化管理面板
+# Huobao-Drama 短剧服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,11 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="wenxin2api"
-BASE_DIR="/opt/baiduchat2api"
-# 直接将面板和源码放在一起
-SRC_DIR="$BASE_DIR" 
-REPO_URL="https://github.com/XxxXTeam/baiduchat2api.git"
+CONTAINER_NAME="huobao-drama"
+BASE_DIR="/opt/huobao-drama"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+CONFIG_FILE="$BASE_DIR/configs/config.yaml"
 
 # 检测依赖
 check_dependencies() {
@@ -22,40 +21,45 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态获取服务端口与运行状态
+# 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    # 优先从根目录的 .env 文件中读取之前自定义过的端口
-    if [ -f "$SRC_DIR/.env" ]; then
-        webui_port=$(grep "WENXIN_PORT=" "$SRC_DIR/.env" | cut -d'=' -f2)
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
     fi
 
-    local container_id=$(docker ps -q -f "name=wenxin2api" -f "status=running" 2>/dev/null)
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
 
-    if [[ -n "$container_id" ]]; then
-        status="${GREEN}运行中${RESET}"
-        # 如果 .env 没读到，降级使用 docker inspect 抓取
-        if [[ -z "$webui_port" ]]; then
-            webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
-            [[ -z "$webui_port" ]] && webui_port="8000"
-        fi
+        # 从容器状态提取内部暴露端口绑定的宿主机端口（根据 config.yaml，内部实际监听的是 5678 端口）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5678/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 兜底获取第一个绑定的端口
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="5678"
+
+        # 从容器状态提取数据目录（挂载路径）
+        data_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$data_dir" ]] && data_dir="/opt/huobao-drama/data"
     else
-        if [ -d "$SRC_DIR/.git" ]; then
-            status="${RED}已停止${RESET}"
-        else
-            status="${RED}未部署${RESET}"
-        fi
-        [[ -z "$webui_port" ]] && webui_port="N/A"
+        # 容器未安装/未部署时的返回值
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        data_dir="N/A"
     fi
 }
 
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local mode=${1:-"auto"}
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -77,196 +81,160 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署核心逻辑
-install_translate() {
+# 部署 Huobao-Drama
+install_huobao_drama() {
     check_dependencies
+    
+    mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 1. 端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 百度转API 映射端口 (对应 WENXIN_PORT) [默认: 8000]: ${RESET}"
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    echo -ne "${YELLOW}请输入 Huobao-Drama 访问端口 (宿主机端口) [默认: 5678]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8000"
-
-    echo -e "\n${CYAN}====== 2. 安全配置 ======${RESET}"
-    echo -ne "${YELLOW}请设置你的公网访问 API Key (例如 sk-123456) [留空则不启用鉴权]: ${RESET}"
-    read -r custom_key
-
-    # 克隆官方仓库到当前工作目录
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "\n${YELLOW}正在克隆官方 GitHub 仓库...${RESET}"
-        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
-        if [ $? -eq 0 ]; then
-            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
-            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
-            rm -rf "$SRC_DIR/tmp_repo"
-        else
-            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
-            exit 1
-        fi
-    else
-        echo -e "\n${GREEN}检测到本地已存在官方仓库，正在同步最新代码...${RESET}"
-        cd "$SRC_DIR" && git pull
-    fi
-
-    # 回到仓库根目录
-    cd "$SRC_DIR"
-
-    # 处理 API Key 数组格式
-    if [[ -z "$custom_key" ]]; then
-        toml_keys="[]"
-    else
-        toml_keys="[\"$custom_key\"]"
-    fi
-
-    # 动态写入适配支持自定义端口与挂载的 docker-compose.yml
-    cat <<EOF > docker-compose.yml
-
-services:
-  wenxin2api:
-    build: .
-    image: wenxin2api:latest
-    container_name: wenxin2api
-    restart: unless-stopped
-    ports:
-      - "\${WENXIN_PORT:-8000}:8000"
-    volumes:
-      - ./config.toml:/app/config.toml:ro
-      - ./cookies.json:/app/cookies.json
-EOF
-
-    # 动态生成配套的 config.toml
-    cat <<EOF > config.toml
-[cookies]
-value = ""
-
-[server]
-host = "0.0.0.0"
-port = 8000
-
-[auth]
-api_keys = $toml_keys
-
-[models]
-wenxin = "ernie-4.5"
-deepseek_r1 = "deepseek-r1"
-dsv4pro = "deepseek-v4-pro"
-
-[headers]
-user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-[cookie_persistence]
-cookie_file = "cookies.json"
-auto_save_cookies = true
-
-[context]
-fresh_conversation = true
-max_chars = 12000
-max_messages = 16
-max_message_chars = 2000
-
-[options]
-default_model = "ernie-4.5"
-stream = true
-EOF
-
-    # 初始化被挂载的为空 JSON 文件，防止 docker 将其识别为目录
-    touch cookies.json
-    chmod 666 cookies.json
-
-    # 将自定义端口写入持久化环境文件
-    if [ -f ".env" ]; then
-        sed -i '/^WENXIN_PORT=/d' .env
-        echo "WENXIN_PORT=$custom_port" >> .env
-    else
-        echo "WENXIN_PORT=$custom_port" > .env
-    fi
-
-    # 执行集群编译启动
-    echo -e "\n${YELLOW}正在执行原生编译启动命令...${RESET}"
-    WENXIN_PORT=$custom_port docker compose up -d --build
-
-    echo -e "${YELLOW}正在等待容器集群 Build 编译并拉起服务 (约 5 秒)...${RESET}"
-    sleep 5
-
-    get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}        BAIDUCHAT2API 编译并启动成功！              ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}API 接口地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    if [[ -n "$custom_key" ]]; then
-        echo -e "${YELLOW}预设鉴权密钥 : ${custom_key}${RESET}"
-    fi
-    echo -e "${YELLOW}项目所在路径 : ${SRC_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-
-# 原生更新：拉取代码 + 重新 Build
-update_translate() {
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
+    [[ -z "$custom_port" ]] && custom_port="5678"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
-    get_status_info
-    local current_port=$webui_port
-    [[ "$current_port" == "N/A" || -z "$current_port" ]] && current_port="8000"
 
-    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
-    cd "$SRC_DIR" && git pull
+    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/huobao-drama/data]: ${RESET}"
+    read -r custom_data
+    [[ -z "$custom_data" ]] && custom_data="/opt/huobao-drama/data"
+
+    # 1. 创建所需的宿主机目录
+    mkdir -p "$custom_data"
+    mkdir -p "$BASE_DIR/configs"
     
-    if [ -f ".env" ]; then
-        sed -i '/^WENXIN_PORT=/d' .env
-        echo "WENXIN_PORT=$current_port" >> .env
-    fi
+    # 2. 动态自动写入用户提供的完整 config.yaml 配置内容
+    echo -e "${YELLOW}正在初始化并写入应用配置文件 (config.yaml)...${RESET}"
+    cat <<EOF > "$CONFIG_FILE"
+app:
+  name: "Huobao Drama API"
+  version: "1.0.0"
+  debug: true
+  language: "zh"
 
-    echo -e "${YELLOW}正在使用原自定义端口 [$current_port] 重编镜像并热更新...${RESET}"
-    WENXIN_PORT=$current_port docker compose up -d --build --remove-orphans
-    echo -e "${GREEN}集群更新并重编完成！${RESET}"
+server:
+  port: 5678
+  host: "0.0.0.0"
+  cors_origins:
+    - "http://localhost:3012"
+  read_timeout: 600
+  write_timeout: 600
+
+database:
+  type: "sqlite"
+  path: "./data/huobao_drama.db"
+  max_idle: 10
+  max_open: 100
+
+storage:
+  type: "local"
+  local_path: "./data/storage"
+  base_url: "http://localhost:${custom_port}/static"
+
+ai:
+  default_text_provider: "openai"
+  default_image_provider: "openai"
+  default_video_provider: "doubao"
+EOF
+    
+    chmod -R 777 "$BASE_DIR" "$custom_data"
+
+    # 3. 动态生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  huobao-drama:
+    image: huobao/huobao-drama:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:5678"
+    volumes:
+      - ${custom_data}:/app/data
+      - ./configs/config.yaml:/app/configs/config.yaml
+    environment:
+      - NODE_ENV=production
+      - PORT=5678
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Huobao-Drama 短剧服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    Huobao-Drama 部署成功！      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
+    echo -e "${YELLOW}宿主机配置路径 : $CONFIG_FILE${RESET}"
+    echo -e "${YELLOW}提示: 如果需要修改 AI 供应商或其他参数，请直接编辑 config.yaml 并重启容器。${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 彻底卸载
-uninstall_translate() {
-    echo -ne "${RED}确定要停止并卸载 BAIDUCHAT2API 容器集群吗？(y/n): ${RESET}"
+# 更新 Huobao-Drama 镜像
+update_huobao_drama() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取 Huobao-Drama 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+}
+
+# 卸载 Huobao-Drama
+uninstall_huobao_drama() {
+    echo -ne "${YELLOW}确定要卸载并删除 Huobao-Drama 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -d "$SRC_DIR/.git" ]; then
-            cd "$SRC_DIR" && docker compose down
-            echo -e "${GREEN}容器与网络已被安全停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同步连根拔除本地克隆的【全部源码及环境配置】？(y/n): ${RESET}"
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和业务数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有源码与持久化数据已被彻底清除！${RESET}"
+                echo -e "${GREEN}所有数据目录与配置文件已彻底清理。${RESET}"
             fi
         else
-            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 联动生命周期
-start_translate() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}集群已全面启动${RESET}"; }
-stop_translate() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}集群已安全停止${RESET}"; }
-restart_translate() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}集群已平滑重启${RESET}"; }
-logs_translate() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
+start_huobao_drama() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_huobao_drama() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_huobao_drama() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_huobao_drama() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    local DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}集群运行状态     : $status"
-    echo -e "${YELLOW}服务请求地址     : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN} ◈ BAIDUCHAT2API 自动化管理面板 ◈   ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}  ◈  Huobao-Drama 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -276,17 +244,17 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
+        1) install_huobao_drama ;;
+        2) update_huobao_drama ;;
+        3) uninstall_huobao_drama ;;
+        4) start_huobao_drama ;;
+        5) stop_huobao_drama ;;
+        6) restart_huobao_drama ;;
+        7) logs_huobao_drama ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

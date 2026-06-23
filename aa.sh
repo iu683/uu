@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# FOSSBilling 自动化管理面板
+# Paymenter 自动化管理面板
 # =================================================================
 
 # 颜色
@@ -11,8 +11,8 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # 定义核心容器名
-CONTAINER_NAME="fossbilling-web"
-BASE_DIR="/opt/fossbilling"
+CONTAINER_NAME="paymenter-web"
+BASE_DIR="/opt/paymenter"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -41,17 +41,11 @@ get_status_info() {
         webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port="80"
-
-        # 动态提取宿主机挂载的绝对路径
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/www/html"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/www"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        data_dir="N/A"
     fi
 }
-
 get_public_ip() {
     local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
@@ -80,58 +74,53 @@ generate_password() {
     if command -v openssl &> /dev/null; then
         openssl rand -hex 12
     else
-        echo "foss_pass_$(date +%s)"
+        echo "pay_pass_$(date +%s)"
     fi
 }
 
-# 部署 FOSSBilling 主函数
-install_fossbilling() {
+
+
+# 部署 Paymenter 主函数
+install_paymenter() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 1. 基础环境配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 FOSSBilling 访问端口 [默认: 80]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Paymenter 访问端口 [默认: 80]: ${RESET}"
     read -r custom_port
     [[ -z "$custom_port" ]] && custom_port="80"
 
-    echo -ne "${YELLOW}请输入网页数据本地挂载绝对路径 [默认: $BASE_DIR/www]: ${RESET}"
-    read -r local_web_dir
-    [[ -z "$local_web_dir" ]] && local_web_dir="$BASE_DIR/www"
-
     echo -e "\n${CYAN}====== 2. 数据库类型选择 ======${RESET}"
-    echo -e "${GREEN}1) 部署全新的本地 MySQL 数据库 (数据同样挂载到本地)${RESET}"
-    echo -e "${GREEN}2) 连接已有的远程/外部 MySQL 数据库 (不需要本地库)${RESET}"
+    echo -e "${GREEN}1) 部署全新的本地 MariaDB 数据库 (数据挂载在本地 ./database)${RESET}"
+    echo -e "${GREEN}2) 连接已有的远程/外部 MySQL/MariaDB 数据库${RESET}"
     echo -ne "${YELLOW}请选择数据库部署模式 [默认 1]: ${RESET}"
     read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
     if [[ "$db_mode" == "1" ]]; then
-        # 本地数据库配置
-        db_host="fossbilling-db"
+        db_host="paymenter-db"
         db_port="3306"
+        db_connection="mariadb"
+        db_name="paymenter"
+        db_user="paymenter"
         
-        echo -ne "${YELLOW}请输入本地数据库数据挂载绝对路径 [默认: $BASE_DIR/mysql]: ${RESET}"
-        read -r local_db_dir
-        [[ -z "$local_db_dir" ]] && local_db_dir="$BASE_DIR/mysql"
-
-        echo -ne "${YELLOW}请输入本地数据库名称 [默认: fossbilling]: ${RESET}"
-        read -r db_name
-        [[ -z "$db_name" ]] && db_name="fossbilling"
-
-        echo -ne "${YELLOW}请输入本地数据库用户名 [默认: foss_user]: ${RESET}"
-        read -r db_user
-        [[ -z "$db_user" ]] && db_user="foss_user"
-
-        echo -ne "${YELLOW}请输入本地数据库密码 (留空则随机生成): ${RESET}"
+        echo -ne "${YELLOW}请输入本地数据库用户密码 (留空则随机生成): ${RESET}"
         read -r db_password
         [[ -z "$db_password" ]] && db_password=$(generate_password)
 
+        echo -ne "${YELLOW}请输入本地数据库 Root 密码 (留空则随机生成): ${RESET}"
+        read -r db_root_password
+        [[ -z "$db_root_password" ]] && db_root_password=$(generate_password)
+
     elif [[ "$db_mode" == "2" ]]; then
-        # 远程数据库配置
-        echo -ne "${YELLOW}请输入远程数据库地址 (Host) [例如 192.168.1.100]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库驱动类型 (mysql / mariadb) [默认 mariadb]: ${RESET}"
+        read -r db_connection
+        [[ -z "$db_connection" ]] && db_connection="mariadb"
+
+        echo -ne "${YELLOW}请输入远程数据库地址 (Host): ${RESET}"
         read -r db_host
         while [[ -z "$db_host" ]]; do
-            echo -e "${RED}错误: 远程数据库地址不能为空！${RESET}"
+            echo -e "${RED}错误: 数据库地址不能为空！${RESET}"
             echo -ne "${YELLOW}请输入远程数据库地址 (Host): ${RESET}"
             read -r db_host
         done
@@ -140,13 +129,13 @@ install_fossbilling() {
         read -r db_port
         [[ -z "$db_port" ]] && db_port="3306"
 
-        echo -ne "${YELLOW}请输入远程数据库名称 [默认: fossbilling]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库名称 [默认: paymenter]: ${RESET}"
         read -r db_name
-        [[ -z "$db_name" ]] && db_name="fossbilling"
+        [[ -z "$db_name" ]] && db_name="paymenter"
 
-        echo -ne "${YELLOW}请输入远程数据库用户名 [默认: foss_user]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库用户名 [默认: paymenter]: ${RESET}"
         read -r db_user
-        [[ -z "$db_user" ]] && db_user="foss_user"
+        [[ -z "$db_user" ]] && db_user="paymenter"
 
         echo -ne "${YELLOW}请输入远程数据库密码: ${RESET}"
         read -r db_password
@@ -155,175 +144,265 @@ install_fossbilling() {
         return
     fi
 
-    # 3. 创建本地挂载目录并赋予权限，防止容器内部无写入权限
-    echo -e "\n${YELLOW}正在创建本地挂载目录并配置文件权限...${RESET}"
-    mkdir -p "$local_web_dir"
-    chmod -R 777 "$local_web_dir"
-    if [[ "$db_mode" == "1" ]]; then
-        mkdir -p "$local_db_dir"
-        chmod -R 777 "$local_db_dir"
-    fi
+    # 创建本地所需要的持久化目录并放开权限
+    echo -e "\n${YELLOW}正在初始化本地挂载目录权限...${RESET}"
+    mkdir -p "$BASE_DIR/storage/logs" "$BASE_DIR/storage/public" "$BASE_DIR/themes" "$BASE_DIR/extensions" "$BASE_DIR/database"
+    chmod -R 777 "$BASE_DIR"
 
-    # 4. 写入环境配置文件 .env
+    # 3. 写入环境配置文件 .env
     cat <<EOF > "$ENV_FILE"
+DB_CONNECTION=${db_connection}
 DB_HOST=${db_host}
 DB_PORT=${db_port}
 DB_NAME=${db_name}
 DB_USER=${db_user}
 DB_PASSWORD=${db_password}
-LOCAL_WEB_DIR=${local_web_dir}
-LOCAL_DB_DIR=${local_db_dir}
 EOF
 
-    # 5. 根据模式动态生成纯绝对路径挂载的 docker-compose.yml
+    # 4. 根据模式动态生成纯绝对路径挂载的 docker-compose.yml
     echo -e "${YELLOW}正在生成对应的 docker-compose.yml 配置文件...${RESET}"
+    
+    # 基础公共 Service：包含 web, cache 和 asset-builder
     if [[ "$db_mode" == "1" ]]; then
+        # 带有本地 MariaDB 的模板
         cat <<EOF > "$COMPOSE_FILE"
 services:
-  fossbilling:
+  database:
+    container_name: paymenter-db
+    image: mariadb:lts
+    restart: always
+    command: --default-authentication-plugin=mysql_native_password --max_allowed_packet=64M --wait_timeout=28800
+    volumes:
+      - "./database:/var/lib/mysql"
+    environment:
+      MYSQL_ROOT_PASSWORD: "${db_root_password}"
+      MYSQL_DATABASE: "${db_name}"
+      MYSQL_USER: "${db_user}"
+      MYSQL_PASSWORD: "${db_password}"
+    networks:
+      - paymenter_nw
+
+  cache:
+    container_name: paymenter-cache
+    image: redis:alpine
+    restart: always
+    networks:
+      - paymenter_nw
+
+  paymenter:
     container_name: ${CONTAINER_NAME}
-    image: fossbilling/fossbilling:latest
+    image: ghcr.io/paymenter/paymenter:latest
     restart: always
     ports:
       - "${custom_port}:80"
-    environment:
-      - DB_HOST=\${DB_HOST}
-      - DB_NAME=\${DB_NAME}
-      - DB_USER=\${DB_USER}
-      - DB_PASSWORD=\${DB_PASSWORD}
     volumes:
-      - \${LOCAL_WEB_DIR}:/var/www/html
+      - "./:/app/var/"
+      - "./storage/logs:/app/storage/logs"
+      - "./storage/public:/app/storage/app/public"
+      - "./themes:/app/themes"
+      - "./extensions:/app/extensions"
+      - "app_volume:/app"
+    environment:
+      DB_CONNECTION: "\${DB_CONNECTION}"
+      DB_HOST: "\${DB_HOST}"
+      DB_PORT: "\${DB_PORT}"
+      DB_DATABASE: "\${DB_NAME}"
+      DB_USERNAME: "\${DB_USER}"
+      DB_PASSWORD: "\${DB_PASSWORD}"
+      APP_ENV: "production"
+      CACHE_STORE: "redis"
+      REDIS_HOST: "paymenter-cache"
+      PAYMENTER_SKIP_DEFAULT: "false"
     depends_on:
-      - mysql
+      - database
+      - cache
+    networks:
+      - paymenter_nw
 
-  mysql:
-    container_name: fossbilling-db
-    image: mysql:8.2
-    restart: always
-    environment:
-      MYSQL_DATABASE: \${DB_NAME}
-      MYSQL_USER: \${DB_USER}
-      MYSQL_PASSWORD: \${DB_PASSWORD}
-      MYSQL_RANDOM_ROOT_PASSWORD: '1'
+  asset-builder:
+    container_name: paymenter-asset-builder
+    image: node:22-alpine
+    profiles: ["build"]
+    working_dir: /app
     volumes:
-      - \${LOCAL_DB_DIR}:/var/lib/mysql
+      - "./themes:/app/themes"
+      - "./extensions:/app/extensions"
+      - "./:/app/var"
+      - "app_volume:/app"
+    command: >
+      sh -c "tail -f /dev/null"
+    networks:
+      - paymenter_nw
+
+networks:
+  paymenter_nw:
+    driver: bridge
+
+volumes:
+  app_volume:
 EOF
     else
+        # 不带本地数据库的纯 Web 容器模板
         cat <<EOF > "$COMPOSE_FILE"
 services:
-  fossbilling:
+  cache:
+    container_name: paymenter-cache
+    image: redis:alpine
+    restart: always
+    networks:
+      - paymenter_nw
+
+  paymenter:
     container_name: ${CONTAINER_NAME}
-    image: fossbilling/fossbilling:latest
+    image: ghcr.io/paymenter/paymenter:latest
     restart: always
     ports:
       - "${custom_port}:80"
-    environment:
-      - DB_HOST=\${DB_HOST}
-      - DB_PORT=\${DB_PORT}
-      - DB_NAME=\${DB_NAME}
-      - DB_USER=\${DB_USER}
-      - DB_PASSWORD=\${DB_PASSWORD}
     volumes:
-      - \${LOCAL_WEB_DIR}:/var/www/html
+      - "./:/app/var/"
+      - "./storage/logs:/app/storage/logs"
+      - "./storage/public:/app/storage/app/public"
+      - "./themes:/app/themes"
+      - "./extensions:/app/extensions"
+      - "app_volume:/app"
+    environment:
+      DB_CONNECTION: "\${DB_CONNECTION}"
+      DB_HOST: "\${DB_HOST}"
+      DB_PORT: "\${DB_PORT}"
+      DB_DATABASE: "\${DB_NAME}"
+      DB_USERNAME: "\${DB_USER}"
+      DB_PASSWORD: "\${DB_PASSWORD}"
+      APP_ENV: "production"
+      CACHE_STORE: "redis"
+      REDIS_HOST: "paymenter-cache"
+      PAYMENTER_SKIP_DEFAULT: "false"
+    depends_on:
+      - cache
+    networks:
+      - paymenter_nw
+
+  asset-builder:
+    container_name: paymenter-asset-builder
+    image: node:22-alpine
+    profiles: ["build"]
+    working_dir: /app
+    volumes:
+      - "./themes:/app/themes"
+      - "./extensions:/app/extensions"
+      - "./:/app/var"
+      - "app_volume:/app"
+    command: >
+      sh -c "tail -f /dev/null"
+    networks:
+      - paymenter_nw
+
+networks:
+  paymenter_nw:
+    driver: bridge
+
+volumes:
+  app_volume:
 EOF
     fi
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动容器服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}等待本地容器和数据库初始化 (约5秒)...${RESET}"
-        sleep 5
-    else
-        echo -e "${YELLOW}等待网页容器初始化 (约2秒)...${RESET}"
-        sleep 2
-    fi
+    echo -e "${YELLOW}等待服务及依赖初始化 (约 10 秒)...${RESET}"
+    sleep 10
+
+    # 5. 执行官方要求的初始化命令
+    echo -e "\n${CYAN}====== 3. 开始执行 Paymenter 官方初始化命令行 ======${RESET}"
+    
+    echo -e "${YELLOW}[1/3] 正在配置系统应用 URL...${RESET}"
+    docker compose exec -it paymenter php artisan app:init
+
+    echo -e "${YELLOW}[2/3] 正在为数据库添加初始属性...${RESET}"
+    docker compose exec -it paymenter php artisan db:seed --class=CustomPropertySeeder
+
+    echo -e "${YELLOW}[3/3] 正在创建初始管理员用户...${RESET}"
+    docker compose exec -it paymenter php artisan app:user:create
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================================${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${GREEN}     FOSSBilling 部署成功 (本地库+全本地挂载)    ${RESET}"
-    else
-        echo -e "${GREEN}     FOSSBilling 部署成功 (远程库+本地网页挂载)  ${RESET}"
-    fi
+    echo -e "${GREEN}     Paymenter 部署与初始化全部完成！            ${RESET}"
     echo -e "${GREEN}================================================${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}网页本地路径 : ${local_web_dir}${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}数据库路径   : ${local_db_dir}${RESET}"
-    fi
+    echo -e "${YELLOW}面板访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}面板安装根目录: ${BASE_DIR}${RESET}"
     echo -e "${YELLOW}数据库主机   : ${db_host}${RESET}"
     echo -e "${YELLOW}数据库名称   : ${db_name}${RESET}"
     echo -e "${YELLOW}数据库用户   : ${db_user}${RESET}"
     echo -e "${YELLOW}数据库密码   : ${db_password}${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}DB Root 密码 : ${db_root_password}${RESET}"
+    fi
     echo -e "${GREEN}------------------------------------------------${RESET}"
-    echo -e "${CYAN}提示: 所有的容器数据都已映射到上面打印的宿主机绝对路径中，${RESET}"
-    echo -e "${CYAN}您可以非常方便地在宿主机直接修改文件、进行备份或搬家。${RESET}"
+    echo -e "${CYAN}提示：如果你在代理(Nginx/CDN)后运行，请进入 管理员 -> 设置 -> 安全设置${RESET}"
+    echo -e "${CYAN}配置可信代理（如 172.23.0.0/16），否则文件上传会失败。${RESET}"
     echo -e "${GREEN}================================================${RESET}"
 }
 
-# 更新 FOSSBilling 镜像
-update_translate() {
+# 编译资产编译器的前端静态文件 (主题/扩展)
+build_assets() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新镜像并平滑升级...${RESET}"
+    echo -e "${YELLOW}正在启动 asset-builder 编译前端资源...${RESET}"
+    cd "$BASE_DIR"
+    docker compose run --rm asset-builder npm install
+    docker compose run --rm asset-builder npm run build
+    echo -e "${GREEN}前端资源 (Themes & Extensions) 编译成功并已应用！${RESET}"
+}
+
+# 更新 Paymenter 镜像
+update_paymenter() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在拉取最新 Paymenter 镜像并升级...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 FOSSBilling
-uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 FOSSBilling 堆栈容器吗？(y/n): ${RESET}"
+# 卸载 Paymenter
+uninstall_paymenter() {
+    echo -ne "${YELLOW}确定要卸载并删除 Paymenter 堆栈容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
+            cd "$BASE_DIR" && docker compose down -v
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            
-            # 读取 .env 以获取实际的挂载路径进行清理提示
-            if [[ -f "$ENV_FILE" ]]; then
-                source "$ENV_FILE"
-            fi
-            
-            echo -ne "${YELLOW}是否删除所有本地挂载的业务数据和配置文件？(包含网页和数据库文件) (y/n): ${RESET}"
+            echo -ne "${YELLOW}是否删除本地所有下载的代码、扩展、主题及数据库文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                [[ -n "$LOCAL_WEB_DIR" ]] && rm -rf "$LOCAL_WEB_DIR"
-                [[ -n "$LOCAL_DB_DIR" ]] && rm -rf "$LOCAL_DB_DIR"
-                echo -e "${GREEN}本地所有挂载的数据文件夹已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有数据已彻底清理。${RESET}"
             else
-                echo -e "${YELLOW}已保留本地数据。您的网页数据位于: ${LOCAL_WEB_DIR:-未指定}${RESET}"
+                echo -e "${YELLOW}已保留本地挂载数据，目录位于: $BASE_DIR${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" fossbilling-db 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" paymenter-db paymenter-cache 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
-logs_translate() { cd "$BASE_DIR" && docker compose logs -f; }
+start_paymenter() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_paymenter() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_paymenter() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_paymenter() { cd "$BASE_DIR" && docker compose logs -f; }
 
 show_info() {
     get_status_info
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}Web端镜像      : ${img_version}${RESET}"
     echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}网页数据挂载   : ${data_dir}${RESET}"
-    if [[ -f "$ENV_FILE" ]]; then
-        echo -e "${GREEN}--------------------------------${RESET}"
-        echo -e "${CYAN}当前所配环境参数 (来自 .env):${RESET}"
-        cat "$ENV_FILE" | sed 's/^/  /'
-    fi
+    echo -e "${YELLOW}面板安装目录   : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -331,32 +410,34 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈ FOSSBilling 管理面板 ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  Paymenter 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新服务${RESET}"
-    echo -e "${GREEN}3. 卸载服务${RESET}"
-    echo -e "${GREEN}4. 启动服务${RESET}"
-    echo -e "${GREEN}5. 停止服务${RESET}"
-    echo -e "${GREEN}6. 重启服务${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}1. 部署启动 (包含自动化初始化)${RESET}"
+    echo -e "${GREEN}2. 编译前端 (安装/修改主题和扩展后执行)${RESET}"
+    echo -e "${GREEN}3. 更新服务${RESET}"
+    echo -e "${GREEN}4. 卸载服务${RESET}"
+    echo -e "${GREEN}5. 启动服务${RESET}"
+    echo -e "${GREEN}6. 停止服务${RESET}"
+    echo -e "${GREEN}7. 重启服务${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_fossbilling ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
-        8) show_info ;;
+        1) install_paymenter ;;
+        2) build_assets ;;
+        3) update_paymenter ;;
+        4) uninstall_paymenter ;;
+        5) start_paymenter ;;
+        6) stop_paymenter ;;
+        7) restart_paymenter ;;
+        8) logs_paymenter ;;
+        9) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

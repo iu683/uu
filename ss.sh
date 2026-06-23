@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# gcli2api Docker Compose 管理面板
+# octopus Docker Compose 管理面板 (智能防冲突版)
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="gcli2api"
-BASE_DIR="/opt/gcli2api"
+CONTAINER_NAME="octopus"
+BASE_DIR="/opt/octopus"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -21,6 +21,7 @@ check_dependencies() {
         exit 1
     fi
 }
+
 
 get_public_ip() {
     local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
@@ -56,102 +57,79 @@ get_status_info() {
     fi
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "7861/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="7861"
-
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8080"
+        
         data_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="./data/creds"
+        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/data"
     else
-        img_version="${RED}未安装${RESET}"
         webui_port="N/A"
         data_dir="N/A"
     fi
 }
 
-# 部署 gcli2api
-install_gcli2api() {
+# 部署 octopus
+install_octopus() {
     check_dependencies
+    
+    # 先建立脚本工作目录
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 7861]: ${RESET}"
+    # 1. 端口配置
+    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="7861"
+    [[ -z "$custom_port" ]] && custom_port="8080"
 
-    echo -ne "${YELLOW}请输入数据凭证存储绝对路径 [默认: /opt/gcli2api/data/creds]: ${RESET}"
+    # 2. 路径配置
+    echo -ne "${YELLOW}请输入数据存放绝对路径 [默认: /opt/octopus/data]: ${RESET}"
     read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="/opt/gcli2api/data/creds"
+    [[ -z "$custom_data" ]] && custom_data="/opt/octopus/data"
 
-    # 1. 配置 API_PASSWORD (回车默认随机)
-    echo -ne "${YELLOW}请输入接口密码 API_PASSWORD [直接回车自动生成随机密钥]: ${RESET}"
-    read -r custom_api_password
-    if [[ -z "$custom_api_password" ]]; then
-        custom_api_password="sk-$(date +%s%N | sha256sum | head -c 15)"
-        echo -e "${GREEN} -> 已自动生成随机密码: $custom_api_password${RESET}"
-        sleep 0.001
+    # 【核心修复】检查如果目标路径是个残留的“坏文件”，直接扬了它，防止 Docker 挂载报错
+    if [ -e "$custom_data" ] && [ ! -d "$custom_data" ]; then
+        echo -e "${RED}警告: 检测到路径 $custom_data 被普通文件占用，正在强行清理...${RESET}"
+        rm -rf "$custom_data"
     fi
 
-    # 2. 配置 PANEL_PASSWORD (回车默认随机)
-    echo -ne "${YELLOW}请输入面板密码 PANEL_PASSWORD [直接回车自动生成随机密钥]: ${RESET}"
-    read -r custom_panel_password
-    if [[ -z "$custom_panel_password" ]]; then
-        custom_panel_password="sk-$(date +%s%N | sha256sum | head -c 15)"
-        echo -e "${GREEN} -> 已自动生成随机密码: $custom_panel_password${RESET}"
-    fi
-
+    # 递归创建真正的文件夹，并赋予权限
     mkdir -p "$custom_data"
-    chmod -R 777 "$BASE_DIR" "$custom_data" 2>/dev/null
+    chmod -R 777 "$custom_data" 2>/dev/null
 
-    echo -e "${YELLOW}正在生成符合官方标准的分离密码 docker-compose.yml 配置文件...${RESET}"
+    echo -e "${YELLOW}正在生成标准完美的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  gcli2api:
-    image: ghcr.io/su-kaka/gcli2api:latest
+  octopus:
+    image: bestrui/octopus
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     ports:
-      - "${custom_port}:7861"
-    environment:
-      - PORT=7861
-      - API_PASSWORD=${custom_api_password}
-      - PANEL_PASSWORD=${custom_panel_password}
-    volumes:
-      - ${custom_data}:/app/creds
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import sys, urllib.request, os; port = os.environ.get('PORT', '7861'); req = urllib.request.Request(f'http://localhost:{port}/v1/models', headers={'Authorization': 'Bearer ' + os.environ.get('API_PASSWORD', '${custom_api_password}')}); sys.exit(0 if urllib.request.urlopen(req, timeout=5).getcode() == 200 else 1)\""]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      - "${custom_port}:8080"
+    volumes:      
+      - ${custom_data}:/app/data
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 gcli2api 服务...${RESET}"
+    echo -e "${YELLOW}正在启动 octopus 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化并执行健康检查 (约5秒)...${RESET}"
+    echo -e "${YELLOW}等待服务初始化 (约5秒)...${RESET}"
     sleep 5
 
     local current_ip
     current_ip=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        gcli2api 部署成功！       ${RESET}"
+    echo -e "${GREEN}         octopus 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}服务访问地址   : http://${current_ip}:${custom_port}${RESET}"
+    echo -e "${YELLOW}默认账号密码   : admin/admin${RESET}"
     echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
-    echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${GREEN}🔑 本次部署所使用的分离密钥：${RESET}"
-    echo -e "${YELLOW}接口调用密码 (API_PASSWORD)   : $custom_api_password${RESET}"
-    echo -e "${YELLOW}面板管理密码 (PANEL_PASSWORD) : $custom_panel_password${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
 # 更新镜像
-update_gcli2api() {
+update_octopus() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
@@ -163,14 +141,14 @@ update_gcli2api() {
 }
 
 # 卸载容器
-uninstall_gcli2api() {
-    echo -ne "${YELLOW}确定要卸载并删除 gcli2api 容器吗？(y/n): ${RESET}"
+uninstall_octopus() {
+    echo -ne "${YELLOW}确定要卸载并删除 octopus 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和凭证数据？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和挂载的数据数据？(y/n): ${RESET}"
             read -r clean_data
             if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
                 rm -rf "$BASE_DIR"
@@ -187,7 +165,7 @@ uninstall_gcli2api() {
     fi
 }
 
-start_gcli2api() { 
+start_octopus() { 
     if [ -f "$COMPOSE_FILE" ]; then
         cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"
     else
@@ -195,7 +173,7 @@ start_gcli2api() {
     fi
 }
 
-stop_gcli2api() { 
+stop_octopus() { 
     if [ -f "$COMPOSE_FILE" ]; then
         cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"
     else
@@ -203,7 +181,7 @@ stop_gcli2api() {
     fi
 }
 
-restart_gcli2api() { 
+restart_octopus() { 
     if [ -f "$COMPOSE_FILE" ]; then
         cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"
     else
@@ -211,7 +189,7 @@ restart_gcli2api() {
     fi
 }
 
-logs_gcli2api() { 
+logs_octopus() { 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         docker logs -f "$CONTAINER_NAME"
     else
@@ -226,16 +204,8 @@ show_info() {
     
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    if [[ "$webui_port" == "N/A" ]]; then
-        echo -e "${YELLOW}服务访问地址   : N/A${RESET}"
-    else
-        echo -e "${YELLOW}服务访问地址   : http://${current_ip}:${webui_port}${RESET}"
-    fi
+    echo -e "${YELLOW}服务访问地址   : http://${current_ip}:${webui_port}${RESET}"
     echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
-    echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${YELLOW}接口调用密码   : $custom_api_password${RESET}"
-    echo -e "${YELLOW}面板管理密码   : $custom_panel_password${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -243,7 +213,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  gcli2api 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  octopus 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -261,13 +231,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_gcli2api ;;
-        2) update_gcli2api ;;
-        3) uninstall_gcli2api ;;
-        4) start_gcli2api ;;
-        5) stop_gcli2api ;;
-        6) restart_gcli2api ;;
-        7) logs_gcli2api ;;
+        1) install_octopus ;;
+        2) update_octopus ;;
+        3) uninstall_octopus ;;
+        4) start_octopus ;;
+        5) stop_octopus ;;
+        6) restart_octopus ;;
+        7) logs_octopus ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

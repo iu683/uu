@@ -1,290 +1,329 @@
 #!/bin/bash
-# ========================================
-# CodeWhale 管理面板
-# ========================================
 
+# 颜色定义
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 RESET='\033[0m'
 
-CONFIG_PATH="$HOME/.codewhale/config.toml"
+# OpenCode 官方全局配置文件路径
+OPENCODE_CONFIG_DIR="$HOME/.config/opencode"
+OPENCODE_CONFIG_FILE="$OPENCODE_CONFIG_DIR/opencode.json"
+OPENCODE_AUTH_FILE="$HOME/.local/share/opencode/auth.json"
 
-# 默默在后台把全局安装的 bin 路径以及常用的 Node 路径加进去，防止找不到命令
-ensure_env_path() {
-    # 兼容通过普通包管理器或 NodeSource 安装的路径
-    export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-    
-    if command -v npm &> /dev/null; then
-        local npm_bin
-        npm_bin=$(npm config get prefix 2>/dev/null)/bin
-        if [[ -d "$npm_bin" && ":$PATH:" != *":$npm_bin:"* ]]; then
-            export PATH="$npm_bin:$PATH"
-        fi
-    fi
-}
+# 尝试在脚本内直接载入可能写入了环境路径的 bashrc 
+[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
+export PATH="$HOME/.local/bin:/root/.local/bin:$PATH"
 
+# 获取状态与版本信息
 get_status() {
-    ensure_env_path
-    if command -v codewhale &> /dev/null; then
+    if command -v opencode &> /dev/null; then
         status="${GREEN}已安装${RESET}"
-        version_info=$(codewhale --version 2>/dev/null | head -n 1)
+        version_info=$(opencode -v 2>/dev/null || opencode --version 2>/dev/null | head -n 1)
         [ -z "$version_info" ] && version_info="已就绪"
-        codewhale_version="${YELLOW}${version_info}${RESET}"
+        opencode_version="${YELLOW}${version_info}${RESET}"
     else
         status="${RED}未安装${RESET}"
-        codewhale_version="${RED}-${RESET}"
+        opencode_version="${RED}-${RESET}"
     fi
 
-    if [[ -f "$CONFIG_PATH" ]]; then
-        current_model=$(grep 'default_text_model' "$CONFIG_PATH" | cut -d '"' -f 2)
-        [ -z "$current_model" ] && current_model="已配置"
-        api_status="${GREEN}${current_model}${RESET}"
+    # 检查凭据文件和配置文件
+    if [ -f "$OPENCODE_AUTH_FILE" ]; then
+        auth_status="${GREEN}已连接${RESET}"
     else
-        api_status="${RED}未设置${RESET}"
+        auth_status="${RED}未连接${RESET}"
+    fi
+
+    if [ -f "$OPENCODE_CONFIG_FILE" ]; then
+        config_status="${YELLOW}已配置${RESET}"
+    else
+        config_status="${GREEN}官方默认${RESET}"
     fi
 }
 
+# 菜单面板
 show_menu() {
     clear
     get_status
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  CodeWhale  管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  OpenCode CLI  管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} $codewhale_version"
-    echo -e "${GREEN}API  :${RESET} $api_status"
+    echo -e "${GREEN}版本 :${RESET} $opencode_version"
+    echo -e "${GREEN}凭据 :${RESET} $auth_status"
+    echo -e "${GREEN}配置 :${RESET} $config_status"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 当前目录启动${RESET}"
-    echo -e "${GREEN}3. 指定路径启动${RESET}"
-    echo -e "${GREEN}4. 登录/切换账户${RESET}"
-    echo -e "${GREEN}5. 设置自定义API模型/中转${RESET}"
-    echo -e "${GREEN}6. 更新${RESET}"
-    echo -e "${GREEN}7. 卸载${RESET}"
+    echo -e "${GREEN}1. 安装 OpenCode${RESET}"
+    echo -e "${GREEN}2. 在当前目录启动${RESET}"
+    echo -e "${GREEN}3. 在指定路径启动${RESET}"
+    echo -e "${GREEN}4. 连接模型提供商 (/connect)${RESET}"
+    echo -e "${GREEN}5. 配置自定义提供商/Base URL/API Key (JSON)${RESET}"
+    echo -e "${GREEN}6. 更新 OpenCode${RESET}"
+    echo -e "${GREEN}7. 卸载 OpenCode${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
 }
 
-# 1. 安装 (支持自动补全 Node.js / npm 依赖)
-install_app() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "\n${RED}❌ 错误: 安装需要 root 权限，请使用 sudo 运行本脚本！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return 1
-    fi
+# 1. 安装
+install_opencode() {
+    echo -e "\n${YELLOW}[1/2] 正在通过官方通道安装 OpenCode...${RESET}"
+    curl -fsSL https://opencode.ai/install.sh | bash
+    
+    # 安装完立刻在当前会话尝试重新刷新 PATH
+    [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
 
-    # 检测并安装 Node.js 与 npm 核心运行环境
-    if ! command -v node &> /dev/null || ! command -v npm &> /dev/null; then
-        echo -e "\n${YELLOW}检测到系统未安装 Node.js/npm 运行环境，正在尝试自动安装...${RESET}"
+    echo -e "\n${YELLOW}[2/2] 正在检测并安装 bubblewrap 沙箱依赖...${RESET}"
+    if command -v bwrap &> /dev/null; then
+        echo -e "${GREEN}✔ 检测到系统已存在 bubblewrap，跳过安装。${RESET}"
+    else
         if command -v apt-get &> /dev/null; then
-            apt-get update -y
-            # 引入 NodeSource 安全稳定的 LTS 源
-            curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
-            apt-get install -y nodejs
+            echo -e "${YELLOW}检测到 Debian/Ubuntu 系统，正在使用 apt 安装...${RESET}"
+            apt-get update && apt-get install -y bubblewrap
         elif command -v dnf &> /dev/null; then
-            dnf module json -y nodejs:lts &>/dev/null
-            dnf install -y nodejs npm
+            echo -e "${YELLOW}检测到 RedHat/Fedora/CentOS 系统，正在使用 dnf 安装...${RESET}"
+            dnf install -y bubblewrap
         elif command -v yum &> /dev/null; then
-            curl -fsSL https://rpm.nodesource.com/setup_lts.x | bash -
-            yum install -y nodejs
+            echo -e "${YELLOW}检测到 CentOS 旧版本系统，正在使用 yum 安装...${RESET}"
+            yum install -y bubblewrap
         else
-            echo -e "${RED}❌ 无法识别的系统包管理器，请手动安装 Node.js 后再试！${RESET}"
-            echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-            return 1
+            echo -e "${RED}❌ 未能识别您的包管理器，请手动执行安装命令：apt/dnf install bubblewrap${RESET}"
         fi
     fi
 
-    # 二次验证 Node 环境是否成功就绪
-    ensure_env_path
-    if ! command -v npm &> /dev/null; then
-        echo -e "\n${RED}❌ Node.js 环境安装失败，请手动检查系统包源。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return 1
-    fi
-
-    echo -e "\n${YELLOW}正在补充系统基础编译依赖项 (C++ 模块构建需求)...${RESET}"
-    if command -v apt-get &> /dev/null; then
-        apt-get install -y build-essential pkg-config libdbus-1-dev curl
-    elif command -v dnf &> /dev/null; then
-        dnf install -y gcc pkgconfig dbus-devel curl
-    elif command -v yum &> /dev/null; then
-        yum install -y gcc pkgconfig dbus-devel curl
-    fi
-
-    echo -e "\n${YELLOW}正在通过 npm 全局安装 CodeWhale...${RESET}"
-    npm install -g codewhale
-
-    local npm_bin
-    npm_bin=$(npm config get prefix 2>/dev/null)/bin
-    if ! grep -q "$npm_bin" "$HOME/.bashrc" 2>/dev/null; then
-        echo "export PATH=\"\$PATH:$npm_bin\"" >> "$HOME/.bashrc"
-    fi
-    ensure_env_path
-
-    echo -e "\n${GREEN}✔ 安装成功！正在执行首次运行诊断...${RESET}"
-    codewhale doctor
+    echo -e "\n${GREEN}✔ 所有安装与沙箱环境修复完成！${RESET}"
     echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
 # 2. 当前目录启动
-start_current_dir() {
-    ensure_env_path
-    if ! command -v codewhale &> /dev/null; then
-        echo -e "\n${RED}❌ 请先执行选项 1 安装程序！${RESET}"
+start_current() {
+    if command -v opencode &> /dev/null; then
+        echo -e "\n${GREEN}正在当前目录启动 OpenCode...${RESET}"
+        opencode
+    else
+        echo -e "\n${RED}未检测到 opencode 命令，请先执行安装！${RESET}"
         echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return
     fi
-    echo -e "\n${GREEN}正在唤醒 CLI 界面...${RESET}"
-    echo -e "${YELLOW}💡 提示：进入会话后，可使用以下快捷斜杠指令：${RESET}"
-    echo -e "   /provider 或 /model  -> 中途切换路由/模型"
-    echo -e "   /restore             -> 回滚上一轮对话 (Side-Git快照)"
-    echo -e "   /config              -> 编辑运行时设置与状态条"
-    echo -e "   ! <command>          -> 正常调用沙箱 Shell 命令\n"
-    
-    DEEPSEEK_ALLOW_INSECURE_HTTP=1 codewhale
 }
 
 # 3. 指定路径启动
-start_spec_dir() {
-    ensure_env_path
-    if ! command -v codewhale &> /dev/null; then
-        echo -e "\n${RED}❌ 请先执行选项 1 安装程序！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return
-    fi
-    echo -e "\n${YELLOW}请输入目标工作绝对路径:${RESET}"
-    echo -ne " 路径: "
-    read -r target_path
+start_path() {
+    echo -e "\n"
+    echo -ne "${GREEN}请输入你的项目绝对路径: ${RESET}"
+    read target_path
     if [ -d "$target_path" ]; then
-        echo -e "\n${GREEN}正在切换目录并唤醒 CLI 界面...${RESET}\n"
-        cd "$target_path" || return
-        DEEPSEEK_ALLOW_INSECURE_HTTP=1 codewhale
+        echo -e "${GREEN}正在切换到 $target_path 并启动 OpenCode...${RESET}"
+        cd "$target_path" && opencode
     else
-        echo -e "\n${RED}❌ 路径不正确或不存在。${RESET}"
+        echo -e "${RED}路径不存在，请检查后重试！${RESET}"
         echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
     fi
 }
 
-# 4. 登录/切换账户
-account_auth() {
-    ensure_env_path
-    if ! command -v codewhale &> /dev/null; then
-        echo -e "\n${RED}❌ 请先执行选项 1 安装程序！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return
+# 4. 连接/添加 API 密钥
+login_opencode() {
+    if command -v opencode &> /dev/null; then
+        echo -e "\n${YELLOW}正在调用 OpenCode 凭据连接程序 (/connect)...${RESET}"
+        echo -e "${YELLOW}提示：若要使用第三方兼容提供商，请向下滚动到 'Other' 并设置自定义 ID。${RESET}\n"
+        opencode /connect
+    else
+        echo -e "\n${RED}未检测到已安装的 OpenCode。${RESET}"
     fi
-    
-    echo -e "\n${YELLOW}--- 登录与切换通道账户 ---${RESET}"
-    echo "1. 登录 DeepSeek 官方通道"
-    echo "2. 登录 Anthropic (Claude) 通道"
-    echo "3. 登录 OpenRouter 通道"
-    echo "4. 登录 Moonshot (Kimi) 通道"
-    echo "5. 切换到本地免 Key 运行时 (Ollama / vLLM / sglang)"
-    echo "6. 查看当前通道鉴权状态 (Auth Status)"
-    echo -ne "请选择选项 [1-6]: "
-    read -r auth_choice
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+}
 
-    case $auth_choice in
-        1) codewhale auth set --provider deepseek ;;
-        2) codewhale auth set --provider anthropic ;;
-        3) codewhale auth set --provider openrouter ;;
-        4) codewhale auth set --provider moonshot ;;
-        5) 
-            echo -e "\n${GREEN}已自动指向本地环回。请确保您的本地后端已启动（默认端口）。${RESET}"
+# 5. 配置高级自定义提供商 JSON
+config_custom_api() {
+    echo -e "\n${GREEN}================================${RESET}"
+    echo -e "${GREEN}    OpenCode 提供商配置管理      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 快捷设置官方预设提供商的 Base URL (如 anthropic)${RESET}"
+    echo -e "${GREEN}2. 注入第三方 OpenAI 兼容提供商 (支持硬编码 API Key)${RESET}"
+    echo -e "${GREEN}3. 清除自定义 JSON 配置（恢复默认）${RESET}"
+    echo -e "${GREEN}0. 返回主菜单${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read api_choice
+
+    # 确保全局配置目录存在
+    mkdir -p "$OPENCODE_CONFIG_DIR"
+
+    case $api_choice in
+        1)
+            echo -e "\n${YELLOW}请输入官方提供商标识 (例如: anthropic, openai, deepseek):${RESET}"
+            echo -ne "   提供商标识: "
+            read input_provider
+            [ -z "$input_provider" ] && input_provider="anthropic"
+            
+            echo -e "\n${YELLOW}请输入该提供商的自定义 Base URL:${RESET}"
+            echo -ne "   Base URL: "
+            read input_url
+            
+            if [ -n "$input_url" ]; then
+                cat << EOF > "$OPENCODE_CONFIG_FILE"
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "$input_provider": {
+      "options": {
+        "baseURL": "$input_url"
+      }
+    }
+  }
+}
+EOF
+                echo -e "\n${GREEN}✔ 官方预设扩展配置已成功写入：$OPENCODE_CONFIG_FILE${RESET}"
+            else
+                echo -e "${RED}输入不能为空，取消设置。${RESET}"
+            fi
             ;;
-        6) 
-            echo -e "\n${GREEN}--- 当前通道凭证状态 ---${RESET}"
-            codewhale auth status 
+        2)
+            echo -e "\n${YELLOW}1/6. 请输入提供商的唯一 ID (需与 /connect 一致；如选择直接填 Key 则可自定义):${RESET}"
+            echo -ne "   提供商 ID (例如: myprovider): "
+            read custom_id
+            [ -z "$custom_id" ] && custom_id="myprovider"
+
+            echo -e "\n${YELLOW}2/6. 请输入该提供商的展示名称 (Display Name):${RESET}"
+            echo -ne "   展示名称: "
+            read custom_name
+            [ -z "$custom_name" ] && custom_name="My AI Provider"
+
+            echo -e "\n${YELLOW}3/6. 请输入 API 基础端点地址 (Base URL):${RESET}"
+            echo -ne "   Base URL: "
+            read custom_url
+            
+            echo -e "\n${YELLOW}4/6. [可选] 是否直接在此硬编码 API 密钥 (apiKey)？${RESET}"
+            echo -e "   ${YELLOW}(直接回车则跳过，继续使用 /connect 存储的凭据)${RESET}"
+            echo -ne "   API Key / Token: "
+            read custom_key
+
+            echo -e "\n${YELLOW}5/6. 请输入你要映射的模型 ID (API 调用的实际模型名):${RESET}"
+            echo -ne "   模型 ID (例如: deepseek-chat): "
+            read model_id
+            [ -z "$model_id" ] && model_id="custom-model"
+
+            echo -e "\n${YELLOW}6/6. 请输入该模型在 OpenCode UI 中的展示名称:${RESET}"
+            echo -ne "   模型展示名称: "
+            read model_name
+            [ -z "$model_name" ] && model_name="My Custom Model"
+
+            if [ -n "$custom_url" ]; then
+                # 核心逻辑：根据是否输入了 Key，动态构建 options 内部的 JSON 字符串
+                if [ -n "$custom_key" ]; then
+                    options_json="\"baseURL\": \"$custom_url\", \"apiKey\": \"$custom_key\""
+                else
+                    options_json="\"baseURL\": \"$custom_url\""
+                fi
+
+                cat << EOF > "$OPENCODE_CONFIG_FILE"
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "$custom_id": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "$custom_name",
+      "options": {
+        $options_json
+      },
+      "models": {
+        "$model_id": {
+          "name": "$model_name"
+        }
+      }
+    }
+  }
+}
+EOF
+                echo -e "\n${GREEN}✔ 兼容提供商 JSON 配置文件已成功覆盖生成！${RESET}"
+                [ -n "$custom_key" ] && echo -e "${YELLOW}🔑 已成功在 options 中嵌入明文 API Key。${RESET}"
+                echo -e "${YELLOW}查看路径: $OPENCODE_CONFIG_FILE${RESET}"
+            else
+                echo -e "${RED}由于 Base URL 不能为空，配置已被取消。${RESET}"
+            fi
             ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
+        3)
+            if [ -f "$OPENCODE_CONFIG_FILE" ]; then
+                rm -f "$OPENCODE_CONFIG_FILE"
+                echo -e "${GREEN}✔ 已彻底删除全局配置 $OPENCODE_CONFIG_FILE，恢复默认。${RESET}"
+            else
+                echo -e "${YELLOW}当前已经是默认状态。${RESET}"
+            fi
+            ;;
+        *)
+            return
+            ;;
     esac
-    
-    echo -ne "\n${GREEN}操作完成。按回车键返回主菜单...${RESET}" && read
-}
-
-# 5. 设置自定义API模型/中转
-config_api() {
-    mkdir -p "$(dirname "$CONFIG_PATH")"
-    echo -e "\n${YELLOW}--- 快速自定义 API/中转网关 ---${RESET}"
-    echo -ne "1. 请输入中转网关 Base URL: "
-    read -r g_url
-    echo -ne "2. 请输入你的 API 密钥 (API Key): "
-    read -r g_key
-    echo -ne "3. 请输入默认模型 ID (例如 qwen-plus 或 deepseek-chat): "
-    read -r g_model
-
-    {
-        echo "provider = \"openai\""
-        echo "default_text_model = \"$g_model\""
-        echo ""
-        echo "[providers.openai]"
-        echo "api_key = \"$g_key\""
-        echo "base_url = \"$g_url\""
-    } > "$CONFIG_PATH"
-
-    echo -e "\n${GREEN}✔ 配置文件已保存至 ~/.codewhale/config.toml${RESET}"
     echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
 # 6. 更新
-update_app() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "\n${RED}❌ 错误: 更新需要 root 权限，请使用 sudo 运行本脚本！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return 1
-    fi
-    echo -e "\n${YELLOW}正在更新程序包...${RESET}"
-    npm install -g codewhale@latest
-    echo -ne "\n${GREEN}更新完毕。按回车键返回主菜单...${RESET}" && read
+update_opencode() {
+    echo -e "\n${YELLOW}正在检查并更新 OpenCode...${RESET}"
+    curl -fsSL https://opencode.ai/install | bash
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
-# 7. 卸载 (带配置文件清理的二次确认)
-uninstall_app() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "\n${RED}❌ 错误: 卸载需要 root 权限，请使用 sudo 运行本脚本！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return 1
-    fi
-
-    # 第一次确认：卸载程序本体
-    echo -ne "\n${RED}确定要卸载 CodeWhale 主程序吗？(y/n): ${RESET}"
-    read -r ans1
-    if [[ "$ans1" == "y" || "$ans1" == "Y" ]]; then
-        npm uninstall -g codewhale &>/dev/null
-        npm uninstall -g deepseek-tui &>/dev/null
-        echo -e "${GREEN}✔ 主程序已成功卸载。${RESET}"
-
-        # 第二次确认：询问是否清除所有配置文件和历史会话
-        echo -e "\n${YELLOW}检测到本地残留有配置文件、密钥和会话快照。${RESET}"
-        echo -ne "${RED}是否同步清理这些本地配置文件？(会清除历史记录) (y/n): ${RESET}"
-        read -r ans2
-        if [[ "$ans2" == "y" || "$ans2" == "Y" ]]; then
-            rm -rf "$HOME/.codewhale" "$HOME/.deepseek" "/root/.codewhale" 2>/dev/null
-            echo -e "${GREEN}✔ 残留配置文件已彻底清除。${RESET}"
+# 7. 整合卸载
+uninstall_opencode_flow() {
+    echo -e "\n${RED}准备进入卸载流程...${RESET}"
+    echo -ne "${RED}确定要卸载 OpenCode 主程序吗？(y/n): ${RESET}"
+    read ans
+    if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+        # 第一步：卸载程序
+        echo -e "${YELLOW}[步骤 1/3] 正在删除主程序可执行文件与缓存...${RESET}"
+        rm -f ~/.local/bin/opencode
+        rm -rf ~/.local/share/opencode
+        echo -e "${GREEN}✔ 主程序及本地缓存卸载成功。${RESET}"
+        
+        # 第二步：清除配置文件
+        echo -e "\n${RED}[步骤 2/3] 是否清除配置文件与连接凭据(auth.json)？${RESET}"
+        echo -e "${RED}注意：此操作将清除所有已连接的 API 密钥及代理设置！${RESET}"
+        echo -ne "${RED}是否清除？(y/n): ${RESET}"
+        read ans_config
+        if [ "$ans_config" = "y" ] || [ "$ans_config" = "Y" ]; then
+            echo -e "${YELLOW}正在清除全局配置文件与凭据...${RESET}"
+            rm -rf "$OPENCODE_CONFIG_DIR"
+            rm -rf "$HOME/.local/share/opencode"
+            echo -e "${GREEN}✔ 配置文件与凭据已彻底干净！${RESET}"
         else
-            echo -e "${YELLOW}ℹ 已保留您的历史会话与本地配置文件。${RESET}"
+            echo -e "${YELLOW}已保留配置文件与凭据。你可以随时重新安装并恢复使用。${RESET}"
+        fi
+
+        # 第三步：清除沙箱依赖（bubblewrap）
+        echo -e "\n${RED}[步骤 3/3] 是否连同 bubblewrap 沙箱依赖包一起卸载？${RESET}"
+        echo -ne "${RED}若该机器无其他沙箱业务，建议执行卸载。(y/n): ${RESET}"
+        read ans_bwrap
+        if [ "$ans_bwrap" = "y" ] || [ "$ans_bwrap" = "Y" ]; then
+            echo -e "${YELLOW}正在清理系统的 bubblewrap 组件...${RESET}"
+            if command -v apt-get &> /dev/null; then
+                apt-get autoremove -y bubblewrap
+            elif command -v dnf &> /dev/null; then
+                dnf remove -y bubblewrap
+            elif command -v yum &> /dev/null; then
+                yum remove -y bubblewrap
+            fi
+            echo -e "${GREEN}✔ 沙箱组件卸载成功。${RESET}"
+        else
+            echo -e "${YELLOW}已保留系统的 bubblewrap。${RESET}"
         fi
     else
-        echo -e "${YELLOW}已取消卸载。${RESET}"
+        echo "已取消卸载操作。"
     fi
-
     echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
 # 主循环
 while true; do
     show_menu
-    read -r choice
+    read choice
     case $choice in
-        1) install_app ;;
-        2) start_current_dir ;;
-        3) start_spec_dir ;;
-        4) account_auth ;;
-        5) config_api ;;
-        6) update_app ;;
-        7) uninstall_app ;;
+        1) install_opencode ;;
+        2) start_current ;;
+        3) start_path ;;
+        4) login_opencode ;;
+        5) config_custom_api ;;
+        6) update_opencode ;;
+        7) uninstall_opencode_flow ;;
         0) clear; exit 0 ;;
         *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
     esac

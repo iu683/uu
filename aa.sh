@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Puppy Stardew Server Docker Compose 交互式管理面板
+# FOSSBilling 自动化管理面板
 # =================================================================
 
 # 颜色
@@ -10,12 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-MAIN_CONTAINER="puppy-stardew"
-INIT_CONTAINER="puppy-stardew-init"
-MGR_CONTAINER="puppy-stardew-manager"
-
-REPO_URL="https://github.com/AmigaMeow/puppy-stardew-server.git"
-BASE_DIR="/opt/puppy-stardew"
+# 定义核心容器名
+CONTAINER_NAME="fossbilling-web"
+BASE_DIR="/opt/fossbilling"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -25,39 +22,33 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态获取容器状态和端口信息
+# 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    if [ "$(docker ps -q -f name=^/${MAIN_CONTAINER}$)" ]; then
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${MAIN_CONTAINER}$)" ]; then
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    if [ "$(docker ps -aq -f name=^/${MAIN_CONTAINER}$)" ]; then
-        game_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if index $p | grep -q "udp"}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$MAIN_CONTAINER" 2>/dev/null)
-        web_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "18642/tcp") 0).HostPort}}' "$MAIN_CONTAINER" 2>/dev/null)
-        vnc_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5900/tcp") 0).HostPort}}' "$MAIN_CONTAINER" 2>/dev/null)
-        metric_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9090/tcp") 0).HostPort}}' "$MAIN_CONTAINER" 2>/dev/null)
-    fi
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
 
-    [[ -z "$game_port" || "$game_port" == "<nil>" ]] && game_port="24642"
-    [[ -z "$web_port" || "$web_port" == "<nil>" ]] && web_port="18642"
-    [[ -z "$vnc_port" || "$vnc_port" == "<nil>" ]] && vnc_port="5900"
-    [[ -z "$metric_port" || "$metric_port" == "<nil>" ]] && metric_port="9090"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="80"
 
-    if [ "$status" == "${RED}未部署${RESET}" ] && [ ! -f "$ENV_FILE" ]; then
-        game_port="N/A"
-        web_port="N/A"
-        vnc_port="N/A"
-        metric_port="N/A"
+        # 动态提取宿主机挂载的绝对路径
+        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/www/html"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/www"
+    else
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        data_dir="N/A"
     fi
 }
 
@@ -84,363 +75,288 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署并配置 Stardew Valley 服务器
-install_stardew() {
+# 生成随机密码
+generate_password() {
+    if command -v openssl &> /dev/null; then
+        openssl rand -hex 12
+    else
+        echo "foss_pass_$(date +%s)"
+    fi
+}
+
+# 部署 FOSSBilling 主函数
+install_fossbilling() {
     check_dependencies
-    
-    echo -e "${CYAN}====== 1. 路径与端口自定义配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入宿主机数据安装绝对路径 [默认: /opt/puppy-stardew]: ${RESET}"
-    read -r custom_path
-    [[ -z "$custom_path" ]] && custom_path="/opt/puppy-stardew"
-    
-    BASE_DIR="$custom_path"
-    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-    ENV_FILE="$BASE_DIR/.env"
+    mkdir -p "$BASE_DIR"
 
-    echo -ne "${YELLOW}请输入游戏联机端口 (UDP) [默认: 24642]: ${RESET}"
-    read -r custom_game_port
-    [[ -z "$custom_game_port" ]] && custom_game_port="24642"
+    echo -e "${CYAN}====== 1. 基础环境配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 FOSSBilling 访问端口 [默认: 80]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="80"
 
-    echo -ne "${YELLOW}请输入 Web 管理面板端口 (TCP) [默认: 18642]: ${RESET}"
-    read -r custom_web_port
-    [[ -z "$custom_web_port" ]] && custom_web_port="18642"
+    echo -ne "${YELLOW}请输入网页数据本地挂载绝对路径 [默认: $BASE_DIR/www]: ${RESET}"
+    read -r local_web_dir
+    [[ -z "$local_web_dir" ]] && local_web_dir="$BASE_DIR/www"
 
-    echo -ne "${YELLOW}请输入 VNC 远程桌面端口 (TCP) [默认: 5900]: ${RESET}"
-    read -r custom_vnc_port
-    [[ -z "$custom_vnc_port" ]] && custom_vnc_port="5900"
+    echo -e "\n${CYAN}====== 2. 数据库类型选择 ======${RESET}"
+    echo -e "${GREEN}1) 部署全新的本地 MySQL 数据库 (数据同样挂载到本地)${RESET}"
+    echo -e "${GREEN}2) 连接已有的远程/外部 MySQL 数据库 (不需要本地库)${RESET}"
+    echo -ne "${YELLOW}请选择数据库部署模式 [默认 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
 
-    echo -ne "${YELLOW}请输入 Prometheus 指标监控端口 (TCP) [默认: 9090]: ${RESET}"
-    read -r custom_metric_port
-    [[ -z "$custom_metric_port" ]] && custom_metric_port="9090"
+    if [[ "$db_mode" == "1" ]]; then
+        # 本地数据库配置
+        db_host="fossbilling-db"
+        db_port="3306"
+        
+        echo -ne "${YELLOW}请输入本地数据库数据挂载绝对路径 [默认: $BASE_DIR/mysql]: ${RESET}"
+        read -r local_db_dir
+        [[ -z "$local_db_dir" ]] && local_db_dir="$BASE_DIR/mysql"
 
-    echo -e "\n${CYAN}====== 2. Steam 账号凭证配置 (必需) ======${RESET}"
-    echo -ne "${YELLOW}请输入 Steam 用户名 (非邮箱): ${RESET}"
-    read -r steam_user
-    while [[ -z "$steam_user" ]]; do
-        echo -ne "${RED}用户名不能为空，请重新输入: ${RESET}"
-        read -r steam_user
-    done
+        echo -ne "${YELLOW}请输入本地数据库名称 [默认: fossbilling]: ${RESET}"
+        read -r db_name
+        [[ -z "$db_name" ]] && db_name="fossbilling"
 
-    echo -ne "${YELLOW}请输入 Steam 密码: ${RESET}"
-    read -r -s steam_pass
-    echo ""
-    while [[ -z "$steam_pass" ]]; do
-        echo -ne "${RED}密码不能为空，请重新输入: ${RESET}"
-        read -r -s steam_pass
-        echo ""
-    done
+        echo -ne "${YELLOW}请输入本地数据库用户名 [默认: foss_user]: ${RESET}"
+        read -r db_user
+        [[ -z "$db_user" ]] && db_user="foss_user"
 
-    echo -e "\n${CYAN}====== 3. 高级环境配置 (可选) ======${RESET}"
-    echo -ne "${YELLOW}请输入服务器时区 [默认: Asia/Shanghai]: ${RESET}"
-    read -r custom_tz
-    [[ -z "$custom_tz" ]] && custom_tz="Asia/Shanghai"
+        echo -ne "${YELLOW}请输入本地数据库密码 (留空则随机生成): ${RESET}"
+        read -r db_password
+        [[ -z "$db_password" ]] && db_password=$(generate_password)
 
-    echo -ne "${YELLOW}是否启用自动备份功能？(true/false) [默认: true]: ${RESET}"
-    read -r enable_backup
-    [[ -z "$enable_backup" ]] && enable_backup="true"
+    elif [[ "$db_mode" == "2" ]]; then
+        # 远程数据库配置
+        echo -ne "${YELLOW}请输入远程数据库地址 (Host) [例如 192.168.1.100]: ${RESET}"
+        read -r db_host
+        while [[ -z "$db_host" ]]; do
+            echo -e "${RED}错误: 远程数据库地址不能为空！${RESET}"
+            echo -ne "${YELLOW}请输入远程数据库地址 (Host): ${RESET}"
+            read -r db_host
+        done
 
-    # 1. 智能检测宿主机 CPU 核心数
-    local cpu_cores=$(nproc 2>/dev/null)
-    [[ -z "$cpu_cores" ]] && cpu_cores=1
-    local cpu_limit="2.0"
-    if [ "$cpu_cores" -eq 1 ]; then
-        cpu_limit="1.0"
-    fi
+        echo -ne "${YELLOW}请输入远程数据库端口 [默认: 3306]: ${RESET}"
+        read -r db_port
+        [[ -z "$db_port" ]] && db_port="3306"
 
-    # 2. 智能检测并计算最优内存资源分配 (单位: M)
-    local total_mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    local total_mem_mb=$((total_mem_kb / 1024))
-    
-    local mem_limit="2G"
-    local mem_reserve="1G"
+        echo -ne "${YELLOW}请输入远程数据库名称 [默认: fossbilling]: ${RESET}"
+        read -r db_name
+        [[ -z "$db_name" ]] && db_name="fossbilling"
 
-    if [ "$total_mem_mb" -le 2048 ]; then
-        # 内存小于等于 2G (如 1G 或 2G VPS)
-        mem_limit="1.5G"
-        mem_reserve="512M"
-    elif [ "$total_mem_mb" -le 4096 ]; then
-        # 内存小于等于 4G
-        mem_limit="2G"
-        mem_reserve="1G"
+        echo -ne "${YELLOW}请输入远程数据库用户名 [默认: foss_user]: ${RESET}"
+        read -r db_user
+        [[ -z "$db_user" ]] && db_user="foss_user"
+
+        echo -ne "${YELLOW}请输入远程数据库密码: ${RESET}"
+        read -r db_password
     else
-        # 内存大于 4G (按原厂指南调整为高配)
-        mem_limit="4G"
-        mem_reserve="2G"
-    fi
-
-    echo -e "${CYAN}系统资源自动审计完成: 自动限制限制 CPU: ${cpu_limit}核 | 内存上限: ${mem_limit} | 内存预留: ${mem_reserve}${RESET}"
-
-    # 克隆源码仓库
-    if [ ! -d "$BASE_DIR/.git" ]; then
-        echo -e "${YELLOW}正在从 GitHub 克隆原厂项目源码到 $BASE_DIR...${RESET}"
-        mkdir -p "$BASE_DIR"
-        git clone "$REPO_URL" "$BASE_DIR"
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}错误: 克隆源码失败，请检查网络环境！${RESET}"
-            return 1
-        fi
-    else
-        echo -e "${GREEN}检测到已存在源码，跳过克隆。${RESET}"
-    fi
-
-    # 预先修复权限并建立好目录卷 (UID 1000:1000)
-    echo -e "${YELLOW}正在执行权限初始化 (模拟原厂 init.sh)...${RESET}"
-    mkdir -p "$BASE_DIR"/data/{saves,game,steam,logs,backups,panel,custom-mods}
-    chown -R 1000:1000 "$BASE_DIR/data"
-    chmod -R 755 "$BASE_DIR/data"
-
-    # 写入 .env 配置文件
-    echo -e "${YELLOW}正在写入 .env 配置文件...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-STEAM_USERNAME=${steam_user}
-STEAM_PASSWORD=${steam_pass}
-ENABLE_VNC=true
-VNC_PASSWORD=
-TZ=${custom_tz}
-ENABLE_LOG_MONITOR=true
-ENABLE_AUTO_BACKUP=${enable_backup}
-MAX_BACKUPS=7
-BACKUP_HOUR=4
-ENABLE_CRASH_RESTART=true
-EOF
-
-    # 生成 docker-compose.yml (注入全自定义端口与计算出的 CPU/内存 阈值)
-    echo -e "${YELLOW}正在动态生成 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  stardew-manager:
-    build: ${BASE_DIR}/docker/manager
-    image: puppy-stardew-manager:local
-    container_name: ${MGR_CONTAINER}
-    restart: unless-stopped
-    environment:
-      - PROJECT_DIR=${BASE_DIR}
-      - COMPOSE_FILE=${COMPOSE_FILE}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${BASE_DIR}:${BASE_DIR}:ro
-
-  stardew-init:
-    build: ${BASE_DIR}/docker
-    image: puppy-stardew-server:local
-    container_name: ${INIT_CONTAINER}
-    user: root
-    entrypoint: ["/home/steam/scripts/init-container.sh"]
-    environment:
-      - USE_GPU=\${USE_GPU:-false}
-    volumes:
-      - ${BASE_DIR}/data/saves:/home/steam/.config/StardewValley:rw
-      - ${BASE_DIR}/data/game:/home/steam/stardewvalley:rw
-      - ${BASE_DIR}/data/steam:/home/steam/Steam:rw
-      - ${BASE_DIR}/data/logs:/home/steam/.local/share/puppy-stardew/logs:rw
-      - ${BASE_DIR}/data/backups:/home/steam/.local/share/puppy-stardew/backups:rw
-      - ${BASE_DIR}/data/panel:/home/steam/web-panel/data:rw
-
-  stardew-server:
-    build: ${BASE_DIR}/docker
-    image: puppy-stardew-server:local
-    container_name: ${MAIN_CONTAINER}
-    restart: unless-stopped
-    depends_on:
-      stardew-manager:
-        condition: service_started
-      stardew-init:
-        condition: service_completed_successfully
-    stdin_open: true
-    tty: true
-    environment:
-      - STEAM_USERNAME=\${STEAM_USERNAME}
-      - STEAM_PASSWORD=\${STEAM_PASSWORD}
-      - STEAM_GUARD_CODE=\${STEAM_GUARD_CODE:-}
-      - ENABLE_VNC=\${ENABLE_VNC:-true}
-      - VNC_PASSWORD=\${VNC_PASSWORD:-}
-      - ENABLE_LOG_MONITOR=\${ENABLE_LOG_MONITOR:-true}
-      - USE_GPU=\${USE_GPU:-false}
-      - RESOLUTION_WIDTH=\${RESOLUTION_WIDTH:-1280}
-      - RESOLUTION_HEIGHT=\${RESOLUTION_HEIGHT:-720}
-      - REFRESH_RATE=\${REFRESH_RATE:-60}
-      - LOW_PERF_MODE=\${LOW_PERF_MODE:-false}
-      - ENABLE_AUTO_BACKUP=\${ENABLE_AUTO_BACKUP:-false}
-      - MAX_BACKUPS=\${MAX_BACKUPS:-7}
-      - BACKUP_HOUR=\${BACKUP_HOUR:-4}
-      - ENABLE_CRASH_RESTART=\${ENABLE_CRASH_RESTART:-false}
-    ports:
-      - "${custom_game_port}:24642/udp"
-      - "${custom_vnc_port}:5900/tcp"
-      - "${custom_metric_port}:9090/tcp"
-      - "${custom_web_port}:18642/tcp"
-    volumes:
-      - ${BASE_DIR}/data/saves:/home/steam/.config/StardewValley:rw
-      - ${BASE_DIR}/data/game:/home/steam/stardewvalley:rw
-      - ${BASE_DIR}/data/steam:/home/steam/Steam:rw
-      - ${BASE_DIR}/data/logs:/home/steam/.local/share/puppy-stardew/logs:rw
-      - ${BASE_DIR}/data/backups:/home/steam/.local/share/puppy-stardew/backups:rw
-      - ${BASE_DIR}/data/panel:/home/steam/web-panel/data:rw
-      - ${BASE_DIR}/data/custom-mods:/home/steam/custom-mods:rw
-    deploy:
-      resources:
-        limits:
-          cpus: '${cpu_limit}'
-          memory: ${mem_limit}
-        reservations:
-          memory: ${mem_reserve}
-    healthcheck:
-      test: ["CMD", "pgrep", "-f", "StardewModdingAPI"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 180s
-    cap_drop:
-      - NET_RAW
-      - SYS_ADMIN
-      - MKNOD
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-EOF
-
-    echo -e "${YELLOW}正在拉起容器组...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d
-
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${GREEN}             Puppy Stardew 容器服务本地构建并拉起成功！          ${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${YELLOW}【关键下一步】: 请立即在主菜单使用 选项 9 进入终端输入 Steam 令牌！${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
-}
-
-# 捕获并连接到 Steam 令牌交互终端
-attach_steam_guard() {
-    if [ "$(docker ps -q -f name=^/${MAIN_CONTAINER}$)" ]; then
-        echo -e "${CYAN}正在连接到服务器后台终端...${RESET}"
-        echo -e "${YELLOW}提示: 如果看到输入 Steam Guard 代码提示，直接键入并回车即可。${RESET}"
-        echo -e "${RED}⚠️  注意退出方法: 必须按快捷键 Ctrl+P 然后按 Ctrl+Q 来安全分离！${RESET}"
-        echo -e "${RED}   切勿使用 Ctrl+C，否则会导致容器意外关闭！${RESET}"
-        echo -ne "${GREEN}按回车键确认进入终端...${RESET}"
-        read -r
-        docker attach "$MAIN_CONTAINER"
-    else
-        echo -e "${RED}错误: 服务器容器当前未运行，无法连接令牌终端！${RESET}"
-    fi
-}
-
-# 更新源码并重新编译
-update_stardew() {
-    if [[ ! -d "$BASE_DIR/.git" ]]; then
-        echo -e "${RED}错误: 未检测到源码仓库，请先执行选项 1 进行部署！${RESET}"
+        echo -e "${RED}输入有误，取消部署。${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取原厂最新更新代码...${RESET}"
-    cd "$BASE_DIR" && git pull
-    echo -e "${YELLOW}正在同步重新编译并更新容器...${RESET}"
-    docker compose up -d --build --remove-orphans
-    echo -e "${GREEN}服务热重载更新编译完成！${RESET}"
+
+    # 3. 创建本地挂载目录并赋予权限，防止容器内部无写入权限
+    echo -e "\n${YELLOW}正在创建本地挂载目录并配置文件权限...${RESET}"
+    mkdir -p "$local_web_dir"
+    chmod -R 777 "$local_web_dir"
+    if [[ "$db_mode" == "1" ]]; then
+        mkdir -p "$local_db_dir"
+        chmod -R 777 "$local_db_dir"
+    fi
+
+    # 4. 写入环境配置文件 .env
+    cat <<EOF > "$ENV_FILE"
+DB_HOST=${db_host}
+DB_PORT=${db_port}
+DB_NAME=${db_name}
+DB_USER=${db_user}
+DB_PASSWORD=${db_password}
+LOCAL_WEB_DIR=${local_web_dir}
+LOCAL_DB_DIR=${local_db_dir}
+EOF
+
+    # 5. 根据模式动态生成纯绝对路径挂载的 docker-compose.yml
+    echo -e "${YELLOW}正在生成对应的 docker-compose.yml 配置文件...${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  fossbilling:
+    container_name: ${CONTAINER_NAME}
+    image: fossbilling/fossbilling:latest
+    restart: always
+    ports:
+      - "${custom_port}:80"
+    environment:
+      - DB_HOST=\${DB_HOST}
+      - DB_NAME=\${DB_NAME}
+      - DB_USER=\${DB_USER}
+      - DB_PASSWORD=\${DB_PASSWORD}
+    volumes:
+      - \${LOCAL_WEB_DIR}:/var/www/html
+    depends_on:
+      - mysql
+
+  mysql:
+    container_name: fossbilling-db
+    image: mysql:8.2
+    restart: always
+    environment:
+      MYSQL_DATABASE: \${DB_NAME}
+      MYSQL_USER: \${DB_USER}
+      MYSQL_PASSWORD: \${DB_PASSWORD}
+      MYSQL_RANDOM_ROOT_PASSWORD: '1'
+    volumes:
+      - \${LOCAL_DB_DIR}:/var/lib/mysql
+EOF
+    else
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  fossbilling:
+    container_name: ${CONTAINER_NAME}
+    image: fossbilling/fossbilling:latest
+    restart: always
+    ports:
+      - "${custom_port}:80"
+    environment:
+      - DB_HOST=\${DB_HOST}
+      - DB_PORT=\${DB_PORT}
+      - DB_NAME=\${DB_NAME}
+      - DB_USER=\${DB_USER}
+      - DB_PASSWORD=\${DB_PASSWORD}
+    volumes:
+      - \${LOCAL_WEB_DIR}:/var/www/html
+EOF
+    fi
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}等待本地容器和数据库初始化 (约5秒)...${RESET}"
+        sleep 5
+    else
+        echo -e "${YELLOW}等待网页容器初始化 (约2秒)...${RESET}"
+        sleep 2
+    fi
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}================================================${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${GREEN}     FOSSBilling 部署成功 (本地库+全本地挂载)    ${RESET}"
+    else
+        echo -e "${GREEN}     FOSSBilling 部署成功 (远程库+本地网页挂载)  ${RESET}"
+    fi
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}网页本地路径 : ${local_web_dir}${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}数据库路径   : ${local_db_dir}${RESET}"
+    fi
+    echo -e "${YELLOW}数据库主机   : ${db_host}${RESET}"
+    echo -e "${YELLOW}数据库名称   : ${db_name}${RESET}"
+    echo -e "${YELLOW}数据库用户   : ${db_user}${RESET}"
+    echo -e "${YELLOW}数据库密码   : ${db_password}${RESET}"
+    echo -e "${GREEN}------------------------------------------------${RESET}"
+    echo -e "${CYAN}提示: 所有的容器数据都已映射到上面打印的宿主机绝对路径中，${RESET}"
+    echo -e "${CYAN}您可以非常方便地在宿主机直接修改文件、进行备份或搬家。${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
 }
 
-# 彻底卸载服务
-uninstall_stardew() {
-    echo -ne "${YELLOW}确定要完全卸载并删除小狗星谷服务器组吗？(y/n): ${RESET}"
+# 更新 FOSSBilling 镜像
+update_translate() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在拉取最新镜像并平滑升级...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+}
+
+# 卸载 FOSSBilling
+uninstall_translate() {
+    echo -ne "${YELLOW}确定要卸载并删除 FOSSBilling 堆栈容器吗？(y/n): ${RESET}"
     read -r confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}所有相关容器已安全停止并销毁。${RESET}"
-            echo -ne "${YELLOW}是否要同时删除所有的游戏世界存档、代码组件、Steam 凭证和备份？(y/n): ${RESET}"
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            
+            # 读取 .env 以获取实际的挂载路径进行清理提示
+            if [[ -f "$ENV_FILE" ]]; then
+                source "$ENV_FILE"
+            fi
+            
+            echo -ne "${YELLOW}是否删除所有本地挂载的业务数据和配置文件？(包含网页和数据库文件) (y/n): ${RESET}"
             read -r clean_data
-            if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}所有物理路径及存档已被彻底清除。${RESET}"
+                [[ -n "$LOCAL_WEB_DIR" ]] && rm -rf "$LOCAL_WEB_DIR"
+                [[ -n "$LOCAL_DB_DIR" ]] && rm -rf "$LOCAL_DB_DIR"
+                echo -e "${GREEN}本地所有挂载的数据文件夹已彻底清理。${RESET}"
+            else
+                echo -e "${YELLOW}已保留本地数据。您的网页数据位于: ${LOCAL_WEB_DIR:-未指定}${RESET}"
             fi
         else
-            docker rm -f "$MAIN_CONTAINER" "$INIT_CONTAINER" "$MGR_CONTAINER" 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" fossbilling-db 2>/dev/null
         fi
-        echo -e "${GREEN}卸载流程执行完毕！${RESET}"
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_stardew() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器组已拉起。${RESET}"; }
-stop_stardew() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器组已降下停止。${RESET}"; }
-restart_stardew() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器组已执行重启. ${RESET}"; }
-logs_stardew() { docker logs -f --tail 100 "$MAIN_CONTAINER"; }
+start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_translate() { cd "$BASE_DIR" && docker compose logs -f; }
 
-# 状态与信息面板
 show_info() {
     get_status_info
-    local current_ip=$(get_public_ip)
-    
-    local vnc_pass="未生成或已禁用 VNC"
-    local pass_file="$BASE_DIR/data/panel/vnc_password.txt"
-    if [[ -f "$pass_file" ]]; then
-        vnc_pass=$(cat "$pass_file" 2>/dev/null)
-        [[ -z "$vnc_pass" ]] && vnc_pass="为空 (可能尚未完成初始化)"
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}Web端镜像      : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}网页数据挂载   : ${data_dir}${RESET}"
+    if [[ -f "$ENV_FILE" ]]; then
+        echo -e "${GREEN}--------------------------------${RESET}"
+        echo -e "${CYAN}当前所配环境参数 (来自 .env):${RESET}"
+        cat "$ENV_FILE" | sed 's/^/  /'
     fi
-
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${GREEN}                   小狗星露谷服务器 运行时配置                   ${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${YELLOW}当前核心状态   : $status"
-    echo -e "${YELLOW}Web 管理控制台 : http://${current_ip}:${web_port}${RESET}"
-    echo -e "${YELLOW}VNC 远程桌面   : ${current_ip}:${vnc_port}${RESET}"
-    echo -e "${RED}动态 VNC 密码   : ${vnc_pass}${RESET}"
-    echo -e "${YELLOW}指标监控地址   : http://${current_ip}:${metric_port}/metrics${RESET}"
-    echo -e "${YELLOW}联机直连游戏IP : ${current_ip} (UDP端口: ${game_port})${RESET}"
-    echo -e "${YELLOW}数据持久化基路 : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${CYAN}💡 首次开服向导：${RESET}"
-    echo -e " 1. 看到容器运行后，用 [选项 9] 盲输绑定的 Steam 令牌验证码（若有提示）。"
-    echo -e " 2. 登录 Web 控制台或通过 VNC 桌面连接服务器，创建/加载一张农场世界存档。"
-    echo -e " 3. 游戏正常进图开始广播后，可去修改该目录下的 .env 中的 ENABLE_VNC=false 节省 50M 内存。"
-    echo -e "${GREEN}================================================================${RESET}"
-}
-
-auto_find_base_dir() {
-    if [ ! -f "$COMPOSE_FILE" ]; then
-        if [ -f "/opt/puppy-stardew/docker-compose.yml" ]; then
-            BASE_DIR="/opt/puppy-stardew"
-        fi
-        COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-        ENV_FILE="$BASE_DIR/.env"
-    fi
+    echo -e "${GREEN}================================${RESET}"
 }
 
 menu() {
     clear
-    auto_find_base_dir
     get_status_info
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}     ◈  星露谷物语 开服管理面板  ◈     ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}服务状态 :${RESET} $status"
-    echo -e "${GREEN}UDP端口  :${RESET} ${YELLOW}${game_port}${RESET}"
-    echo -e "${GREEN}Web端口  :${RESET} ${YELLOW}${web_port}${RESET}"
-    echo -e "${GREEN}VNC端口  :${RESET} ${YELLOW}${vnc_port}${RESET}" 
-    echo -e "${GREEN}监控端口 :${RESET} ${YELLOW}${metric_port}${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}1. 部署安装服务${RESET}"
-    echo -e "${GREEN}2. 更新服务器组${RESET}"
-    echo -e "${GREEN}3. 卸载服务器组${RESET}"
-    echo -e "${GREEN}4. 开启服务器组${RESET}"
-    echo -e "${GREEN}5. 关闭服务器组${RESET}"
-    echo -e "${GREEN}6. 重启服务器组${RESET}"
-    echo -e "${GREEN}7. 查看游戏日志${RESET}"
-    echo -e "${GREEN}8. 查看连接信息与VNC密码${RESET}"
-    echo -e "${GREEN}9. 连接到 Steam 令牌交互终端${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈ FOSSBilling 管理面板 ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新服务${RESET}"
+    echo -e "${GREEN}3. 卸载服务${RESET}"
+    echo -e "${GREEN}4. 启动服务${RESET}"
+    echo -e "${GREEN}5. 停止服务${RESET}"
+    echo -e "${GREEN}6. 重启服务${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_stardew ;;
-        2) update_stardew ;;
-        3) uninstall_stardew ;;
-        4) start_stardew ;;
-        5) stop_stardew ;;
-        6) restart_stardew ;;
-        7) logs_stardew ;;
+        1) install_fossbilling ;;
+        2) update_translate ;;
+        3) uninstall_translate ;;
+        4) start_translate ;;
+        5) stop_translate ;;
+        6) restart_translate ;;
+        7) logs_translate ;;
         8) show_info ;;
-        9) attach_steam_guard ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

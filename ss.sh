@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# 颜色定义
-GREEN='\033;32m'
-YELLOW='\033;1;33m'
-RED='\033;31m'
+# 标准 ANSI 颜色定义
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
 RESET='\033[0m'
 
 # 尝试在脚本内直接载入可能写入了环境路径的 bashrc 
@@ -13,13 +13,12 @@ export PATH="$HOME/.local/bin:/root/.local/bin:/root/.opencode/bin:$PATH"
 
 # 动态定位 OpenCode 实际安装与配置路径
 get_paths() {
-    # 默认使用当前用户的家目录
     OPENCODE_CONFIG_DIR="$HOME/.config/opencode"
     OPENCODE_CONFIG_FILE="$OPENCODE_CONFIG_DIR/opencode.json"
     OPENCODE_AUTH_FILE="$HOME/.local/share/opencode/auth.json"
     REAL_EXEC_PATH=$(command -v opencode 2>/dev/null)
 
-    # 核心修正：如果检测到 opencode 挂在 root 旗下，重定向路径定义
+    # 如果检测到 opencode 挂在 root 旗下，重定向路径定义
     if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
         OPENCODE_CONFIG_DIR="/root/.config/opencode"
         OPENCODE_CONFIG_FILE="$OPENCODE_CONFIG_DIR/opencode.json"
@@ -27,11 +26,14 @@ get_paths() {
     fi
 }
 
+
+
+
 # 获取状态与版本信息
 get_status() {
     get_paths
     if [ -n "$REAL_EXEC_PATH" ]; then
-        status="${GREEN}已安装 (${REAL_EXEC_PATH})${RESET}"
+        status="${GREEN}已安装${RESET}"
         version_info=$(opencode -v 2>/dev/null || opencode --version 2>/dev/null | head -n 1)
         [ -z "$version_info" ] && version_info="已就绪"
         opencode_version="${YELLOW}${version_info}${RESET}"
@@ -40,8 +42,8 @@ get_status() {
         opencode_version="${RED}-${RESET}"
     fi
 
-    # 检查凭据文件和配置文件 (针对 root 路径需要用 sudo 检查是否存在)
-    if sudo [ -f "$OPENCODE_AUTH_FILE" ] 2>/dev/null; then
+     # 检查凭据状态 (通过官方 list 命令判断是否有已连接的项目)
+    if opencode providers list 2>/dev/null | grep -qE "connected|login|✔"; then
         auth_status="${GREEN}已连接${RESET}"
     else
         auth_status="${RED}未连接${RESET}"
@@ -54,27 +56,28 @@ get_status() {
     fi
 }
 
+
 # 菜单面板
 show_menu() {
     clear
     get_status
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN}    ◈  OpenCode CLI  智能权限管理面板  ◈    ${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}  ◈  OpenCode CLI 管理面板  ◈  ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}版本 :${RESET} $opencode_version"
     echo -e "${GREEN}凭据 :${RESET} $auth_status"
     echo -e "${GREEN}配置 :${RESET} $config_status"
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN}1. 安装 OpenCode (默认当前用户)${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
     echo -e "${GREEN}2. 在当前目录启动${RESET}"
     echo -e "${GREEN}3. 在指定路径启动${RESET}"
-    echo -e "${GREEN}4. 连接模型提供商 (/connect)${RESET}"
-    echo -e "${GREEN}5. 配置自定义提供商/Base URL/API Key (JSON)${RESET}"
-    echo -e "${GREEN}6. 更新 OpenCode${RESET}"
-    echo -e "${GREEN}7. 彻底卸载 OpenCode (自动净化 root/普通路径)${RESET}"
+    echo -e "${GREEN}4. 连接模型提供商${RESET}"
+    echo -e "${GREEN}5. 配置自定义提供商${RESET}"
+    echo -e "${GREEN}6. 更新${RESET}"
+    echo -e "${GREEN}7. 卸载${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
 }
 
@@ -85,7 +88,7 @@ install_opencode() {
     
     [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
 
-    echo -e "\n${YELLOW}[2/2] 正在检测并安装 bubblewrap 沙箱依赖 (可能需要输入 sudo 密码)...${RESET}"
+    echo -e "\n${YELLOW}[2/2] 正在检测并安装 bubblewrap 沙箱依赖...${RESET}"
     if command -v bwrap &> /dev/null; then
         echo -e "${GREEN}✔ 检测到系统已存在 bubblewrap，跳过安装。${RESET}"
     else
@@ -109,7 +112,6 @@ start_current() {
     get_paths
     if [ -n "$REAL_EXEC_PATH" ]; then
         echo -e "\n${GREEN}正在启动 OpenCode...${RESET}"
-        # 如果可执行文件在 root 目录下，则自动使用 sudo 唤起
         if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
             sudo "$REAL_EXEC_PATH"
         else
@@ -147,15 +149,15 @@ start_path() {
     fi
 }
 
-# 4. 连接/添加 API 密钥
+# 4. 连接/添加 API 密钥 (精准调用官方的 providers login)
 login_opencode() {
     get_paths
     if [ -n "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${YELLOW}正在调用 OpenCode 凭据连接程序 (/connect)...${RESET}"
+        echo -e "\n${YELLOW}正在调用 OpenCode 凭据登录程序 (providers login)...${RESET}"
         if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
-            sudo "$REAL_EXEC_PATH" /connect
+            sudo "$REAL_EXEC_PATH" providers login
         else
-            opencode /connect
+            opencode providers login
         fi
     else
         echo -e "\n${RED}未检测到已安装的 OpenCode。${RESET}"
@@ -177,7 +179,6 @@ config_custom_api() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read api_choice
 
-    # 提权确保目标配置目录存在
     if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
         sudo mkdir -p "$OPENCODE_CONFIG_DIR"
     else
@@ -186,7 +187,6 @@ config_custom_api() {
 
     case $api_choice in
         1|2)
-            # 配置文本生成核心逻辑统一处理
             if [ "$api_choice" = "1" ]; then
                 echo -ne "\n${YELLOW}提供商标识 (anthropic/openai/deepseek): ${RESET}"
                 read input_provider
@@ -220,7 +220,6 @@ config_custom_api() {
                 json_content="{\"\$schema\":\"https://opencode.ai/config.json\",\"provider\":{\"$custom_id\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"$custom_name\",\"options\":{$options_json},\"models\":{\"$model_id\":{\"name\":\"$model_name\"}}}}}"
             fi
 
-            # 写入文件（如果是 root 路径则通过 sudo dd 写入文件避免权限被拒）
             if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
                 echo "$json_content" | sudo tee "$OPENCODE_CONFIG_FILE" > /dev/null
             else
@@ -253,42 +252,36 @@ update_opencode() {
     echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
-# 7. 整合卸载（支持清理 root 安装与系统安装）
+# 7. 整合卸载 (修正为优先调用官方原生的 uninstall 机制)
 uninstall_opencode_flow() {
     get_paths
     echo -e "\n${RED}准备进入卸载流程...${RESET}"
     echo -ne "${RED}确定要完全卸载 OpenCode 主程序吗？(y/n): ${RESET}"
     read ans
     if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
-        # 第一步：卸载程序 (双向清理，防止清理不干净)
-        echo -e "${YELLOW}[步骤 1/3] 正在删除主程序可执行文件与缓存 (需要时将请求 sudo 权限)...${RESET}"
-        
-        # 1. 干净移除普通用户路径下的痕迹
+        echo -e "${YELLOW}[步骤 1/2] 正在调用官方原生引擎执行卸载...${RESET}"
+        if [ -n "$REAL_EXEC_PATH" ]; then
+            if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
+                sudo "$REAL_EXEC_PATH" uninstall
+            else
+                opencode uninstall
+            fi
+        fi
+
+        # 强力双向扫尾清理
         rm -f ~/.local/bin/opencode
         rm -rf ~/.local/share/opencode
+        rm -rf "$HOME/.config/opencode"
         
-        # 2. 强力移除 /root/ 下的核心文件与二进制组件
         sudo rm -f /root/.local/bin/opencode
         sudo rm -rf /root/.opencode
         sudo rm -rf /root/.local/share/opencode
+        sudo rm -rf "/root/.config/opencode"
 
-        echo -e "${GREEN}✔ 主程序及本地缓存清理完成。${RESET}"
-        
-        # 第二步：清除配置文件
-        echo -e "\n${RED}[步骤 2/3] 是否清除全局配置文件与连接凭据(auth.json)？${RESET}"
-        echo -ne "${RED}是否清除？(y/n): ${RESET}"
-        read ans_config
-        if [ "$ans_config" = "y" ] || [ "$ans_config" = "Y" ]; then
-            echo -e "${YELLOW}正在彻底擦除全局配置文件与凭据...${RESET}"
-            rm -rf "$HOME/.config/opencode"
-            sudo rm -rf "/root/.config/opencode"
-            echo -e "${GREEN}✔ 配置文件与凭据已彻底干净！${RESET}"
-        else
-            echo -e "${YELLOW}已保留配置文件。${RESET}"
-        fi
+        echo -e "${GREEN}✔ 核心程序、本地缓存与配置文件已全部净化！${RESET}"
 
-        # 第三步：清除沙箱依赖（bubblewrap）
-        echo -e "\n${RED}[步骤 3/3] 是否连同 bubblewrap 沙箱依赖包一起卸载？${RESET}"
+        # 第二步：清除沙箱依赖
+        echo -e "\n${RED}[步骤 2/2] 是否连同 bubblewrap 沙箱依赖包一起卸载？${RESET}"
         echo -ne "${RED}若该机器无其他沙箱业务，建议卸载。(y/n): ${RESET}"
         read ans_bwrap
         if [ "$ans_bwrap" = "y" ] || [ "$ans_bwrap" = "Y" ]; then

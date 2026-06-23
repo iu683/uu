@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# CLI Proxy API 服务 Docker Compose 管理面板 
+# grok2api Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,10 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="cli-proxy-api"
-BASE_DIR="/opt/cliproxy"
+CONTAINER_NAME="grok2api"
+BASE_DIR="/opt/grok2api"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONFIG_FILE="$BASE_DIR/config.yaml"
+ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -23,41 +23,8 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
-get_status_info() {
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
-
-    # 2. 如果容器存在，从容器状态中提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 从容器状态提取 Web 管理面板端口（默认是 8317）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8317/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8317"
-
-        # 从容器状态提取 API 端口（默认是 8085）
-        api_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8085/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$api_port" ]] && api_port="8085"
-    else
-        # 容器未安装/未部署时的返回值
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-        api_port="N/A"
-    fi
-}
-
-# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"}
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -78,194 +45,287 @@ get_public_ip() {
     fi
     echo "127.0.0.1" && return 0
 }
+# 动态获取容器状态
+get_status_info() {
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
 
-# 部署 CLI Proxy API
-install_cliproxy() {
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 读取映射端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8000"
+    else
+        webui_port="N/A"
+    fi
+}
+
+# 部署 grok2api
+install_grok2api() {
     check_dependencies
-    
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -ne "${YELLOW}请输入 Web 管理面板端口 (宿主机端口) [默认: 8317]: ${RESET}"
-    read -r custom_web_port
-    [[ -z "$custom_web_port" ]] && custom_web_port="8317"
+    # 1. 宿主机映射端口
+    echo -ne "${YELLOW}请输入服务访问端口 (宿主机 Host Port) [默认: 8000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8000"
 
-    echo -ne "${YELLOW}请输入 API 服务端口 (宿主机端口) [默认: 8085]: ${RESET}"
-    read -r custom_api_port
-    [[ -z "$custom_api_port" ]] && custom_api_port="8085"
+    # 2. 数据与日志存储路径
+    echo -ne "${YELLOW}请输入数据与日志宿主机存放绝对基准路径 [默认: /opt/grok2api]: ${RESET}"
+    read -r custom_path
+    [[ -z "$custom_path" ]] && custom_path="/opt/grok2api"
 
-    echo -ne "${YELLOW}请设置远程 Web 管理面板的登录密码 (Secret Key, 建议16位以上): ${RESET}"
-    read -r secret_key
-    while [[ -z "$secret_key" ]]; do
-        echo -e "${RED}错误: 密码不能为空，请输入密码！${RESET}"
-        echo -ne "${YELLOW}请设置远程 Web 管理面板的登录密码: ${RESET}"
-        read -r secret_key
-    done
+    # 创建子目录并赋权
+    mkdir -p "$custom_path/data" "$custom_path/logs"
+    chmod -R 777 "$custom_path" 2>/dev/null
 
-    # 1. 创建所需的宿主机目录与基础配置
-    mkdir -p "$BASE_DIR/auths" "$BASE_DIR/logs"
-    chmod -R 777 "$BASE_DIR"
+    # 3. 高级可选服务询问 (回车默认不开启)
+    echo -ne "${YELLOW}是否启用 CF 自动刷新功能 (Flaresolverr)？(y/n) [默认: n]: ${RESET}"
+    read -r enable_cf
+    [[ -z "$enable_cf" ]] && enable_cf="n"
 
-    # 2. 动态生成符合要求的 config.yaml 配置文件
-    echo -e "${YELLOW}正在生成内置安全鉴权的 config.yaml 配置文件...${RESET}"
-    cat <<EOF > "$CONFIG_FILE"
-host: ""
-port: 8317
-tls:
-  enable: false
-  cert: ""
-  key: ""
-remote-management:
-  allow-remote: true
-  secret-key: "${secret_key}"
-  disable-control-panel: false
-  panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
-auth-dir: "~/.cli-proxy-api"
-api-keys:
-  - "your-api-key-1"
-debug: false
-pprof:
-  enable: false
-  addr: "127.0.0.1:8316"
-plugins:
-  enabled: false
-  dir: "plugins"
-commercial-mode: false
-logging-to-file: false
-logs-max-total-size-mb: 0
-error-logs-max-files: 10
-usage-statistics-enabled: false
-redis-usage-queue-retention-seconds: 60
-proxy-url: ""
-force-model-prefix: false
-passthrough-headers: false
-request-retry: 3
-max-retry-credentials: 0
-max-retry-interval: 30
-disable-cooling: false
-save-cooldown-status: false
-transient-error-cooldown-seconds: 0
-disable-claude-cloak-mode: false
-disable-image-generation: false
-video-result-auth-cache-ttl: "3h"
-quota-exceeded:
-  switch-project: true
-  switch-preview-model: true
-  antigravity-credits: true
-routing:
-  strategy: "round-robin"
-  session-affinity: false
-  session-affinity-ttl: "1h"
-codex:
-  identity-confuse: false
-ws-auth: true
-nonstream-keepalive-interval: 0
-EOF
+    echo -ne "${YELLOW}是否启用 Warp 落地代理防止 IP 变脏？(y/n) [默认: n]: ${RESET}"
+    read -r enable_warp
+    [[ -z "$enable_warp" ]] && enable_warp="n"
 
-    # 3. 动态生成 docker-compose.yml
-    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
+    # 开始组织 docker-compose.yml 文本
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml...${RESET}"
+    
+    # 写入 compose 头部及主服务
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  cli-proxy-api:
-    image: eceasy/cli-proxy-api:latest
-    pull_policy: always
-    container_name: ${CONTAINER_NAME}
+  grok2api:
+    container_name: grok2api
+    image: ghcr.io/chenyme/grok2api:latest
     ports:
-      - "${custom_web_port}:8317"
-      - "${custom_api_port}:8085"
-      - "1455:1455"
-      - "54545:54545"
-      - "51121:51121"
-      - "11451:11451"
-    volumes:
-      - ./config.yaml:/CLIProxyAPI/config.yaml
-      - ./auths:/root/.cli-proxy-api
-      - ./logs:/CLIProxyAPI/logs
+      - "\${HOST_PORT:-8000}:\${SERVER_PORT:-8000}"
     environment:
-      - TZ=Asia/Shanghai
+      TZ: Asia/Shanghai
+      LOG_LEVEL: \${LOG_LEVEL:-INFO}
+      SERVER_HOST: \${SERVER_HOST:-0.0.0.0}
+      SERVER_PORT: \${SERVER_PORT:-8000}
+      SERVER_WORKERS: \${SERVER_WORKERS:-1}
+      ACCOUNT_STORAGE: \${ACCOUNT_STORAGE:-local}
+      ACCOUNT_LOCAL_PATH: \${ACCOUNT_LOCAL_PATH:-data/accounts.db}
+      ACCOUNT_REDIS_URL: \${ACCOUNT_REDIS_URL:-}
+      ACCOUNT_MYSQL_URL: \${ACCOUNT_MYSQL_URL:-}
+      ACCOUNT_POSTGRESQL_URL: \${ACCOUNT_POSTGRESQL_URL:-}
+EOF
+
+    # 处理 grok2api 服务内部针对 CF 的环境变量注释
+    if [[ "$enable_cf" == "y" || "$enable_cf" == "Y" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
+      FLARESOLVERR_URL: http://flaresolverr:8191
+      CF_REFRESH_INTERVAL: "600"
+      CF_TIMEOUT: "60"
+EOF
+    else
+        cat <<EOF >> "$COMPOSE_FILE"
+      # FLARESOLVERR_URL: http://flaresolverr:8191
+      # CF_REFRESH_INTERVAL: "600"
+      # CF_TIMEOUT: "60"
+EOF
+    fi
+
+    # 写入主服务的卷挂载和重启策略
+    cat <<EOF >> "$COMPOSE_FILE"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
     restart: unless-stopped
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动服务...${RESET}"
+    # 附加可选服务 1: Warp
+    if [[ "$enable_warp" == "y" || "$enable_warp" == "Y" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
+
+  warp:
+    container_name: warp
+    image: caomingjun/warp:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1080:1080"
+    environment:
+      - WARP_SLEEP=2
+    cap_add:
+      - NET_ADMIN
+EOF
+    fi
+
+    # 附加可选服务 2: Flaresolverr
+    if [[ "$enable_cf" == "y" || "$enable_cf" == "Y" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
+
+  flaresolverr:
+    container_name: flaresolverr
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    ports:
+      - "127.0.0.1:8191:8191"
+    environment:
+      TZ: Asia/Shanghai
+      LOG_LEVEL: info
+    restart: unless-stopped
+EOF
+    fi
+
+
+    # 开始组织并生成环境配置文件 .env
+    echo -e "${YELLOW}正在生成配对的 .env 配置文件...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+# ==================== 基础运行 ====================
+TZ=Asia/Shanghai
+LOG_LEVEL=INFO
+LOG_FILE_ENABLED=true
+ACCOUNT_SYNC_INTERVAL=30
+
+# ==================== Web 服务 / Docker Compose ====================
+SERVER_HOST=0.0.0.0
+SERVER_PORT=8000
+SERVER_WORKERS=1
+
+# Docker Compose 宿主机映射端口
+HOST_PORT=${custom_port}
+
+# ==================== 账号存储（启动期） ====================
+ACCOUNT_STORAGE=local
+
+# ==================== 可选：本地数据 / 日志目录 ====================
+DATA_DIR=${custom_path}/data
+LOG_DIR=${custom_path}/logs
+EOF
+
+    # 纠正或者软链接本地 compose 执行目录内的数据流，确保和用户自定路径一致
+    rm -rf "$BASE_DIR/data" "$BASE_DIR/logs"
+    ln -sf "$custom_path/data" "$BASE_DIR/data"
+    ln -sf "$custom_path/logs" "$BASE_DIR/logs"
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 grok2api 服务集群...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}等待服务初始化 (约5秒)...${RESET}"
+    sleep 5
 
-    DETECT_IP=$(get_public_ip)
+    local current_ip
+    current_ip=$(get_public_ip)
 
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${GREEN}                 CLI Proxy API 部署成功！                       ${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${YELLOW}Web 管理面板地址 : http://${DETECT_IP}:${custom_web_port}/management.html${RESET}"
-    echo -e "${YELLOW}管理面板登录密码 : ${secret_key}${RESET}"
-    echo -e "${YELLOW}API 服务访问地址 : http://${DETECT_IP}:${custom_api_port}${RESET}"
-    echo -e "${YELLOW}宿主机安装根路径 : $BASE_DIR${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}        grok2api 部署成功！       ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}服务访问地址     : http://${current_ip}:${custom_port}${RESET}"
+    echo -e "${YELLOW}数据存储路径     : $custom_path/data${RESET}"
+    echo -e "${YELLOW}日志存储路径     : $custom_path/logs${RESET}"
+    echo -e "${CYAN}--------------------------------${RESET}"
+    echo -e "${CYAN}💡 功能开启状态：${RESET}"
+    echo -e "${YELLOW}CF 盾自动刷新服务 : $([ "$enable_cf" = "y" ] && echo -e "${GREEN}已开启${RESET}" || echo -e "${RED}未开启${RESET}")${RESET}"
+    echo -e "${YELLOW}Warp 落地代理服务 : $([ "$enable_warp" = "y" ] && echo -e "${GREEN}开(请至config.toml配置socks5://warp:1080)${RESET}" || echo -e "${RED}未开启${RESET}")${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
 # 更新镜像
-update_cliproxy() {
+update_grok2api() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取最新服务集群镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+    echo -e "${GREEN}集群更新完成！组件均已处于最新状态。${RESET}"
 }
 
-# 卸载服务
-uninstall_cliproxy() {
-    echo -ne "${YELLOW}确定要卸载并删除 CLI Proxy API 容器吗？(y/n): ${RESET}"
+# 卸载集群
+uninstall_grok2api() {
+    echo -ne "${YELLOW}确定要卸载并删除 grok2api 容器集群吗？(y/n): ${RESET}"
     read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件、日志和认证数据？(y/n): ${RESET}"
+            echo -e "${GREEN}容器集群已停止并安全移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地存储的所有账号数据库和配置日志？(y/n): ${RESET}"
             read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+            if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
+                # 从 .env 提取路径安全清理
+                local real_data
+                real_data=$(grep DATA_DIR "$ENV_FILE" | cut -d'=' -f2)
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据根目录已彻底清理。${RESET}"
+                if [[ -n "$real_data" && -d "$(dirname "$real_data")" ]]; then
+                    rm -rf "$(dirname "$real_data")"
+                fi
+                echo -e "${GREEN}所有数据资产和配置文件已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            docker rm -f grok2api warp flaresolverr 2>/dev/null
+            echo -e "${GREEN}独立容器已强行清除。${RESET}"
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        echo -e "${GREEN}卸载彻底完成！${RESET}"
     fi
 }
 
-start_cliproxy() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_cliproxy() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_cliproxy() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_cliproxy() { docker logs -f "$CONTAINER_NAME"; }
+start_grok2api() { 
+    if [ -f "$COMPOSE_FILE" ]; then
+        cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}集群服务已启动${RESET}"
+    else
+        echo -e "${RED}错误: 未检测到配置，无法启动。${RESET}"
+    fi
+}
+
+stop_grok2api() { 
+    if [ -f "$COMPOSE_FILE" ]; then
+        cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}集群服务已挂起停止${RESET}"
+    else
+        echo -e "${RED}错误: 未检测到配置，无法停止。${RESET}"
+    fi
+}
+
+restart_grok2api() { 
+    if [ -f "$COMPOSE_FILE" ]; then
+        cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}集群服务已成功重启${RESET}"
+    else
+        echo -e "${RED}错误: 未检测到配置，无法重启。${RESET}"
+    fi
+}
+
+logs_grok2api() { 
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        docker logs -f "$CONTAINER_NAME"
+    else
+        echo -e "${RED}错误: 主业务容器不存在，无法追踪日志。${RESET}"
+    fi
+}
 
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${YELLOW}当前状态     : $status"
-    echo -e "${YELLOW}镜像名称     : ${img_version}"
-    if [ "$webui_port" != "N/A" ]; then
-        echo -e "${YELLOW}管理面板地址 : http://${DETECT_IP}:${webui_port}/management.html"
-        echo -e "${YELLOW}API 服务地址 : http://${DETECT_IP}:${api_port}"
+    local current_ip
+    current_ip=$(get_public_ip)
+    
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}主服务状态     : $status"
+    if [[ "$webui_port" == "N/A" ]]; then
+        echo -e "${YELLOW}API 访问地址   : N/A${RESET}"
+    else
+        echo -e "${YELLOW}API 访问地址   : http://${current_ip}:${webui_port}${RESET}"
     fi
-    echo -e "${YELLOW}配置文件路径 : ${CONFIG_FILE}${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
+    echo -e "${CYAN}--------------------------------${RESET}"
+    echo -e "${CYAN}📂 运行配置文件分布情况：${RESET}"
+    echo -e "${YELLOW}Docker Compose 结构文件 : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}底层环境变量映射文件    : $ENV_FILE${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈  CLI Proxy API 管理面板 ◈   ${RESET}"
+    echo -e "${GREEN}    ◈  grok2api 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}面板 :${RESET} ${YELLOW}${webui_port}${RESET}"  
-    echo -e "${GREEN}API  :${RESET} ${YELLOW}${api_port}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -280,13 +340,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_cliproxy ;;
-        2) update_cliproxy ;;
-        3) uninstall_cliproxy ;;
-        4) start_cliproxy ;;
-        5) stop_cliproxy ;;
-        6) restart_cliproxy ;;
-        7) logs_cliproxy ;;
+        1) install_grok2api ;;
+        2) update_grok2api ;;
+        3) uninstall_grok2api ;;
+        4) start_grok2api ;;
+        5) stop_grok2api ;;
+        6) restart_grok2api ;;
+        7) logs_grok2api ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

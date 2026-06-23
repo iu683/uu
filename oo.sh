@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Antigravity Manager Docker Compose 管理面板 
+# gemini-business2api 管理面板
 # =================================================================
 
 # 颜色
@@ -10,9 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="antigravity-manager"
-BASE_DIR="/opt/antigravity-manager"
+CONTAINER_NAME="gemini-business2api"
+BASE_DIR="/opt/gemini-business2api"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -22,9 +23,8 @@ check_dependencies() {
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"}
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -46,9 +46,8 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取容器状态
 get_status_info() {
-    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -57,196 +56,216 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 从容器状态提取 WebUI 端口（容器内部监听的是 8045 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8045/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 兜底获取第一个绑定的端口
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8045"
-
-        # 从容器状态提取数据目录（挂载路径）
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="~/.antigravity_tools"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "7860/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="7860"
     else
-        # 容器未安装/未部署时的返回值
-        img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        data_dir="N/A"
     fi
 }
 
-# 部署 Antigravity Manager
-install_antigravity() {
+# 部署服务
+install_gemini() {
     check_dependencies
-    
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 8045]: ${RESET}"
+    # 1. 配置管理后台登录密码 ADMIN_KEY (回车默认纯随机)
+    echo -ne "${YELLOW}请输入后台管理密码 ADMIN_KEY [直接回车自动生成随机密码]: ${RESET}"
+    read -r custom_admin_key
+    if [[ -z "$custom_admin_key" ]]; then
+        custom_admin_key="$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)"
+        echo -e "${GREEN} -> 已自动生成后台密码: $custom_admin_key${RESET}"
+    fi
+
+    # 2. 宿主机映射主端口
+    echo -ne "${YELLOW}请输入主服务访问端口 (PORT) [默认: 7860]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8045"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
+    [[ -z "$custom_port" ]] && custom_port="7860"
+
+    # 3. 宿主机映射 Worker 健康端口
+    echo -ne "${YELLOW}请输入刷新 Worker 健康端口 (REFRESH_HEALTH_PORT) [默认: 8080]: ${RESET}"
+    read -r custom_worker_port
+    [[ -z "$custom_worker_port" ]] && custom_worker_port="8080"
+
+    # 4. 数据存放基准路径
+    echo -ne "${YELLOW}请输入数据存放绝对基准路径 [默认: /opt/gemini-business2api]: ${RESET}"
+    read -r custom_path
+    [[ -z "$custom_path" ]] && custom_path="/opt/gemini-business2api"
+
+    # 定义子挂载目录
+    local path_data="$custom_path/data"
+
+    # 检查并清理残留的坏文件
+    if [ -e "$path_data" ] && [ ! -d "$path_data" ]; then
+        rm -rf "$path_data"
     fi
+    mkdir -p "$path_data"
+    chmod -R 777 "$custom_path" 2>/dev/null
 
-    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: ~/.antigravity_tools]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="$HOME/.antigravity_tools"
+    # 5. 是否同时启用 refresh-worker 刷新组件
+    echo -ne "${YELLOW}是否同步启动定时刷新 Worker 组件 (refresh-worker)？(y/n) [默认: n]: ${RESET}"
+    read -r enable_worker
+    [[ -z "$enable_worker" ]] && enable_worker="n"
 
-    # WEB密码配置（非空）
-    echo -ne "${YELLOW}请输入 WEB 管理密码 (WEB_PASSWORD): ${RESET}"
-    read -r custom_password
-    while [[ -z "$custom_password" ]]; do
-        echo -e "${RED}错误: 密码不能为空，请重新输入！${RESET}"
-        echo -ne "${YELLOW}请输入 WEB 管理密码 (WEB_PASSWORD): ${RESET}"
-        read -r custom_password
-    done
-
-    # API_KEY 配置（支持高级随机生成，不随机则强制手动输入）
-    echo -ne "${YELLOW}是否随机生成 sk- 格式的 API_KEY 密钥？(y/n) [默认: y]: ${RESET}"
-    read -r gen_api_choice
-    [[ -z "$gen_api_choice" ]] && gen_api_choice="y"
-
-    if [[ "$gen_api_choice" == "y" || "$gen_api_choice" == "Y" ]]; then
-        # 生成 sk-$(date +%s%N | sha256sum | head -c 15) 格式的高级随机密钥
-        local random_hash
-        random_hash=$(date +%s%N | sha256sum | head -c 15)
-        local random_key="sk-${random_hash}"
-        api_key_line="API_KEY=${random_key}"
-        display_api_key="$random_key"
-    else
-        # 手动输入 API_KEY 并强校验非空
-        echo -ne "${YELLOW}请输入您自定义的 API 调用密钥 (API_KEY): ${RESET}"
-        read -r custom_api_key
-        while [[ -z "$custom_api_key" ]]; do
-            echo -e "${RED}错误: API 密钥不能为空，请重新输入！${RESET}"
-            echo -ne "${YELLOW}请输入您自定义的 API 调用密钥 (API_KEY): ${RESET}"
-            read -r custom_api_key
-        done
-        api_key_line="API_KEY=${custom_api_key}"
-        display_api_key="$custom_api_key"
-    fi
-
-    # 1. 创建所需的宿主机目录
-    mkdir -p "$custom_data"
-    chmod -R 777 "$BASE_DIR" "$custom_data" 2>/dev/null
-
-    # 2. 动态生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  antigravity-manager:
-    image: lbjlaq/antigravity-manager
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:8045"
-    volumes:
-      - ${custom_data}:/root/.antigravity_tools
-    environment:
-      - LOG_LEVEL=\${LOG_LEVEL:-info}
-      - WEB_PASSWORD=${custom_password}
-      - ${api_key_line}
+    # 组织并生成环境配置文件 .env
+    echo -e "${YELLOW}正在生成配套的 .env 配置文件...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+ADMIN_KEY=${custom_admin_key}
+PORT=${custom_port}
+REFRESH_WORKER_IMAGE=cooooookk/gemini-refresh-worker:latest
+REFRESH_HEALTH_PORT=${custom_worker_port}
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Antigravity Manager...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    # 同步数据流路径
+    if [ "$custom_path" != "$BASE_DIR" ]; then
+        rm -rf "$BASE_DIR/data"
+        ln -sf "$path_data" "$BASE_DIR/data"
+    fi
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    # 生成魔改后的 docker-compose.yml (彻底移除官方死锁的 healthcheck)
+    echo -e "${YELLOW}正在生成完美适配自定义端口的 docker-compose.yml...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  gemini-api:
+    image: cooooookk/gemini-business2api:latest
+    container_name: gemini-business2api
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:7860"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  refresh-worker:
+    image: \${REFRESH_WORKER_IMAGE:-cooooookk/gemini-refresh-worker:latest}
+    container_name: gemini-refresh-worker
+    restart: unless-stopped
+    profiles:
+      - refresh
+    depends_on:
+      - gemini-api
+    env_file:
+      - .env
+    environment:
+      SQLITE_PATH: /app/data/data.db
+      HEALTH_PORT: ${custom_worker_port}
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "${custom_worker_port}:${custom_worker_port}"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+
+    echo -e "${YELLOW}正在彻底清理旧集群并重新秒级拉起服务...${RESET}"
+    cd "$BASE_DIR"
+    docker compose --profile refresh down --remove-orphans 2>/dev/null
+    
+    if [[ "$enable_worker" == "y" || "$enable_worker" == "Y" ]]; then
+        docker compose --profile refresh up -d --force-recreate
+    else
+        docker compose up -d --force-recreate
+    fi
+
+    echo -e "${YELLOW}等待服务初始化 (约5秒)...${RESET}"
+    sleep 5
 
     local current_ip
     current_ip=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   Antigravity Manager 部署成功！  ${RESET}"
+    echo -e "${GREEN}    gemini-business2api 部署成功！${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${current_ip}:${custom_port}${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
-    echo -e "${YELLOW}Web 管理密码   : $custom_password${RESET}"
-    echo -e "${YELLOW}当前 API KEY   : $display_api_key${RESET}"
+    echo -e "${YELLOW}后台管理地址   : http://${current_ip}:${custom_port}/admin${RESET}"
+    echo -e "${YELLOW}管理登录密码   : ${custom_admin_key}${RESET}"
+    echo -e "${YELLOW}数据本地存放路径 : $path_data${RESET}"
     echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${CYAN}🔒 权限隔离安全提示：${RESET}"
-    echo -e "${CYAN}1. Web 登录：必须使用 WEB_PASSWORD。输入 API Key 将被拒绝。${RESET}"
-    echo -e "${CYAN}2. API 调用：请继续使用上面确定的 API KEY，确保管理与调用权限隔离。${RESET}"
+    echo -e "${CYAN}💡 组件开启状态：${RESET}"
+    echo -e "${YELLOW}定时刷新 Worker组件 : $([ "$enable_worker" = "y" ] && echo -e "${GREEN}已开启 (本地映射端口: $custom_worker_port)${RESET}" || echo -e "${RED}未开启${RESET}")${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
 # 更新镜像
-update_antigravity() {
+update_gemini() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+    echo -e "${YELLOW}正在从远端拉取最新服务镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose --profile refresh pull
+    if [ "$(docker ps -aq -f name=^/gemini-refresh-worker$)" ]; then
+        docker compose --profile refresh up -d --remove-orphans
+    else
+        docker compose up -d --remove-orphans
+    fi
+    echo -e "${GREEN}集群更新完成！组件均已处于最新状态。${RESET}"
 }
 
-# 卸载容器
-uninstall_antigravity() {
-    echo -ne "${YELLOW}确定要卸载并删除 Antigravity Manager 容器吗？(y/n): ${RESET}"
+# 卸载服务
+uninstall_gemini() {
+    echo -ne "${YELLOW}确定要卸载并删除 gemini-business2api 容器集群吗？(y/n): ${RESET}"
     read -r confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和缓存数据？(y/n): ${RESET}"
+            cd "$BASE_DIR" && docker compose --profile refresh down
+            echo -e "${GREEN}容器已停止并安全移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地存储的所有数据库和凭证数据？(y/n): ${RESET}"
             read -r clean_data
             if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
                 rm -rf "$BASE_DIR"
-                # 兼容带有波浪号的路径解析
-                eval local real_data_dir="$data_dir"
-                if [ "$real_data_dir" != "N/A" ] && [ -d "$real_data_dir" ]; then
-                    rm -rf "$real_data_dir"
+                if [ -d "/opt/gemini-business2api/data" ]; then
+                    rm -rf "/opt/gemini-business2api/data"
                 fi
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}数据资产和配置文件已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
-            echo -e "${GREEN}独立容器已强行移除。${RESET}"
+            docker rm -f gemini-business2api gemini-refresh-worker 2>/dev/null
+            echo -e "${GREEN}独立容器已强行清除。${RESET}"
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        echo -e "${GREEN}卸载彻底完成！${RESET}"
     fi
 }
 
-start_antigravity() { 
+start_gemini() { 
     if [ -f "$COMPOSE_FILE" ]; then
-        cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"
+        cd "$BASE_DIR" && docker compose --profile refresh start && echo -e "${GREEN}服务集群已全部拉起启动${RESET}"
     else
-        echo -e "${RED}错误: 未检测到配置文件，无法启动。${RESET}"
+        echo -e "${RED}错误: 未检测到配置，无法启动。${RESET}"
     fi
 }
 
-stop_antigravity() { 
+stop_gemini() { 
     if [ -f "$COMPOSE_FILE" ]; then
-        cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"
+        cd "$BASE_DIR" && docker compose --profile refresh stop && echo -e "${YELLOW}服务集群已全面停止挂起${RESET}"
     else
-        echo -e "${RED}错误: 未检测到配置文件，无法停止。${RESET}"
+        echo -e "${RED}错误: 未检测到配置，无法停止。${RESET}"
     fi
 }
 
-restart_antigravity() { 
+restart_gemini() { 
     if [ -f "$COMPOSE_FILE" ]; then
-        cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"
+        cd "$BASE_DIR" && docker compose --profile refresh restart && echo -e "${GREEN}服务集群已成功完成重启${RESET}"
     else
-        echo -e "${RED}错误: 未检测到配置文件，无法重启。${RESET}"
+        echo -e "${RED}错误: 未检测到配置，无法重启。${RESET}"
     fi
 }
 
-logs_antigravity() { 
+logs_gemini() { 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         docker logs -f "$CONTAINER_NAME"
     else
-        echo -e "${RED}错误: 容器不存在，无法查看日志。${RESET}"
+        echo -e "${RED}错误: 主容器不存在，无法追踪日志。${RESET}"
     fi
 }
 
@@ -256,18 +275,14 @@ show_info() {
     current_ip=$(get_public_ip)
     
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}主服务状态     : $status"
     if [[ "$webui_port" == "N/A" ]]; then
-        echo -e "${YELLOW}服务访问地址   : N/A${RESET}"
+        echo -e "${YELLOW}后台管理地址   : N/A${RESET}"
     else
-        echo -e "${YELLOW}服务访问地址   : http://${current_ip}:${webui_port}${RESET}"
+        echo -e "${YELLOW}后台管理地址   : http://${current_ip}:${webui_port}/admin${RESET}"
     fi
-    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
     echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${CYAN}🔒 权限隔离说明：${RESET}"
-    echo -e "${CYAN}Web 登录专享 => $custom_password${RESET}"
-    echo -e "${CYAN}API 调用专享 => $display_api_key${RESET}"
+    echo -e "${YELLOW}管理登录密码   : ${custom_admin_key}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -275,10 +290,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈  Antigravity  管理面板  ◈    ${RESET}"
+    echo -e "${GREEN} ◈ gemini-business2api 管理面板 ◈ ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}主服务状态 :${RESET} $status"
+    echo -e "${GREEN}主访问端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -293,13 +308,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_antigravity ;;
-        2) update_antigravity ;;
-        3) uninstall_antigravity ;;
-        4) start_antigravity ;;
-        5) stop_antigravity ;;
-        6) restart_antigravity ;;
-        7) logs_antigravity ;;
+        1) install_gemini ;;
+        2) update_gemini ;;
+        3) uninstall_gemini ;;
+        4) start_gemini ;;
+        5) stop_gemini ;;
+        6) restart_gemini ;;
+        7) logs_gemini ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

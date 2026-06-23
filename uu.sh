@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# gcli2api Docker Compose 管理面板 (分离密码·接口加sk版)
+# aiclient2api Docker Compose 管理面板 (多端口智能防冲突版)
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="gcli2api"
-BASE_DIR="/opt/gcli2api"
+CONTAINER_NAME="aiclient2api"
+BASE_DIR="/opt/aiclient2api"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -21,6 +21,7 @@ check_dependencies() {
         exit 1
     fi
 }
+
 
 get_public_ip() {
     local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
@@ -56,101 +57,104 @@ get_status_info() {
     fi
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "7861/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="7861"
-
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="./data/creds"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
+        
+        config_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/configs"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$config_dir" ]] && config_dir="$BASE_DIR/configs"
     else
-        img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        data_dir="N/A"
+        config_dir="N/A"
     fi
 }
 
-# 部署 gcli2api
-install_gcli2api() {
+# 部署 aiclient2api
+install_aiclient2api() {
     check_dependencies
+    
+    # 先建立脚本工作目录
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 7861]: ${RESET}"
+    # 1. 端口配置 (默认保留官方复杂端口群映射)
+    echo -ne "${YELLOW}请输入主服务访问端口 (宿主机端口) [默认: 3000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="7861"
+    [[ -z "$custom_port" ]] && custom_port="3000"
 
-    echo -ne "${YELLOW}请输入数据凭证存储绝对路径 [默认: /opt/gcli2api/data/creds]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="/opt/gcli2api/data/creds"
+    # 2. 基准路径配置
+    echo -ne "${YELLOW}请输入服务配置与插件存放绝对基准路径 [默认: /opt/aiclient2api]: ${RESET}"
+    read -r custom_base_path
+    [[ -z "$custom_base_path" ]] && custom_base_path="/opt/aiclient2api"
 
-    # 1. 配置 API_PASSWORD (回车默认带 sk-)
-    echo -ne "${YELLOW}请输入接口密码 API_PASSWORD [直接回车自动生成随机 sk- 密钥]: ${RESET}"
-    read -r custom_api_password
-    if [[ -z "$custom_api_password" ]]; then
-        custom_api_password="sk-$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 15 | head -n 1)"
-        echo -e "${GREEN} -> 已自动生成接口密钥: $custom_api_password${RESET}"
-    fi
+    # 定义子挂载目录
+    local path_configs="$custom_base_path/configs"
+    local path_plugins="$custom_base_path/plugins"
 
-    # 2. 配置 PANEL_PASSWORD (回车默认纯随机，无 sk-)
-    echo -ne "${YELLOW}请输入面板密码 PANEL_PASSWORD [直接回车自动生成随机密码]: ${RESET}"
-    read -r custom_panel_password
-    if [[ -z "$custom_panel_password" ]]; then
-        custom_panel_password="$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)"
-        echo -e "${GREEN} -> 已自动生成面板密码: $custom_panel_password${RESET}"
-    fi
+    # 【核心修复】检查并清理残留的坏文件，防止 Docker 挂载报错
+    for check_path in "$path_configs" "$path_plugins"; do
+        if [ -e "$check_path" ] && [ ! -d "$check_path" ]; then
+            echo -e "${RED}警告: 检测到路径 $check_path 被普通文件占用，正在强行清理...${RESET}"
+            rm -rf "$check_path"
+        fi
+        mkdir -p "$check_path"
+    done
 
-    mkdir -p "$custom_data"
-    chmod -R 777 "$BASE_DIR" "$custom_data" 2>/dev/null
+    # 赋予权限
+    chmod -R 777 "$custom_base_path" 2>/dev/null
 
-    echo -e "${YELLOW}正在生成符合官方标准的分离密码 docker-compose.yml 配置文件...${RESET}"
+    # 3. 环境变量可选参数
+    echo -ne "${YELLOW}请输入附加运行参数 ARGS [直接回车留空]: ${RESET}"
+    read -r custom_args
+
+    echo -e "${YELLOW}正在生成标准完美的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  gcli2api:
-    image: ghcr.io/su-kaka/gcli2api:latest
+  aiclient-api:
+    image: justlikemaki/aiclient-2-api:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     ports:
-      - "${custom_port}:7861"
-    environment:
-      - PORT=7861
-      - API_PASSWORD=${custom_api_password}
-      - PANEL_PASSWORD=${custom_panel_password}
+      - "${custom_port}:3000"
+      - "8085-8087:8085-8087"
+      - "1455:1455"
+      - "56121:56121"
+      - "19876-19880:19876-19880"
     volumes:
-      - ${custom_data}:/app/creds
+      - ${path_configs}:/app/configs
+      - ${path_plugins}:/app/src/plugins-user
+    environment:
+      - ARGS=${custom_args}
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import sys, urllib.request, os; port = os.environ.get('PORT', '7861'); req = urllib.request.Request(f'http://localhost:{port}/v1/models', headers={'Authorization': 'Bearer ' + os.environ.get('API_PASSWORD', '${custom_api_password}')}); sys.exit(0 if urllib.request.urlopen(req, timeout=5).getcode() == 200 else 1)\""]
+      test: ["CMD", "node", "healthcheck.js"]
       interval: 30s
-      timeout: 10s
+      timeout: 3s
+      start_period: 5s
       retries: 3
-      start_period: 40s
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 gcli2api 服务...${RESET}"
+    echo -e "${YELLOW}正在启动 aiclient2api 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化并执行健康检查 (约5秒)...${RESET}"
+    echo -e "${YELLOW}等待服务初始化并执行健康检查 (约5秒)...${RESET}"
     sleep 5
 
     local current_ip
     current_ip=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        gcli2api 部署成功！       ${RESET}"
+    echo -e "${GREEN}       aiclient2api 部署成功！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${current_ip}:${custom_port}${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
-    echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${GREEN}🔑 本次部署所使用的分离密钥：${RESET}"
-    echo -e "${YELLOW}接口调用密码 (API_PASSWORD)   : $custom_api_password${RESET}"
-    echo -e "${YELLOW}面板管理密码 (PANEL_PASSWORD) : $custom_panel_password${RESET}"
+    echo -e "${YELLOW}主服务访问地址 : http://${current_ip}:${custom_port}${RESET}"
+    echo -e "${YELLOW}其他开放端口段 : 8085-8087, 1455, 56121, 19876-19880 (请注意放行防火墙)${RESET}"
+    echo -e "${YELLOW}默认密码       : admin123${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $path_configs${RESET}"
+    echo -e "${YELLOW}插件目录路径   : $path_plugins${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
 # 更新镜像
-update_gcli2api() {
+update_aiclient2api() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
@@ -162,19 +166,19 @@ update_gcli2api() {
 }
 
 # 卸载容器
-uninstall_gcli2api() {
-    echo -ne "${YELLOW}确定要卸载并删除 gcli2api 容器吗？(y/n): ${RESET}"
+uninstall_aiclient2api() {
+    echo -ne "${YELLOW}确定要卸载并删除 aiclient2api 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和凭证数据？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和挂载的插件数据？(y/n): ${RESET}"
             read -r clean_data
             if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
                 rm -rf "$BASE_DIR"
-                if [ "$data_dir" != "N/A" ] && [ -d "$data_dir" ]; then
-                    rm -rf "$data_dir"
+                if [ "$config_dir" != "N/A" ] && [ -d "$(dirname "$config_dir")" ]; then
+                    rm -rf "$(dirname "$config_dir")"
                 fi
                 echo -e "${GREEN}数据与配置文件已彻底清理。${RESET}"
             fi
@@ -186,7 +190,7 @@ uninstall_gcli2api() {
     fi
 }
 
-start_gcli2api() { 
+start_aiclient2api() { 
     if [ -f "$COMPOSE_FILE" ]; then
         cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"
     else
@@ -194,7 +198,7 @@ start_gcli2api() {
     fi
 }
 
-stop_gcli2api() { 
+stop_aiclient2api() { 
     if [ -f "$COMPOSE_FILE" ]; then
         cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"
     else
@@ -202,7 +206,7 @@ stop_gcli2api() {
     fi
 }
 
-restart_gcli2api() { 
+restart_aiclient2api() { 
     if [ -f "$COMPOSE_FILE" ]; then
         cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"
     else
@@ -210,7 +214,7 @@ restart_gcli2api() {
     fi
 }
 
-logs_gcli2api() { 
+logs_aiclient2api() { 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         docker logs -f "$CONTAINER_NAME"
     else
@@ -225,16 +229,8 @@ show_info() {
     
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    if [[ "$webui_port" == "N/A" ]]; then
-        echo -e "${YELLOW}服务访问地址   : N/A${RESET}"
-    else
-        echo -e "${YELLOW}服务访问地址   : http://${current_ip}:${webui_port}${RESET}"
-    fi
-    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
-    echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${YELLOW}接口调用密码   : $custom_api_password${RESET}"
-    echo -e "${YELLOW}面板管理密码   : $custom_panel_password${RESET}"
+    echo -e "${YELLOW}主服务访问地址 : http://${current_ip}:${webui_port}${RESET}"
+    echo -e "${YELLOW}数据挂载基准   : ${config_dir}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -242,7 +238,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  gcli2api 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}   ◈  aiclient2api 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -260,13 +256,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_gcli2api ;;
-        2) update_gcli2api ;;
-        3) uninstall_gcli2api ;;
-        4) start_gcli2api ;;
-        5) stop_gcli2api ;;
-        6) restart_gcli2api ;;
-        7) logs_gcli2api ;;
+        1) install_aiclient2api ;;
+        2) update_aiclient2api ;;
+        3) uninstall_aiclient2api ;;
+        4) start_aiclient2api ;;
+        5) stop_aiclient2api ;;
+        6) restart_aiclient2api ;;
+        7) logs_aiclient2api ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

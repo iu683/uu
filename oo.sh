@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Paymenter 自动化管理面板
+# Paymenter 自动化管理面板 
 # =================================================================
 
 # 颜色
@@ -44,7 +44,7 @@ get_status_info() {
 }
 
 get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local mode=${1:-"auto"}
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -95,7 +95,7 @@ install_paymenter() {
     if [[ "$db_mode" == "1" ]]; then
         db_host="paymenter-db"
         db_port="3306"
-        db_connection="mariadb"
+        db_connection="mysql"
         db_name="paymenter"
         db_user="paymenter"
         
@@ -108,9 +108,9 @@ install_paymenter() {
         [[ -z "$db_root_password" ]] && db_root_password=$(generate_password)
 
     elif [[ "$db_mode" == "2" ]]; then
-        echo -ne "${YELLOW}请输入远程数据库驱动类型 (mysql / mariadb) [默认 mariadb]: ${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库驱动类型 (mysql / mariadb) [默认 mysql]: ${RESET}"
         read -r db_connection
-        [[ -z "$db_connection" ]] && db_connection="mariadb"
+        [[ -z "$db_connection" ]] && db_connection="mysql"
 
         echo -ne "${YELLOW}请输入远程数据库地址 (Host): ${RESET}"
         read -r db_host
@@ -139,34 +139,86 @@ install_paymenter() {
         return
     fi
 
+    echo -e "\n${CYAN}====== 3. Redis 缓存类型选择 ======${RESET}"
+    echo -e "${GREEN}1) 部署全新的本地 Redis 容器${RESET}"
+    echo -e "${GREEN}2) 连接已有的远程/外部 Redis 服务器${RESET}"
+    echo -ne "${YELLOW}请选择 Redis 部署模式 [默认 1]: ${RESET}"
+    read -r redis_mode
+    [[ -z "$redis_mode" ]] && redis_mode="1"
+
+    if [[ "$redis_mode" == "1" ]]; then
+        redis_host="paymenter-cache"
+        redis_port="6379"
+        redis_password=""
+    elif [[ "$redis_mode" == "2" ]]; then
+        echo -ne "${YELLOW}请输入远程 Redis 地址 (Host): ${RESET}"
+        read -r redis_host
+        while [[ -z "$redis_host" ]]; do
+            echo -e "${RED}错误: Redis 地址不能为空！${RESET}"
+            echo -ne "${YELLOW}请输入远程 Redis 地址 (Host): ${RESET}"
+            read -r redis_host
+        done
+
+        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r redis_port
+        [[ -z "$redis_port" ]] && redis_port="6379"
+
+        echo -ne "${YELLOW}请输入远程 Redis 密码 (若无则留空): ${RESET}"
+        read -r redis_password
+    else
+        echo -e "${RED}输入有误，取消部署。${RESET}"
+        return
+    fi
+
+    echo -ne "${YELLOW}请输入 Redis 分区 DB 编号 (0-15) [默认 0]: ${RESET}"
+    read -r redis_db
+    [[ -z "$redis_db" ]] && redis_db="0"
+
     # 创建本地持久化目录
     echo -e "\n${YELLOW}正在初始化本地挂载目录...${RESET}"
     mkdir -p "$BASE_DIR/storage/logs" "$BASE_DIR/storage/public" "$BASE_DIR/themes" "$BASE_DIR/extensions" "$BASE_DIR/database"
 
-    # 【核心修复】写入环境配置文件 .env，补齐基础变量占位符，规避 500 错误
+    # 【核心修复】写入环境配置文件 .env，采用双重绑定变量，彻底杜绝 500 报错与 WARN 警告
     cat <<EOF > "$ENV_FILE"
 APP_ENV=production
-APP_DEBUG=false
+APP_DEBUG=true
 APP_KEY=
 
+# Docker Compose 使用的旧变量名
+DB_NAME=${db_name}
+DB_USER=${db_user}
+CACHE_STORE=redis
+
+# Laravel 框架底层使用的标准变量名
 DB_CONNECTION=${db_connection}
 DB_HOST=${db_host}
 DB_PORT=${db_port}
-DB_NAME=${db_name}
-DB_USER=${db_user}
+DB_DATABASE=${db_name}
+DB_USERNAME=${db_user}
 DB_PASSWORD=${db_password}
+
+CACHE_DRIVER=redis
+SESSION_DRIVER=redis
+QUEUE_CONNECTION=redis
+
+REDIS_HOST=${redis_host}
+REDIS_PASSWORD=${redis_password}
+REDIS_PORT=${redis_port}
+REDIS_DB=${redis_db}
 EOF
     
-    # 规范安全权限，配置文件不允许使用 777
     chmod 644 "$ENV_FILE"
 
     # 生成 docker-compose.yml
     echo -e "${YELLOW}正在生成配置文件...${RESET}"
     
-    if [[ "$db_mode" == "1" ]]; then
-        # 带有本地 MariaDB 优化的模板
-        cat <<EOF > "$COMPOSE_FILE"
+    cat <<EOF > "$COMPOSE_FILE"
 services:
+EOF
+
+    # 1. 动态注入本地数据库服务
+    if [[ "$db_mode" == "1" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
   database:
     container_name: paymenter-db
     image: mariadb:lts
@@ -181,135 +233,81 @@ services:
       MYSQL_PASSWORD: "${db_password}"
     networks:
       - paymenter_nw
-
-  cache:
-    container_name: paymenter-cache
-    image: redis:alpine
-    restart: always
-    networks:
-      - paymenter_nw
-
-  paymenter:
-    container_name: ${CONTAINER_NAME}
-    image: ghcr.io/paymenter/paymenter:latest
-    restart: always
-    ports:
-      - "${custom_port}:80"
-    volumes:
-      - "./:/app/var/"
-      - "./storage/logs:/app/storage/logs"
-      - "./storage/public:/app/storage/app/public"
-      - "./themes:/app/themes"
-      - "./extensions:/app/extensions"
-      - "app_volume:/app"
-    environment:
-      APP_ENV: "\${APP_ENV}"
-      APP_DEBUG: "\${APP_DEBUG}"
-      APP_KEY: "\${APP_KEY}"
-      DB_CONNECTION: "\${DB_CONNECTION}"
-      DB_HOST: "\${DB_HOST}"
-      DB_PORT: "\${DB_PORT}"
-      DB_DATABASE: "\${DB_NAME}"
-      DB_USERNAME: "\${DB_USER}"
-      DB_PASSWORD: "\${DB_PASSWORD}"
-      CACHE_STORE: "redis"
-      REDIS_HOST: "paymenter-cache"
-      PAYMENTER_SKIP_DEFAULT: "false"
-    depends_on:
-      - database
-      - cache
-    networks:
-      - paymenter_nw
-
-  asset-builder:
-    container_name: paymenter-asset-builder
-    image: node:22-alpine
-    profiles: ["build"]
-    working_dir: /app
-    volumes:
-      - "./themes:/app/themes"
-      - "./extensions:/app/extensions"
-      - "./:/app/var"
-      - "app_volume:/app"
-    command: >
-      sh -c "tail -f /dev/null"
-    networks:
-      - paymenter_nw
-
-networks:
-  paymenter_nw:
-    driver: bridge
-
-volumes:
-  app_volume:
-EOF
-    else
-        # 不带本地数据库的纯 Web 容器模板
-        cat <<EOF > "$COMPOSE_FILE"
-services:
-  cache:
-    container_name: paymenter-cache
-    image: redis:alpine
-    restart: always
-    networks:
-      - paymenter_nw
-
-  paymenter:
-    container_name: ${CONTAINER_NAME}
-    image: ghcr.io/paymenter/paymenter:latest
-    restart: always
-    ports:
-      - "${custom_port}:80"
-    volumes:
-      - "./:/app/var/"
-      - "./storage/logs:/app/storage/logs"
-      - "./storage/public:/app/storage/app/public"
-      - "./themes:/app/themes"
-      - "./extensions:/app/extensions"
-      - "app_volume:/app"
-    environment:
-      APP_ENV: "\${APP_ENV}"
-      APP_DEBUG: "\${APP_DEBUG}"
-      APP_KEY: "\${APP_KEY}"
-      DB_CONNECTION: "\${DB_CONNECTION}"
-      DB_HOST: "\${DB_HOST}"
-      DB_PORT: "\${DB_PORT}"
-      DB_DATABASE: "\${DB_NAME}"
-      DB_USERNAME: "\${DB_USER}"
-      DB_PASSWORD: "\${DB_PASSWORD}"
-      CACHE_STORE: "redis"
-      REDIS_HOST: "paymenter-cache"
-      PAYMENTER_SKIP_DEFAULT: "false"
-    depends_on:
-      - cache
-    networks:
-      - paymenter_nw
-
-  asset-builder:
-    container_name: paymenter-asset-builder
-    image: node:22-alpine
-    profiles: ["build"]
-    working_dir: /app
-    volumes:
-      - "./themes:/app/themes"
-      - "./extensions:/app/extensions"
-      - "./:/app/var"
-      - "app_volume:/app"
-    command: >
-      sh -c "tail -f /dev/null"
-    networks:
-      - paymenter_nw
-
-networks:
-  paymenter_nw:
-    driver: bridge
-
-volumes:
-  app_volume:
 EOF
     fi
 
-    # 递归放开其他运行目录的读写权限（不污染.env的权限）
+    # 2. 动态注入本地 Redis 服务
+    if [[ "$redis_mode" == "1" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
+  cache:
+    container_name: paymenter-cache
+    image: redis:alpine
+    restart: always
+    networks:
+      - paymenter_nw
+EOF
+    fi
+
+    # 3. 注入 Paymenter 主 Web 服务
+    cat <<EOF >> "$COMPOSE_FILE"
+  paymenter:
+    container_name: ${CONTAINER_NAME}
+    image: ghcr.io/paymenter/paymenter:latest
+    restart: always
+    ports:
+      - "${custom_port}:80"
+    volumes:
+      - "./:/app/var/"
+      - "./storage/logs:/app/storage/logs"
+      - "./storage/public:/app/storage/app/public"
+      - "./themes:/app/themes"
+      - "./extensions:/app/extensions"
+      - "app_volume:/app"
+    environment:
+      APP_ENV: "\${APP_ENV}"
+      APP_DEBUG: "\${APP_DEBUG}"
+      APP_KEY: "\${APP_KEY}"
+      DB_CONNECTION: "\${DB_CONNECTION}"
+      DB_HOST: "\${DB_HOST}"
+      DB_PORT: "\${DB_PORT}"
+      DB_DATABASE: "\${DB_DATABASE}"
+      DB_USERNAME: "\${DB_USERNAME}"
+      DB_PASSWORD: "\${DB_PASSWORD}"
+      CACHE_STORE: "\${CACHE_STORE}"
+      REDIS_HOST: "\${REDIS_HOST}"
+      REDIS_PASSWORD: "\${REDIS_PASSWORD}"
+      REDIS_PORT: "\${REDIS_PORT}"
+      REDIS_DB: "\${REDIS_DB}"
+      PAYMENTER_SKIP_DEFAULT: "false"
+    depends_on:
+$( [[ "$db_mode" == "1" ]] && echo "      - database" )
+$( [[ "$redis_mode" == "1" ]] && echo "      - cache" )
+    networks:
+      - paymenter_nw
+
+  asset-builder:
+    container_name: paymenter-asset-builder
+    image: node:22-alpine
+    profiles: ["build"]
+    working_dir: /app
+    volumes:
+      - "./themes:/app/themes"
+      - "./extensions:/app/extensions"
+      - "./:/app/var"
+      - "app_volume:/app"
+    command: >
+      sh -c "tail -f /dev/null"
+    networks:
+      - paymenter_nw
+
+networks:
+  paymenter_nw:
+    driver: bridge
+
+volumes:
+  app_volume:
+EOF
+
     chmod -R 777 "$BASE_DIR/storage" "$BASE_DIR/themes" "$BASE_DIR/extensions" "$BASE_DIR/database" 2>/dev/null
 
     echo -e "${YELLOW}正在通过 Docker Compose 启动容器服务...${RESET}"
@@ -318,12 +316,10 @@ EOF
     echo -e "${YELLOW}等待服务及依赖初始化 (约 10 秒)...${RESET}"
     sleep 10
 
-    # 执行官方要求的初始化命令
-    echo -e "\n${CYAN}====== 3. 开始执行 Paymenter 官方初始化命令行 ======${RESET}"
+    echo -e "\n${CYAN}====== 4. 开始执行 Paymenter 官方初始化命令行 ======${RESET}"
     
-    # 手动强制生成一次加密 Key，彻底解决 500 报错
     echo -e "${YELLOW}[准备阶段] 正在生成应用安全密钥 (APP_KEY)...${RESET}"
-    docker compose exec paymenter php artisan key:generate
+    docker compose exec paymenter php artisan key:generate --force
 
     echo -e "${YELLOW}[1/3] 正在配置系统应用 URL...${RESET}"
     docker compose exec -it paymenter php artisan app:init
@@ -334,8 +330,14 @@ EOF
     echo -e "${YELLOW}[3/3] 正在创建初始管理员用户...${RESET}"
     docker compose exec -it paymenter php artisan app:user:create
 
-    # 清理缓存使其强制刷新
-    docker compose exec paymenter php artisan config:clear &>/dev/null
+    # 【采纳修改点】切换路径，彻底 down 掉旧容器，再 up -d 重建，强行刷新变量映射
+    echo -e "${YELLOW}正在通过 Docker Compose 彻底重构并启动服务...${RESET}"
+    cd "$BASE_DIR" && docker compose down
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}正在清理系统过载配置缓存...${RESET}"
+    cd "$BASE_DIR" && docker compose exec paymenter php artisan config:clear &>/dev/null
+    cd "$BASE_DIR" && docker compose exec paymenter php artisan cache:clear &>/dev/null
 
     DETECT_IP=$(get_public_ip)
 
@@ -347,7 +349,6 @@ EOF
     echo -e "${GREEN}================================================${RESET}"
 }
 
-# 编译资产编译器的前端静态文件
 build_assets() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
@@ -360,7 +361,6 @@ build_assets() {
     echo -e "${GREEN}前端资源 (Themes & Extensions) 编译成功并已应用！${RESET}"
 }
 
-# 更新 Paymenter 镜像
 update_paymenter() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
@@ -372,7 +372,6 @@ update_paymenter() {
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Paymenter
 uninstall_paymenter() {
     echo -ne "${YELLOW}确定要卸载并删除 Paymenter 堆栈容器吗？(y/n): ${RESET}"
     read -r confirm
@@ -420,9 +419,9 @@ menu() {
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 编译前端(修改主题和扩展后执行)${RESET}"
-    echo -e "${GREEN}3. 更新服务${RESET}"
-    echo -e "${GREEN}4. 卸载服务${RESET}"
+    echo -e "${GREEN}2. 更新服务${RESET}"
+    echo -e "${GREEN}3. 卸载服务${RESET}"
+    echo -e "${GREEN}4. 编译前端(修改主题和扩展后执行)${RESET}"
     echo -e "${GREEN}5. 启动服务${RESET}"
     echo -e "${GREEN}6. 停止服务${RESET}"
     echo -e "${GREEN}7. 重启服务${RESET}"
@@ -434,9 +433,9 @@ menu() {
     read -r choice
     case "$choice" in
         1) install_paymenter ;;
-        2) build_assets ;;
-        3) update_paymenter ;;
-        4) uninstall_paymenter ;;
+        2) update_paymenter ;;
+        3) uninstall_paymenter ;;
+        4) build_assets ;;
         5) start_paymenter ;;
         6) stop_paymenter ;;
         7) restart_paymenter ;;

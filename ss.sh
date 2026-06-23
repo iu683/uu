@@ -1,321 +1,213 @@
 #!/bin/bash
+# ========================================
+# DrissionPage 管理
+# ========================================
 
-# 标准 ANSI 颜色定义
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-RESET='\033[0m'
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-# 尝试在脚本内直接载入可能写入了环境路径的 bashrc 
-[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
-# 增强 PATH 搜索：同时兼容普通用户、root 用户以及自定义的 root 安装路径
-export PATH="$HOME/.local/bin:/root/.local/bin:/root/.opencode/bin:$PATH"
+APP_NAME="DrissionPage"
 
-# 动态定位 OpenCode 实际安装与配置路径
-get_paths() {
-    OPENCODE_CONFIG_DIR="$HOME/.config/opencode"
-    OPENCODE_CONFIG_FILE="$OPENCODE_CONFIG_DIR/opencode.json"
-    OPENCODE_AUTH_FILE="$HOME/.local/share/opencode/auth.json"
-    REAL_EXEC_PATH=$(command -v opencode 2>/dev/null)
-
-    # 如果检测到 opencode 挂在 root 旗下，重定向路径定义
-    if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
-        OPENCODE_CONFIG_DIR="/root/.config/opencode"
-        OPENCODE_CONFIG_FILE="$OPENCODE_CONFIG_DIR/opencode.json"
-        OPENCODE_AUTH_FILE="/root/.local/share/opencode/auth.json"
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}✘ 请使用 root 用户或 sudo 运行此脚本${RESET}"
+        exit 1
     fi
 }
 
-
-
-
-# 获取状态与版本信息
+# 动态监测当前系统关键组件的状态
 get_status() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        status="${GREEN}已安装${RESET}"
-        version_info=$(opencode -v 2>/dev/null || opencode --version 2>/dev/null | head -n 1)
-        [ -z "$version_info" ] && version_info="已就绪"
-        opencode_version="${YELLOW}${version_info}${RESET}"
+    # 1. 检查 Python 库状态
+    if python3 -c "import DrissionPage" 2>/dev/null; then
+        dp_version=$(python3 -c "import DrissionPage; print(DrissionPage.__version__)" 2>/dev/null)
+        [ -z "$dp_version" ] && dp_version="已就绪"
+        dp_status="${GREEN}已安装 (${dp_version})${RESET}"
     else
-        status="${RED}未安装${RESET}"
-        opencode_version="${RED}-${RESET}"
+        dp_status="${RED}未安装${RESET}"
     fi
 
-     # 检查凭据状态 (通过官方 list 命令判断是否有已连接的项目)
-    if opencode providers list 2>/dev/null | grep -qE "connected|login|✔"; then
-        auth_status="${GREEN}已连接${RESET}"
+    # 2. 检查 Chromium 浏览器路径与状态
+    chrome_path=""
+    paths=('/usr/bin/chromium' '/usr/bin/chromium-browser' '/usr/bin/google-chrome' '/snap/bin/chromium')
+    for p in "${paths[@]}"; do
+        if [ -x "$p" ]; then
+            chrome_path="$p"
+            break
+        fi
+    done
+
+    if [ -n "$chrome_path" ]; then
+        chrome_status="${GREEN}已就绪 (${chrome_path})${RESET}"
     else
-        auth_status="${RED}未连接${RESET}"
+        chrome_status="${RED}未检测到有效浏览器${RESET}"
     fi
 
-    if sudo [ -f "$OPENCODE_CONFIG_FILE" ] 2>/dev/null; then
-        config_status="${YELLOW}已配置${RESET}"
-    else
-        config_status="${GREEN}官方默认${RESET}"
-    fi
+    # 3. 检查当前运行的用户身份
+    current_user=$(whoami)
+    user_status="${YELLOW}${current_user}${RESET}"
 }
 
+install_dp() {
+    echo -e "${YELLOW}▶ 正在更新系统软件包...${RESET}"
+    apt update -y
 
-# 菜单面板
-show_menu() {
-    clear
-    get_status
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈  OpenCode CLI 管理面板  ◈  ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} $opencode_version"
-    echo -e "${GREEN}凭据 :${RESET} $auth_status"
-    echo -e "${GREEN}配置 :${RESET} $config_status"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 在当前目录启动${RESET}"
-    echo -e "${GREEN}3. 在指定路径启动${RESET}"
-    echo -e "${GREEN}4. 连接模型提供商${RESET}"
-    echo -e "${GREEN}5. 配置自定义提供商${RESET}"
-    echo -e "${GREEN}6. 更新${RESET}"
-    echo -e "${GREEN}7. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-}
+    echo -e "${GREEN}▶ 正在安装 Python3 和 Pip...${RESET}"
+    apt install -y python3 python3-pip python3-venv
 
-# 1. 安装
-install_opencode() {
-    echo -e "\n${YELLOW}[1/2] 正在通过官方通道安装 OpenCode...${RESET}"
-    curl -fsSL https://opencode.ai/install | bash
+    echo -e "${GREEN}▶ 正在安装 DrissionPage...${RESET}"
+    # 兼容新版系统（如 Ubuntu 24.04）的外部管理包限制
+    pip3 install -U DrissionPage --break-system-packages || pip3 install -U DrissionPage
+
+    echo -e "${GREEN}▶ 正在安装 Chromium 浏览器...${RESET}"
+    apt install -y chromium-browser || apt install -y chromium
+
+    echo -e "${GREEN}▶ 正在安装必要的底层依赖库 (防止报错)...${RESET}"
     
-    [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
+    # 基础依赖列表
+    deps="libnss3 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+          libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 \
+          libcairo2 libxshmfence1 libglu1-mesa fonts-liberation libnss3-dev xvfb"
 
-    echo -e "\n${YELLOW}[2/2] 正在检测并安装 bubblewrap 沙箱依赖...${RESET}"
-    if command -v bwrap &> /dev/null; then
-        echo -e "${GREEN}✔ 检测到系统已存在 bubblewrap，跳过安装。${RESET}"
-    else
-        if command -v apt-get &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y bubblewrap
-        elif command -v dnf &> /dev/null; then
-            sudo dnf install -y bubblewrap
-        elif command -v yum &> /dev/null; then
-            sudo yum install -y bubblewrap
-        else
-            echo -e "${RED}❌ 未能识别您的包管理器，请手动执行：sudo apt/dnf install bubblewrap${RESET}"
-        fi
-    fi
+    # 执行安装
+    apt install -y $deps
 
-    echo -e "\n${GREEN}✔ 所有安装与沙箱环境修复完成！${RESET}"
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    # 针对 libasound2 的特殊兼容性处理
+    echo -e "${YELLOW}▶ 正在处理音频依赖兼容性...${RESET}"
+    apt install -y libasound2 || apt install -y libasound2t64
+
+    # 针对 libatk1.0-0 的特殊兼容性处理
+    apt install -y libatk1.0-0 || apt install -y libatk1.0-0t64
+    
+    echo -e "${GREEN}✔ 依赖库安装尝试完成${RESET}"
+
+    echo -e "${GREEN}✔ 安装环境配置完成！${RESET}"
 }
 
-# 2. 当前目录启动
-start_current() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${GREEN}正在启动 OpenCode...${RESET}"
-        if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
-            sudo "$REAL_EXEC_PATH"
-        else
-            opencode
-        fi
+test_dp() {
+    echo -e "${YELLOW}▶ 正在启动自动化测试...${RESET}"
+
+    # 创建测试脚本
+    cat > /tmp/test_dp.py <<EOF
+from DrissionPage import ChromiumPage, ChromiumOptions
+import os
+import sys
+
+try:
+    co = ChromiumOptions()
+    co.headless(True)  # VPS 必须开启无头模式
+    co.set_argument('--no-sandbox')  # root 用户必须开启
+    co.set_argument('--disable-dev-shm-usage')
+    co.set_argument('--disable-gpu')
+
+    # 尝试自动定位 Chromium 路径
+    paths = ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome']
+    for p in paths:
+        if os.path.exists(p):
+            co.set_browser_path(p)
+            break
+
+    print(f"正在启动浏览器...")
+    page = ChromiumPage(co)
+    page.get('https://www.baidu.com')
+    
+    title = page.title
+    print(f"成功获取页面标题: {title}")
+    
+    if "百度" in title:
+        print("测试结果: 成功")
+    else:
+        print("测试结果: 异常 (获取到的标题不正确)")
+    
+    page.quit()
+except Exception as e:
+    print(f"测试过程中出现错误: {e}")
+    sys.exit(1)
+EOF
+
+    python3 /tmp/test_dp.py --break-system-packages 2>/dev/null || python3 /tmp/test_dp.py
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✔ DrissionPage 测试通过！${RESET}"
     else
-        echo -e "\n${RED}未检测到 opencode 命令，请先执行安装！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+        echo -e "${RED}✘ 测试失败，请检查上方报错信息${RESET}"
     fi
 }
 
-# 3. 指定路径启动
-start_path() {
-    get_paths
-    if [ -z "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${RED}未检测到已安装的 OpenCode。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+uninstall_dp() {
+    echo -e "${YELLOW}▶ 正在卸载 $APP_NAME 及相关组件...${RESET}"
+    echo -e "\n${RED}准备进入全面卸载清除流...${RESET}"
+    read -r -p "确定要彻底移除 $APP_NAME 及其所有浏览器残留缓存吗？(y/n): " confirm_un
+    if [[ "$confirm_un" != "y" && "$confirm_un" != "Y" ]]; then
+        echo "已取消卸载。"
         return
     fi
 
-    echo -e "\n"
-    echo -ne "${GREEN}请输入你的项目绝对路径: ${RESET}"
-    read target_path
-    if [ -d "$target_path" ]; then
-        echo -e "${GREEN}正在切换到 $target_path 并启动 OpenCode...${RESET}"
-        cd "$target_path" || return
-        if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
-            sudo "$REAL_EXEC_PATH"
-        else
-            opencode
-        fi
-    else
-        echo -e "${RED}路径不存在，请检查后重试！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    # 1. 强制杀死所有相关进程（防止文件占用导致卸载失败）
+    echo -e "${GREEN}▶ 停止所有运行中的 Chromium 进程...${RESET}"
+    pkill -9 -f chromium 2>/dev/null
+    pkill -9 -f DrissionPage 2>/dev/null
+
+    # 2. 卸载 Python 库（包含依赖包）
+    echo -e "${GREEN}▶ 正在卸载 Python 库...${RESET}"
+    pip3 uninstall -y DrissionPage DownloadKit DataRecorder --break-system-packages 2>/dev/null || \
+    pip3 uninstall -y DrissionPage DownloadKit DataRecorder 2>/dev/null
+
+    # 3. 卸载 APT 版本的 Chromium
+    echo -e "${GREEN}▶ 正在清理 APT 软件包...${RESET}"
+    apt purge -y chromium-browser chromium chromium-common 2>/dev/null
+    apt autoremove -y
+
+    # 4. 彻底清理 Snap 版本的 Chromium (Ubuntu 默认安装方式)
+    if command -v snap >/dev/null; then
+        echo -e "${GREEN}▶ 正在清理 Snap 软件包...${RESET}"
+        snap remove --purge chromium 2>/dev/null
     fi
+
+    # 5. 清理残留的配置文件夹和缓存
+    echo -e "${GREEN}▶ 正在清理残留配置和临时文件...${RESET}"
+    rm -rf /usr/bin/chromium
+    rm -rf /usr/bin/chromium-browser
+    rm -rf ~/.config/chromium
+    rm -rf ~/.cache/chromium
+    rm -rf /tmp/.com.google.Chrome.*
+    rm -rf /tmp/test_dp.py
+
+    echo -e "${GREEN}✔ 卸载及深度清理完成！${RESET}"
 }
 
-# 4. 连接/添加 API 密钥 (精准调用官方的 providers login)
-login_opencode() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${YELLOW}正在调用 OpenCode 凭据登录程序 (providers login)...${RESET}"
-        if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
-            sudo "$REAL_EXEC_PATH" providers login
-        else
-            opencode providers login
-        fi
-    else
-        echo -e "\n${RED}未检测到已安装的 OpenCode。${RESET}"
-    fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 5. 配置高级自定义提供商 JSON
-config_custom_api() {
-    get_paths
-    echo -e "\n${GREEN}================================${RESET}"
-    echo -e "${GREEN}    OpenCode 提供商配置管理      ${RESET}"
+menu() {
+    clear
+    get_status
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 快捷设置官方预设提供商的 Base URL (如 anthropic)${RESET}"
-    echo -e "${GREEN}2. 注入第三方 OpenAI 兼容提供商 (支持硬编码 API Key)${RESET}"
-    echo -e "${GREEN}3. 清除自定义 JSON 配置（恢复默认）${RESET}"
-    echo -e "${GREEN}0. 返回主菜单${RESET}"
+    echo -e "${GREEN} ◈  DrissionPage 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read api_choice
+    echo -e "${GREEN}框架状态:${RESET} $dp_status"
+    echo -e "${GREEN}内核状态:${RESET} $chrome_status"
+    echo -e "${GREEN}执行用户:${RESET} $user_status"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
+    echo -e "${GREEN}2. 运行环境测试${RESET}"
+    echo -e "${GREEN}3. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    read -r -p $'\033[32m请输入选项: \033[0m' choice
 
-    if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
-        sudo mkdir -p "$OPENCODE_CONFIG_DIR"
-    else
-        mkdir -p "$OPENCODE_CONFIG_DIR"
-    fi
-
-    case $api_choice in
-        1|2)
-            if [ "$api_choice" = "1" ]; then
-                echo -ne "\n${YELLOW}提供商标识 (anthropic/openai/deepseek): ${RESET}"
-                read input_provider
-                [ -z "$input_provider" ] && input_provider="anthropic"
-                echo -ne "${YELLOW}Base URL: ${RESET}"
-                read input_url
-                [ -z "$input_url" ] && return
-                json_content="{\"\$schema\":\"https://opencode.ai/config.json\",\"provider\":{\"$input_provider\":{\"options\":{\"baseURL\":\"$input_url\"}}}}"
-            else
-                echo -ne "\n${YELLOW}提供商 ID (如 myprovider): ${RESET}"
-                read custom_id
-                [ -z "$custom_id" ] && custom_id="myprovider"
-                echo -ne "${YELLOW}展示名称: ${RESET}"
-                read custom_name
-                echo -ne "${YELLOW}Base URL: ${RESET}"
-                read custom_url
-                [ -z "$custom_url" ] && return
-                echo -ne "${YELLOW}API Key (明文，可选): ${RESET}"
-                read custom_key
-                echo -ne "${YELLOW}模型 ID (如 deepseek-chat): ${RESET}"
-                read model_id
-                [ -z "$model_id" ] && model_id="custom-model"
-                echo -ne "${YELLOW}模型 UI 展示名称: ${RESET}"
-                read model_name
-
-                if [ -n "$custom_key" ]; then
-                    options_json="\"baseURL\": \"$custom_url\", \"apiKey\": \"$custom_key\""
-                else
-                    options_json="\"baseURL\": \"$custom_url\""
-                fi
-                json_content="{\"\$schema\":\"https://opencode.ai/config.json\",\"provider\":{\"$custom_id\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"$custom_name\",\"options\":{$options_json},\"models\":{\"$model_id\":{\"name\":\"$model_name\"}}}}}"
-            fi
-
-            if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
-                echo "$json_content" | sudo tee "$OPENCODE_CONFIG_FILE" > /dev/null
-            else
-                echo "$json_content" > "$OPENCODE_CONFIG_FILE"
-            fi
-            echo -e "\n${GREEN}✔ 配置写入成功 -> $OPENCODE_CONFIG_FILE${RESET}"
-            ;;
-        3)
-            if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
-                sudo rm -f "$OPENCODE_CONFIG_FILE"
-            else
-                rm -f "$OPENCODE_CONFIG_FILE"
-            fi
-            echo -e "${GREEN}✔ 已清理自定义配置。${RESET}"
-            ;;
-        *) return ;;
-    esac
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 6. 更新
-update_opencode() {
-    get_paths
-    echo -e "\n${YELLOW}正在检查并更新 OpenCode...${RESET}"
-    if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
-        sudo curl -fsSL https://opencode.ai/install | bash
-    else
-        curl -fsSL https://opencode.ai/install | bash
-    fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 7. 整合卸载 (修正为优先调用官方原生的 uninstall 机制)
-uninstall_opencode_flow() {
-    get_paths
-    echo -e "\n${RED}准备进入卸载流程...${RESET}"
-    echo -ne "${RED}确定要完全卸载 OpenCode 主程序吗？(y/n): ${RESET}"
-    read ans
-    if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
-        echo -e "${YELLOW}[步骤 1/2] 正在调用官方原生引擎执行卸载...${RESET}"
-        if [ -n "$REAL_EXEC_PATH" ]; then
-            if [[ "$REAL_EXEC_PATH" == "/root/"* ]]; then
-                sudo "$REAL_EXEC_PATH" uninstall
-            else
-                opencode uninstall
-            fi
-        fi
-
-        # 强力双向扫尾清理
-        rm -f ~/.local/bin/opencode
-        rm -rf ~/.local/share/opencode
-        rm -rf "$HOME/.config/opencode"
-        
-        sudo rm -f /root/.local/bin/opencode
-        sudo rm -rf /root/.opencode
-        sudo rm -rf /root/.local/share/opencode
-        sudo rm -rf "/root/.config/opencode"
-
-        echo -e "${GREEN}✔ 核心程序、本地缓存与配置文件已全部净化！${RESET}"
-
-        # 第二步：清除沙箱依赖
-        echo -e "\n${RED}[步骤 2/2] 是否连同 bubblewrap 沙箱依赖包一起卸载？${RESET}"
-        echo -ne "${RED}若该机器无其他沙箱业务，建议卸载。(y/n): ${RESET}"
-        read ans_bwrap
-        if [ "$ans_bwrap" = "y" ] || [ "$ans_bwrap" = "Y" ]; then
-            echo -e "${YELLOW}正在清理系统的 bubblewrap 组件...${RESET}"
-            if command -v apt-get &> /dev/null; then
-                sudo apt-get autoremove -y bubblewrap
-            elif command -v dnf &> /dev/null; then
-                sudo dnf remove -y bubblewrap
-            elif command -v yum &> /dev/null; then
-                sudo yum remove -y bubblewrap
-            fi
-            echo -e "${GREEN}✔ 系统沙箱组件卸载成功。${RESET}"
-        else
-            echo -e "${YELLOW}已保留系统的 bubblewrap。${RESET}"
-        fi
-    else
-        echo "已取消卸载操作。"
-    fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 主循环
-while true; do
-    show_menu
-    read choice
     case $choice in
-        1) install_opencode ;;
-        2) start_current ;;
-        3) start_path ;;
-        4) login_opencode ;;
-        5) config_custom_api ;;
-        6) update_opencode ;;
-        7) uninstall_opencode_flow ;;
-        0) clear; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
+        1) install_dp ;;
+        2) test_dp ;;
+        3) uninstall_dp ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+}
+
+# 脚本入口
+check_root
+
+while true; do
+    menu
+    read -p "按回车继续..." confirm
+    clear
 done

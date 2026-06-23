@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Puppy Stardew Server Docker Compose 交互式管理面板
+# Paymenter 自动化管理面板 
 # =================================================================
 
 # 颜色
@@ -10,12 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-MAIN_CONTAINER="puppy-stardew"
-INIT_CONTAINER="puppy-stardew-init"
-MGR_CONTAINER="puppy-stardew-manager"
-
-REPO_URL="https://github.com/AmigaMeow/puppy-stardew-server.git"
-BASE_DIR="/opt/puppy-stardew"
+# 定义核心容器名
+CONTAINER_NAME="paymenter-web"
+BASE_DIR="/opt/paymenter"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -25,44 +22,29 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态获取容器状态和端口信息
+# 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    if [ "$(docker ps -q -f name=^/${MAIN_CONTAINER}$)" ]; then
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${MAIN_CONTAINER}$)" ]; then
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    if [ "$(docker ps -aq -f name=^/${MAIN_CONTAINER}$)" ]; then
-        game_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if index $p | grep -q "udp"}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$MAIN_CONTAINER" 2>/dev/null)
-        web_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "18642/tcp") 0).HostPort}}' "$MAIN_CONTAINER" 2>/dev/null)
-        vnc_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5900/tcp") 0).HostPort}}' "$MAIN_CONTAINER" 2>/dev/null)
-        metric_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9090/tcp") 0).HostPort}}' "$MAIN_CONTAINER" 2>/dev/null)
-    fi
-
-    [[ -z "$game_port" || "$game_port" == "<nil>" ]] && game_port="24642"
-    [[ -z "$web_port" || "$web_port" == "<nil>" ]] && web_port="18642"
-    [[ -z "$vnc_port" || "$vnc_port" == "<nil>" ]] && vnc_port="5900"
-    [[ -z "$metric_port" || "$metric_port" == "<nil>" ]] && metric_port="9090"
-
-    if [ "$status" == "${RED}未部署${RESET}" ] && [ ! -f "$ENV_FILE" ]; then
-        game_port="N/A"
-        web_port="N/A"
-        vnc_port="N/A"
-        metric_port="N/A"
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="80"
+    else
+        webui_port="N/A"
     fi
 }
 
 get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local mode=${1:-"auto"}
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -84,332 +66,393 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署并配置 Stardew Valley 服务器
-install_stardew() {
+# 生成随机密码
+generate_password() {
+    if command -v openssl &> /dev/null; then
+        openssl rand -hex 12
+    else
+        echo "pay_pass_$(date +%s)"
+    fi
+}
+
+# 部署 Paymenter 主函数
+install_paymenter() {
     check_dependencies
-    
-    echo -e "${CYAN}====== 1. 路径与端口自定义配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入宿主机数据安装绝对路径 [默认: /opt/puppy-stardew]: ${RESET}"
-    read -r custom_path
-    [[ -z "$custom_path" ]] && custom_path="/opt/puppy-stardew"
-    
-    BASE_DIR="$custom_path"
-    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-    ENV_FILE="$BASE_DIR/.env"
+    mkdir -p "$BASE_DIR"
 
-    echo -ne "${YELLOW}请输入游戏联机端口 (UDP) [默认: 24642]: ${RESET}"
-    read -r custom_game_port
-    [[ -z "$custom_game_port" ]] && custom_game_port="24642"
+    echo -e "${CYAN}====== 1. 基础环境配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Paymenter 访问端口 [默认: 80]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="80"
 
-    echo -ne "${YELLOW}请输入 Web 管理面板端口 (TCP) [默认: 18642]: ${RESET}"
-    read -r custom_web_port
-    [[ -z "$custom_web_port" ]] && custom_web_port="18642"
+    echo -e "\n${CYAN}====== 2. 数据库类型选择 ======${RESET}"
+    echo -e "${GREEN}1) 部署全新的本地 MariaDB 数据库 (数据挂载在本地 ./database)${RESET}"
+    echo -e "${GREEN}2) 连接已有的远程/外部 MySQL/MariaDB 数据库${RESET}"
+    echo -ne "${YELLOW}请选择数据库部署模式 [默认 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
 
-    echo -ne "${YELLOW}请输入 VNC 远程桌面端口 (TCP) [默认: 5900]: ${RESET}"
-    read -r custom_vnc_port
-    [[ -z "$custom_vnc_port" ]] && custom_vnc_port="5900"
+    if [[ "$db_mode" == "1" ]]; then
+        db_host="paymenter-db"
+        db_port="3306"
+        db_connection="mysql"
+        db_name="paymenter"
+        db_user="paymenter"
+        
+        echo -ne "${YELLOW}请输入本地数据库用户密码 (留空则随机生成): ${RESET}"
+        read -r db_password
+        [[ -z "$db_password" ]] && db_password=$(generate_password)
 
-    echo -ne "${YELLOW}请输入 Prometheus 指标监控端口 (TCP) [默认: 9090]: ${RESET}"
-    read -r custom_metric_port
-    [[ -z "$custom_metric_port" ]] && custom_metric_port="9090"
+        echo -ne "${YELLOW}请输入本地数据库 Root 密码 (留空则随机生成): ${RESET}"
+        read -r db_root_password
+        [[ -z "$db_root_password" ]] && db_root_password=$(generate_password)
 
-    echo -e "\n${CYAN}====== 2. Steam 账号凭证配置 (必需) ======${RESET}"
-    echo -ne "${YELLOW}请输入 Steam 用户名 (非邮箱): ${RESET}"
-    read -r steam_user
-    while [[ -z "$steam_user" ]]; do
-        echo -ne "${RED}用户名不能为空，请重新输入: ${RESET}"
-        read -r steam_user
-    done
+    elif [[ "$db_mode" == "2" ]]; then
+        echo -ne "${YELLOW}请输入远程数据库驱动类型 (mysql / mariadb) [默认 mysql]: ${RESET}"
+        read -r db_connection
+        [[ -z "$db_connection" ]] && db_connection="mysql"
 
-    echo -ne "${YELLOW}请输入 Steam 密码: ${RESET}"
-    read -r -s steam_pass
-    echo ""
-    while [[ -z "$steam_pass" ]]; do
-        echo -ne "${RED}密码不能为空，请重新输入: ${RESET}"
-        read -r -s steam_pass
-        echo ""
-    done
+        echo -ne "${YELLOW}请输入远程数据库地址 (Host): ${RESET}"
+        read -r db_host
+        while [[ -z "$db_host" ]]; do
+            echo -e "${RED}错误: 数据库地址不能为空！${RESET}"
+            echo -ne "${YELLOW}请输入远程数据库地址 (Host): ${RESET}"
+            read -r db_host
+        done
 
-    echo -e "\n${CYAN}====== 3. 高级环境配置 (可选) ======${RESET}"
-    echo -ne "${YELLOW}请输入服务器时区 [默认: Asia/Shanghai]: ${RESET}"
-    read -r custom_tz
-    [[ -z "$custom_tz" ]] && custom_tz="Asia/Shanghai"
+        echo -ne "${YELLOW}请输入远程数据库端口 [默认: 3306]: ${RESET}"
+        read -r db_port
+        [[ -z "$db_port" ]] && db_port="3306"
 
-    echo -ne "${YELLOW}是否启用自动备份功能？(true/false) [默认: true]: ${RESET}"
-    read -r enable_backup
-    [[ -z "$enable_backup" ]] && enable_backup="true"
+        echo -ne "${YELLOW}请输入远程数据库名称 [默认: paymenter]: ${RESET}"
+        read -r db_name
+        [[ -z "$db_name" ]] && db_name="paymenter"
 
-    # 克隆源码仓库
-    if [ ! -d "$BASE_DIR/.git" ]; then
-        echo -e "${YELLOW}正在从 GitHub 克隆原厂项目源码到 $BASE_DIR...${RESET}"
-        mkdir -p "$BASE_DIR"
-        git clone "$REPO_URL" "$BASE_DIR"
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}错误: 克隆源码失败，请检查网络环境！${RESET}"
-            return 1
-        fi
+        echo -ne "${YELLOW}请输入远程数据库用户名 [默认: paymenter]: ${RESET}"
+        read -r db_user
+        [[ -z "$db_user" ]] && db_user="paymenter"
+
+        echo -ne "${YELLOW}请输入远程数据库密码: ${RESET}"
+        read -r db_password
     else
-        echo -e "${GREEN}检测到已存在源码，跳过克隆。${RESET}"
-    fi
-
-    # 预先修复权限并建立好目录卷 (UID 1000:1000)
-    echo -e "${YELLOW}正在执行权限初始化 (模拟原厂 init.sh)...${RESET}"
-    mkdir -p "$BASE_DIR"/data/{saves,game,steam,logs,backups,panel,custom-mods}
-    chown -R 1000:1000 "$BASE_DIR/data"
-    chmod -R 755 "$BASE_DIR/data"
-
-    # 写入 .env 配置文件
-    echo -e "${YELLOW}正在写入 .env 配置文件...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-STEAM_USERNAME=${steam_user}
-STEAM_PASSWORD=${steam_pass}
-ENABLE_VNC=true
-VNC_PASSWORD=
-TZ=${custom_tz}
-ENABLE_LOG_MONITOR=true
-ENABLE_AUTO_BACKUP=${enable_backup}
-MAX_BACKUPS=7
-BACKUP_HOUR=4
-ENABLE_CRASH_RESTART=true
-EOF
-
-    # 生成 docker-compose.yml (注入全自定义端口与正确的 Build 路径)
-    echo -e "${YELLOW}正在动态生成 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  stardew-manager:
-    build: ${BASE_DIR}/docker/manager
-    image: puppy-stardew-manager:local
-    container_name: ${MGR_CONTAINER}
-    restart: unless-stopped
-    environment:
-      - PROJECT_DIR=${BASE_DIR}
-      - COMPOSE_FILE=${COMPOSE_FILE}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${BASE_DIR}:${BASE_DIR}:ro
-
-  stardew-init:
-    build: ${BASE_DIR}/docker
-    image: puppy-stardew-server:local
-    container_name: ${INIT_CONTAINER}
-    user: root
-    entrypoint: ["/home/steam/scripts/init-container.sh"]
-    environment:
-      - USE_GPU=\${USE_GPU:-false}
-    volumes:
-      - ${BASE_DIR}/data/saves:/home/steam/.config/StardewValley:rw
-      - ${BASE_DIR}/data/game:/home/steam/stardewvalley:rw
-      - ${BASE_DIR}/data/steam:/home/steam/Steam:rw
-      - ${BASE_DIR}/data/logs:/home/steam/.local/share/puppy-stardew/logs:rw
-      - ${BASE_DIR}/data/backups:/home/steam/.local/share/puppy-stardew/backups:rw
-      - ${BASE_DIR}/data/panel:/home/steam/web-panel/data:rw
-
-  stardew-server:
-    build: ${BASE_DIR}/docker
-    image: puppy-stardew-server:local
-    container_name: ${MAIN_CONTAINER}
-    restart: unless-stopped
-    depends_on:
-      stardew-manager:
-        condition: service_started
-      stardew-init:
-        condition: service_completed_successfully
-    stdin_open: true
-    tty: true
-    environment:
-      - STEAM_USERNAME=\${STEAM_USERNAME}
-      - STEAM_PASSWORD=\${STEAM_PASSWORD}
-      - STEAM_GUARD_CODE=\${STEAM_GUARD_CODE:-}
-      - ENABLE_VNC=\${ENABLE_VNC:-true}
-      - VNC_PASSWORD=\${VNC_PASSWORD:-}
-      - ENABLE_LOG_MONITOR=\${ENABLE_LOG_MONITOR:-true}
-      - USE_GPU=\${USE_GPU:-false}
-      - RESOLUTION_WIDTH=\${RESOLUTION_WIDTH:-1280}
-      - RESOLUTION_HEIGHT=\${RESOLUTION_HEIGHT:-720}
-      - REFRESH_RATE=\${REFRESH_RATE:-60}
-      - LOW_PERF_MODE=\${LOW_PERF_MODE:-false}
-      - ENABLE_AUTO_BACKUP=\${ENABLE_AUTO_BACKUP:-false}
-      - MAX_BACKUPS=\${MAX_BACKUPS:-7}
-      - BACKUP_HOUR=\${BACKUP_HOUR:-4}
-      - ENABLE_CRASH_RESTART=\${ENABLE_CRASH_RESTART:-false}
-    ports:
-      - "${custom_game_port}:24642/udp"
-      - "${custom_vnc_port}:5900/tcp"
-      - "${custom_metric_port}:9090/tcp"
-      - "${custom_web_port}:18642/tcp"
-    volumes:
-      - ${BASE_DIR}/data/saves:/home/steam/.config/StardewValley:rw
-      - ${BASE_DIR}/data/game:/home/steam/stardewvalley:rw
-      - ${BASE_DIR}/data/steam:/home/steam/Steam:rw
-      - ${BASE_DIR}/data/logs:/home/steam/.local/share/puppy-stardew/logs:rw
-      - ${BASE_DIR}/data/backups:/home/steam/.local/share/puppy-stardew/backups:rw
-      - ${BASE_DIR}/data/panel:/home/steam/web-panel/data:rw
-      - ${BASE_DIR}/data/custom-mods:/home/steam/custom-mods:rw
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 2G
-        reservations:
-          memory: 1G
-    healthcheck:
-      test: ["CMD", "pgrep", "-f", "StardewModdingAPI"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 180s
-    cap_drop:
-      - NET_RAW
-      - SYS_ADMIN
-      - MKNOD
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-EOF
-
-    echo -e "${YELLOW}正在本地进行原厂构建并拉起容器组...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --build
-
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${GREEN}             Puppy Stardew 容器服务本地构建并拉起成功！          ${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${YELLOW}【关键下一步】: 请立即在主菜单使用 选项 9 进入终端输入 Steam 令牌！${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
-}
-
-# 捕获并连接到 Steam 令牌交互终端
-attach_steam_guard() {
-    if [ "$(docker ps -q -f name=^/${MAIN_CONTAINER}$)" ]; then
-        echo -e "${CYAN}正在连接到服务器后台终端...${RESET}"
-        echo -e "${YELLOW}提示: 如果看到输入 Steam Guard 代码提示，直接键入并回车即可。${RESET}"
-        echo -e "${RED}⚠️  注意退出方法: 必须按快捷键 Ctrl+P 然后按 Ctrl+Q 来安全分离！${RESET}"
-        echo -e "${RED}   切勿使用 Ctrl+C，否则会导致容器意外关闭！${RESET}"
-        echo -ne "${GREEN}按回车键确认进入终端...${RESET}"
-        read -r
-        docker attach "$MAIN_CONTAINER"
-    else
-        echo -e "${RED}错误: 服务器容器当前未运行，无法连接令牌终端！${RESET}"
-    fi
-}
-
-# 更新源码并重新编译
-update_stardew() {
-    if [[ ! -d "$BASE_DIR/.git" ]]; then
-        echo -e "${RED}错误: 未检测到源码仓库，请先执行选项 1 进行部署！${RESET}"
+        echo -e "${RED}输入有误，取消部署。${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取原厂最新更新代码...${RESET}"
-    cd "$BASE_DIR" && git pull
-    echo -e "${YELLOW}正在同步重新编译并更新容器...${RESET}"
-    docker compose up -d --build --remove-orphans
-    echo -e "${GREEN}服务热重载更新编译完成！${RESET}"
+
+    echo -e "\n${CYAN}====== 3. Redis 缓存类型选择 ======${RESET}"
+    echo -e "${GREEN}1) 部署全新的本地 Redis 容器${RESET}"
+    echo -e "${GREEN}2) 连接已有的远程/外部 Redis 服务器${RESET}"
+    echo -ne "${YELLOW}请选择 Redis 部署模式 [默认 1]: ${RESET}"
+    read -r redis_mode
+    [[ -z "$redis_mode" ]] && redis_mode="1"
+
+    if [[ "$redis_mode" == "1" ]]; then
+        redis_host="paymenter-cache"
+        redis_port="6379"
+        redis_password=""
+    elif [[ "$redis_mode" == "2" ]]; then
+        echo -ne "${YELLOW}请输入远程 Redis 地址 (Host): ${RESET}"
+        read -r redis_host
+        while [[ -z "$redis_host" ]]; do
+            echo -e "${RED}错误: Redis 地址不能为空！${RESET}"
+            echo -ne "${YELLOW}请输入远程 Redis 地址 (Host): ${RESET}"
+            read -r redis_host
+        done
+
+        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r redis_port
+        [[ -z "$redis_port" ]] && redis_port="6379"
+
+        echo -ne "${YELLOW}请输入远程 Redis 密码 (若无则留空): ${RESET}"
+        read -r redis_password
+    else
+        echo -e "${RED}输入有误，取消部署。${RESET}"
+        return
+    fi
+
+    echo -ne "${YELLOW}请输入 Redis 分区 DB 编号 (0-15) [默认 0]: ${RESET}"
+    read -r redis_db
+    [[ -z "$redis_db" ]] && redis_db="0"
+
+    # 创建本地持久化目录
+    echo -e "\n${YELLOW}正在初始化本地挂载目录...${RESET}"
+    mkdir -p "$BASE_DIR/storage/logs" "$BASE_DIR/storage/public" "$BASE_DIR/themes" "$BASE_DIR/extensions" "$BASE_DIR/database"
+
+    # 写入环境配置文件 .env
+    cat <<EOF > "$ENV_FILE"
+APP_ENV=production
+APP_DEBUG=true
+APP_KEY=
+
+# Docker Compose 使用的旧变量名
+DB_NAME=${db_name}
+DB_USER=${db_user}
+CACHE_STORE=redis
+
+# Laravel 框架底层使用的标准变量名
+DB_CONNECTION=${db_connection}
+DB_HOST=${db_host}
+DB_PORT=${db_port}
+DB_DATABASE=${db_name}
+DB_USERNAME=${db_user}
+DB_PASSWORD=${db_password}
+
+CACHE_DRIVER=redis
+SESSION_DRIVER=redis
+QUEUE_CONNECTION=redis
+
+REDIS_HOST=${redis_host}
+REDIS_PASSWORD=${redis_password}
+REDIS_PORT=${redis_port}
+REDIS_DB=${redis_db}
+EOF
+    
+    chmod 644 "$ENV_FILE"
+
+    # 生成 docker-compose.yml
+    echo -e "${YELLOW}正在生成配置文件...${RESET}"
+    
+    # 💡 采用最安全的逐段追加方式，保证缩进绝对一致
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+EOF
+
+    # 1. 动态注入本地数据库服务
+    if [[ "$db_mode" == "1" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
+  database:
+    container_name: paymenter-db
+    image: mariadb:lts
+    restart: always
+    command: --default-authentication-plugin=mysql_native_password --max_allowed_packet=64M --wait_timeout=28800
+    volumes:
+      - "./database:/var/lib/mysql"
+    environment:
+      MYSQL_ROOT_PASSWORD: "${db_root_password}"
+      MYSQL_DATABASE: "${db_name}"
+      MYSQL_USER: "${db_user}"
+      MYSQL_PASSWORD: "${db_password}"
+    networks:
+      - paymenter_nw
+EOF
+    fi
+
+    # 2. 动态注入本地 Redis 服务
+    if [[ "$redis_mode" == "1" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
+  cache:
+    container_name: paymenter-cache
+    image: redis:alpine
+    restart: always
+    networks:
+      - paymenter_nw
+EOF
+    fi
+
+    # 3. 注入 Paymenter 主 Web 服务（严格锁定缩进结构）
+    cat <<EOF >> "$COMPOSE_FILE"
+  paymenter:
+    container_name: ${CONTAINER_NAME}
+    image: ghcr.io/paymenter/paymenter:latest
+    restart: always
+    ports:
+      - "${custom_port}:80"
+    volumes:
+      - "./:/app/var/"
+      - "./storage/logs:/app/storage/logs"
+      - "./storage/public:/app/storage/app/public"
+      - "./themes:/app/themes"
+      - "./extensions:/app/extensions"
+      - "app_volume:/app"
+    environment:
+      APP_ENV: "\${APP_ENV}"
+      APP_DEBUG: "\${APP_DEBUG}"
+      APP_KEY: "\${APP_KEY}"
+      DB_CONNECTION: "\${DB_CONNECTION}"
+      DB_HOST: "\${DB_HOST}"
+      DB_PORT: "\${DB_PORT}"
+      DB_DATABASE: "\${DB_DATABASE}"
+      DB_USERNAME: "\${DB_USERNAME}"
+      DB_PASSWORD: "\${DB_PASSWORD}"
+      CACHE_STORE: "\${CACHE_STORE}"
+      REDIS_HOST: "\${REDIS_HOST}"
+      REDIS_PASSWORD: "\${REDIS_PASSWORD}"
+      REDIS_PORT: "\${REDIS_PORT}"
+      REDIS_DB: "\${REDIS_DB}"
+      PAYMENTER_SKIP_DEFAULT: "false"
+    networks:
+      - paymenter_nw
+EOF
+
+    # 4. 只有存在本地服务时才写入 depends_on
+    if [[ "$db_mode" == "1" || "$redis_mode" == "1" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
+    depends_on:
+$( [[ "$db_mode" == "1" ]] && echo "      - database" )
+$( [[ "$redis_mode" == "1" ]] && echo "      - cache" )
+EOF
+    fi
+
+    # 5. 写入公共配置尾部
+    cat <<EOF >> "$COMPOSE_FILE"
+
+  asset-builder:
+    container_name: paymenter-asset-builder
+    image: node:22-alpine
+    profiles: ["build"]
+    working_dir: /app
+    volumes:
+      - "./themes:/app/themes"
+      - "./extensions:/app/extensions"
+      - "./:/app/var"
+      - "app_volume:/app"
+    command: >
+      sh -c "tail -f /dev/null"
+    networks:
+      - paymenter_nw
+
+networks:
+  paymenter_nw:
+    driver: bridge
+
+volumes:
+  app_volume:
+EOF
+
+    chmod -R 777 "$BASE_DIR/storage" "$BASE_DIR/themes" "$BASE_DIR/extensions" "$BASE_DIR/database" 2>/dev/null
+
+    echo -e "${YELLOW}正在通过 Docker Compose 重构并启动基础容器服务...${RESET}"
+    cd "$BASE_DIR" && docker compose down
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待服务及依赖网络完全初始化 (约 10 秒)...${RESET}"
+    sleep 10
+
+    echo -e "\n${CYAN}====== 4. 开始执行 Paymenter 官方初始化命令行 ======${RESET}"
+    cd "$BASE_DIR"
+    
+    echo -e "${YELLOW}[准备阶段] 正在生成应用安全密钥 (APP_KEY)...${RESET}"
+    docker compose exec paymenter php artisan key:generate --force
+
+    echo -e "${YELLOW}[1/3] 正在配置系统应用 URL...${RESET}"
+    docker compose exec -it paymenter php artisan app:init
+
+    echo -e "${YELLOW}[2/3] 正在为数据库添加初始属性...${RESET}"
+    docker compose exec -it paymenter php artisan db:seed --class=CustomPropertySeeder
+
+    echo -e "${YELLOW}[3/3] 正在创建初始管理员用户...${RESET}"
+    docker compose exec -it paymenter php artisan app:user:create
+
+    echo -e "${YELLOW}正在通过 Docker Compose 彻底刷新并同步容器全局变量...${RESET}"
+    cd "$BASE_DIR" && docker compose down
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}正在清理系统过载配置缓存...${RESET}"
+    cd "$BASE_DIR" && docker compose exec paymenter php artisan config:clear &>/dev/null
+    cd "$BASE_DIR" && docker compose exec paymenter php artisan cache:clear &>/dev/null
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${GREEN}     Paymenter 部署与初始化全部完成！            ${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${YELLOW}面板访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}面板安装根目录: ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
 }
 
-# 彻底卸载服务
-uninstall_stardew() {
-    echo -ne "${YELLOW}确定要完全卸载并删除小狗星谷服务器组吗？(y/n): ${RESET}"
+build_assets() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在启动 asset-builder 编译前端资源...${RESET}"
+    cd "$BASE_DIR"
+    docker compose run --rm asset-builder npm install
+    docker compose run --rm asset-builder npm run build
+    echo -e "${GREEN}前端资源 (Themes & Extensions) 编译成功并已应用！${RESET}"
+}
+
+update_paymenter() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在拉取最新 Paymenter 镜像并升级...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+}
+
+uninstall_paymenter() {
+    echo -ne "${YELLOW}确定要卸载并删除 Paymenter 堆栈容器吗？(y/n): ${RESET}"
     read -r confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}所有相关容器已安全停止并销毁。${RESET}"
-            echo -ne "${YELLOW}是否要同时删除所有的游戏世界存档、代码组件、Steam 凭证和备份？(y/n): ${RESET}"
+            cd "$BASE_DIR" && docker compose down -v
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否删除本地所有下载的代码、扩展、主题及数据库文件？(y/n): ${RESET}"
             read -r clean_data
-            if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}所有物理路径及存档已被彻底清除。${RESET}"
+                echo -e "${GREEN}本地所有数据已彻底清理。${RESET}"
+            else
+                echo -e "${YELLOW}已保留本地挂载数据，目录位于: $BASE_DIR${RESET}"
             fi
         else
-            docker rm -f "$MAIN_CONTAINER" "$INIT_CONTAINER" "$MGR_CONTAINER" 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" paymenter-db paymenter-cache 2>/dev/null
         fi
-        echo -e "${GREEN}卸载流程执行完毕！${RESET}"
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_stardew() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器组已拉起。${RESET}"; }
-stop_stardew() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器组已降下停止。${RESET}"; }
-restart_stardew() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器组已执行重启. ${RESET}"; }
-logs_stardew() { docker logs -f --tail 100 "$MAIN_CONTAINER"; }
+start_paymenter() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_paymenter() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_paymenter() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_paymenter() { cd "$BASE_DIR" && docker compose logs -f; }
 
-# 状态与信息面板
 show_info() {
     get_status_info
-    local current_ip=$(get_public_ip)
-    
-    local vnc_pass="未生成或已禁用 VNC"
-    local pass_file="$BASE_DIR/data/panel/vnc_password.txt"
-    if [[ -f "$pass_file" ]]; then
-        vnc_pass=$(cat "$pass_file" 2>/dev/null)
-        [[ -z "$vnc_pass" ]] && vnc_pass="为空 (可能尚未完成初始化)"
-    fi
-
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${GREEN}                   小狗星露谷服务器 运行时配置                   ${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${YELLOW}当前核心状态   : $status"
-    echo -e "${YELLOW}Web 管理控制台 : http://${current_ip}:${web_port}${RESET}"
-    echo -e "${YELLOW}VNC 远程桌面   : ${current_ip}:${vnc_port}${RESET}"
-    echo -e "${RED}动态 VNC 密码   : ${vnc_pass}${RESET}"
-    echo -e "${YELLOW}指标监控地址   : http://${current_ip}:${metric_port}/metrics${RESET}"
-    echo -e "${YELLOW}联机直连游戏IP : ${current_ip} (UDP端口: ${game_port})${RESET}"
-    echo -e "${YELLOW}数据持久化基路 : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
-    echo -e "${CYAN}💡 首次开服向导：${RESET}"
-    echo -e " 1. 看到容器运行后，用 [选项 9] 盲输绑定的 Steam 令牌验证码（若有提示）。"
-    echo -e " 2. 登录 Web 控制台或通过 VNC 桌面连接服务器，创建/加载一张农场世界存档。"
-    echo -e " 3. 游戏正常进图开始广播后，可去修改该目录下的 .env 中的 ENABLE_VNC=false 节省 50M 内存。"
-    echo -e "${GREEN}================================================================${RESET}"
-}
-
-auto_find_base_dir() {
-    if [ ! -f "$COMPOSE_FILE" ]; then
-        if [ -f "/opt/puppy-stardew/docker-compose.yml" ]; then
-            BASE_DIR="/opt/puppy-stardew"
-        fi
-        COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-        ENV_FILE="$BASE_DIR/.env"
-    fi
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}面板安装目录   : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
 menu() {
     clear
-    auto_find_base_dir
     get_status_info
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}     ◈  星露谷物语 开服管理面板  ◈     ${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}服务状态 :${RESET} $status"
-    echo -e "${GREEN}UDP端口  :${RESET} ${YELLOW}${game_port}${RESET}"
-    echo -e "${GREEN}Web端口  :${RESET} ${YELLOW}${web_port}${RESET}"
-    echo -e "${GREEN}VNC端口  :${RESET} ${YELLOW}${vnc_port}${RESET}" 
-    echo -e "${GREEN}监控端口 :${RESET} ${YELLOW}${metric_port}${RESET}"
-    echo -e "${GREEN}=======================================${RESET}"
-    echo -e "${GREEN}1. 部署安装服务${RESET}"
-    echo -e "${GREEN}2. 更新服务器组${RESET}"
-    echo -e "${GREEN}3. 卸载服务器组${RESET}"
-    echo -e "${GREEN}4. 开启服务器组${RESET}"
-    echo -e "${GREEN}5. 关闭服务器组${RESET}"
-    echo -e "${GREEN}6. 重启服务器组${RESET}"
-    echo -e "${GREEN}7. 查看游戏日志${RESET}"
-    echo -e "${GREEN}8. 查看连接信息与VNC密码${RESET}"
-    echo -e "${GREEN}9. 连接到 Steam 令牌交互终端${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    ◈  Paymenter 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新服务${RESET}"
+    echo -e "${GREEN}3. 卸载服务${RESET}"
+    echo -e "${GREEN}4. 编译前端(修改主题和扩展后执行)${RESET}"
+    echo -e "${GREEN}5. 启动服务${RESET}"
+    echo -e "${GREEN}6. 停止服务${RESET}"
+    echo -e "${GREEN}7. 重启服务${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_stardew ;;
-        2) update_stardew ;;
-        3) uninstall_stardew ;;
-        4) start_stardew ;;
-        5) stop_stardew ;;
-        6) restart_stardew ;;
-        7) logs_stardew ;;
-        8) show_info ;;
-        9) attach_steam_guard ;;
+        1) install_paymenter ;;
+        2) update_paymenter ;;
+        3) uninstall_paymenter ;;
+        4) build_assets ;;
+        5) start_paymenter ;;
+        6) stop_paymenter ;;
+        7) restart_paymenter ;;
+        8) logs_paymenter ;;
+        9) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

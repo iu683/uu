@@ -1,268 +1,277 @@
 #!/bin/bash
-# =================================================================
-# Huobao-Drama 短剧服务 Docker Compose 管理面板 
-# =================================================================
 
-# 颜色
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\033[0m"
+# 颜色定义
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
 
-CONTAINER_NAME="huobao-drama"
-BASE_DIR="/opt/huobao-drama"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONFIG_FILE="$BASE_DIR/configs/config.yaml"
+# 自定义配置文件路径
+ENV_FILE="$HOME/.claude_custom_env"
 
-# 检测依赖
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
+# 临时和永久确保当前脚本进程能找到最新的 PATH
+export PATH="$HOME/.local/bin:$PATH"
+
+# 自动刷新和导出自定义 API 环境配置（让主面板状态100%同步）
+refresh_env() {
+    if [ -f "$ENV_FILE" ]; then
+        source "$ENV_FILE"
+        [ -n "$CLAUDE_BASE_URL" ] && export CLAUDE_BASE_URL="$CLAUDE_BASE_URL"
+        [ -n "$ANTHROPIC_BASE_URL" ] && export ANTHROPIC_BASE_URL="$ANTHROPIC_BASE_URL"
+        [ -n "$ANTHROPIC_API_KEY" ] && export ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+        [ -n "$ANTHROPIC_AUTH_TOKEN" ] && export ANTHROPIC_AUTH_TOKEN="$ANTHROPIC_AUTH_TOKEN"
+        [ -n "$ANTHROPIC_MODEL" ] && export ANTHROPIC_MODEL="$ANTHROPIC_MODEL"
+        [ -n "$ANTHROPIC_DEFAULT_OPUS_MODEL" ] && export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_DEFAULT_OPUS_MODEL"
+        [ -n "$ANTHROPIC_DEFAULT_SONNET_MODEL" ] && export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_DEFAULT_SONNET_MODEL"
+        [ -n "$ANTHROPIC_DEFAULT_HAIKU_MODEL" ] && export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_DEFAULT_HAIKU_MODEL"
+        [ -n "$CLAUDE_CODE_SUBAGENT_MODEL" ] && export CLAUDE_CODE_SUBAGENT_MODEL="$CLAUDE_CODE_SUBAGENT_MODEL"
+        [ -n "$CLAUDE_CODE_EFFORT_LEVEL" ] && export CLAUDE_CODE_EFFORT_LEVEL="$CLAUDE_CODE_EFFORT_LEVEL"
     fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
-get_status_info() {
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
+# 首次和循环时加载环境
+refresh_env
+
+# 获取状态与版本信息
+get_status() {
+    if command -v claude &> /dev/null; then
+        status="${GREEN}已安装${RESET}"
+        version_info=$(claude -v 2>/dev/null | head -n 1)
+        [ -z "$version_info" ] && version_info="未知版本"
+        claude_version="${YELLOW}${version_info}${RESET}"
     else
-        status="${RED}未部署${RESET}"
+        status="${RED}未安装${RESET}"
+        claude_version="${RED}-${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 从容器状态提取内部暴露端口绑定的宿主机端口（根据 config.yaml，内部实际监听的是 5678 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5678/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 兜底获取第一个绑定的端口
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="5678"
-
-        # 从容器状态提取数据目录（挂载路径）
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{break}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="/opt/huobao-drama/data"
+    # 检查是否配置了自定义 API
+    if [ -n "$CLAUDE_BASE_URL" ] || [ -n "$ANTHROPIC_BASE_URL" ]; then
+        api_status="${YELLOW}自定义中转${RESET}"
     else
-        # 容器未安装/未部署时的返回值
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-        data_dir="N/A"
+        api_status="${GREEN}官方默认${RESET}"
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
-get_public_ip() {
-    local mode=${1:-"auto"}
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
-}
-
-# 部署 Huobao-Drama
-install_huobao_drama() {
-    check_dependencies
-    
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入 Huobao-Drama 访问端口 (宿主机端口) [默认: 5678]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="5678"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
-
-    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/huobao-drama/data]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="/opt/huobao-drama/data"
-
-    # 1. 创建所需的宿主机目录
-    mkdir -p "$custom_data"
-    mkdir -p "$BASE_DIR/configs"
-    
-    # 2. 动态自动写入用户提供的完整 config.yaml 配置内容
-    echo -e "${YELLOW}正在初始化并写入应用配置文件 (config.yaml)...${RESET}"
-    cat <<EOF > "$CONFIG_FILE"
-app:
-  name: "Huobao Drama API"
-  version: "1.0.0"
-  debug: true
-  language: "zh"
-
-server:
-  port: 5678
-  host: "0.0.0.0"
-  cors_origins:
-    - "http://localhost:3012"
-  read_timeout: 600
-  write_timeout: 600
-
-database:
-  type: "sqlite"
-  path: "./data/huobao_drama.db"
-  max_idle: 10
-  max_open: 100
-
-storage:
-  type: "local"
-  local_path: "./data/storage"
-  base_url: "http://localhost:${custom_port}/static"
-
-ai:
-  default_text_provider: "openai"
-  default_image_provider: "openai"
-  default_video_provider: "doubao"
-EOF
-    
-    chmod -R 777 "$BASE_DIR" "$custom_data"
-
-    # 3. 动态生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  huobao-drama:
-    image: huobao/huobao-drama:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:5678"
-    volumes:
-      - ${custom_data}:/app/data
-      - ./configs/config.yaml:/app/configs/config.yaml
-    environment:
-      - NODE_ENV=production
-      - PORT=5678
-EOF
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Huobao-Drama 短剧服务...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
-
-    DETECT_IP=$(get_public_ip)
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Huobao-Drama 部署成功！      ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
-    echo -e "${YELLOW}宿主机配置路径 : $CONFIG_FILE${RESET}"
-    echo -e "${YELLOW}提示: 如果需要修改 AI 供应商或其他参数，请直接编辑 config.yaml 并重启容器。${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-# 更新 Huobao-Drama 镜像
-update_huobao_drama() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return
-    fi
-    echo -e "${YELLOW}正在从远端拉取 Huobao-Drama 最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
-}
-
-# 卸载 Huobao-Drama
-uninstall_huobao_drama() {
-    echo -ne "${YELLOW}确定要卸载并删除 Huobao-Drama 容器吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和业务数据？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}所有数据目录与配置文件已彻底清理。${RESET}"
-            fi
-        else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
-        fi
-        echo -e "${GREEN}卸载完成！${RESET}"
-    fi
-}
-
-start_huobao_drama() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_huobao_drama() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_huobao_drama() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_huobao_drama() { docker logs -f "$CONTAINER_NAME"; }
-
-show_info() {
-    get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-menu() {
+# 菜单面板
+show_menu() {
     clear
-    get_status_info
+    get_status
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈  Huobao-Drama 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}   ◈  Claude Code 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}版本 :${RESET} $claude_version"
+    echo -e "${GREEN}API  :${RESET} $api_status"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
+    echo -e "${GREEN}2. 当前目录启动${RESET}"
+    echo -e "${GREEN}3. 指定路径启动${RESET}"
+    echo -e "${GREEN}4. 登录/切换账户${RESET}"
+    echo -e "${GREEN}5. 设置自定义API模型/中转${RESET}"
+    echo -e "${GREEN}6. 更新${RESET}"
+    echo -e "${GREEN}7. 卸载${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_huobao_drama ;;
-        2) update_huobao_drama ;;
-        3) uninstall_huobao_drama ;;
-        4) start_huobao_drama ;;
-        5) stop_huobao_drama ;;
-        6) restart_huobao_drama ;;
-        7) logs_huobao_drama ;;
-        8) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
 }
 
+# 1. 安装
+install_claude() {
+    echo -e "\n${YELLOW}正在通过官方安装 Claude Code...${RESET}"
+    curl -fsSL https://claude.ai/install.sh | bash
+    
+    echo -e "\n${YELLOW}正在检查环境并自动修复 PATH...${RESET}"
+    local shell_config=""
+    if [ -n "$ZSH_VERSION" ] || [ -f "$HOME/.zshrc" ]; then
+        shell_config="$HOME/.zshrc"
+    else
+        shell_config="$HOME/.bashrc"
+    fi
+
+    if ! grep -q '\.local/bin' "$shell_config" 2>/dev/null; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$shell_config"
+        echo -e "${GREEN}✔ 已自动将 ~/.local/bin 写入 $shell_config${RESET}"
+    else
+        echo -e "${GREEN}✔ 配置文件中已存在 PATH 记录，无需重复添加。${RESET}"
+    fi
+
+    export PATH="$HOME/.local/bin:$PATH"
+    echo -e "${GREEN}安装与修复完成！${RESET}"
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+}
+
+# 2. 当前目录启动
+start_current() {
+    if command -v claude &> /dev/null; then
+        echo -e "\n${GREEN}正在当前目录启动 Claude Code...${RESET}"
+        refresh_env
+        claude
+    else
+        echo -e "\n${RED}未检测到 claude 命令，请先执行安装！${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    fi
+}
+
+# 3. 指定路径启动
+start_path() {
+    echo -e "\n"
+    echo -ne "${GREEN}请输入你的项目绝对路径: ${RESET}"
+    read target_path
+    if [ -d "$target_path" ]; then
+        echo -e "${GREEN}正在切换到 $target_path 并启动 Claude Code...${RESET}"
+        refresh_env
+        cd "$target_path" && claude
+    else
+        echo -e "${RED}路径不存在，请检查后重试！${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    fi
+}
+
+# 4. 登录
+login_claude() {
+    if command -v claude &> /dev/null; then
+        echo -e "\n${YELLOW}正在启动登录程序...${RESET}"
+        echo -e "提示：如果已经在会话中，直接输入 /login 即可"
+        refresh_env
+        claude -c "/login" 2>/dev/null || claude
+    else
+        echo -e "\n${RED}未检测到已安装的 Claude Code。${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    fi
+}
+
+# 5. 配置高级自定义 API 模型路径和 Key
+config_custom_api() {
+    echo -e "\n${GREEN}================================${RESET}"
+    echo -e "${GREEN}      自定义 API 配置管理       ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}当前保存的 Base URL:${RESET} ${YELLOW}${CLAUDE_BASE_URL:-${ANTHROPIC_BASE_URL:-官方默认}}${RESET}"
+    echo -e "${GREEN}当前保存的主模型:${RESET}    ${YELLOW}${ANTHROPIC_MODEL:-默认 (Sonnet/Opus)}${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${GREEN}1. 快捷设置 DeepSeek / 代理模型配置${RESET}"
+    echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
+    echo -e "${GREEN}0. 返回主菜单${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read api_choice
+
+    case $api_choice in
+        1)
+            echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关:${RESET}"
+            echo -ne "   (默认可填: https://api.deepseek.com/anthropic 或你的千行AI地址)\n   地址: "
+            read input_url
+            
+            echo -e "\n${YELLOW}2/4. 请输入你的 API Key / Token:${RESET}"
+            echo -ne "   秘钥: "
+            read input_key
+            
+            echo -e "\n${YELLOW}3/4. 请输入你想指定的主核心模型:${RESET}"
+            echo -ne "   (直接回车默认使用: deepseek-v4-pro)\n   模型名: "
+            read input_model
+            [ -z "$input_model" ] && input_model="deepseek-v4-pro"
+
+            echo -e "\n${YELLOW}4/4. 请输入你想指定的子代理 (Subagent) 模型:${RESET}"
+            echo -ne "   (直接回车默认使用: deepseek-v4-flash)\n   模型名: "
+            read input_submodel
+            [ -z "$input_submodel" ] && input_submodel="deepseek-v4-flash"
+
+            if [ -n "$input_url" ] && [ -n "$input_key" ]; then
+                # 写入本地持久化环境配置文件，全量覆盖注入
+                echo "export CLAUDE_BASE_URL=\"$input_url\"" > "$ENV_FILE"
+                echo "export ANTHROPIC_BASE_URL=\"$input_url\"" >> "$ENV_FILE"
+                echo "export ANTHROPIC_API_KEY=\"$input_key\"" >> "$ENV_FILE"
+                echo "export ANTHROPIC_AUTH_TOKEN=\"$input_key\"" >> "$ENV_FILE"
+                echo "export ANTHROPIC_MODEL=\"$input_model\"" >> "$ENV_FILE"
+                echo "export ANTHROPIC_DEFAULT_OPUS_MODEL=\"$input_model\"" >> "$ENV_FILE"
+                echo "export ANTHROPIC_DEFAULT_SONNET_MODEL=\"$input_model\"" >> "$ENV_FILE"
+                echo "export ANTHROPIC_DEFAULT_HAIKU_MODEL=\"$input_submodel\"" >> "$ENV_FILE"
+                echo "export CLAUDE_CODE_SUBAGENT_MODEL=\"$input_submodel\"" >> "$ENV_FILE"
+                echo "export CLAUDE_CODE_EFFORT_LEVEL=\"max\"" >> "$ENV_FILE"
+                
+                # 触发即时生效
+                refresh_env
+                echo -e "\n${GREEN}✔ 恭喜！高级多模型变量已成功保存。启动时将全面劫持并生效。${RESET}"
+            else
+                echo -e "${RED}输入不能为空，取消设置。${RESET}"
+            fi
+            ;;
+        2)
+            if [ -f "$ENV_FILE" ]; then
+                rm -f "$ENV_FILE"
+                # 全量取消变量定义
+                unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+                unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
+                unset CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_EFFORT_LEVEL
+                echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复官方默认配置。${RESET}"
+            else
+                echo -e "${YELLOW}当前本来就是官方默认配置。${RESET}"
+            fi
+            ;;
+        *)
+            return
+            ;;
+    esac
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+}
+
+# 6. 更新
+update_claude() {
+    echo -e "\n${YELLOW}正在尝试更新 Claude Code...${RESET}"
+    if command -v claude &> /dev/null; then
+        claude update || claude install
+    else
+        echo -e "${RED}未检测到已安装的 Claude Code，无法更新。${RESET}"
+    fi
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+}
+
+# 7. 整合卸载
+uninstall_claude_flow() {
+    echo -e "\n${RED}准备进入卸载流程...${RESET}"
+    echo -ne "${RED}确定要卸载 Claude Code 主程序吗？(y/n): ${RESET}"
+    read ans
+    if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+        # 第一步：卸载程序
+        echo -e "${YELLOW}[步骤 1/2] 正在删除主程序可执行文件...${RESET}"
+        rm -f ~/.local/bin/claude
+        rm -rf ~/.local/share/claude
+        echo -e "${GREEN}✔ 主程序卸载成功。${RESET}"
+        
+        # 第二步：清除配置文件
+        echo -e "\n${RED}[步骤 2/2] 是否需要连同配置文件、历史记录、自定义API及MCP设置一起清除？${RESET}"
+        echo -e "${RED}注意：此操作不可逆，清除后所有本地历史将永久丢失！${RESET}"
+        echo -ne "${RED}是否清除配置文件？(y/n): ${RESET}"
+        read ans_config
+        if [ "$ans_config" = "y" ] || [ "$ans_config" = "Y" ]; then
+            echo -e "${YELLOW}正在清除全局、本地及API配置文件...${RESET}"
+            rm -rf ~/.claude
+            rm -f ~/.claude.json
+            rm -rf .claude
+            rm -f .mcp.json
+            rm -f "$ENV_FILE"
+            echo -e "${GREEN}✔ 配置文件清除完毕，所有数据已彻底干净！${RESET}"
+        else
+            echo -e "${YELLOW}已保留配置文件。你可以随时重新安装并恢复使用。${RESET}"
+        fi
+    else
+        echo "已取消卸载操作。"
+    fi
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+}
+
+# 主循环
 while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
+    show_menu
+    read choice
+    case $choice in
+        1) install_claude ;;
+        2) start_current ;;
+        3) start_path ;;
+        4) login_claude ;;
+        5) config_custom_api ;;
+        6) update_claude ;;
+        7) uninstall_claude_flow ;;
+        0) clear; exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
+    esac
 done

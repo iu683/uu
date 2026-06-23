@@ -1,17 +1,17 @@
 #!/bin/bash
 # =================================================================
-# grok2api Docker Compose 管理面板 
+# codeg Docker Compose 管理面板 
 # =================================================================
 
-# 颜色
+# 颜色定义
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="grok2api"
-BASE_DIR="/opt/grok2api"
+CONTAINER_NAME="codeg"
+BASE_DIR="/opt/codeg"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -45,6 +45,7 @@ get_public_ip() {
     fi
     echo "127.0.0.1" && return 0
 }
+
 # 动态获取容器状态
 get_status_info() {
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -56,246 +57,157 @@ get_status_info() {
     fi
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 读取映射端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8000"
+        # 提取宿主机映射到容器内部 3080 的真实外部端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3080"
     else
         webui_port="N/A"
     fi
 }
 
-# 部署 grok2api
-install_grok2api() {
+# 部署与安装服务
+install_codeg() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    # 1. 宿主机映射端口
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机 Host Port) [默认: 8000]: ${RESET}"
+    # 1. 安全 Token 配置 (回车默认纯随机)
+    echo -ne "${YELLOW}请输入访问 Token (CODEG_TOKEN) [直接回车自动生成随机Token]: ${RESET}"
+    read -r custom_token
+    if [[ -z "$custom_token" ]]; then
+        custom_token="$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)"
+        echo -e "${GREEN} -> 已自动生成访问 Token: $custom_token${RESET}"
+    fi
+
+    # 2. 宿主机主访问端口
+    echo -ne "${YELLOW}请输入服务对外访问端口 [默认: 3080]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8000"
+    [[ -z "$custom_port" ]] && custom_port="3080"
 
-    # 2. 数据与日志存储路径
-    echo -ne "${YELLOW}请输入数据与日志宿主机存放绝对基准路径 [默认: /opt/grok2api]: ${RESET}"
-    read -r custom_path
-    [[ -z "$custom_path" ]] && custom_path="/opt/grok2api"
+    # 3. 项目代码挂载绝对路径
+    echo -ne "${YELLOW}请输入宿主机项目代码存放绝对路径 [默认: /opt/codeg/projects]: ${RESET}"
+    read -r custom_projects_path
+    [[ -z "$custom_projects_path" ]] && custom_projects_path="/opt/codeg/projects"
 
-    # 创建子目录并赋权
-    mkdir -p "$custom_path/data" "$custom_path/logs"
-    chmod -R 777 "$custom_path" 2>/dev/null
+    # 严格清理项目代码路径的残留非目录文件
+    if [ -e "$custom_projects_path" ] && [ ! -d "$custom_projects_path" ]; then
+        rm -rf "$custom_projects_path"
+    fi
+    mkdir -p "$custom_projects_path"
+    chmod -R 777 "$custom_projects_path" 2>/dev/null
 
-    # 3. 高级可选服务询问 (回车默认不开启)
-    echo -ne "${YELLOW}是否启用 CF 自动刷新功能 (Flaresolverr)？(y/n) [默认: n]: ${RESET}"
-    read -r enable_cf
-    [[ -z "$enable_cf" ]] && enable_cf="n"
+    # 组织生成环境配置文件 .env
+    cat <<EOF > "$ENV_FILE"
+CODEG_TOKEN=${custom_token}
+EOF
 
-    echo -ne "${YELLOW}是否启用 Warp 落地代理防止 IP 变脏？(y/n) [默认: n]: ${RESET}"
-    read -r enable_warp
-    [[ -z "$enable_warp" ]] && enable_warp="n"
-
-    # 开始组织 docker-compose.yml 文本
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml...${RESET}"
-    
-    # 写入 compose 头部及主服务
+    # 生成绝对端口解耦的 docker-compose.yml 文件
+    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  grok2api:
-    container_name: grok2api
-    image: ghcr.io/chenyme/grok2api:latest
+  codeg:
+    image: xintaofei/codeg:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
     ports:
-      - "\${HOST_PORT:-8000}:\${SERVER_PORT:-8000}"
-    environment:
-      TZ: Asia/Shanghai
-      LOG_LEVEL: \${LOG_LEVEL:-INFO}
-      SERVER_HOST: \${SERVER_HOST:-0.0.0.0}
-      SERVER_PORT: \${SERVER_PORT:-8000}
-      SERVER_WORKERS: \${SERVER_WORKERS:-1}
-      ACCOUNT_STORAGE: \${ACCOUNT_STORAGE:-local}
-      ACCOUNT_LOCAL_PATH: \${ACCOUNT_LOCAL_PATH:-data/accounts.db}
-      ACCOUNT_REDIS_URL: \${ACCOUNT_REDIS_URL:-}
-      ACCOUNT_MYSQL_URL: \${ACCOUNT_MYSQL_URL:-}
-      ACCOUNT_POSTGRESQL_URL: \${ACCOUNT_POSTGRESQL_URL:-}
-EOF
-
-    # 处理 grok2api 服务内部针对 CF 的环境变量注释
-    if [[ "$enable_cf" == "y" || "$enable_cf" == "Y" ]]; then
-        cat <<EOF >> "$COMPOSE_FILE"
-      FLARESOLVERR_URL: http://flaresolverr:8191
-      CF_REFRESH_INTERVAL: "600"
-      CF_TIMEOUT: "60"
-EOF
-    else
-        cat <<EOF >> "$COMPOSE_FILE"
-      # FLARESOLVERR_URL: http://flaresolverr:8191
-      # CF_REFRESH_INTERVAL: "600"
-      # CF_TIMEOUT: "60"
-EOF
-    fi
-
-    # 写入主服务的卷挂载和重启策略
-    cat <<EOF >> "$COMPOSE_FILE"
+      - "${custom_port}:3080"
     volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-    restart: unless-stopped
-EOF
-
-    # 附加可选服务 1: Warp
-    if [[ "$enable_warp" == "y" || "$enable_warp" == "Y" ]]; then
-        cat <<EOF >> "$COMPOSE_FILE"
-
-  warp:
-    container_name: warp
-    image: caomingjun/warp:latest
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:1080:1080"
+      - codeg-data:/data
+      - ${custom_projects_path}:/projects
     environment:
-      - WARP_SLEEP=2
-    cap_add:
-      - NET_ADMIN
-EOF
-    fi
+      - CODEG_TOKEN=\${CODEG_TOKEN:-}
+      - CODEG_PORT=3080
+      - CODEG_HOST=0.0.0.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-    # 附加可选服务 2: Flaresolverr
-    if [[ "$enable_cf" == "y" || "$enable_cf" == "Y" ]]; then
-        cat <<EOF >> "$COMPOSE_FILE"
-
-  flaresolverr:
-    container_name: flaresolverr
-    image: ghcr.io/flaresolverr/flaresolverr:latest
-    ports:
-      - "127.0.0.1:8191:8191"
-    environment:
-      TZ: Asia/Shanghai
-      LOG_LEVEL: info
-    restart: unless-stopped
-EOF
-    fi
-
-
-    # 开始组织并生成环境配置文件 .env
-    echo -e "${YELLOW}正在生成配对的 .env 配置文件...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-# ==================== 基础运行 ====================
-TZ=Asia/Shanghai
-LOG_LEVEL=INFO
-LOG_FILE_ENABLED=true
-ACCOUNT_SYNC_INTERVAL=30
-
-# ==================== Web 服务 / Docker Compose ====================
-SERVER_HOST=0.0.0.0
-SERVER_PORT=8000
-SERVER_WORKERS=1
-
-# Docker Compose 宿主机映射端口
-HOST_PORT=${custom_port}
-
-# ==================== 账号存储（启动期） ====================
-ACCOUNT_STORAGE=local
-
-# ==================== 可选：本地数据 / 日志目录 ====================
-DATA_DIR=${custom_path}/data
-LOG_DIR=${custom_path}/logs
+volumes:
+  codeg-data:
 EOF
 
-    # 纠正或者软链接本地 compose 执行目录内的数据流，确保和用户自定路径一致
-    rm -rf "$BASE_DIR/data" "$BASE_DIR/logs"
-    ln -sf "$custom_path/data" "$BASE_DIR/data"
-    ln -sf "$custom_path/logs" "$BASE_DIR/logs"
+    echo -e "${YELLOW}正在安全清理旧集群与发生迁移锁死的命名卷...${RESET}"
+    cd "$BASE_DIR"
+    # -v 参数会强行把残留的旧数据卷一同冲刷掉，彻底解决 duplicate column 崩溃 Bug
+    docker compose down -v --remove-orphans 2>/dev/null
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 grok2api 服务集群...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    echo -e "${YELLOW}正在从零拉起干净的服务容器...${RESET}"
+    docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务初始化 (约5秒)...${RESET}"
-    sleep 5
+    echo -e "${YELLOW}等待服务初始化...${RESET}"
+    sleep 4
 
     local current_ip
     current_ip=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        grok2api 部署成功！       ${RESET}"
+    echo -e "${GREEN}          codeg 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址     : http://${current_ip}:${custom_port}${RESET}"
-    echo -e "${YELLOW}数据存储路径     : $custom_path/data${RESET}"
-    echo -e "${YELLOW}日志存储路径     : $custom_path/logs${RESET}"
-    echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${CYAN}💡 功能开启状态：${RESET}"
-    echo -e "${YELLOW}CF 盾自动刷新服务 : $([ "$enable_cf" = "y" ] && echo -e "${GREEN}已开启${RESET}" || echo -e "${RED}未开启${RESET}")${RESET}"
-    echo -e "${YELLOW}Warp 落地代理服务 : $([ "$enable_warp" = "y" ] && echo -e "${GREEN}开(请至config.toml配置socks5://warp:1080)${RESET}" || echo -e "${RED}未开启${RESET}")${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${current_ip}:${custom_port}${RESET}"
+    echo -e "${YELLOW}安全访问 Token : ${custom_token}${RESET}"
+    echo -e "${YELLOW}代码挂载路径   : $custom_projects_path${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
 # 更新镜像
-update_grok2api() {
+update_codeg() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新服务集群镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}集群更新完成！组件均已处于最新状态。${RESET}"
+    echo -e "${GREEN}服务更新完成！${RESET}"
 }
 
-# 卸载集群
-uninstall_grok2api() {
-    echo -ne "${YELLOW}确定要卸载并删除 grok2api 容器集群吗？(y/n): ${RESET}"
+# 卸载服务
+uninstall_codeg() {
+    echo -ne "${YELLOW}确定要卸载并删除 codeg 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器集群已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地存储的所有账号数据库和配置日志？(y/n): ${RESET}"
+            cd "$BASE_DIR" && docker compose down -v
+            echo -e "${GREEN}容器及命名卷已安全移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地项目配置目录？(y/n): ${RESET}"
             read -r clean_data
             if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
-                # 从 .env 提取路径安全清理
-                local real_data
-                real_data=$(grep DATA_DIR "$ENV_FILE" | cut -d'=' -f2)
                 rm -rf "$BASE_DIR"
-                if [[ -n "$real_data" && -d "$(dirname "$real_data")" ]]; then
-                    rm -rf "$(dirname "$real_data")"
-                fi
-                echo -e "${GREEN}所有数据资产和配置文件已彻底清理。${RESET}"
+                echo -e "${GREEN}本地配置文件已彻底清理。${RESET}"
             fi
         else
-            docker rm -f grok2api warp flaresolverr 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
             echo -e "${GREEN}独立容器已强行清除。${RESET}"
         fi
-        echo -e "${GREEN}卸载彻底完成！${RESET}"
     fi
 }
 
-start_grok2api() { 
+start_codeg() { 
     if [ -f "$COMPOSE_FILE" ]; then
-        cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}集群服务已启动${RESET}"
-    else
-        echo -e "${RED}错误: 未检测到配置，无法启动。${RESET}"
+        cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已拉起启动${RESET}"
     fi
 }
 
-stop_grok2api() { 
+stop_codeg() { 
     if [ -f "$COMPOSE_FILE" ]; then
-        cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}集群服务已挂起停止${RESET}"
-    else
-        echo -e "${RED}错误: 未检测到配置，无法停止。${RESET}"
+        cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已安全停止${RESET}"
     fi
 }
 
-restart_grok2api() { 
+restart_codeg() { 
     if [ -f "$COMPOSE_FILE" ]; then
-        cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}集群服务已成功重启${RESET}"
-    else
-        echo -e "${RED}错误: 未检测到配置，无法重启。${RESET}"
+        cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已成功完成重启${RESET}"
     fi
 }
 
-logs_grok2api() { 
+logs_codeg() { 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         docker logs -f "$CONTAINER_NAME"
     else
-        echo -e "${RED}错误: 主业务容器不存在，无法追踪日志。${RESET}"
+        echo -e "${RED}错误: 容器不存在，无法追踪日志。${RESET}"
     fi
 }
 
@@ -305,16 +217,14 @@ show_info() {
     current_ip=$(get_public_ip)
     
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}主服务状态     : $status"
+    echo -e "${YELLOW}当前服务状态   : $status"
     if [[ "$webui_port" == "N/A" ]]; then
-        echo -e "${YELLOW}API 访问地址   : N/A${RESET}"
+        echo -e "${YELLOW}访问地址       : N/A${RESET}"
     else
-        echo -e "${YELLOW}API 访问地址   : http://${current_ip}:${webui_port}${RESET}"
+        echo -e "${YELLOW}访问地址       : http://${current_ip}:${webui_port}${RESET}"
     fi
     echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${CYAN}📂 运行配置文件分布情况：${RESET}"
-    echo -e "${YELLOW}Docker Compose 结构文件 : $COMPOSE_FILE${RESET}"
-    echo -e "${YELLOW}底层环境变量映射文件    : $ENV_FILE${RESET}"
+     echo -e "${YELLOW}安全访问 Token : ${custom_token}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -322,10 +232,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  grok2api 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}       ◈  codeg 管理面板  ◈      ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}服务状态 :${RESET} $status"
+    echo -e "${GREEN}当前端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -340,13 +250,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_grok2api ;;
-        2) update_grok2api ;;
-        3) uninstall_grok2api ;;
-        4) start_grok2api ;;
-        5) stop_grok2api ;;
-        6) restart_grok2api ;;
-        7) logs_grok2api ;;
+        1) install_codeg ;;
+        2) update_codeg ;;
+        3) uninstall_codeg ;;
+        4) start_codeg ;;
+        5) stop_codeg ;;
+        6) restart_codeg ;;
+        7) logs_codeg ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

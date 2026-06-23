@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# uPay 支付服务 Docker Compose 管理面板 
+# Paymenter 自动化管理面板 
 # =================================================================
 
 # 颜色
@@ -10,9 +10,11 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="upay_pro"
-BASE_DIR="/opt/upay"
+# 定义核心容器名
+CONTAINER_NAME="paymenter-web"
+BASE_DIR="/opt/paymenter"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -24,7 +26,6 @@ check_dependencies() {
 
 # 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -33,29 +34,17 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 从容器状态提取 Web 端口（根据绑定的端口动态获取）
-        webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8090"
-
-        # 从容器状态提取外部卷映射路径
-        data_dir="使用 Docker 外部数据卷 (upay_logs, upay_db)"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="80"
     else
-        # 容器未安装/未部署时的返回值
-        img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        data_dir="N/A"
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"}
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -77,176 +66,339 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 检查环境是否已经部署
-check_compose_exists() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return 1
+# 生成随机密码
+generate_password() {
+    if command -v openssl &> /dev/null; then
+        openssl rand -hex 12
+    else
+        echo "pay_pass_$(date +%s)"
     fi
-    return 0
 }
 
-# 部署 uPay
-install_upay() {
+# 部署 Paymenter 主函数
+install_paymenter() {
     check_dependencies
-    
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 系统架构检测与参数配置 ======${RESET}"
-    
-    # 自动识别系统架构并选择镜像 Tag
-    local arch
-    arch=$(uname -m)
-    local image_tag="wangergou111/upay:latest"
-    
-    if [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
-        image_tag="wangergou111/upay:latest-arm64"
-        echo -e "${GREEN}检测到当前机器为 ARM64 架构，自动选择镜像: ${image_tag}${RESET}"
-    else
-        echo -e "${GREEN}检测到当前机器为 AMD64 架构，自动选择镜像: ${image_tag}${RESET}"
-    fi
-
-    echo -ne "${YELLOW}请输入 uPay 访问端口 (宿主机端口) [默认: 8090]: ${RESET}"
+    echo -e "${CYAN}====== 1. 基础环境配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Paymenter 访问端口 [默认: 80]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8090"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+    [[ -z "$custom_port" ]] && custom_port="80"
+
+    echo -e "\n${CYAN}====== 2. 数据库类型选择 ======${RESET}"
+    echo -e "${GREEN}1) 部署全新的本地 MariaDB 数据库 (数据挂载在本地 ./database)${RESET}"
+    echo -e "${GREEN}2) 连接已有的远程/外部 MySQL/MariaDB 数据库${RESET}"
+    echo -ne "${YELLOW}请选择数据库部署模式 [默认 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
+
+    if [[ "$db_mode" == "1" ]]; then
+        db_host="paymenter-db"
+        db_port="3306"
+        db_connection="mariadb"
+        db_name="paymenter"
+        db_user="paymenter"
+        
+        echo -ne "${YELLOW}请输入本地数据库用户密码 (留空则随机生成): ${RESET}"
+        read -r db_password
+        [[ -z "$db_password" ]] && db_password=$(generate_password)
+
+        echo -ne "${YELLOW}请输入本地数据库 Root 密码 (留空则随机生成): ${RESET}"
+        read -r db_root_password
+        [[ -z "$db_root_password" ]] && db_root_password=$(generate_password)
+
+    elif [[ "$db_mode" == "2" ]]; then
+        echo -ne "${YELLOW}请输入远程数据库驱动类型 (mysql / mariadb) [默认 mariadb]: ${RESET}"
+        read -r db_connection
+        [[ -z "$db_connection" ]] && db_connection="mariadb"
+
+        echo -ne "${YELLOW}请输入远程数据库地址 (Host): ${RESET}"
+        read -r db_host
+        while [[ -z "$db_host" ]]; do
+            echo -e "${RED}错误: 数据库地址不能为空！${RESET}"
+            echo -ne "${YELLOW}请输入远程数据库地址 (Host): ${RESET}"
+            read -r db_host
+        done
+
+        echo -ne "${YELLOW}请输入远程数据库端口 [默认: 3306]: ${RESET}"
+        read -r db_port
+        [[ -z "$db_port" ]] && db_port="3306"
+
+        echo -ne "${YELLOW}请输入远程数据库名称 [默认: paymenter]: ${RESET}"
+        read -r db_name
+        [[ -z "$db_name" ]] && db_name="paymenter"
+
+        echo -ne "${YELLOW}请输入远程数据库用户名 [默认: paymenter]: ${RESET}"
+        read -r db_user
+        [[ -z "$db_user" ]] && db_user="paymenter"
+
+        echo -ne "${YELLOW}请输入远程数据库密码: ${RESET}"
+        read -r db_password
+    else
+        echo -e "${RED}输入有误，取消部署。${RESET}"
         return
     fi
 
-    # 1. 自动创建依赖的 Docker 外部数据卷（如果不存在的话）
-    echo -e "${YELLOW}正在检查并创建 Docker 外部数据卷...${RESET}"
-    docker volume inspect upay_logs &>/dev/null || docker volume create upay_logs
-    docker volume inspect upay_db &>/dev/null || docker volume create upay_db
+    # 新增: 缓存缓存类型选择
+    echo -e "\n${CYAN}====== 3. Redis 缓存类型选择 ======${RESET}"
+    echo -e "${GREEN}1) 部署全新的本地 Redis 容器${RESET}"
+    echo -e "${GREEN}2) 连接已有的远程/外部 Redis 服务器${RESET}"
+    echo -ne "${YELLOW}请选择 Redis 部署模式 [默认 1]: ${RESET}"
+    read -r redis_mode
+    [[ -z "$redis_mode" ]] && redis_mode="1"
 
-    # 2. 动态生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    if [[ "$redis_mode" == "1" ]]; then
+        redis_host="paymenter-cache"
+        redis_port="6379"
+        redis_password=""
+    elif [[ "$redis_mode" == "2" ]]; then
+        echo -ne "${YELLOW}请输入远程 Redis 地址 (Host): ${RESET}"
+        read -r redis_host
+        while [[ -z "$redis_host" ]]; do
+            echo -e "${RED}错误: Redis 地址不能为空！${RESET}"
+            echo -ne "${YELLOW}请输入远程 Redis 地址 (Host): ${RESET}"
+            read -r redis_host
+        done
+
+        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r redis_port
+        [[ -z "$redis_port" ]] && redis_port="6379"
+
+        echo -ne "${YELLOW}请输入远程 Redis 密码 (若无则留空): ${RESET}"
+        read -r redis_password
+    else
+        echo -e "${RED}输入有误，取消部署。${RESET}"
+        return
+    fi
+
+    echo -ne "${YELLOW}请输入 Redis 分区 DB 编号 (0-15) [默认 0]: ${RESET}"
+    read -r redis_db
+    [[ -z "$redis_db" ]] && redis_db="0"
+
+    # 创建本地持久化目录
+    echo -e "\n${YELLOW}正在初始化本地挂载目录...${RESET}"
+    mkdir -p "$BASE_DIR/storage/logs" "$BASE_DIR/storage/public" "$BASE_DIR/themes" "$BASE_DIR/extensions" "$BASE_DIR/database"
+
+    # 写入环境配置文件 .env
+    cat <<EOF > "$ENV_FILE"
+APP_ENV=production
+APP_DEBUG=false
+APP_KEY=
+
+DB_CONNECTION=${db_connection}
+DB_HOST=${db_host}
+DB_PORT=${db_port}
+DB_NAME=${db_name}
+DB_USER=${db_user}
+DB_PASSWORD=${db_password}
+
+CACHE_STORE=redis
+REDIS_HOST=${redis_host}
+REDIS_PASSWORD=${redis_password}
+REDIS_PORT=${redis_port}
+REDIS_DB=${redis_db}
+EOF
+    
+    # 规范安全权限
+    chmod 644 "$ENV_FILE"
+
+    # 生成 docker-compose.yml
+    echo -e "${YELLOW}正在生成配置文件...${RESET}"
+    
+    # 动态组装 docker-compose 内部的 services 部分
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  upay:
-    container_name: ${CONTAINER_NAME}
-    image: ${image_tag}
-    restart: always
-    ports:
-      - "${custom_port}:8090"
-    volumes:
-      - upay_logs:/app/logs
-      - upay_db:/app/DBS
-
-volumes:
-  upay_logs:
-    external: true
-    name: upay_logs
-  upay_db:
-    external: true
-    name: upay_db
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 uPay 服务...${RESET}"
+    # 1. 动态判断并注入数据库服务
+    if [[ "$db_mode" == "1" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
+  database:
+    container_name: paymenter-db
+    image: mariadb:lts
+    restart: always
+    command: --default-authentication-plugin=mysql_native_password --max_allowed_packet=64M --wait_timeout=28800
+    volumes:
+      - "./database:/var/lib/mysql"
+    environment:
+      MYSQL_ROOT_PASSWORD: "${db_root_password}"
+      MYSQL_DATABASE: "${db_name}"
+      MYSQL_USER: "${db_user}"
+      MYSQL_PASSWORD: "${db_password}"
+    networks:
+      - paymenter_nw
+EOF
+    fi
+
+    # 2. 动态判断并注入Redis服务
+    if [[ "$redis_mode" == "1" ]]; then
+        cat <<EOF >> "$COMPOSE_FILE"
+  cache:
+    container_name: paymenter-cache
+    image: redis:alpine
+    restart: always
+    networks:
+      - paymenter_nw
+EOF
+    fi
+
+    # 3. 注入 Paymenter 主服务
+    cat <<EOF >> "$COMPOSE_FILE"
+  paymenter:
+    container_name: ${CONTAINER_NAME}
+    image: ghcr.io/paymenter/paymenter:latest
+    restart: always
+    ports:
+      - "${custom_port}:80"
+    volumes:
+      - "./:/app/var/"
+      - "./storage/logs:/app/storage/logs"
+      - "./storage/public:/app/storage/app/public"
+      - "./themes:/app/themes"
+      - "./extensions:/app/extensions"
+      - "app_volume:/app"
+    environment:
+      APP_ENV: "\${APP_ENV}"
+      APP_DEBUG: "\${APP_DEBUG}"
+      APP_KEY: "\${APP_KEY}"
+      DB_CONNECTION: "\${DB_CONNECTION}"
+      DB_HOST: "\${DB_HOST}"
+      DB_PORT: "\${DB_PORT}"
+      DB_DATABASE: "\${DB_NAME}"
+      DB_USERNAME: "\${DB_USER}"
+      DB_PASSWORD: "\${DB_PASSWORD}"
+      CACHE_STORE: "\${CACHE_STORE}"
+      REDIS_HOST: "\${REDIS_HOST}"
+      REDIS_PASSWORD: "\${REDIS_PASSWORD}"
+      REDIS_PORT: "\${REDIS_PORT}"
+      REDIS_DB: "\${REDIS_DB}"
+      PAYMENTER_SKIP_DEFAULT: "false"
+    depends_on:
+$( [[ "$db_mode" == "1" ]] && echo "      - database" )
+$( [[ "$redis_mode" == "1" ]] && echo "      - cache" )
+    networks:
+      - paymenter_nw
+
+  asset-builder:
+    container_name: paymenter-asset-builder
+    image: node:22-alpine
+    profiles: ["build"]
+    working_dir: /app
+    volumes:
+      - "./themes:/app/themes"
+      - "./extensions:/app/extensions"
+      - "./:/app/var"
+      - "app_volume:/app"
+    command: >
+      sh -c "tail -f /dev/null"
+    networks:
+      - paymenter_nw
+
+networks:
+  paymenter_nw:
+    driver: bridge
+
+volumes:
+  app_volume:
+EOF
+
+    # 递归放开其他运行目录的读写权限
+    chmod -R 777 "$BASE_DIR/storage" "$BASE_DIR/themes" "$BASE_DIR/extensions" "$BASE_DIR/database" 2>/dev/null
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动容器服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化并生成初始账密 (约5秒)...${RESET}"
-    sleep 5
+    echo -e "${YELLOW}等待服务及依赖初始化 (约 10 秒)...${RESET}"
+    sleep 10
 
-    # 3. 动态从日志中抓取初始账号密码
-    local logs_content
-    logs_content=$(docker logs "$CONTAINER_NAME" 2>&1)
+    # 执行官方要求的初始化命令
+    echo -e "\n${CYAN}====== 4. 开始执行 Paymenter 官方初始化命令行 ======${RESET}"
     
-    local init_user
-    init_user=$(echo "$logs_content" | grep -oE '"username": "[^"]+"' | head -n1 | cut -d'"' -f4)
-    local init_pass
-    init_pass=$(echo "$logs_content" | grep -oE '"password": "[^"]+"' | head -n1 | cut -d'"' -f4)
+    echo -e "${YELLOW}[准备阶段] 正在生成应用安全密钥 (APP_KEY)...${RESET}"
+    docker compose exec paymenter php artisan key:generate
 
-    # 如果没抓取到（可能不是第一次启动），给个默认兜底提示
-    [[ -z "$init_user" ]] && init_user="[非首次启动，请查看历史修改记录或按选项7查看日志]"
-    [[ -z "$init_pass" ]] && init_pass="[非首次启动，请查看历史修改记录或按选项7查看日志]"
+    echo -e "${YELLOW}[1/3] 正在配置系统应用 URL...${RESET}"
+    docker compose exec -it paymenter php artisan app:init
 
-    local detect_ip
-    detect_ip=$(get_public_ip)
+    echo -e "${YELLOW}[2/3] 正在为数据库添加初始属性...${RESET}"
+    docker compose exec -it paymenter php artisan db:seed --class=CustomPropertySeeder
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}         uPay 部署成功！        ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${detect_ip}:${custom_port}${RESET}"
-    echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${GREEN}🔑 系统自动生成的初始账密：${RESET}"
-    echo -e "${RED}初始用户名     : ${init_user}${RESET}"
-    echo -e "${RED}初始密码       : ${init_pass}${RESET}"
-    echo -e "${RED}重要提示       : 登录后请务必立刻修改默认密码！${RESET}"
-    echo -e "${CYAN}--------------------------------${RESET}"
-    echo -e "${GREEN}常用的快捷接口文档提示：${RESET}"
-    echo -e "${YELLOW}1. 创建订单 (POST) : http://${detect_ip}:${custom_port}/api/create_order${RESET}"
-    echo -e "${YELLOW}2. 查询状态 (GET)  : http://${detect_ip}:${custom_port}/pay/check-status/{trade_id}${RESET}"
-    echo -e "${YELLOW}3. 支付收银台(GET) : http://${detect_ip}:${custom_port}/pay/checkout-counter/{trade_id}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}[3/3] 正在创建初始管理员用户...${RESET}"
+    docker compose exec -it paymenter php artisan app:user:create
+
+    # 清理缓存使其强制刷新
+    docker compose exec paymenter php artisan config:clear &>/dev/null
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${GREEN}     Paymenter 部署与初始化全部完成！            ${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${YELLOW}面板访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}面板安装根目录: ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
 }
 
-# 更新 uPay 镜像
-update_upay() {
-    check_compose_exists || return
-    echo -e "${YELLOW}正在从远端拉取 uPay 最新镜像...${RESET}"
+# 编译资产编译器的前端静态文件
+build_assets() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在启动 asset-builder 编译前端资源...${RESET}"
+    cd "$BASE_DIR"
+    docker compose run --rm asset-builder npm install
+    docker compose run --rm asset-builder npm run build
+    echo -e "${GREEN}前端资源 (Themes & Extensions) 编译成功并已应用！${RESET}"
+}
+
+# 更新 Paymenter 镜像
+update_paymenter() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在拉取最新 Paymenter 镜像并升级...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 uPay
-uninstall_upay() {
-    echo -ne "${YELLOW}确定要卸载并删除 uPay 容器吗？(y/n): ${RESET}"
+# 卸载 Paymenter
+uninstall_paymenter() {
+    echo -ne "${YELLOW}确定要卸载并删除 Paymenter 堆栈容器吗？(y/n): ${RESET}"
     read -r confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
+            cd "$BASE_DIR" && docker compose down -v
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地 Compose 配置和 Docker 外部存储数据卷？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否删除本地所有下载的代码、扩展、主题及数据库文件？(y/n): ${RESET}"
             read -r clean_data
-            if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                docker volume rm upay_logs upay_db 2>/dev/null
-                echo -e "${GREEN}配置路径与 Docker 外部卷 (upay_logs, upay_db) 已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有数据已彻底清理。${RESET}"
+            else
+                echo -e "${YELLOW}已保留本地挂载数据，目录位于: $BASE_DIR${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" paymenter-db paymenter-cache 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_upay() { 
-    check_compose_exists || return
-    cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"
-}
-
-stop_upay() { 
-    check_compose_exists || return
-    cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"
-}
-
-restart_upay() { 
-    check_compose_exists || return
-    cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"
-}
-
-logs_upay() { 
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        docker logs -f "$CONTAINER_NAME"
-    else
-        echo -e "${RED}错误: 容器不存在，无法查看日志！${RESET}"
-    fi
-}
+start_paymenter() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_paymenter() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_paymenter() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_paymenter() { cd "$BASE_DIR" && docker compose logs -f; }
 
 show_info() {
     get_status_info
-    local detect_ip="127.0.0.1"
-    if [[ "$webui_port" != "N/A" ]]; then
-        detect_ip=$(get_public_ip)
-    fi
-    
+    DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${detect_ip}:${webui_port}${RESET}"
-    echo -e "${YELLOW}存储数据目录   : ${data_dir}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}面板安装目录   : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -254,38 +406,39 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      ◈  uPay 管理面板  ◈        ${RESET}"
+    echo -e "${GREEN}    ◈  Paymenter 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}2. 编译前端(修改主题和扩展后执行)${RESET}"
+    echo -e "${GREEN}3. 更新服务${RESET}"
+    echo -e "${GREEN}4. 卸载服务${RESET}"
+    echo -e "${GREEN}5. 启动服务${RESET}"
+    echo -e "${GREEN}6. 停止服务${RESET}"
+    echo -e "${GREEN}7. 重启服务${RESET}"
+    echo -e "${GREEN}8. 查看日志${RESET}"
+    echo -e "${GREEN}9. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_upay ;;
-        2) update_upay ;;
-        3) uninstall_upay ;;
-        4) start_upay ;;
-        5) stop_upay ;;
-        6) restart_upay ;;
-        7) logs_upay ;;
-        8) show_info ;;
+        1) install_paymenter ;;
+        2) build_assets ;;
+        3) update_paymenter ;;
+        4) uninstall_paymenter ;;
+        5) start_paymenter ;;
+        6) stop_paymenter ;;
+        7) restart_paymenter ;;
+        8) logs_paymenter ;;
+        9) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 
-# 主循环
 while true; do
     menu
     echo -ne "${YELLOW}按回车键继续...${RESET}"

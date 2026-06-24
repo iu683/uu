@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# LangBot 官方克隆版 Docker Compose 管理面板 
+# 1Shell 运维助手 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,9 +10,11 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="langbot"
-# 默认进入当前目录下的 LangBot/docker，如果脚本在其他地方运行，请修改此路径
-BASE_DIR="./LangBot/docker"
+CONTAINER_NAME="1shell"
+# 固定安装到 /opt/1Shell
+TARGET_DIR="/opt/1Shell"
+COMPOSE_FILE="$TARGET_DIR/docker-compose.yml"
+ENV_FILE="$TARGET_DIR/.env"
 
 # 检测并修复依赖与权限
 check_dependencies() {
@@ -31,12 +33,12 @@ check_dependencies() {
         echo -e "${YELLOW}检测到当前用户无 Docker 访问权限，正在尝试修复...${RESET}"
         sudo usermod -aG docker $USER
         echo -e "${GREEN}已将当前用户加入 docker 组。${RESET}"
-        echo -e "${RED}由于 Linux 机制，权限变更需要重新加载组。请执行 'newgrp docker' 或重新登录终端后再次运行此脚本。${RESET}"
+        echo -e "${RED}由于 Linux 机制，权限变更需要重新加载组。请执行 'newgrp docker' 。${RESET}"
         exit 1
     fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取容器状态、映射端口
 get_status_info() {
     # 1. 检查主容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -47,16 +49,11 @@ get_status_info() {
         status="${RED}未部署 / 未启动${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5300/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="5300"
-    else
-        webui_port="5300 (默认)"
+    # 2. 如果容器存在，从环境或容器中提取端口
+    if [ -f "$ENV_FILE" ]; then
+        webui_port=$(grep "^PORT=" "$ENV_FILE" | cut -d'=' -f2 | tr -d '\r ')
     fi
+    [[ -z "$webui_port" ]] && webui_port="3301"
 }
 
 get_public_ip() {
@@ -82,125 +79,143 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 按照官方指引克隆并部署 LangBot
-install_langbot() {
+# 按照官方指引克隆并部署 1Shell
+install_1shell() {
     check_dependencies
     
-    echo -e "${CYAN}====== 开始执行官方克隆部署 ======${RESET}"
+    echo -e "${CYAN}====== 开始执行 1Shell 克隆部署 ======${RESET}"
     
-    if [ -d "LangBot" ]; then
-        echo -e "${YELLOW}提示: 检测到当前目录下已存在 LangBot 文件夹。${RESET}"
-        echo -ne "${YELLOW}是否重新克隆？(y/n) [默认: n]: ${RESET}"
-        read -r re_clone
-        if [[ "$re_clone" == "y" || "$re_clone" == "Y" ]]; then
-            rm -rf LangBot
-            git clone https://github.com/langbot-app/LangBot
-        fi
-    else
-        git clone https://github.com/langbot-app/LangBot
+    # 确保对 /opt 有操作权限
+    if [ ! -w "/opt" ]; then
+        echo -e "${YELLOW}提示: 当前用户对 /opt 目录没有写权限，正在请求 sudo 权限创建目录...${RESET}"
+        sudo mkdir -p "$TARGET_DIR"
+        sudo chown -R $USER:$USER "$TARGET_DIR"
     fi
 
-    if [ ! -d "$BASE_DIR" ]; then
-        echo -e "${RED}错误: 未找到 $BASE_DIR 目录，请检查 Git 克隆是否成功！${RESET}"
+    if [ -d "$TARGET_DIR" ] && [ "$(ls -A $TARGET_DIR)" ]; then
+        echo -e "${YELLOW}提示: 检测到 $TARGET_DIR 文件夹已存在且不为空。${RESET}"
+        echo -ne "${YELLOW}是否清空并重新克隆？(y/n) [默认: n]: ${RESET}"
+        read -r re_clone
+        if [[ "$re_clone" == "y" || "$re_clone" == "Y" ]]; then
+            rm -rf "$TARGET_DIR"
+            git clone https://github.com/weidu12123/1Shell.git "$TARGET_DIR"
+        fi
+    else
+        git clone https://github.com/weidu12123/1Shell.git "$TARGET_DIR"
+    fi
+
+    if [ ! -f "$TARGET_DIR/docker-compose.yml" ]; then
+        echo -e "${RED}错误: 克隆失败或未在 $TARGET_DIR 中找到 docker-compose.yml！${RESET}"
         return
     fi
 
-    # 中国大陆镜像替换提示
-    echo -ne "${YELLOW}是否位于中国大陆，需要一键替换为官方提供的国内镜像源？(y/n) [默认: n]: ${RESET}"
-    read -r use_mirror
-    if [[ "$use_mirror" == "y" || "$use_mirror" == "Y" ]]; then
-        echo -e "${YELLOW}正在修改 docker-compose.yaml 使用国内镜像源...${RESET}"
-        sed -i 's|rockchin/langbot:latest|docker.langbot.app/langbot-public/rockchin/langbot:latest|g' "$BASE_DIR/docker-compose.yaml"
+    # 准备 .env 文件
+    if [ ! -f "$ENV_FILE" ]; then
+        echo -e "${YELLOW}正在创建 .env 配置文件...${RESET}"
+        cp "$TARGET_DIR/.env.example" "$ENV_FILE"
     fi
 
-    # 可选配置 LANGBOT_BOX_ROOT
+    # 配置环境变量交互
     echo -e "${CYAN}----------------------------------${RESET}"
-    echo -e "${YELLOW}提示: 若要改 Box 根目录，请使用绝对路径设置。${RESET}"
-    echo -ne "${YELLOW}是否设置自定义 LANGBOT_BOX_ROOT 绝对路径？(直接回车跳过使用默认值): ${RESET}"
-    read -r custom_box_root
+    echo -e "${YELLOW}开始初始化 1Shell 核心配置参数：${RESET}"
+    
+    echo -ne "${YELLOW}1. 请输入服务监听端口 [默认: 3301]: ${RESET}"
+    read -r custom_port
+    [[ -n "$custom_port" ]] && sed -i "s|^PORT=.*|PORT=$custom_port|g" "$ENV_FILE"
 
-    cd "$BASE_DIR" || return
+    echo -ne "${YELLOW}2. 请输入 OpenAI 兼容 API 基础地址 [默认: https://api.openai.com/v1]: ${RESET}"
+    read -r api_base
+    [[ -n "$api_base" ]] && sed -i "s|^OPENAI_API_BASE=.*|OPENAI_API_BASE=$api_base|g" "$ENV_FILE"
 
-    if [[ -n "$custom_box_root" ]]; then
-        if [[ ! "$custom_box_root" =~ ^/ ]]; then
-            echo -e "${RED}错误: Box 根目录必须使用绝对路径！部署中断。${RESET}"
-            cd - > /dev/null || return
-            return
-        fi
-        echo -e "${YELLOW}正在使用自定义路径启动官方容器...${RESET}"
-        export LANGBOT_BOX_ROOT="$custom_box_root"
-        docker compose --profile all up -d
-    else
-        echo -e "${YELLOW}正在按照官方推荐启动容器 (开启 --profile all)...${RESET}"
-        docker compose --profile all up -d
-    fi
+    echo -ne "${YELLOW}3. 请输入 OpenAI API Key: ${RESET}"
+    read -r api_key
+    [[ -n "$api_key" ]] && sed -i "s|^OPENAI_API_KEY=.*|OPENAI_API_KEY=$api_key|g" "$ENV_FILE"
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    echo -ne "${YELLOW}4. 请输入使用的模型名称 [默认: gpt-4o]: ${RESET}"
+    read -r model_name
+    [[ -n "$model_name" ]] && sed -i "s|^OPENAI_MODEL=.*|OPENAI_MODEL=$model_name|g" "$ENV_FILE"
+
+    echo -ne "${YELLOW}5. 请输入 Web 控制台管理员用户名 [默认: admin]: ${RESET}"
+    read -r username
+    [[ -n "$username" ]] && sed -i "s|^APP_LOGIN_USERNAME=.*|APP_LOGIN_USERNAME=$username|g" "$ENV_FILE"
+
+    echo -ne "${YELLOW}6. 请输入 Web 控制台管理员密码 (必填以确保能远程访问): ${RESET}"
+    read -r password
+    [[ -n "$password" ]] && sed -i "s|^APP_LOGIN_PASSWORD=.*|APP_LOGIN_PASSWORD=$password|g" "$ENV_FILE"
+
+    # 启动与构建容器
+    cd "$TARGET_DIR" || return
+    echo -e "${YELLOW}正在构建 1Shell 镜像并启动容器 (首次构建需要一点时间)...${RESET}"
+    docker compose up -d --build
+
+    echo -e "${YELLOW}等待容器启动 (约3秒)...${RESET}"
     sleep 3
 
     DETECT_IP=$(get_public_ip)
+    get_status_info
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      LangBot 启动命令已发送！    ${RESET}"
+    echo -e "${GREEN}      1Shell 部署启动指令已执行！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}OneBot 反向端口: 2280-2285${RESET}"
-    echo -e "${RED}首次启动请注意：请观察终端输出或容器日志，按照提示继续配置文件。${RESET}"
+    echo -e "${YELLOW}控制台访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}管理员用户名   : $username${RESET}"
+    echo -e "${YELLOW}管理员密码     : $password${RESET}"
+    echo -e "${RED}安全提示: 默认挂载为宿主机各运维目录的只读(:ro)权限。若需文件修改功能，请在面板中添加该机器作为“SSH 主机”操作。${RESET}"
     echo -e "${GREEN}================================${RESET}"
     
     cd - > /dev/null || return
 }
 
-# 更新 LangBot 官方代码与镜像
-update_langbot() {
-    if [ ! -d "$BASE_DIR" ]; then
-        echo -e "${RED}错误: 未检测到官方目录，请先执行选项 1 部署！${RESET}"
+# 更新 1Shell 代码并重新编译
+update_1shell() {
+    if [ ! -d "$TARGET_DIR" ]; then
+        echo -e "${RED}错误: 未检测到官方目录 $TARGET_DIR，请先执行选项 1 部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在同步官方最新代码 (Git Pull)...${RESET}"
-    cd "$BASE_DIR/.." && git pull
-    cd "docker" || return
-    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
-    docker compose --profile all pull
-    docker compose --profile all up -d --remove-orphans
-    echo -e "${GREEN}更新完成！${RESET}"
+    echo -e "${YELLOW}正在拉取 Git 最新代码...${RESET}"
+    cd "$TARGET_DIR" && git pull
+    echo -e "${YELLOW}检测到代码更新，正在重新构建并重启容器...${RESET}"
+    docker compose up -d --build --remove-orphans
+    echo -e "${GREEN}1Shell 重新构建与升级完成！${RESET}"
     cd - > /dev/null || return
 }
 
-# 卸载 LangBot 容器
-uninstall_langbot() {
-    if [ ! -d "$BASE_DIR" ]; then
-        echo -e "${RED}错误: 未检测到官方目录！${RESET}"
+# 卸载 1Shell 容器
+uninstall_1shell() {
+    if [ ! -d "$TARGET_DIR" ]; then
+        echo -e "${RED}错误: 未检测到目录 $TARGET_DIR！${RESET}"
         return
     fi
-    echo -ne "${YELLOW}确定要停止并删除 LangBot 官方容器组吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要停止并删除 1Shell 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        cd "$BASE_DIR" || return
-        docker compose --profile all down
-        echo -e "${GREEN}官方容器组已停止并移除。${RESET}"
-        cd - > /dev/null || return
+        cd "$TARGET_DIR" || return
+        docker compose down
+        echo -e "${GREEN}1Shell 容器已停止并移除。${RESET}"
         
-        echo -ne "${YELLOW}是否彻底删除克隆的 LangBot 源码文件夹？(y/n): ${RESET}"
+        echo -ne "${YELLOW}是否彻底删除 /opt/1Shell 源码及持久化数据文件夹？(y/n): ${RESET}"
         read -r delete_dir
         if [ "$delete_dir" = "y" ] || [ "$delete_dir" = "Y" ]; then
-            rm -rf LangBot
-            echo -e "${GREEN}LangBot 源码目录已彻底删除。${RESET}"
+            cd - > /dev/null || return
+            rm -rf "$TARGET_DIR"
+            echo -e "${GREEN}1Shell 的所有文件与数据已彻底清理。${RESET}"
+        else
+            cd - > /dev/null || return
         fi
     fi
 }
 
-start_langbot() { 
-    if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose --profile all start && echo -e "${GREEN}服务已启动${RESET}" && cd - > /dev/null; fi
+start_1shell() { 
+    if [ -d "$TARGET_DIR" ]; then cd "$TARGET_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}" && cd - > /dev/null; fi
 }
-stop_langbot() { 
-    if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose --profile all stop && echo -e "${YELLOW}服务已停止${RESET}" && cd - > /dev/null; fi
+stop_1shell() { 
+    if [ -d "$TARGET_DIR" ]; then cd "$TARGET_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}" && cd - > /dev/null; fi
 }
-restart_langbot() { 
-    if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose --profile all restart && echo -e "${GREEN}服务已重启${RESET}" && cd - > /dev/null; fi
+restart_1shell() { 
+    if [ -d "$TARGET_DIR" ]; then cd "$TARGET_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}" && cd - > /dev/null; fi
 }
-logs_langbot() { 
-    if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose --profile all logs -f "$CONTAINER_NAME"; cd - > /dev/null; fi
+logs_1shell() { 
+    if [ -d "$TARGET_DIR" ]; then cd "$TARGET_DIR" && docker compose logs -f "$CONTAINER_NAME"; cd - > /dev/null; fi
 }
 
 show_info() {
@@ -208,8 +223,8 @@ show_info() {
     local DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}官方目录位置   : $BASE_DIR${RESET}"
+    echo -e "${YELLOW}控制台访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}安装绝对路径   : $TARGET_DIR${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -217,7 +232,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  LangBot 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}     ◈  1Shell 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -235,13 +250,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_langbot ;;
-        2) update_langbot ;;
-        3) uninstall_langbot ;;
-        4) start_langbot ;;
-        5) stop_langbot ;;
-        6) restart_langbot ;;
-        7) logs_langbot ;;
+        1) install_1shell ;;
+        2) update_1shell ;;
+        3) uninstall_1shell ;;
+        4) start_1shell ;;
+        5) stop_1shell ;;
+        6) restart_1shell ;;
+        7) logs_1shell ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

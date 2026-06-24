@@ -1,22 +1,20 @@
 #!/bin/bash
 # =================================================================
-# ACG-FAKA 发卡系统 (支持外部 MySQL & 外部多分区 Redis) 自动化管理面板
+# Twilight (Emby/Jellyfin 大管家) 混合动力自动化编译部署管理面板
 # =================================================================
 
-# 颜色
+# 颜色定义
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
-RESET="\03 counseling"
 RESET="\033[0m"
 
-APP_NAME="acg-faka-app"
-BASE_DIR="/opt/acg-faka"
-SRC_DIR="$BASE_DIR" 
-REPO_URL="https://github.com/lizhipay/acg-faka.git"
+BASE_DIR="/opt/twilight"
+SRC_DIR="$BASE_DIR/Twilight"
+REPO_URL="https://github.com/Prejudice-Studio/Twilight.git"
 
-# 检测依赖
+# 检测基础依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
@@ -28,383 +26,458 @@ check_dependencies() {
     fi
 }
 
-# 动态获取服务端口与运行状态
+# 获取集群状态
 get_status_info() {
-    local container_id=$(docker ps -q -f "ancestor=acg-faka-app" -f "status=running" 2>/dev/null)
-    [[ -z "$container_id" ]] && container_id=$(docker ps -q -f "name=app" -f "status=running" 2>/dev/null)
-
-    if [[ -n "$container_id" ]]; then
-        status="${GREEN}运行中${RESET}"
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8080"
-    else
-        if [ -d "$SRC_DIR/.git" ]; then
-            status="${RED}已停止${RESET}"
+    if [ -d "$SRC_DIR" ]; then
+        local running_count=$(docker ps -q -f "name=twilight-" | wc -l)
+        if [ "$running_count" -ge 1 ]; then
+            status="${GREEN}运行中 (已拉起 $running_count 个容器)${RESET}"
         else
-            status="${RED}未部署${RESET}"
+            status="${RED}已停止${RESET}"
         fi
-        webui_port="N/A"
+        
+        if [ -f "$SRC_DIR/.env" ]; then
+            web_port=$(grep "WEBUI_PORT=" "$SRC_DIR/.env" 2>/dev/null | cut -d'=' -f2)
+            [[ -z "$web_port" ]] && web_port="3000"
+        else
+            web_port="3000"
+        fi
+    else
+        status="${RED}未部署${RESET}"
+        web_port="N/A"
     fi
+}
+
+# 动态分析组件形态
+get_env_summary() {
+    if [ -f "$SRC_DIR/docker-compose.yml" ]; then
+        local has_pg=$(grep "container_name: twilight-postgres" "$SRC_DIR/docker-compose.yml")
+        local has_rds=$(grep "container_name: twilight-redis" "$SRC_DIR/docker-compose.yml")
+        
+        if [[ -n "$has_pg" ]]; then pg_info="${GREEN}内置容器${RESET}"; else pg_info="${YELLOW}外部托管${RESET}"; fi
+        if [[ -n "$has_rds" ]]; then rds_info="${GREEN}内置容器${RESET}"; else rds_info="${YELLOW}外部托管${RESET}"; fi
+    else
+        pg_info="${RED}未部署${RESET}"
+        rds_info="${RED}未部署${RESET}"
+    fi
+    echo -e "PostgreSQL: $pg_info | Redis: $rds_info"
 }
 
 get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
+    for url in "https://api.ipify.org" "https://4.ip.sb"; do
+        ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+    done
     echo "127.0.0.1" && return 0
 }
 
-# 动态分析当前组件环境状态
-get_env_summary() {
-    if [ -f "$SRC_DIR/docker-compose.yml" ]; then
-        local has_mysql=$(grep "container_name: acg-faka-mysql" "$SRC_DIR/docker-compose.yml")
-        local has_redis=$(grep "container_name: acg-faka-redis" "$SRC_DIR/docker-compose.yml")
-        
-        if [[ -n "$has_mysql" ]]; then mysql_info="${GREEN}内置容器${RESET}"; else mysql_info="${YELLOW}外部托管${RESET}"; fi
-        if [[ -n "$has_redis" ]]; then redis_info="${GREEN}内置容器${RESET}"; else redis_info="${YELLOW}外部托管${RESET}"; fi
-    else
-        mysql_info="${RED}未部署${RESET}"
-        redis_info="${RED}未部署${RESET}"
-    fi
-    echo -e "MySQL: $mysql_info | Redis: $redis_info"
-}
-
-# 部署核心逻辑
-install_translate() {
+# 1. 部署启动
+install_twilight() {
     check_dependencies
+    mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 1. 端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 ACG-FAKA 映射端口 (对应 ACG_HTTP_PORT) [默认: 8080]: ${RESET}"
+    echo -e "${CYAN}====== 1. 前端基础配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Twilight 前端网络访问端口 [默认: 3000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
+    [[ -z "$custom_port" ]] && custom_port="3000"
 
-    # MySQL 路由配置
-    echo -e "\n${CYAN}====== 2. MySQL 数据库配置 ======${RESET}"
-    echo -e "${YELLOW}请选择 MySQL 数据库类型:${RESET}"
-    echo -e "  ${CYAN}1.${RESET} 使用集群自带内置 MySQL 容器 (自动创建)"
-    echo -e "  ${CYAN}2.${RESET} 使用外部独立/远程 MySQL 数据库"
+    echo -ne "${YELLOW}请输入初始超级管理员用户名 (首位注册以此为准) [默认: admin]: ${RESET}"
+    read -r admin_user
+    [[ -z "$admin_user" ]] && admin_user="admin"
+
+    echo -ne "${YELLOW}请输入 Bot 内部通讯密钥 (建议随机长字符串) [默认: secret_twilight_666]: ${RESET}"
+    read -r bot_secret
+    [[ -z "$bot_secret" ]] && bot_secret="secret_twilight_666"
+
+    # PostgreSQL 路由分配
+    echo -e "\n${CYAN}====== 2. PostgreSQL 数据库配置 ======${RESET}"
+    echo -e "${YELLOW}请选择 PostgreSQL 架构类型:${RESET}"
+    echo -e "  ${CYAN}1.${RESET} 使用集群自带内置 PostgreSQL 容器 (全自动)"
+    echo -e "  ${CYAN}2.${RESET} 使用外部独立/远程 PostgreSQL 数据库"
     echo -ne "${YELLOW}请选择 (1-2) [默认: 1]: ${RESET}"
-    read -r db_choice
+    read -r pg_choice
 
-    local use_builtin_mysql="true"
-    local tip_db_host="mysql"
-    local tip_db_name="acg_faka"
-    local tip_db_user="acg"
-    local tip_db_pass="acg_password"
+    local use_builtin_pg="true"
+    local fin_pg_host="postgres"
+    local fin_pg_port="5432"
+    local fin_pg_user="twilight"
+    local fin_pg_pass="twilight_pass_999"
+    local fin_pg_db="twilight"
 
-    if [[ "$db_choice" == "2" ]]; then
-        use_builtin_mysql="false"
-        echo -e "\n${CYAN}--- 远程 MySQL 数据库连接配置 ---${RESET}"
-        echo -ne "${YELLOW}请输入远程 MySQL 主机IP/域名: ${RESET}"
-        read -r remote_db_host
-        while [[ -z "$remote_db_host" ]]; do echo -ne "${RED}不能为空，请重新输入: ${RESET}"; read -r remote_db_host; done
+    if [[ "$pg_choice" == "2" ]]; then
+        use_builtin_pg="false"
+        echo -e "\n${CYAN}--- 远程 PostgreSQL 数据库连接凭证 ---${RESET}"
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 主机 IP/域名: ${RESET}"
+        read -r remote_pg_host
+        while [[ -z "$remote_pg_host" ]]; do echo -ne "${RED}不能为空: ${RESET}"; read -r remote_pg_host; done
         
-        echo -ne "${YELLOW}请输入远程 MySQL 端口 [默认: 3306]: ${RESET}"
-        read -r remote_db_port
-        [[ -z "$remote_db_port" ]] && remote_db_port="3306"
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 端口 [默认: 5432]: ${RESET}"
+        read -r remote_pg_port
+        [[ -z "$remote_pg_port" ]] && remote_pg_port="5432"
 
-        echo -ne "${YELLOW}请输入远程 MySQL 用户名: ${RESET}"
-        read -r remote_db_user
-        while [[ -z "$remote_db_user" ]]; do echo -ne "${RED}不能为空，请重新输入: ${RESET}"; read -r remote_db_user; done
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 用户名 [默认: twilight]: ${RESET}"
+        read -r remote_pg_user
+        [[ -z "$remote_pg_user" ]] && remote_pg_user="twilight"
 
-        echo -ne "${YELLOW}请输入远程 MySQL 密码: ${RESET}"
-        read -r remote_db_pass
-        while [[ -z "$remote_db_pass" ]]; do echo -ne "${RED}不能为空，请重新输入: ${RESET}"; read -r remote_db_pass; done
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 密码: ${RESET}"
+        read -r remote_pg_pass
+        while [[ -z "$remote_pg_pass" ]]; do echo -ne "${RED}不能为空: ${RESET}"; read -r remote_pg_pass; done
 
-        echo -ne "${YELLOW}请输入远程 MySQL 数据库名: ${RESET}"
-        read -r remote_db_name
-        while [[ -z "$remote_db_name" ]]; do echo -ne "${RED}不能为空，请重新输入: ${RESET}"; read -r remote_db_name; done
+        echo -ne "${YELLOW}请输入远程 PostgreSQL 数据库名 [默认: twilight]: ${RESET}"
+        read -r remote_pg_db
+        [[ -z "$remote_pg_db" ]] && remote_pg_db="twilight"
 
-        tip_db_host="${remote_db_host}:${remote_db_port}"
-        tip_db_name="$remote_db_name"
-        tip_db_user="$remote_db_user"
-        tip_db_pass="$remote_db_pass"
+        fin_pg_host="$remote_pg_host"
+        fin_pg_port="$remote_pg_port"
+        fin_pg_user="$remote_pg_user"
+        fin_pg_pass="$remote_pg_pass"
+        fin_pg_db="$remote_pg_db"
     fi
 
-    # Redis 路由配置
+    # Redis 路由分配
     echo -e "\n${CYAN}====== 3. Redis 缓存配置 ======${RESET}"
-    echo -e "${YELLOW}请选择 Redis 缓存类型:${RESET}"
-    echo -e "  ${CYAN}1.${RESET} 使用集群自带内置 Redis 容器 (自动创建)"
-    echo -e "  ${CYAN}2.${RESET} 使用外部独立/远程 Redis 缓存"
+    echo -e "${YELLOW}请选择 Redis 缓存架构类型:${RESET}"
+    echo -e "  ${CYAN}1.${RESET} 使用集群自带内置 Redis 容器 (全自动)"
+    echo -e "  ${CYAN}2.${RESET} 使用外部独立/远程 Redis 缓存服务器"
     echo -ne "${YELLOW}请选择 (1-2) [默认: 1]: ${RESET}"
     read -r redis_choice
 
     local use_builtin_redis="true"
-    local tip_redis_host="redis"
-    local tip_redis_port="6379"
-    local tip_redis_pass=""
-    local tip_redis_db="0"
+    local fin_redis_url="redis://redis:6379/0"
+    local fin_redis_db="0"
 
     if [[ "$redis_choice" == "2" ]]; then
         use_builtin_redis="false"
-        echo -e "\n${CYAN}--- 远程 Redis 缓存连接配置 ---${RESET}"
-        echo -ne "${YELLOW}请输入远程 Redis 主机IP/域名: ${RESET}"
+        echo -e "\n${CYAN}--- 远程 Redis 缓存连接凭证 ---${RESET}"
+        echo -ne "${YELLOW}请输入远程 Redis 主机 IP/域名: ${RESET}"
         read -r remote_redis_host
-        while [[ -z "$remote_redis_host" ]]; do echo -ne "${RED}不能为空，请重新输入: ${RESET}"; read -r remote_redis_host; done
+        while [[ -z "$remote_redis_host" ]]; do echo -ne "${RED}不能为空: ${RESET}"; read -r remote_redis_host; done
 
         echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
         read -r remote_redis_port
         [[ -z "$remote_redis_port" ]] && remote_redis_port="6379"
 
-        echo -ne "${YELLOW}请输入远程 Redis 密码 (如果没有请留空直接回车): ${RESET}"
+        echo -ne "${YELLOW}请输入远程 Redis 认证密码 (无密码直接回车): ${RESET}"
         read -r remote_redis_pass
 
-        echo -ne "${YELLOW}请输入 Redis 分区编号/DB ID (0-15) [默认: 0]: ${RESET}"
+        echo -ne "${YELLOW}请输入预备分配的 Redis 分区/DB ID (0-15) [默认: 0]: ${RESET}"
         read -r remote_redis_db
         [[ -z "$remote_redis_db" ]] && remote_redis_db="0"
+        fin_redis_db="$remote_redis_db"
 
-        tip_redis_host="$remote_redis_host"
-        tip_redis_port="$remote_redis_port"
-        tip_redis_pass="$remote_redis_pass"
-        tip_redis_db="$remote_redis_db"
-    else
-        echo -ne "${YELLOW}请输入内置 Redis 分区编号/DB ID (0-15) [默认: 0]: ${RESET}"
-        read -r builtin_redis_db
-        [[ -z "$builtin_redis_db" ]] && builtin_redis_db="0"
-        tip_redis_db="$builtin_redis_db"
-    fi
-
-    # 克隆官方仓库到当前工作目录
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "\n${YELLOW}正在克隆官方 GitHub 仓库...${RESET}"
-        mkdir -p "$SRC_DIR"
-        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
-        if [ $? -eq 0 ]; then
-            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
-            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
-            rm -rf "$SRC_DIR/tmp_repo"
+        if [[ -z "$remote_redis_pass" ]]; then
+            fin_redis_url="redis://${remote_redis_host}:${remote_redis_port}/${remote_redis_db}"
         else
-            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
-            exit 1
+            fin_redis_url="redis://:${remote_redis_pass}@${remote_redis_host}:${remote_redis_port}/${remote_redis_db}"
         fi
     else
-        echo -e "\n${GREEN}检测到本地已存在官方仓库，正在同步最新代码...${RESET}"
+        echo -ne "${YELLOW}请输入内置 Redis 分区/DB ID (0-15) [默认: 0]: ${RESET}"
+        read -r builtin_redis_db
+        [[ -z "$builtin_redis_db" ]] && builtin_redis_db="0"
+        fin_redis_db="$builtin_redis_db"
+        fin_redis_url="redis://redis:6379/${builtin_redis_db}"
+    fi
+
+    # Emby 核心对接
+    echo -e "\n${CYAN}====== 4. Emby 服务器业务对接 ======${RESET}"
+    echo -ne "${YELLOW}请输入您的 Emby 服务器地址 (如 http://127.0.0.1:8096): ${RESET}"
+    read -r emby_url
+    while [[ -z "$emby_url" ]]; do echo -ne "${RED}不能为空，请重新输入: ${RESET}"; read -r emby_url; done
+
+    echo -ne "${YELLOW}请输入您的 Emby API Token: ${RESET}"
+    read -r emby_token
+    while [[ -z "$emby_token" ]]; do echo -ne "${RED}不能为空，请重新输入: ${RESET}"; read -r emby_token; done
+
+    # 拉取或同步源码
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "\n${YELLOW}正在克隆 Twilight 官方 GitHub 源码仓库...${RESET}"
+        git clone "$REPO_URL" "$SRC_DIR"
+        if [ $? -ne 0 ]; then echo -e "${RED}错误: 克隆失败，请检查网络！${RESET}"; exit 1; fi
+    else
+        echo -e "\n${GREEN}本地已存在源码，正在同步 Git 分支...${RESET}"
         cd "$SRC_DIR" && git pull
     fi
 
-    cd "$SRC_DIR"
+    cd "$SRC_DIR" || exit
 
-    # 【核心修复】：强力创建本地物理目录，赋予最高权限，防止空挂载导致容器内代码不释放
-    echo -e "${YELLOW}正在强力修复持久化卷的本地文件映射骨架与权限...${RESET}"
-    mkdir -p config kernel/Install runtime assets/cache app/Plugin app/Pay app/View/User/Theme
-    chmod -R 777 config kernel/Install runtime assets/cache app/Plugin app/Pay app/View/User/Theme
+    # 格式化 config.toml
+    echo -e "${YELLOW}正在注入配置文件 config.toml ...${RESET}"
+    cp deploy/docker/config.docker.toml config.toml
+    
+    sed -i "s|emby_url = \"http://your-emby-server:8096\"|emby_url = \"${emby_url}\"|g" config.toml
+    sed -i "s|emby_token = \"\"|emby_token = \"${emby_token}\"|g" config.toml
+    sed -i "s|redis_url = \"redis://redis:6379/0\"|redis_url = \"${fin_redis_url}\"|g" config.toml
+    
+    sed -i "s|postgres_host = \"postgres\"|postgres_host = \"${fin_pg_host}\"|g" config.toml
+    sed -i "s|postgres_port = 5432|postgres_port = ${fin_pg_port}|g" config.toml
+    sed -i "s|postgres_user = \"twilight\"|postgres_user = \"${fin_pg_user}\"|g" config.toml
+    sed -i "s|postgres_password = \"twilight\"|postgres_password = \"${fin_pg_pass}\"|g" config.toml
+    sed -i "s|postgres_database = \"twilight\"|postgres_database = \"${fin_pg_db}\"|g" config.toml
 
-    # ======== 动态组装 docker-compose.yml ========
-    cat <<EOF > "$SRC_DIR/docker-compose.yml"
+    # 释放前端基址
+    cp webui/.env.example webui/.env
+
+    # 组装宿主机全局 .env
+    cat <<EOF > .env
+TZ=Asia/Shanghai
+WEBUI_PORT=${custom_port}
+BACKEND_URL=http://twilight:5000
+POSTGRES_PASSWORD=${fin_pg_pass}
+BOT_INTERNAL_SECRET=${bot_secret}
+ADMIN_USERNAMES=${admin_user}
+SITE_NAME=Twilight
+LOG_LEVEL=info
+RUNTIME_LOG_LIMIT=5000
+EOF
+
+    # 重组解耦型 docker-compose.yml (彻底修复缩进问题)
+    cat <<EOF > docker-compose.yml
+name: twilight
+
+x-service-defaults: &service-defaults
+  init: true
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
-  app:
+EOF
+
+    if [[ "$use_builtin_pg" == "true" ]]; then
+        cat <<EOF >> docker-compose.yml
+  postgres:
+    <<: *service-defaults
+    image: postgres:17-alpine
+    container_name: twilight-postgres
+    restart: unless-stopped
+    environment:
+      TZ: \${TZ:-Asia/Shanghai}
+      POSTGRES_USER: twilight
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-twilight}
+      POSTGRES_DB: twilight
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/docker/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U twilight"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - twilight-net
+EOF
+    fi
+
+    if [[ "$use_builtin_redis" == "true" ]]; then
+        cat <<EOF >> docker-compose.yml
+  redis:
+    <<: *service-defaults
+    image: redis:7-alpine
+    container_name: twilight-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    environment:
+      TZ: \${TZ:-Asia/Shanghai}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - twilight-net
+EOF
+    fi
+
+    cat <<EOF >> docker-compose.yml
+  twilight:
+    <<: *service-defaults
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: acg-faka-app
+    image: twilight-backend:latest
+    container_name: twilight-backend
     restart: unless-stopped
-    ports:
-      - "\${ACG_HTTP_PORT:-8080}:80"
-    volumes:
-      - acg_config:/var/www/html/config
-      - acg_install:/var/www/html/kernel/Install
-      - acg_runtime:/var/www/html/runtime
-      - acg_assets_cache:/var/www/html/assets/cache
-      - acg_plugins:/var/www/html/app/Plugin
-      - acg_pay:/var/www/html/app/Pay
-      - acg_themes:/var/www/html/app/View/User/Theme
 EOF
 
-    if [[ "$use_builtin_mysql" == "true" || "$use_builtin_redis" == "true" ]]; then
-        cat <<EOF >> "$SRC_DIR/docker-compose.yml"
-    depends_on:
-EOF
-        if [[ "$use_builtin_mysql" == "true" ]]; then
-            cat <<EOF >> "$SRC_DIR/docker-compose.yml"
-      mysql:
-        condition: service_healthy
-EOF
-        fi
-        if [[ "$use_builtin_redis" == "true" ]]; then
-            cat <<EOF >> "$SRC_DIR/docker-compose.yml"
-      redis:
-        condition: service_started
-EOF
-        fi
+    if [[ "$use_builtin_pg" == "true" || "$use_builtin_redis" == "true" ]]; then
+        echo "    depends_on:" >> docker-compose.yml
+        [[ "$use_builtin_pg" == "true" ]] && echo -e "      postgres:\n        condition: service_healthy" >> docker-compose.yml
+        [[ "$use_builtin_redis" == "true" ]] && echo -e "      redis:\n        condition: service_healthy" >> docker-compose.yml
     fi
 
-    if [[ "$use_builtin_mysql" == "true" ]]; then
-        cat <<EOF >> "$SRC_DIR/docker-compose.yml"
-
-  mysql:
-    image: mysql:8.0
-    container_name: acg-faka-mysql
-    restart: unless-stopped
+    cat <<EOF >> docker-compose.yml
     environment:
-      MYSQL_ROOT_PASSWORD: \${MYSQL_ROOT_PASSWORD:-root_password}
-      MYSQL_DATABASE: \${MYSQL_DATABASE:-acg_faka}
-      MYSQL_USER: \${MYSQL_USER:-acg}
-      MYSQL_PASSWORD: \${MYSQL_PASSWORD:-acg_password}
-      TZ: Asia/Shanghai
-    command:
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
-      - --default-authentication-plugin=mysql_native_password
+      TZ: \${TZ:-Asia/Shanghai}
+      TWILIGHT_GLOBAL_SERVER_NAME: \${SITE_NAME:-Twilight}
+      TWILIGHT_LOG_LEVEL: \${LOG_LEVEL:-info}
+      TWILIGHT_RUNTIME_LOG_LIMIT: \${RUNTIME_LOG_LIMIT:-5000}
+      TWILIGHT_DATABASE_DRIVER: postgres
+      TWILIGHT_POSTGRES_HOST: ${fin_pg_host}
+      TWILIGHT_POSTGRES_PORT: ${fin_pg_port}
+      TWILIGHT_POSTGRES_USER: ${fin_pg_user}
+      TWILIGHT_POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+      TWILIGHT_POSTGRES_DATABASE: ${fin_pg_db}
+      TWILIGHT_POSTGRES_SSLMODE: disable
+      TWILIGHT_REDIS_URL: ${fin_redis_url}
+      TWILIGHT_API_HOST: 0.0.0.0
+      TWILIGHT_API_PORT: 5000
+      TWILIGHT_ADMIN_USERNAMES: \${ADMIN_USERNAMES:-admin}
+      TWILIGHT_BOT_INTERNAL_SECRET: \${BOT_INTERNAL_SECRET:-}
+    env_file:
+      - path: .env
+        required: false
     volumes:
-      - acg_mysql:/var/lib/mysql
+      - ./config.toml:/app/config.toml:ro
+      - twilight_uploads:/app/uploads
+      - twilight_backups:/app/db/backups
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "mysqladmin ping -h 127.0.0.1 -uroot -p\$\${MYSQL_ROOT_PASSWORD} --silent",
-        ]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-EOF
-    fi
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5000/api/v1/system/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - twilight-net
 
-    if [[ "$use_builtin_redis" == "true" ]]; then
-        cat <<EOF >> "$SRC_DIR/docker-compose.yml"
-
-  redis:
-    image: redis:7-alpine
-    container_name: acg-faka-redis
+  webui:
+    <<: *service-defaults
+    build:
+      context: ./webui
+      dockerfile: Dockerfile
+    image: twilight-webui:latest
+    container_name: twilight-webui
     restart: unless-stopped
-    command: redis-server --appendonly yes
-    volumes:
-      - acg_redis:/data
-EOF
-    fi
+    depends_on:
+      twilight:
+        condition: service_healthy
+    environment:
+      TZ: \${TZ:-Asia/Shanghai}
+      NODE_ENV: production
+      PORT: 3000
+      BACKEND_URL: \${BACKEND_URL:-http://twilight:5000}
+    env_file:
+      - path: webui/.env
+        required: false
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - twilight-net
+    ports:
+      - "\${WEBUI_PORT:-3000}:3000"
 
-    cat <<EOF >> "$SRC_DIR/docker-compose.yml"
+networks:
+  twilight-net:
+    driver: bridge
+    name: twilight-net
 
 volumes:
-  acg_config:
-  acg_install:
-  acg_runtime:
-  acg_assets_cache:
-  acg_plugins:
-  acg_pay:
-  acg_themes:
+  twilight_uploads:
+    name: twilight-uploads
+  twilight_backups:
+    name: twilight-backups
 EOF
 
-    if [[ "$use_builtin_mysql" == "true" ]]; then
-        echo "  acg_mysql:" >> "$SRC_DIR/docker-compose.yml"
-    fi
-    if [[ "$use_builtin_redis" == "true" ]]; then
-        echo "  acg_redis:" >> "$SRC_DIR/docker-compose.yml"
-    fi
+    [[ "$use_builtin_pg" == "true" ]] && echo -e "  postgres_data:\n    name: twilight-postgres-data" >> docker-compose.yml
+    [[ "$use_builtin_redis" == "true" ]] && echo -e "  redis_data:\n    name: twilight-redis-data" >> docker-compose.yml
 
-    echo -e "\n${YELLOW}正在执行全新无缓存重编启动 (ACG_HTTP_PORT=$custom_port)...${RESET}"
-    # 使用 --force-recreate 强力冲刷可能卡住的 Docker 虚拟网络和旧缓存
-    ACG_HTTP_PORT=$custom_port docker compose up -d --build --force-recreate
+    echo -e "\n${YELLOW}正在编译并拉起容器生态集群 (Next.js 首次编译较慢)...${RESET}"
+    docker compose up -d --build
 
-    echo -e "${YELLOW}正在等待容器集群拉起并向持久化卷释放源码 (约 8 秒)...${RESET}"
-    sleep 8
+    echo -e "${YELLOW}正在建立生命周期健康检查...${RESET}"
+    sleep 5
 
-    # 【关键补强】：让容器内部动态生成的目录在宿主机上也获得 777 读写全开权限
-    chmod -R 777 config kernel/Install runtime assets/cache app/Plugin app/Pay app/View/User/Theme 2>/dev/null
-
-    get_status_info
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}       ACG-FAKA 官方原生集群编译并启动成功！        ${RESET}"
+    echo -e "${GREEN}       Twilight 混合动力集群部署成功！               ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}默认访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}后台管理地址 : http://${DETECT_IP}:${custom_port}/admin${RESET}"
+    echo -e "${YELLOW}前端访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}当前数据库源 : PostgreSQL -> ${fin_pg_host}:${fin_pg_port}${RESET}"
+    echo -e "${YELLOW}当前缓存源   : Redis -> ${fin_redis_url} (分区 ${fin_redis_db})${RESET}"
     echo -e "${GREEN}----------------------------------------------------${RESET}"
-    echo -e "${CYAN}📝 首次安装向导页面填写指南（非常重要）：${RESET}"
-    echo -e "   - 数据库地址 : ${GREEN}${tip_db_host}${RESET}"
-    echo -e "   - 数据库名称 : ${GREEN}${tip_db_name}${RESET}"
-    echo -e "   - 数据库账号 : ${GREEN}${tip_db_user}${RESET}"
-    echo -e "   - 数据库密码 : ${GREEN}${tip_db_pass}${RESET}"
-    echo -e "   - 数据库前缀 : ${GREEN}acg_${RESET}"
-    echo -e "   - 缓存驱动   : ${GREEN}Redis${RESET}"
-    echo -e "   - Redis地址  : ${GREEN}${tip_redis_host}${RESET}"
-    echo -e "   - Redis端口  : ${GREEN}${tip_redis_port}${RESET}"
-    if [[ -n "$tip_redis_pass" ]]; then
-    echo -e "   - Redis密码  : ${GREEN}${tip_redis_pass}${RESET}"
-    fi
-    echo -e "   - Redis数据库: ${GREEN}${tip_redis_db}${RESET}"
+    echo -e "${CYAN}🔑 首次激活指引：${RESET}"
+    echo -e "   1. 浏览器打开上面的网页，点击注册。"
+    echo -e "   2. 注册时填写的用户名【必须】是: ${GREEN}${admin_user}${RESET}"
+    echo -e "   3. 注册成功即刻自动切入超级管理员面板权限！"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 原生更新
-update_translate() {
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
-        return
+# 2. 更新容器
+update_twilight() {
+    if [ -d "$SRC_DIR/.git" ]; then
+        echo -e "${YELLOW}正在从官方 GitHub 同步最新源码...${RESET}"
+        cd "$SRC_DIR" && git pull
+        echo -e "${YELLOW}正在无损无缓存重新编译并滚屏更新集群容器...${RESET}"
+        docker compose up -d --build
+        echo -e "${GREEN}集群镜像已成功热升级！${RESET}"
+    else
+        echo -e "${RED}未检测到部署目录，无法执行更新。${RESET}"
     fi
-    get_status_info
-    local current_port=$webui_port
-    [[ "$current_port" == "N/A" ]] && current_port="8080"
-
-    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
-    cd "$SRC_DIR" && git pull
-    
-    echo -e "${YELLOW}正在使用官方命令重编镜像并热更新...${RESET}"
-    ACG_HTTP_PORT=$current_port docker compose up -d --build --remove-orphans
-    echo -e "${GREEN}官方集群更新并重编完成！${RESET}"
 }
 
-# 彻底卸载
-uninstall_translate() {
-    echo -ne "${RED}确定要停止并卸载 ACG-FAKA 官方容器集群吗？(y/n): ${RESET}"
+# 3. 卸载容器
+uninstall_twilight() {
+    echo -ne "${RED}⚠️ 确定要全面停止并清除 Twilight 容器集群吗？(y/n): ${RESET}"
     read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -d "$SRC_DIR/.git" ]; then
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        if [ -d "$SRC_DIR" ]; then
             cd "$SRC_DIR" && docker compose down
-            echo -e "${GREEN}官方容器与网络已被安全停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同步连根拔除本地克隆的【全部源码、卡密、商品及内部数据库卷】？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否连同【本地源码、历史卡密、切片及本地持久化卷】全盘删除？(y/n): ${RESET}"
             read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+            if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
+                docker volume rm twilight-postgres-data twilight-redis-data twilight-uploads twilight-backups 2>/dev/null
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有源码与持久化数据已被彻底清除！${RESET}"
+                echo -e "${GREEN}所有物理数据已安全抹除清空。${RESET}"
             fi
         else
-            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
+            echo -e "${YELLOW}未检测到有效目录，跳过删除。${RESET}"
         fi
     fi
 }
 
-# 容器管理生命周期
-start_translate() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}原生集群已全面启动${RESET}"; }
-stop_translate() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}原生集群已安全停止${RESET}"; }
-restart_translate() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}原生集群已平滑重启${RESET}"; }
-logs_translate() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
+# 4. 启动容器
+start_twilight() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}集群已全面启动运转${RESET}"; }
 
-show_info() {
-    get_status_info
-    local DETECT_IP=$(get_public_ip)
-    local env_summary=$(get_env_summary)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}集群运行状态     : $status"
-    echo -e "${YELLOW}当前底层依赖     : $env_summary"
-    echo -e "${YELLOW}前端访问地址     : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}后台管理地址     : http://${DETECT_IP}:${webui_port}/admin${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+# 5. 停止容器
+stop_twilight() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}集群已安全停止响应${RESET}"; }
+
+# 6. 重启容器
+restart_twilight() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}集群已完成平滑重载${RESET}"; }
+
+# 7. 查看日志
+logs_twilight() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
+
+# 8. 查看配置
+show_config() {
+    if [ -f "$SRC_DIR/.env" ]; then
+        echo -e "${CYAN}--- 当前宿主机 .env 变量架构 ---${RESET}"
+        cat "$SRC_DIR/.env"
+        echo -e "${CYAN}--------------------------------${RESET}"
+    else
+        echo -e "${RED}未检测到有效的部署变量文件。${RESET}"
+    fi
 }
 
+# 主菜单路由
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}    ◈  ACG-FAKA 发卡管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}   ◈ Twilight 混合拓扑控制面板 ◈   ${RESET}"
     echo -e "${GREEN}===================================${RESET}"
     echo -e "${GREEN}集群状态 :${RESET} $status"
-    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}前端端口 :${RESET} ${YELLOW}${web_port}${RESET}"
     echo -e "${GREEN}===================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -416,24 +489,24 @@ menu() {
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}===================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
+    echo -ne "${GREEN}请输入您的选择: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
-        8) show_info ;;
+        1) install_twilight ;;
+        2) update_twilight ;;
+        3) uninstall_twilight ;;
+        4) start_twilight ;;
+        5) stop_twilight ;;
+        6) restart_twilight ;;
+        7) logs_twilight ;;
+        8) show_config ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
+        *) echo -e "${RED}输入无效，请重新核对！${RESET}" ;;
     esac
 }
 
 while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
+  menu
+  echo -ne "${YELLOW}\n按回车键返回主菜单...${RESET}"
+  read -r
 done

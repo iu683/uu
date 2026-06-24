@@ -15,9 +15,9 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-SCRIPT_NAME="install-panel.sh"
-# 原始的 GitHub 相对路径
-RAW_PATH="VipMaxxxx/payincus/main/scripts/install-panel.sh"
+# GitHub 相对路径
+MANAGER_RAW_PATH="enp6/Zelay/main/zelay_manager.sh"
+AGENT_RAW_PATH="enp6/Zelay/main/zelay_agent.sh"
 
 # GitHub 代理节点列表（第一个为空代表直连）
 GITHUB_PROXY=(
@@ -29,100 +29,173 @@ GITHUB_PROXY=(
     'https://ghproxy.lvedong.eu.org/'
 )
 
-# 下载核心脚本的函数（带代理重试机制）
-check_and_download() {
-    if [ ! -f "$SCRIPT_NAME" ]; then
-        # 检查并安装 curl
-        if ! command -v curl &> /dev/null; then
-            echo -e "${YELLOW}未检测到 curl，正在自动安装...${RESET}"
-            if command -v apt &> /dev/null; then
-                apt update && apt install curl -y
-            elif command -v yum &> /dev/null; then
-                yum install curl -y
-            fi
-        fi
-
-        echo -e "${YELLOW}正在从 GitHub 下载核心安装...${RESET}"
-        
-        # 遍历代理列表进行下载尝试
-        local success=false
-        for proxy in "${GITHUB_PROXY[@]}"; do
-            # 拼接完整的下载 URL
-            local download_url="${proxy}https://raw.githubusercontent.com/${RAW_PATH}"
-            
-            if [ -z "$proxy" ]; then
-                echo -e "${CYAN}正在尝试直连下载...${RESET}"
-            else
-                echo -e "${CYAN}正在尝试通过代理下载: ${proxy}${RESET}"
-            fi
-
-            # 执行下载，设置 15 秒超时防止卡死
-            curl -fsSL --connect-timeout 15 "$download_url" -o "$SCRIPT_NAME"
-            
-            if [ $? -eq 0 ] && [ -s "$SCRIPT_NAME" ]; then
-                echo -e "${GREEN}下载成功！${RESET}"
-                chmod +x "$SCRIPT_NAME"
-                success=true
-                break # 下载成功，跳出循环
-            else
-                echo -e "${YELLOW}当前节点下载失败，正在尝试下一个...${RESET}"
-                [ -f "$SCRIPT_NAME" ] && rm -f "$SCRIPT_NAME" # 删除可能下载失败的空文件
-            fi
-        done
-
-        # 如果所有节点都失败了
-        if [ "$success" = false ]; then
-            echo -e "${RED}错误：所有 GitHub 代理节点均下载失败，请检查网络！${RESET}"
-            exit 1
+# 检查并安装 curl 的函数
+ensure_curl() {
+    if ! command -v curl &> /dev/null; then
+        echo -e "${YELLOW}未检测到 curl，正在自动安装...${RESET}"
+        if command -v apt &> /dev/null; then
+            apt update && apt install curl -y
+        elif command -v yum &> /dev/null; then
+            yum install curl -y
         fi
     fi
+}
+
+# 代理加速执行函数
+run_with_proxy() {
+    local raw_path="$1"
+    shift
+    local extra_args="$@"
+
+    ensure_curl
+    
+    local success=false
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local download_url="${proxy}https://raw.githubusercontent.com/${raw_path}"
+        
+        if [ -z "$proxy" ]; then
+            echo -e "${CYAN}正在尝试直连远程...${RESET}"
+        else
+            echo -e "${CYAN}正在尝试通过代理远程: ${proxy}${RESET}"
+        fi
+
+        if curl -fsSL --connect-timeout 15 "$download_url" | bash -s -- $extra_args; then
+            success=true
+            break
+        else
+            echo -e "${YELLOW}当前节点连接或执行失败，正在尝试下一个...${RESET}"
+        fi
+    done
+
+    if [ "$success" = false ]; then
+        echo -e "${RED}错误：所有 GitHub 代理节点均请求失败，请检查网络！${RESET}"
+    fi
+}
+
+# 子菜单：服务运行管理
+manage_services() {
+    while true; do
+        clear
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -e "${GREEN}         ◈ Zelay 服务运行管理 ◈        ${RESET}"
+        echo -e "${GREEN}=======================================${RESET}"
+        echo -e "${PURPLE} [面板服务 - zelay-manager]${RESET}"
+        echo -e "${GREEN}  1. 启动 面板服务${RESET}"
+        echo -e "${GREEN}  2. 停止 面板服务${RESET}"
+        echo -e "${GREEN}  3. 重启 面板服务${RESET}"
+        echo -e "${GREEN}  4. 查看 面板日志 (按 Ctrl+C 退出)${RESET}"
+        echo -e "${GREEN}---------------------------------------${RESET}"
+        echo -e "${CYAN} [Agent服务 - zelay-agent]${RESET}"
+        echo -e "${CYAN}  5. 启动 Agent服务${RESET}"
+        echo -e "${CYAN}  6. 停止 Agent服务${RESET}"
+        echo -e "${CYAN}  7. 重启 Agent服务${RESET}"
+        echo -e "${CYAN}  8. 查看 Agent日志 (按 Ctrl+C 退出)${RESET}"
+        echo -e "${GREEN}---------------------------------------${RESET}"
+        echo -e "${RED}  0. 返回主菜单${RESET}"
+        echo -e "${GREEN}=======================================${RESET}"
+        
+        echo -e -n "${GREEN}请输入选项 [0-8]: ${RESET}"
+        read svc_choice
+        
+        case $svc_choice in
+            1) systemctl start zelay-manager && echo -e "${GREEN}面板服务已启动！${RESET}" ;;
+            2) systemctl stop zelay-manager && echo -e "${YELLOW}面板服务已停止！${RESET}" ;;
+            3) systemctl restart zelay-manager && echo -e "${GREEN}面板服务已重启！${RESET}" ;;
+            4) journalctl -u zelay-manager -f ;;
+            5) systemctl start zelay-agent && echo -e "${GREEN}Agent服务已启动！${RESET}" ;;
+            6) systemctl stop zelay-agent && echo -e "${YELLOW}Agent服务已停止！${RESET}" ;;
+            7) systemctl restart zelay-agent && echo -e "${GREEN}Agent服务已重启！${RESET}" ;;
+            8) journalctl -u zelay-agent -f ;;
+            0) break ;;
+            *) echo -e "${RED}无效选项！${RESET}" ;;
+        esac
+        
+        if [ "$svc_choice" != "4" ] && [ "$svc_choice" != "8" ]; then
+            echo -e -n "\n${GREEN}按任意键继续...${RESET}"
+            read -n 1 -s -r
+        fi
+    done
 }
 
 # 主菜单循环
 while true; do
     clear
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}   ◈  PayIncus  管理面板 ◈    ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 安装 PayIncus${RESET}"
-    echo -e "${GREEN}2. 升级 PayIncus${RESET}"
-    echo -e "${GREEN}3. 卸载 PayIncus${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}" 
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}          ◈ Zelay 管理菜单 ◈          ${RESET}"
+    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN} 1. 安装 Zelay 面板${RESET}"
+    echo -e "${GREEN} 2. 更新 Zelay 面板${RESET}"
+    echo -e "${GREEN} 3. 卸载 Zelay 面板${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${CYAN} 4. 更新 Zelay Agent (被控端)${RESET}"
+    echo -e "${CYAN} 5. 卸载 Zelay Agent (被控端)${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${PURPLE} 6. 面板/Agent 服务管理 (启动/停止/日志)${RESET}"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    echo -e "${RED} 0. 退出${RESET}"
+    echo -e "${GREEN}=======================================${RESET}" 
     
-    echo -e -n "${GREEN}请输入选项: ${RESET}"
+    echo -e -n "${GREEN}请输入选项 [0-6]: ${RESET}"
     read choice
     
     case $choice in
         1)
-            echo -e "${GREEN}===> 开始安装 PayIncus...${RESET}"
-            check_and_download
-            bash "$SCRIPT_NAME"
+            echo -e "${GREEN}===> 开始安装 Zelay 面板...${RESET}"
+            echo -e -n "${CYAN}请输入面板访问端口 (web-port) [默认: 3000]: ${RESET}"
+            read input_web_port
+            WEB_PORT=${input_web_port:-3000}
+            
+            echo -e -n "${CYAN}请输入 Agent 通信端口 (agent-port) [默认: 3001]: ${RESET}"
+            read input_agent_port
+            AGENT_PORT=${input_agent_port:-3001}
+            
+            echo -e "${YELLOW}将使用以下配置进行安装:${RESET}"
+            echo -e "${BLUE}面板端口: ${WEB_PORT}${RESET}"
+            echo -e "${BLUE}通信端口: ${AGENT_PORT}${RESET}"
+            echo -e "---------------------------------------"
+            
+            run_with_proxy "$MANAGER_RAW_PATH" web-port="$WEB_PORT" agent-port="$AGENT_PORT"
             ;;
         2)
-            echo -e "${YELLOW}===> 开始升级 PayIncus...${RESET}"
-            check_and_download
-            bash "$SCRIPT_NAME" --upgrade
+            echo -e "${YELLOW}===> 开始更新 Zelay 面板...${RESET}"
+            run_with_proxy "$MANAGER_RAW_PATH" update
             ;;
         3)
-            echo -e "${RED}===> 警告：即将卸载 PayIncus 面板！${RESET}"
+            echo -e "${RED}===> 警告：即将卸载 Zelay 面板！${RESET}"
             echo -e -n "${YELLOW}确定要继续吗？(y/n): ${RESET}"
             read confirm
             if [[ "$confirm" == [yY] || "$confirm" == [yY][eE][sS] ]]; then
-                check_and_download
-                bash "$SCRIPT_NAME" --uninstall
+                run_with_proxy "$MANAGER_RAW_PATH" --uninstall
             else
                 echo -e "${GREEN}已取消卸载。${RESET}"
             fi
+            ;;
+        4)
+            echo -e "${YELLOW}===> 开始更新 Zelay Agent...${RESET}"
+            run_with_proxy "$AGENT_RAW_PATH" update
+            ;;
+        5)
+            echo -e "${RED}===> 警告：即将卸载 Zelay Agent！${RESET}"
+            echo -e -n "${YELLOW}确定要继续吗？(y/n): ${RESET}"
+            read confirm
+            if [[ "$confirm" == [yY] || "$confirm" == [yY][eE][sS] ]]; then
+                run_with_proxy "$AGENT_RAW_PATH" --uninstall
+            else
+                echo -e "${GREEN}已取消卸载。${RESET}"
+            fi
+            ;;
+        6)
+            manage_services
+            continue
             ;;
         0)
             exit 0
             ;;
         *)
-            echo -e "${RED}无效选项，请输入 0 到 3 之间的数字！${RESET}"
+            echo -e "${RED}无效选项，请输入 0 到 6 之间的数字！${RESET}"
             ;;
     esac
     
-    echo -e -n "${GREEN}按任意键返回主菜单...${RESET}"
+    echo -e -n "\n${GREEN}按任意键返回主菜单...${RESET}"
     read -n 1 -s -r
 done

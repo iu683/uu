@@ -1,297 +1,572 @@
 #!/bin/bash
+# ========================================
+# 1Panel 风格多路径 Docker Compose 管理脚本
+# ========================================
 
-# 标准 ANSI 颜色定义
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-RESET='\033[0m'
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+ORANGE='\033[38;5;208m'
+RESET="\033[0m"
 
-# 载入环境变量并增强 PATH 搜索
-[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
-[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null
-export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+# ---------------------------
+# 配置：需要扫描的项目根目录列表
+# ---------------------------
+SEARCH_DIRS=(
+    "/opt/flatnas"
+    "/opt/1panel/apps"
+    "/data"
+    "/date"
+    "/app"
+    "/root"
+)
 
-# 动态定位 ReadCLI 实际安装与数据路径
-get_paths() {
-    READCLI_DATA_DIR="${READCLI_DATA_DIR:-$HOME/.readcli}"
-    CONFIG_FILE="$READCLI_DATA_DIR/config.json"
-    BOOKSHELF_FILE="$READCLI_DATA_DIR/bookshelf.json"
-    REAL_EXEC_PATH=$(command -v readcli 2>/dev/null)
-}
-
-# 获取状态与版本信息
-get_status() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        status="${GREEN}已安装 (${REAL_EXEC_PATH})${RESET}"
-        # 假设未来支持 -v，当前若无版本输出则提示已就绪
-        version_info=$($REAL_EXEC_PATH -v 2>/dev/null | head -n 1)
-        [ -z "$version_info" ] && version_info="v0.3.5"
-        readcli_version="${YELLOW}${version_info}${RESET}"
-    else
-        status="${RED}未安装${RESET}"
-        readcli_version="${RED}-${RESET}"
-    fi
-
-    # 检查书架内是否有书
-    if [ -f "$BOOKSHELF_FILE" ] && grep -q '"path"' "$BOOKSHELF_FILE" 2>/dev/null; then
-        bookshelf_status="${GREEN}已有藏书${RESET}"
-    else
-        bookshelf_status="${YELLOW}书架空空${RESET}"
-    fi
-
-    # 检查是否有自定义配置
-    if [ -f "$CONFIG_FILE" ]; then
-        config_status="${YELLOW}自定义配置${RESET}"
-    else
-        config_status="${GREEN}默认配置${RESET}"
-    fi
-}
-
-
-# 自动获取并下载最新版本的核心函数
-download_latest_readcli() {
-    echo -e "\n${YELLOW}正在从 GitHub 检索 ReadCLI 最新版本信息...${RESET}"
+# ---------------------------
+# 动态搜索所有项目并存入数组（精准匹配直连或子目录文件）
+# ---------------------------
+function scan_projects() {
+    PROJECT_NAMES=()
+    PROJECT_PATHS=()
     
-    # 使用 curl 请求 GitHub API 获取最新 release 标签
-    LATEST_TAG=$(curl -s https://api.github.com/repos/lvshp/ReadCLI/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    
-    if [ -z "$LATEST_TAG" ]; then
-        echo -e "${RED}❌ 无法获取最新版本信息，请检查网络（或是否被 GitHub API 频率限制）。${RESET}"
-        return 1
-    fi
-    
-    echo -e "${GREEN}发现最新版本: ${LATEST_TAG}${RESET}"
-    
-    # 构造下载链接（以 Linux amd64 为例，截取纯数字版本号去掉 'v'）
-    VERSION_NUM=$(echo "$LATEST_TAG" | sed 's/^v//')
-    DOWNLOAD_URL="https://github.com/lvshp/ReadCLI/releases/download/${LATEST_TAG}/readcli-linux-amd64-v${VERSION_NUM}.tar.gz"
-    
-    # 建立临时工作目录
-    TMP_DIR=$(mktemp -d)
-    echo -e "${YELLOW}正在下载: ${DOWNLOAD_URL}${RESET}"
-    
-    # 下载压缩包
-    if curl -L "$DOWNLOAD_URL" -o "${TMP_DIR}/readcli.tar.gz"; then
-        echo -e "${GREEN}✔ 下载成功，正在解压并安装...${RESET}"
-        
-        # 解压
-        tar -zxf "${TMP_DIR}/readcli.tar.gz" -C "$TMP_DIR"
-        
-        # 创建安装目录
-        mkdir -p "$HOME/.local/bin"
-        
-        # 移动二进制文件并赋予执行权限
-        if [ -f "${TMP_DIR}/readcli" ]; then
-            mv "${TMP_DIR}/readcli" "$HOME/.local/bin/readcli"
-            chmod +x "$HOME/.local/bin/readcli"
-            echo -e "${GREEN}✔ 最新版 ReadCLI 成功安装到 ~/.local/bin/readcli${RESET}"
-        else
-            echo -e "${RED}❌ 解压文件中未找到 readcli 二进制文件。${RESET}"
-            rm -rf "$TMP_DIR"
-            return 1
+    for s_dir in "${SEARCH_DIRS[@]}"; do
+        if [ -d "$s_dir" ]; then
+            # 允许在配置目录下向深扫描 5 层
+            while IFS= read -r compose_file; do
+                [ -z "$compose_file" ] && continue
+                local app_path=$(dirname "$compose_file")
+                local app_name=""
+                
+                # 如果 compose 文件直接在扫描根目录下 (例如 /opt/flatnas/docker-compose.yml)
+                if [ "$app_path" == "$s_dir" ] || [ "$app_path" == "/" ]; then
+                    app_name=$(basename "$s_dir")
+                else
+                    # 如果在子目录下 (例如 /opt/flatnas/pve/docker-compose.yml -> 提取出 pve)
+                    app_name=$(basename "$app_path")
+                fi
+                
+                PROJECT_NAMES+=("$app_name")
+                PROJECT_PATHS+=("$app_path")
+            done < <(find "$s_dir" -maxdepth 5 \( -name "docker-compose.yml" -o -name "docker-compose.yaml" \) 2>/dev/null | sort -u)
         fi
+    done
+}
+
+# ---------------------------
+# 确认操作
+# ---------------------------
+function confirm_action() {
+    read -p "确认执行此操作吗？(y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        return 0
     else
-        echo -e "${RED}❌ 下载失败，请检查网络连接或手动前往 Releases 页面。${RESET}"
-        rm -rf "$TMP_DIR"
+        echo -e "${RED}操作已取消${RESET}"
+        sleep 1
         return 1
     fi
-    
-    # 清理临时目录
-    rm -rf "$TMP_DIR"
-
-    # 环境变量强力灌注
-    if [ -f "$HOME/.zshrc" ] && ! grep -q "local/bin" "$HOME/.zshrc"; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
-    fi
-    if [ -f "$HOME/.bashrc" ] && ! grep -q "local/bin" "$HOME/.bashrc"; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
-    fi
-    export PATH="$HOME/.local/bin:$PATH"
 }
 
-# 菜单面板
-show_menu() {
-    clear
-    get_status
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈  ReadCLI  终端阅读管理面板 ◈ ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} $readcli_version"
-    echo -e "${GREEN}书架 :${RESET} $bookshelf_status"
-    echo -e "${GREEN}配置 :${RESET} $config_status"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 打开书架${RESET}"
-    echo -e "${GREEN}3. 浏览并打开指定书籍 (TXT/EPUB)${RESET}"
-    echo -e "${GREEN}4. 快速配置BossKey(老板键)${RESET}"
-    echo -e "${GREEN}5. 查看系统常用快捷键指南${RESET}"
-    echo -e "${GREEN}6. 更新${RESET}"
-    echo -e "${GREEN}7. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
+# ---------------------------
+# 操作完成提示
+# ---------------------------
+function action_done() {
+    read -p "$(echo -e ${GREEN}操作完成！按回车返回菜单...${RESET})" temp
 }
 
-# 1. 安装功能
-install_readcli() {
-    download_latest_readcli
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+# ---------------------------
+# 状态汉化核心引擎
+# ---------------------------
+function translate_status() {
+    local raw_status="$1"
+    echo "$raw_status" | \
+        sed 's/Up /运行 /' | \
+        sed 's/Exited/已停止/' | \
+        sed 's/(healthy)/(健康)/' | \
+        sed 's/(unhealthy)/(非健康)/' | \
+        sed 's/(starting)/(启动中)/' | \
+        sed 's/seconds/秒/' | \
+        sed 's/second/秒/' | \
+        sed 's/minutes/分钟/' | \
+        sed 's/minute/分钟/' | \
+        sed 's/hours/小时/' | \
+        sed 's/hour/小时/' | \
+        sed 's/days/天/' | \
+        sed 's/day/天/' | \
+        sed 's/weeks/周/' | \
+        sed 's/week/周/' | \
+        sed 's/months/月/' | \
+        sed 's/month/月/' | \
+        sed 's/about //' | \
+        sed 's/ago/前/'
 }
 
+# ---------------------------
+# 核心功能：绑定/解绑 127.0.0.1
+# ---------------------------
+function toggle_ip_binding() {
+    local action="$1"
+    local backup_file="${COMPOSE_FILE}.bak_ip"
 
-
-# 2. 打开书架
-start_bookshelf() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${GREEN}正在调起 ReadCLI 书架...${RESET}"
-        "$REAL_EXEC_PATH"
-    else
-        echo -e "\n${RED}未检测到 readcli 命令，请先执行安装或配置 PATH！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-    fi
-}
-
-# 3. 指定路径启动
-start_with_book() {
-    get_paths
-    if [ -z "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${RED}未检测到已安装的 ReadCLI。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        echo -e "${RED}错误: 找不到配置文件！${RESET}"
+        sleep 1
         return
     fi
 
-    echo -ne "\n${GREEN}请输入书籍文件的绝对或相对路径 (支持 .txt / .epub): ${RESET}"
-    read -r book_path
-    if [ -f "$book_path" ]; then
-        echo -ne "${YELLOW}请输入阅读时的每页显示行数 (直接回车默认使用系统设置): ${RESET}"
-        read -r line_num
-        if [ -n "$line_num" ]; then
-            "$REAL_EXEC_PATH" -n "$line_num" "$book_path"
-        else
-            "$REAL_EXEC_PATH" "$book_path"
-        fi
+    cp "$COMPOSE_FILE" "$backup_file"
+
+    if [ "$action" == "bind" ]; then
+        echo -e "${YELLOW}正在尝试将外部端口绑定到 127.0.0.1...${RESET}"
+        sed -i -E 's/- ("|'\''?)([0-9]+):([0-9]+)("|'\''?)/- \1127.0.0.1:\2:\3\4/g' "$COMPOSE_FILE"
+        sed -i -E 's/- ("|'\''?)0.0.0.0:([0-9]+):([0-9]+)("|'\''?)/- \1127.0.0.1:\2:\3\4/g' "$COMPOSE_FILE"
+        sed -i 's/0.0.0.0:/127.0.0.1:/g' "$COMPOSE_FILE"
     else
-        echo -e "${RED}文件不存在，请检查路径！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+        echo -e "${YELLOW}正在尝试解绑 127.0.0.1 (恢复为全网公开)...${RESET}"
+        sed -i -E 's/- ("|'\''?)127.0.0.1:([0-9]+):([0-9]+)("|'\''?)/- \1\2:\3\4/g' "$COMPOSE_FILE"
+        sed -i 's/127.0.0.1:/0.0.0.0:/g' "$COMPOSE_FILE"
+    fi
+
+    if diff "$COMPOSE_FILE" "$backup_file" >/dev/null 2>&1; then
+        echo -e "${ORANGE}提示: 端口规则没有发生变化。${RESET}"
+        rm -f "$backup_file"
+    else
+        echo -e "${GREEN}配置已调整，正在重启容器生效...${RESET}"
+        docker compose -f "$COMPOSE_FILE" down && docker compose -f "$COMPOSE_FILE" up -d
+        rm -f "$backup_file"
+        echo -e "${GREEN}网络边界调整成功！${RESET}"
+    fi
+    action_done
+}
+
+# ---------------------------
+# 查看所有项目容器运行状态
+# ---------------------------
+monitor_docker_containers() {
+    clear
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}      🐳 Docker 项目容器状态监控        ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+
+    scan_projects
+    
+    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
+        echo -e "${RED}未在指定目录下找到任何 Docker Compose 项目！${RESET}"
+    else
+        local all_stats
+        all_stats=$(docker stats --no-stream --format "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" 2>/dev/null)
+
+        for i in "${!PROJECT_PATHS[@]}"; do
+            local proj="${PROJECT_PATHS[$i]}"
+            local project_name="${PROJECT_NAMES[$i]}"
+            
+            echo -e "${YELLOW}📁 项目名称: $project_name [根路径: $proj]${RESET}"
+            echo -e "${YELLOW}----------------------------------------${RESET}"
+            
+            local l_compose=""
+            [ -f "$proj/docker-compose.yml" ] && l_compose="$proj/docker-compose.yml"
+            [ -f "$proj/docker-compose.yaml" ] && l_compose="$proj/docker-compose.yaml"
+            
+            local services=$(docker compose -f "$l_compose" ps --services 2>/dev/null)
+            
+            if [ -z "$services" ]; then
+                echo -e "  ${YELLOW}暂无服务配置${RESET}"
+                echo -e "${YELLOW}----------------------------------------${RESET}"
+                continue
+            fi
+
+            local stats_list=()
+            for service in $services; do
+                local container_id=$(docker compose -f "$l_compose" ps -q "$service" 2>/dev/null)
+                local cpu="0.00%" mem="0B / 0B" net="0B / 0B" ports="无端口映射"
+                local raw_status="Exited (0) 0 seconds ago"
+
+                if [ -n "$container_id" ]; then
+                    local match_stats=$(echo "$all_stats" | grep "^${container_id:0:12}")
+                    if [ -n "$match_stats" ]; then
+                        cpu=$(echo "$match_stats" | cut -f2)
+                        mem=$(echo "$match_stats" | cut -f3)
+                        net=$(echo "$match_stats" | cut -f4)
+                    fi
+                    raw_status=$(docker ps -a --filter "id=$container_id" --format "{{.Status}}")
+                    local port_info=$(docker ps -a --filter "id=$container_id" --format "{{.Ports}}")
+                    [ -n "$port_info" ] && ports=$port_info
+                fi
+                stats_list+=("$service	$cpu	$mem	$net	$ports	$raw_status")
+            done
+            
+            printf "%s\n" "${stats_list[@]}" | sort -k3 -hr | while IFS=$'\t' read -r service cpu mem net ports raw_status; do
+                local uptime=$(translate_status "$raw_status")
+                local status_icon="${RED}❌${RESET}"
+                [[ "$raw_status" == *"Up"* ]] && status_icon="${GREEN}✅${RESET}"
+
+                echo -e "${YELLOW}◈ 服务: ${RESET}${YELLOW}${service}${RESET} ${status_icon}"
+                echo -e "  ├─ ${YELLOW}运行状态: ${RESET}${uptime}"
+                echo -e "  ├─ ${YELLOW}端口映射: ${RESET}${GREEN}${ports}${RESET}"
+                echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${cpu}"
+                echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
+                echo -e "  └─ ${YELLOW}网络 I/O: ${RESET}${net}"
+                echo -e "${YELLOW}----------------------------------------${RESET}"
+            done
+            echo
+        done
+    fi
+    read -p "按回车返回主菜单..." temp
+}
+
+# ---------------------------
+# 选择项目
+# ---------------------------
+function select_project() {
+    clear
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}        ◈    请选择要管理的项目    ◈     ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    
+    scan_projects
+
+    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
+        echo -e "${RED}未找到任何 Docker Compose 项目！${RESET}"
+        read -p "按回车返回主菜单..." temp
+        return
+    fi
+    
+    for i in "${!PROJECT_NAMES[@]}"; do
+        local p_name="${PROJECT_NAMES[$i]}"
+        local p_path="${PROJECT_PATHS[$i]}"
+        echo -e "${YELLOW}$((i+1))) $p_name [$p_path]${RESET}"
+    done
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}0) 返回主菜单${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    read -p "$(echo -e ${GREEN}请输入编号: ${RESET})" choice
+    if [[ "$choice" == "0" ]]; then
+        return
+    elif [[ "$choice" =~ ^[0-9]+$ && $choice -ge 1 && $choice -le ${#PROJECT_NAMES[@]} ]]; then
+        PROJECT_DIR=${PROJECT_PATHS[$((choice-1))]}
+        if [ -f "$PROJECT_DIR/docker-compose.yml" ]; then
+            COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
+        else
+            COMPOSE_FILE="$PROJECT_DIR/docker-compose.yaml"
+        fi
+        project_menu
+    else
+        echo -e "${RED}无效选择${RESET}"
+        sleep 1
+        select_project
     fi
 }
 
-# 4. 快速配置 Boss Key
-config_boss_key() {
-    get_paths
-    mkdir -p "$READCLI_DATA_DIR"
+# ---------------------------
+# 进入容器
+# ---------------------------
+function select_container() {
+    local containers=$(docker compose -f "$COMPOSE_FILE" ps --services)
+    if [ -z "$containers" ]; then
+        echo -e "${RED}没有正在运行的容器${RESET}"
+        sleep 1
+        return
+    fi
+    echo -e "${GREEN}可进入的容器：${RESET}"
+    echo -e "${GREEN}$containers${RESET}"
+    read -p "请输入容器名: " cname
+    if [[ "$containers" == *"$cname"* ]]; then
+        docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/sh || docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/bash
+        action_done
+    else
+        echo -e "${RED}容器不存在${RESET}"
+        sleep 1
+    fi
+}
+
+# ---------------------------
+# 删除整个项目
+# ---------------------------
+function delete_project() {
+    echo -e "${RED}注意！这将删除整个项目，包括容器、镜像、数据卷和项目文件夹${RESET}"
+    if confirm_action; then
+        docker compose -f "$COMPOSE_FILE" down --rmi all -v
+        rm -rf "$PROJECT_DIR"
+        echo -e "${GREEN}项目已删除${RESET}"
+        sleep 1
+        return
+    fi
+}
+
+# ---------------------------
+# 多选删除项目
+# ---------------------------
+function delete_multiple_projects() {
+    clear
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}        ◈      多选删除项目     ◈          ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
     
-    echo -e "\n${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ReadCLI 老板键 (Boss Key) 配置 ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "当你在阅读时按下 ${YELLOW}'b'${RESET} 键，系统会立刻切入伪装指令。"
-    echo -e "推荐安装 ${YELLOW}svenstaro/genact${RESET} 伪装成正在编译或跑日志。\n"
-    
-    echo -ne "${YELLOW}请输入你想触发的外部命令 (例如: genact 或 /usr/local/bin/genact -m terraform): ${RESET}"
-    read -r boss_cmd
-    
-    if [ -z "$boss_cmd" ]; then
-        echo -e "${RED}输入为空，取消配置。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+    scan_projects
+
+    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
+        echo -e "${RED}未找到任何项目${RESET}"
+        sleep 1
         return
     fi
 
-    # 简易组装/修改 config.json (如果存在则覆盖，不存在则创建)
-    cat <<EOF > "$CONFIG_FILE"
-{
-  "\$schema": "https://raw.githubusercontent.com/lvshp/ReadCLI/main/config.schema.json",
-  "boss_key_command": "$boss_cmd"
-}
-EOF
+    for i in "${!PROJECT_NAMES[@]}"; do
+        echo -e "${GREEN}$((i+1))) ${PROJECT_NAMES[$i]} [${PROJECT_PATHS[$i]}]${RESET}"
+    done
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}输入要删除的项目编号，用空格分隔（例如: 1 3 5），0 返回主菜单${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choices
 
-    echo -e "\n${GREEN}✔ 老板键伪装指令已成功写入配置文件！${RESET}"
-    echo -e "保存路径: $CONFIG_FILE"
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+    if [[ "$choices" == "0" ]]; then
+        return
+    fi
+
+    for c in $choices; do
+        if [[ "$c" =~ ^[0-9]+$ && $c -ge 1 && $c -le ${#PROJECT_NAMES[@]} ]]; then
+            local proj="${PROJECT_PATHS[$((c-1))]}"
+            local l_compose=""
+            [ -f "$proj/docker-compose.yml" ] && l_compose="$proj/docker-compose.yml"
+            [ -f "$proj/docker-compose.yaml" ] && l_compose="$proj/docker-compose.yaml"
+            
+            local p_name="${PROJECT_NAMES[$((c-1))]}"
+            echo -e "${RED}准备删除项目: $p_name ($proj)${RESET}"
+            if confirm_action; then
+                docker compose -f "$l_compose" down --rmi all -v
+                rm -rf "$proj"
+                echo -e "${GREEN}已删除 $p_name${RESET}"
+            fi
+        else
+            echo -e "${RED}无效编号: $c${RESET}"
+        fi
+    done
+    action_done
 }
 
-# 5. 快捷键指南面板
-show_shortcuts() {
+# ---------------------------
+# 一键删除所有未运行的项目
+# ---------------------------
+function delete_all_stopped_projects() {
     clear
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -e "${YELLOW}               ReadCLI 终端快捷键速查表                  ${RESET}"
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -e "${GREEN}[书架首页]${RESET}"
-    echo -e "  j / k 或 ↑ / ↓  : 移动光标"
-    echo -e "  Enter 或 →      : 打开选中的书籍"
-    echo -e "  i               : 导入本地书籍 (支持路径补全/拖拽/Ctrl+r递归)"
-    echo -e "  o / r           : 书籍排序与过滤"
-    echo -e "  x               : 从书架移除书籍"
-    echo -e "\n${GREEN}[阅读界面]${RESET}"
-    echo -e "  j / k 或 ↑ / ↓  : 向上/向下翻页"
-    echo -e "  [ / ] 或 ← / →  : 切换到 上一章/下一章"
-    echo -e "  /               : 唤起正文搜索 (n/N 跳转结果)"
-    echo -e "  m               : 打开书籍目录 (支持数字跳章)"
-    echo -e "  s / B           : 添加或查看书签"
-    echo -e "  , (逗号)        : 打开阅读样式个性化设置面板"
-    echo -e "  c / T           : 快速切换正文颜色预设 / 切换主题"
-    echo -e "  z               : 一键切换 [精简模式](只看正文) 与 [全信息模式]"
-    echo -e "  t               : 开启 / 关闭自动翻页"
-    echo -e "  + / -           : 动态增减每页显示的正文行数"
-    echo -e "  b               : 瞬间触发 Boss Key (老板键) 伪装"
-    echo -e "  f / p           : 开关外边框 / 查看当前精确阅读进度"
-    echo -e "  q               : 返回书架或退出"
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -ne "${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}   ◈    一键删除所有未运行项目    ◈     ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    
+    scan_projects
 
-# 6. 手动触发更新
-update_readcli() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${YELLOW}开始检查并强制覆盖更新至最新版...${RESET}"
-        download_latest_readcli
-    else
-        echo -e "\n${RED}未检测到已安装的 ReadCLI，将为您直接执行全新安装。${RESET}"
-        download_latest_readcli
+    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
+        echo -e "${RED}未找到任何项目${RESET}"
+        sleep 1
+        return
     fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
 
-# 7. 清理与卸载
-uninstall_readcli() {
-    get_paths
-    echo -e "\n${RED}警告：准备进入 ReadCLI 卸载与数据清理流程...${RESET}"
-    echo -ne "${RED}是否要清除包括书架、书签、阅读进度在内的所有本地数据？(y/n): ${RESET}"
-    read -r ans
-    if [[ "$ans" =~ ^[Yy]$ ]]; then
-        # 清理二进制
-        if [ -n "$REAL_EXEC_PATH" ]; then
-            rm -f "$REAL_EXEC_PATH"
-            echo -e "${GREEN}✔ 已移除二进制程序文件。${RESET}"
+    local deleted_any=false
+    for i in "${!PROJECT_PATHS[@]}"; do
+        local proj="${PROJECT_PATHS[$i]}"
+        local p_name="${PROJECT_NAMES[$i]}"
+        local l_compose=""
+        [ -f "$proj/docker-compose.yml" ] && l_compose="$proj/docker-compose.yml"
+        [ -f "$proj/docker-compose.yaml" ] && l_compose="$proj/docker-compose.yaml"
+        
+        local services=$(docker compose -f "$l_compose" ps --services 2>/dev/null)
+        local all_stopped=true
+        
+        for service in $services; do
+            local cid=$(docker compose -f "$l_compose" ps -q "$service" 2>/dev/null)
+            if [ -n "$cid" ]; then
+                local status=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)
+                if [[ "$status" == "true" ]]; then
+                    all_stopped=false
+                    break
+                fi
+            fi
+        done
+
+        if [ -n "$services" ] && $all_stopped; then
+            echo -e "${RED}准备删除未运行的项目: $p_name ($proj)${RESET}"
+            if confirm_action; then
+                docker compose -f "$l_compose" down --rmi all -v
+                rm -rf "$proj"
+                echo -e "${GREEN}已删除 $p_name${RESET}"
+                deleted_any=true
+            fi
         fi
-        # 清理数据目录
-        if [ -d "$READCLI_DATA_DIR" ]; then
-            rm -rf "$READCLI_DATA_DIR"
-            echo -e "${GREEN}✔ 已彻底净化本地数据目录 (~/.readcli)${RESET}"
-        fi
-        echo -e "${GREEN}✔ 卸载及扫尾清理完成！${RESET}"
-    else
-        echo "已取消卸载操作。"
+    done
+
+    if ! $deleted_any; then
+        echo -e "${GREEN}没有未运行的项目需要删除${RESET}"
     fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+    action_done
 }
 
-# 主循环
-while true; do
-    show_menu
-    read -r choice
-    case $choice in
-        1) install_readcli ;;
-        2) start_bookshelf ;;
-        3) start_with_book ;;
-        4) config_boss_key ;;
-        5) show_shortcuts ;;
-        6) update_readcli ;;
-        7) uninstall_readcli ;;
-        0) clear; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
-    esac
-done
+# ---------------------------
+# 项目管理菜单
+# ---------------------------
+function project_menu() {
+    while true; do
+        clear
+        local project_name=$(basename "$PROJECT_DIR")
+        echo -e "${GREEN}=============================================${RESET}"
+        echo -e "${GREEN}        ◈  管理项目:${RESET} ${YELLOW}$project_name${RESET} ${GREEN} ◈      ${RESET}"
+        echo -e "${GREEN}=============================================${RESET}"
+
+        echo -e "${YELLOW}[ 当前容器实时状态 ]${RESET}"
+        local services=$(docker compose -f "$COMPOSE_FILE" ps --services 2>/dev/null)
+        if [ -z "$services" ]; then
+            echo -e "  ${YELLOW}暂无服务配置${RESET}"
+        else
+            for service in $services; do
+                local container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service" 2>/dev/null)
+                local ports="无端口映射"
+                local raw_status="Exited (0) 0 seconds ago"
+                
+                if [ -n "$container_id" ]; then
+                    raw_status=$(docker ps -a --filter "id=$container_id" --format "{{.Status}}")
+                    local port_info=$(docker ps -a --filter "id=$container_id" --format "{{.Ports}}")
+                    [ -n "$port_info" ] && ports=$port_info
+                fi
+                
+                local uptime=$(translate_status "$raw_status")
+                local status_icon="${RED}❌${RESET}"
+                [[ "$raw_status" == *"Up"* ]] && status_icon="${GREEN}✅${RESET}"
+                
+                echo -e "  ${YELLOW}◈ $service${RESET} $status_icon ${YELLOW}-> $uptime${RESET}"
+                echo -e "    ${YELLOW}└─ 端口:${RESET} ${GREEN}$ports${RESET}"
+            done
+        fi
+        echo -e "${GREEN}---------------------------------------------${RESET}"
+
+        echo -e "${GREEN} 1) 启动服务     |     2) 停止服务${RESET}"
+        echo -e "${GREEN} 3) 重启服务     |     4) 查看日志${RESET}"
+        echo -e "${GREEN} 5) 容器状态     |     6) 更新容器(pull&up)${RESET}"
+        echo -e "${GREEN} 7) 进入容器     |     8) 删除容器+镜像+卷${RESET}"
+        echo -e "${GREEN} 9) 删除容器     |    10) 删除整个项目${RESET}"
+        echo -e "${GREEN}11) 禁止公网     |    12) 允许公网${RESET}"
+        echo -e "${GREEN}=============================================${RESET}"
+        echo -e "${YELLOW}13) 切换项目     |     0) 返回主菜单${RESET}"
+        echo -e "${GREEN}=============================================${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case "$choice" in
+            1) docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
+            2) docker compose -f "$COMPOSE_FILE" stop && action_done ;;
+            3) docker compose -f "$COMPOSE_FILE" down && docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
+            4) docker compose -f "$COMPOSE_FILE" logs -f ; action_done ;;
+            5) docker compose -f "$COMPOSE_FILE" ps ; action_done ;;
+            6) docker compose -f "$COMPOSE_FILE" pull && docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
+            7) select_container ;;
+            8) if confirm_action; then docker compose -f "$COMPOSE_FILE" down --rmi all -v && action_done; fi ;;
+            9) if confirm_action; then docker compose -f "$COMPOSE_FILE" down && action_done; fi ;;
+            10) delete_project; return ;;
+            11) toggle_ip_binding "bind" ;;
+            12) toggle_ip_binding "unbind" ;;
+            13) select_project; return ;;
+            0) return ;;
+            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+# ---------------------------
+# Docker 网络管理
+# ---------------------------
+function network_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}    ◈    Docker 网络管理    ◈   ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}1) 查看所有网络${RESET}"
+        echo -e "${GREEN}2) 创建网络${RESET}"
+        echo -e "${GREEN}3) 删除网络${RESET}"
+        echo -e "${GREEN}4) 将容器加入网络（支持多选）${RESET}"
+        echo -e "${GREEN}5) 将容器退出网络（支持多选）${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case "$choice" in
+            1) docker network ls; read -p "按回车返回..." temp ;;
+            2)
+                read -p "请输入网络名称: " netname
+                read -p "请输入驱动 (bridge/overlay/macvlan，默认 bridge): " netdriver
+                netdriver=${netdriver:-bridge}
+                docker network create -d "$netdriver" "$netname" && echo -e "${GREEN}网络 $netname 创建成功${RESET}"
+                read -p "按回车返回..." temp
+                ;;
+            3)
+                docker network ls --format "{{.Name}}" | nl
+                read -p "请输入要删除的网络编号: " num
+                netname=$(docker network ls --format "{{.Name}}" | sed -n "${num}p")
+                if [ -n "$netname" ]; then
+                    docker network rm "$netname" && echo -e "${GREEN}网络 $netname 删除成功${RESET}"
+                else
+                    echo -e "${RED}无效编号${RESET}"
+                fi
+                read -p "按回车返回..." temp
+                ;;
+            4)
+                echo -e "${GREEN}可用网络：${RESET}"
+                docker network ls --format "{{.Name}}" | nl
+                read -p "请输入要加入的网络编号: " netnum
+                netname=$(docker network ls --format "{{.Name}}" | sed -n "${netnum}p")
+                if [ -z "$netname" ]; then read -p "无效编号，按回车返回..." temp; continue; fi
+
+                echo -e "${GREEN}正在运行的容器：${RESET}"
+                docker ps --format "{{.Names}}" | nl
+                read -p "请输入容器编号（空格分隔支持多选）: " cnumbers
+                for cnum in $cnumbers; do
+                    cname=$(docker ps --format "{{.Names}}" | sed -n "${cnum}p")
+                    [ -n "$cname" ] && docker network connect "$netname" "$cname" && echo -e "${GREEN}容器 $cname 已加入${RESET}"
+                done
+                read -p "按回车返回..." temp
+                ;;
+            5)
+                echo -e "${GREEN}可用网络：${RESET}"
+                docker network ls --format "{{.Name}}" | nl
+                read -p "请输入网络编号: " netnum
+                netname=$(docker network ls --format "{{.Name}}" | sed -n "${netnum}p")
+                if [ -z "$netname" ]; then read -p "无效编号，按回车返回..." temp; continue; fi
+
+                echo -e "${GREEN}已连接容器：${RESET}"
+                docker network inspect "$netname" --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | nl
+                read -p "请输入容器编号（空格分隔支持多选）: " cnumbers
+                containers=($(docker network inspect "$netname" --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n'))
+                for cnum in $cnumbers; do
+                    cname=${containers[$((cnum-1))]}
+                    [ -n "$cname" ] && docker network disconnect "$netname" "$cname" && echo -e "${GREEN}容器 $cname 已退出${RESET}"
+                done
+                read -p "按回车返回..." temp
+                ;;
+            0) return ;;
+            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+# ---------------------------
+# 主菜单
+# ---------------------------
+function main_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} ◈  Docker Compose 项目管理  ◈ ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}1) 管理项目${RESET}"
+        echo -e "${GREEN}2) 网络管理${RESET}"
+        echo -e "${GREEN}3) 查看容器运行状态${RESET}"
+        echo -e "${GREEN}4) 多选删除项目${RESET}"
+        echo -e "${GREEN}5) 删除未运行的项目${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case "$choice" in
+            1) select_project ;;
+            2) network_menu ;;
+            3) monitor_docker_containers ;;
+            4) delete_multiple_projects ;;
+            5) delete_all_stopped_projects ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+# 启动
+main_menu

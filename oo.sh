@@ -1,935 +1,789 @@
-#!/bin/bash
-# ========================================
-# 🐳 一键 VPS Docker 管理工具
-# ========================================
+#!/usr/bin/env bash
+#
+# iptables 端口转发管理工具 (Alpine Linux 专属)
+#
 
-# -----------------------------
-# 颜色
-# -----------------------------
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-BOLD="\033[1m"
-RESET="\033[0m"
-BLUE="\033[34m"
-# -----------------------------
-# 检查 root
-# -----------------------------
-root_use() {
+# ============== 常量定义 ==============
+CONF_DIR="/etc/iptables.d"
+CONF_FILE="${CONF_DIR}/port-forward.rules"
+DEFAULT_BACKUP_DIR="${CONF_DIR}/backups"
+SYSCTL_CONF="/etc/sysctl.d/99-ip-forward.conf"
+LOG_FILE="/var/log/iptables-forward.log"
+CRON_DDNS_SCRIPT="${CONF_DIR}/ddns_sync.sh"
+LOCAL_SCRIPT_PATH="${CONF_DIR}/port_forward_main.sh"
+BIN_LINK_DIR="/usr/local/bin"
+
+
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+)
+
+# ============== 颜色定义 ==============
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+RESET='\033[0m'
+
+# ============== 辅助输出 ==============
+info()   { printf '\033[32m[信息]\033[0m %s\n' "$1"; }
+warn()   { printf '\033[33m[警告]\033[0m %s\n' "$1"; }
+err()    { printf '\033[31m[错误]\033[0m %s\n' "$1"; }
+
+pause_to_menu() {
+    echo ""
+    read -rp "$(echo -e "${GREEN}按任意键或回车返回主菜单...${RESET}")" _unused
+}
+
+check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}请使用 root 用户运行脚本${RESET}"
+        err "此脚本需要 root 权限运行。"
         exit 1
     fi
 }
 
-# -----------------------------
-# 重启 Docker 并恢复容器端口映射
-# -----------------------------
-restart_docker() {
-    root_use
-    echo -e "${YELLOW}正在重启 Docker...${RESET}"
-
-    if systemctl list-unit-files | grep -q "^docker.service"; then
-        systemctl restart docker
-    else
-        pkill dockerd 2>/dev/null
-        nohup dockerd >/dev/null 2>&1 &
-        sleep 5
+# 完美兼容 Alpine 的 v4/v6 双栈服务状态检测
+is_iptables_active() {
+    local v4_ok=0
+    local v6_ok=0
+    
+    # 检测 IPv4 iptables 状态 (兼容 OpenRC 各种微调输出)
+    if rc-service iptables status 2>/dev/null | grep -Ei "started|active" >/dev/null; then
+        v4_ok=1
+    fi
+    
+    # 检测 IPv6 ip6tables 状态
+    if rc-service ip6tables status 2>/dev/null | grep -Ei "started|active" >/dev/null; then
+        v6_ok=1
     fi
 
-    if docker info &>/dev/null; then
-        echo -e "${GREEN}✅ Docker 已成功重启${RESET}"
-        containers=$(docker ps -a -q)
-        if [ -n "$containers" ]; then
-            echo -e "${CYAN}正在重启所有容器以恢复端口映射...${RESET}"
-            docker restart $containers
-            echo -e "${GREEN}✅ 所有容器已重启并恢复端口映射${RESET}"
-        else
-            echo -e "${YELLOW}没有容器需要重启${RESET}"
-        fi
+    # 只要有一个在跑就认为整体在运行，并反馈具体多栈状态
+    if [[ $v4_ok -eq 1 && $v6_ok -eq 1 ]]; then
+        echo "双栈运行中"
+        return 0
+    elif [[ $v4_ok -eq 1 ]]; then
+        echo "仅IPv4运行"
+        return 0
+    elif [[ $v6_ok -eq 1 ]]; then
+        echo "仅IPv6运行"
+        return 0
     else
-        echo -e "${RED}❌ Docker 重启失败，请检查日志${RESET}"
-    fi
-}
-
-# -----------------------------
-# 检测 Docker 是否安装并运行
-# -----------------------------
-check_docker_running() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}❌ Docker 未安装，请先安装 Docker${RESET}"
         return 1
     fi
-    if ! docker info &>/dev/null; then
-        echo -e "${YELLOW} Docker 未运行，尝试启动...${RESET}"
-        if systemctl list-unit-files | grep -q "^docker.service"; then
-            systemctl start docker
-        else
-            nohup dockerd >/dev/null 2>&1 &
-            sleep 5
-        fi
-    fi
-    if ! docker info &>/dev/null; then
-        echo -e "${RED}❌ Docker 启动失败，请检查日志${RESET}"
-        return 1
-    fi
-    return 0
 }
 
-# -----------------------------
-# 自动检测国内/国外
-# -----------------------------
-detect_country() {
-    local country=$(curl -s --max-time 5 ipinfo.io/country)
-    if [[ "$country" == "CN" ]]; then
-        echo "CN"
-    else
-        echo "OTHER"
-    fi
-}
-
-# -----------------------------
-# 安装/更新 Docker
-# -----------------------------
-docker_install() {
-    root_use
-    local country=$(detect_country)
-    echo -e "${CYAN}检测到国家: $country${RESET}"
-    if [ "$country" = "CN" ]; then
-        echo -e "${YELLOW}使用国内源安装 Docker...${RESET}"
-        curl -fsSL https://get.docker.com -o get-docker.sh
-        sh get-docker.sh
-        mkdir -p /etc/docker
-        cat > /etc/docker/daemon.json << EOF
-{
-  "registry-mirrors": [
-    "https://docker.0.unsee.tech",
-    "https://docker.1panel.live",
-    "https://registry.dockermirror.com",
-    "https://docker.m.daocloud.io"
-  ]
-}
-EOF
-    else
-        echo -e "${YELLOW}使用官方源安装 Docker...${RESET}"
-        curl -fsSL https://get.docker.com | sh
-    fi
-    systemctl enable docker
-    systemctl start docker
-    echo -e "${GREEN}Docker 安装完成并已启动（已设置开机自启）${RESET}"
-}
-
-docker_update() {
-    root_use
-    echo -e "${YELLOW}正在更新 Docker...${RESET}"
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sh get-docker.sh
-    systemctl enable docker
-    systemctl restart docker
-    echo -e "${GREEN}Docker 更新完成并已启动（已设置开机自启）${RESET}"
-}
-
-docker_install_update() {
-    root_use
-    if command -v docker &>/dev/null; then
-        docker_update
-    else
-        docker_install
-    fi
-}
-
-# -----------------------------
-# 卸载 Docker
-# -----------------------------
-docker_uninstall() {
-    root_use
-    echo -e "${RED}正在卸载 Docker 和 Docker Compose...${RESET}"
-    systemctl stop docker 2>/dev/null
-    systemctl disable docker 2>/dev/null
-    pkill dockerd 2>/dev/null
-
-    if command -v apt &>/dev/null; then
-        apt remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
-        apt purge -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
-        apt autoremove -y
-    elif command -v yum &>/dev/null; then
-        yum remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
-    fi
-
-    rm -rf /var/lib/docker /etc/docker /var/lib/containerd /var/run/docker.sock /usr/local/bin/docker-compose
-    echo -e "${GREEN}Docker 和 Docker Compose 已卸载干净${RESET}"
-}
-
-# -----------------------------
-# Docker Compose 安装/更新
-# -----------------------------
-docker_compose_install_update() {
-    root_use
-    echo -e "${CYAN}正在安装/更新 Docker Compose...${RESET}"
-    if ! command -v jq &>/dev/null; then
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y jq
-        elif command -v yum &>/dev/null; then
-            yum install -y jq
-        fi
-    fi
-    local latest=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
-    latest=${latest:-"v2.30.0"}
-    curl -L "https://github.com/docker/compose/releases/download/$latest/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
-    echo -e "${GREEN}Docker Compose 已安装/更新到版本 $latest${RESET}"
-}
-
-
-# -----------------------------
-# Docker IPv6
-# -----------------------------
-docker_ipv6_on() {
-    root_use
-    mkdir -p /etc/docker
-    if [ -f /etc/docker/daemon.json ]; then
-        jq '. + {ipv6:true,"fixed-cidr-v6":"fd00::/64"}' /etc/docker/daemon.json 2>/dev/null \
-            >/etc/docker/daemon.json.tmp || \
-            echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
-    else
-        echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
-    fi
-    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-    restart_docker
-    docker ps -a -q | xargs -r docker start
-    echo -e "${GREEN}✅ Docker IPv6 已开启，所有容器已恢复${RESET}"
-}
-
-docker_ipv6_off() {
-    root_use
-    if [ -f /etc/docker/daemon.json ]; then
-        jq 'del(.ipv6) | del(.["fixed-cidr-v6"])' /etc/docker/daemon.json \
-            >/etc/docker/daemon.json.tmp 2>/dev/null || \
-            cp /etc/docker/daemon.json /etc/docker/daemon.json.tmp
-        mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-        restart_docker
-        docker ps -a -q | xargs -r docker start
-        echo -e "${GREEN}✅ Docker IPv6 已关闭，所有容器已恢复${RESET}"
-    else
-        echo -e "${YELLOW} Docker 配置文件不存在，无法关闭 IPv6${RESET}"
-    fi
-}
-
-# -----------------------------
-# 开放所有端口（IPv4 + IPv6 + nftables）
-# -----------------------------
-open_all_ports() {
-    root_use
-    read -p "确认要开放所有端口吗？(Y/N): " confirm
-    [[ $confirm =~ [Yy] ]] || { echo -e "${YELLOW}操作已取消${RESET}"; return; }
-    echo -e "${YELLOW}正在检测可用防火墙工具...${RESET}"
-
+get_iptables_version() {
     if command -v iptables &>/dev/null; then
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-        iptables -F
-    fi
-    if command -v ip6tables &>/dev/null; then
-        ip6tables -P INPUT ACCEPT
-        ip6tables -P FORWARD ACCEPT
-        ip6tables -P OUTPUT ACCEPT
-        ip6tables -F
-    fi
-    if command -v nft &>/dev/null; then
-        nft flush ruleset 2>/dev/null || true
-    fi
-    echo -e "${GREEN}✅ 已开放所有端口${RESET}"
-    restart_docker
-}
-
-# -----------------------------
-# iptables 切换
-# -----------------------------
-switch_iptables_legacy() {
-    root_use
-    if [ -x /usr/sbin/iptables-legacy ] && [ -x /usr/sbin/ip6tables-legacy ]; then
-        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
-        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
-        update-alternatives --set iptables /usr/sbin/iptables-legacy
-        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
-        restart_docker
-        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
-        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
-        echo -e "${GREEN}✅ 已切换到 iptables-legacy 并恢复规则${RESET}"
+        iptables --version 2>/dev/null | awk '{print $2}'
     else
-        echo -e "${RED}系统未安装 iptables-legacy，无法切换${RESET}"
+        echo "未安装"
     fi
 }
 
-switch_iptables_nft() {
-    root_use
-    if [ -x /usr/sbin/iptables-nft ] && [ -x /usr/sbin/ip6tables-nft ]; then
-        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
-        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
-        update-alternatives --set iptables /usr/sbin/iptables-nft
-        update-alternatives --set ip6tables /usr/sbin/ip6tables-nft
-        restart_docker
-        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
-        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
-        echo -e "${GREEN}✅ 已切换到 iptables-nft 并恢复规则${RESET}"
+validate_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+}
+
+detect_ip_type() {
+    local ip="$1"
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS='.' ok=1
+        read -ra octets <<< "$ip"
+        for octet in "${octets[@]}"; do
+            if (( octet > 255 )); then ok=0; fi
+        done
+        [[ $ok -eq 1 ]] && { echo "4"; return; }
+    fi
+    if [[ "$ip" =~ : ]] && [[ ! "$ip" =~ [^0-9a-fA-F:] ]]; then
+        echo "6"
+        return
+    fi
+    if [[ "$ip" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        echo "2"
+        return
+    fi
+    echo "1"
+}
+
+resolve_domain() {
+    local domain="$1"
+    local resolved=""
+    if command -v getent &>/dev/null; then
+        resolved=$(getent ahosts "$domain" 2>/dev/null | grep -E '^[0-9]' | head -n1 | awk '{print $1}')
+    fi
+    if [[ -z "$resolved" ]] && command -v dig &>/dev/null; then
+        resolved=$(dig +short "$domain" @8.8.8.8 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1)
+    fi
+    if [[ -z "$resolved" ]] && command -v nslookup &>/dev/null; then
+        resolved=$(nslookup "$domain" 8.8.8.8 2>/dev/null | awk '/^Address:/ {print $2}' | grep -v "#" | head -n1)
+    fi
+    echo "${resolved//[[:space:]]/}"
+}
+
+enable_ip_forward() {
+    mkdir -p /etc/sysctl.d
+    cat > "${SYSCTL_CONF}" <<EOF
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+    sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
+    
+    # 加载 Alpine 内核模块保底
+    modprobe ip_tables iptable_nat ip6_tables ip6table_nat 2>/dev/null || true
+}
+
+disable_ip_forward() {
+    rm -f "${SYSCTL_CONF}" 2>/dev/null
+}
+
+init_conf() {
+    mkdir -p "${CONF_DIR}" "${DEFAULT_BACKUP_DIR}" 2>/dev/null || return 1
+    touch "${LOG_FILE}" "${CONF_FILE}" 2>/dev/null || true
+}
+
+declare -a RULES=()
+
+sanitize_note() {
+    printf "%s" "${1//|/ }"
+}
+
+# 从自建的纯净规则文件中加载
+load_rules() {
+    RULES=()
+    [[ -f "${CONF_FILE}" ]] || return
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && [[ ! "$line" =~ "RULE:" ]] && continue
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        
+        if [[ "$line" =~ ^#\ RULE:\ (.*)$ ]]; then
+            RULES+=("${BASH_REMATCH[1]}")
+        fi
+    done < "${CONF_FILE}"
+}
+
+# 核心：将本地 RULES 阵列转换为系统 iptables 实际规则并保存
+write_and_apply_rules() {
+    local tmp_file="${CONF_FILE}.tmp.$$"
+    echo "# iptables 端口转发快照" > "${tmp_file}"
+    local rule
+    for rule in "${RULES[@]}"; do
+        echo "# RULE: ${rule}" >> "${tmp_file}"
+    done
+    mv -f "${tmp_file}" "${CONF_FILE}" 2>/dev/null
+
+    # 精准定点清理转发链（绝对不碰 INPUT，SSH永不锁死）
+    iptables -t nat -F PREROUTING 2>/dev/null || true
+    iptables -t nat -F POSTROUTING 2>/dev/null || true
+    ip6tables -t nat -F PREROUTING 2>/dev/null || true
+    ip6tables -t nat -F POSTROUTING 2>/dev/null || true
+
+    local lport target dport note proto type actual_ip
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r lport target dport note proto <<< "$rule"
+        proto="${proto:-ALL}"
+        type=$(detect_ip_type "$target")
+        actual_ip="$target"
+        
+        if [[ "$type" == "2" ]]; then 
+            actual_ip=$(resolve_domain "$target")
+            if [[ -z "$actual_ip" ]]; then
+                # 域名解析闪断保底
+                actual_ip=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -w "dports ${lport}" | awk '{print $NF}' | awk -F':' '{print $1}')
+            fi
+        fi
+        [[ -z "$actual_ip" ]] && continue
+        local ip_ver=$(detect_ip_type "$actual_ip")
+
+        if [[ "$ip_ver" == "4" ]]; then
+            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
+                iptables -t nat -A PREROUTING -p tcp --dport "${lport}" -j DNAT --to-destination "${actual_ip}:${dport}"
+                iptables -t nat -A POSTROUTING -p tcp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
+            fi
+            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
+                iptables -t nat -A PREROUTING -p udp --dport "${lport}" -j DNAT --to-destination "${actual_ip}:${dport}"
+                iptables -t nat -A POSTROUTING -p udp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
+            fi
+        elif [[ "$ip_ver" == "6" ]]; then
+            if [[ "$proto" == "ALL" || "$proto" == "TCP" ]]; then
+                ip6tables -t nat -A PREROUTING -p tcp --dport "${lport}" -j DNAT --to-destination "[${actual_ip}]:${dport}"
+                ip6tables -t nat -A POSTROUTING -p tcp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
+            fi
+            if [[ "$proto" == "ALL" || "$proto" == "UDP" ]]; then
+                ip6tables -t nat -A PREROUTING -p udp --dport "${lport}" -j DNAT --to-destination "[${actual_ip}]:${dport}"
+                ip6tables -t nat -A POSTROUTING -p udp -d "${actual_ip}" --dport "${dport}" -j MASQUERADE
+            fi
+        fi
+    done
+
+    # 持久化保存到 Alpine 系统开机加载目录
+    rc-service iptables save >/dev/null 2>&1 || true
+    rc-service ip6tables save >/dev/null 2>&1 || true
+}
+
+setup_ddns_cron() {
+    rc-update add dcron default >/dev/null 2>&1 || true
+    rc-service dcron start >/dev/null 2>&1 || true
+
+    cat > "${CRON_DDNS_SCRIPT}" <<EOF
+#!/usr/bin/env bash
+CONF_FILE="/etc/iptables.d/port-forward.rules"
+[[ -f "\$CONF_FILE" ]] || exit 0
+if grep -q "RULE:" "\$CONF_FILE"; then
+    /etc/iptables.d/port_forward_main.sh --reload-backend
+fi
+EOF
+    chmod +x "${CRON_DDNS_SCRIPT}" 2>/dev/null
+
+    local tmp_cron="/tmp/current_cron_$$"
+    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" > "${tmp_cron}" || true
+    echo "*/2 * * * * ${CRON_DDNS_SCRIPT} >/dev/null 2>&1" >> "${tmp_cron}"
+    crontab "${tmp_cron}" 2>/dev/null || true
+    rm -f "${tmp_cron}"
+}
+
+do_backend_ddns_sync() {
+    [[ -f "${CONF_FILE}" ]] || exit 0
+    load_rules
+    if [[ ${#RULES[@]} -eq 0 ]]; then exit 0; fi
+
+    local need_reload=0
+    local rule lport target dport note proto type current_dns_ip
+
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r lport target dport note proto <<< "$rule"
+        type=$(detect_ip_type "$target")
+        
+        if [[ "$type" == "2" ]]; then
+            current_dns_ip=$(resolve_domain "$target")
+            if [[ -n "$current_dns_ip" ]]; then
+                local active_ip=""
+                local ip_ver=$(detect_ip_type "$current_dns_ip")
+                
+                # 核心修复：加了 head -n1，多条重复规则只取第一个，彻底干掉换行符
+                if [[ "$ip_ver" == "4" ]]; then
+                    active_ip=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -w "dport ${lport}" | grep -oE 'to-destination [0-9.]+' | awk '{print $2}' | head -n1)
+                elif [[ "$ip_ver" == "6" ]]; then
+                    active_ip=$(ip6tables -t nat -S PREROUTING 2>/dev/null | grep -w "dport ${lport}" | grep -oE 'to-destination \[[0-9a-fA-F:]+\]' | tr -d '[]' | awk '{print $2}' | head -n1)
+                fi
+
+                # 剔除可能存在的首尾空格/换行干净比对
+                active_ip=$(echo "${active_ip}" | tr -d '[:space:]')
+                current_dns_ip=$(echo "${current_dns_ip}" | tr -d '[:space:]')
+
+                if [[ -z "$active_ip" || "$current_dns_ip" != "$active_ip" ]]; then
+                    need_reload=1
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') [DDNS] 检测到域名 ${target} IP 真正发生变动 [旧: ${active_ip:-无} -> 新: ${current_dns_ip}]，触发局部热重载..." >> "${LOG_FILE}"
+                fi
+            fi
+        fi
+    done
+
+    if [[ $need_reload -eq 1 ]]; then
+        write_and_apply_rules
+    fi
+    exit 0
+}
+do_backup_manual() {
+    if [[ ! -f "${CONF_FILE}" ]] || [[ ! -s "${CONF_FILE}" ]]; then
+        err "当前没有任何生效的规则，无需导出。"
+        pause_to_menu
+        return
+    fi
+    local target_dir
+    read -rp "$(echo -e "${GREEN}请输入备份导出目录 [默认: ${DEFAULT_BACKUP_DIR}]: ${RESET}")" target_dir
+    target_dir="${target_dir:-$DEFAULT_BACKUP_DIR}"
+    mkdir -p "${target_dir}" 2>/dev/null
+
+    local bkp_name="iptables_bak_$(date '+%Y%m%d_%H%M%S').rules"
+    cp "${CONF_FILE}" "${target_dir}/${bkp_name}"
+    info "手动导出成功！备份至: ${target_dir}/${bkp_name}"
+    pause_to_menu
+}
+
+do_restore_manual() {
+    local target_input selected_file=""
+    read -rp "$(echo -e "${GREEN}请输入备份文件夹或完整路径 [默认: ${DEFAULT_BACKUP_DIR}]: ${RESET}")" target_input
+    target_input="${target_input:-$DEFAULT_BACKUP_DIR}"
+
+    if [[ -f "$target_input" ]]; then
+        selected_file="$target_input"
     else
-        echo -e "${RED}系统未安装 iptables-nft，无法切换${RESET}"
-    fi
-}
-
-# -----------------------------
-# Docker 状态
-# -----------------------------
-docker_status() {
-    if docker info &>/dev/null; then
-        echo "运行中"
-    else
-        echo "未运行"
-    fi
-}
-
-current_iptables() {
-    ipt=$(update-alternatives --query iptables 2>/dev/null | grep 'Value:' | awk '{print $2}')
-    if [[ $ipt == *legacy ]]; then
-        echo "legacy"
-    else
-        echo "nft"
-    fi
-}
-
-docker_container_info() {
-    total=$(docker ps -a -q | wc -l)
-    running=$(docker ps -q | wc -l)
-    echo "总容器: $total | 运行中: $running"
-}
-
-
-# -----------------------------
-# Docker 容器管理
-# -----------------------------
-docker_ps() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 容器管理 =====${RESET}"
-        docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
-        echo -e "${GREEN}01. 创建新容器${RESET}"
-        echo -e "${GREEN}02. 启动容器${RESET}"
-        echo -e "${GREEN}03. 停止容器${RESET}"
-        echo -e "${GREEN}04. 删除容器${RESET}"
-        echo -e "${GREEN}05. 重启容器${RESET}"
-        echo -e "${GREEN}06. 启动所有容器${RESET}"
-        echo -e "${GREEN}07. 停止所有容器${RESET}"
-        echo -e "${GREEN}08. 删除所有容器${RESET}"
-        echo -e "${GREEN}09. 重启所有容器${RESET}"
-        echo -e "${GREEN}10. 进入容器${RESET}"
-        echo -e "${GREEN}11. 查看日志${RESET}"
-        echo -e "${GREEN} 0. 返回主菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            01|1) read -p "请输入创建命令: " cmd; $cmd ;;
-            02|2) read -p "请输入容器名: " name; docker start $name ;;
-            03|3) read -p "请输入容器名: " name; docker stop $name ;;
-            04|4) read -p "请输入容器名: " name; docker rm -f $name ;;
-            05|5) read -p "请输入容器名: " name; docker restart $name ;;
-            06|6) containers=$(docker ps -a -q); [ -n "$containers" ] && docker start $containers || echo "无容器可启动" ;;
-            07|7) containers=$(docker ps -q); [ -n "$containers" ] && docker stop $containers || echo "无容器正在运行" ;;
-            08|8) read -p "确定删除所有容器? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rm -f $(docker ps -a -q) ;;
-            09|9) containers=$(docker ps -q); [ -n "$containers" ] && docker restart $containers || echo "无容器正在运行" ;;
-            10) read -p "请输入容器名: " name; docker exec -it $name /bin/bash ;;
-            11) read -p "请输入容器名: " name; docker logs -f $name ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-
-# -----------------------------
-# Docker 镜像管理
-# -----------------------------
-docker_image() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 镜像管理 =====${RESET}"
-        docker image ls
-        echo -e "${GREEN}01. 拉取镜像${RESET}"
-        echo -e "${GREEN}02. 更新镜像${RESET}"
-        echo -e "${GREEN}03. 删除镜像${RESET}"
-        echo -e "${GREEN}04. 删除所有镜像${RESET}"
-        echo -e "${GREEN} 0. 返回主菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            01|1) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
-            02|2) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
-            03|3) read -p "请输入镜像名: " imgs; for img in $imgs; do docker rmi -f $img; done ;;
-            04|4) read -p "确定删除所有镜像? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rmi -f $(docker images -q) ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-# -----------------------------
-# Docker 卷管理
-# -----------------------------
-docker_volume() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 卷管理 =====${RESET}"
-        docker volume ls
-        echo -e "${GREEN}1. 创建卷${RESET}"
-        echo -e "${GREEN}2. 删除卷${RESET}"
-        echo -e "${GREEN}3. 删除所有无用卷${RESET}"
-        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            1) read -p "请输入卷名: " v; docker volume create $v ;;
-            2) read -p "请输入卷名: " v; docker volume rm $v ;;
-            3) docker volume prune -f ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-# -----------------------------
-# 清理所有未使用资源
-# -----------------------------
-docker_cleanup() {
-    root_use
-    echo -e "${YELLOW}清理所有未使用容器、镜像、卷...${RESET}"
-    docker system prune -af --volumes
-    echo -e "${GREEN}清理完成${RESET}"
-}
-
-# -----------------------------
-# Docker 网络管理
-# -----------------------------
-docker_network() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 网络管理 =====${RESET}"
-        docker network ls
-        echo -e "${GREEN}1. 创建网络${RESET}"
-        echo -e "${GREEN}2. 加入网络${RESET}"
-        echo -e "${GREEN}3. 退出网络${RESET}"
-        echo -e "${GREEN}4. 删除网络${RESET}"
-        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " sub_choice
-        case $sub_choice in
-            1) read -p "设置新网络名: " dockernetwork; docker network create $dockernetwork ;;
-            2) read -p "加入网络名: " dockernetwork; read -p "容器名: " dockername; docker network connect $dockernetwork $dockername ;;
-            3) read -p "退出网络名: " dockernetwork; read -p "容器名: " dockername; docker network disconnect $dockernetwork $dockername ;;
-            4) read -p "请输入要删除的网络名: " dockernetwork; docker network rm $dockernetwork || echo -e "${RED}删除失败，网络可能被容器占用${RESET}" ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-# -----------------------------
-# Docker 备份/恢复菜单
-# -----------------------------
-# -----------------------------
-# Docker 备份/恢复菜单
-# -----------------------------
-docker_backup_menu() {
-    root_use
-
-    BACKUP_DIR="/opt/docker_backups"
-    LOG_FILE="$BACKUP_DIR/backup.log"
-    mkdir -p "$BACKUP_DIR"
-
-    # -----------------------------
-    # 检查 jq
-    # -----------------------------
-    if ! command -v jq &>/dev/null; then
-        echo -e "${YELLOW}未检测到 jq，正在安装...${RESET}"
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y jq
-        elif command -v yum &>/dev/null; then
-            yum install -y epel-release && yum install -y jq
-        elif command -v dnf &>/dev/null; then
-            dnf install -y jq
-        else
-            echo -e "${RED}无法检测到包管理器，请手动安装 jq${RESET}"
-            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+        local bkp_files=($(ls "${target_input}"/*.rules 2>/dev/null | sort -r))
+        if [[ ${#bkp_files[@]} -eq 0 ]]; then
+            err "未发现备份文件。"
+            pause_to_menu
             return
         fi
+        echo -e "\n${YELLOW}=== 历史备份 ===${RESET}"
+        local idx=1 file
+        for file in "${bkp_files[@]}"; do
+            printf "[%2s] %s\n" "$idx" "$(basename "$file")"
+            ((idx++))
+        done
+        read -rp "请选择序号 (0 取消): " choice
+        if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
+        selected_file="${bkp_files[$((choice-1))]}"
     fi
 
-    # -----------------------------
-    # 检查 Docker
-    # -----------------------------
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y docker.io
-        elif command -v yum &>/dev/null; then
-            yum install -y docker
-        elif command -v dnf &>/dev/null; then
-            dnf install -y docker
+    if [[ -n "$selected_file" && -f "$selected_file" ]]; then
+        cp -f "${selected_file}" "${CONF_FILE}"
+        load_rules
+        write_and_apply_rules
+        info "配置已导入并成功应用！"
+    fi
+    pause_to_menu
+}
+
+do_install() {
+    info "准备安全安装 Alpine iptables 双栈环境..."
+    
+    # 1. 安装基础依赖
+    apk add iptables ip6tables bash curl bind-tools dcron >/dev/null 2>&1
+    
+    # 2. 开启内核转发与初始化配置
+    enable_ip_forward && init_conf
+    
+    # 3. 【核心加固】防止 Alpine 启动默认服务时锁死 SSH 或报错
+    # 提前创建并写入极其纯净、放行的基础规则文件（Alpine 默认路径）
+    mkdir -p /etc/iptables
+    
+    cat << 'EOF' > /etc/iptables/rules.iv4
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+COMMIT
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+COMMIT
+EOF
+
+    # 镜像复制一份给 IPv6
+    cp /etc/iptables/rules.iv4 /etc/iptables/rules.iv6
+
+    # 4. 注册并安全启动服务
+    rc-update add iptables default >/dev/null 2>&1 || true
+    rc-update add ip6tables default >/dev/null 2>&1 || true
+    
+    # 此时启动绝对安全，INPUT 链全放行，且 nat 链已被初始化创建
+    rc-service iptables start >/dev/null 2>&1 || true
+    rc-service ip6tables start >/dev/null 2>&1 || true
+    
+    # 5. 【策略优化】立即执行一次规则写入，确保不用等 cron 触发就直接生效
+    if type write_and_apply_rules >/dev/null 2>&1; then
+        info "正在注入初始端口转发规则..."
+        write_and_apply_rules
+    fi
+    
+    # 6. 配置定时任务（DDNS 域名探针）
+    setup_ddns_cron
+    # 确保 Alpine 的 cron 服务也是启动状态
+    rc-update add dcron default >/dev/null 2>&1 || true
+    rc-service dcron start >/dev/null 2>&1 || true
+    
+    info "Alpine iptables 双栈环境初始化完成！INPUT 链绝对纯净安全。"
+    pause_to_menu
+}
+
+# 3. 手机端纵向块状输出
+_print_rules_list() {
+    local idx=1 rule lport target dport note proto type label proto_label
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r lport target dport note proto <<< "$rule"
+        proto="${proto:-ALL}"
+        type=$(detect_ip_type "$target")
+        
+        if [[ "$type" == "2" ]]; then 
+            label="域名"
+        elif [[ "$type" == "6" ]]; then 
+            label="IPv6" 
+        else 
+            label="IPv4"
+        fi
+        
+        if [[ "$proto" == "ALL" ]]; then 
+            proto_label="TCP+UDP" 
+        else 
+            proto_label="$proto"
+        fi
+
+        local target_display
+        if [[ "$type" == "6" ]]; then
+            target_display="[${target}]:${dport}"
         else
-            echo -e "${RED}无法检测到包管理器，请手动安装 Docker${RESET}"
-            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-            return
+            target_display="${target}:${dport}"
         fi
-    fi
 
-    # -----------------------------
-    # 检查 Docker 服务
-    # -----------------------------
-    if ! pgrep -x dockerd &>/dev/null; then
-        echo -e "${YELLOW}Docker 服务未运行，正在启动...${RESET}"
-        if command -v systemctl &>/dev/null; then
-            systemctl start docker
-            systemctl enable docker
-        else
-            service docker start
-        fi
-        sleep 2
-        if ! pgrep -x dockerd &>/dev/null; then
-            echo -e "${RED}Docker 启动失败，请手动检查服务${RESET}"
-            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-            return
-        fi
-    fi
+        echo -e "${YELLOW}◈ 规则序号: ${RESET}${YELLOW}[${idx}]${RESET}"
+        echo -e "  ├─ ${YELLOW}转发协议: ${RESET}${CYAN}${proto_label} (${label})${RESET}"
+        echo -e "  ├─ ${YELLOW}本机端口: ${RESET}${GREEN}${lport}${RESET}"
+        echo -e "  ├─ ${YELLOW}目标地址: ${RESET}${BLUE}${target_display}${RESET}"
+        echo -e "  └─ ${YELLOW}备注信息: ${RESET}${note:--}"
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+        ((idx++))
+    done
+}
 
-    # -----------------------------
-    # 检查磁盘空间
-    # -----------------------------
-    avail_space=$(df --output=avail "$BACKUP_DIR" | tail -1)
-    if (( avail_space < 1048576 )); then
-        echo -e "${RED}磁盘剩余空间不足 1GB，无法执行备份！${RESET}"
-        read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+
+do_list() {
+    load_rules
+    if [[ ${#RULES[@]} -eq 0 ]]; then 
+        info "当前没有配置任何端口转发规则。"
+        pause_to_menu
+        return
+    fi
+    _print_rules_list
+    echo ""
+    pause_to_menu
+}
+
+do_add() {
+    init_conf || return
+    enable_ip_forward && load_rules
+
+    local lport target dport note proto proto_choice type
+    while true; do
+        read -rp "请输入本机监听端口 (1-65535): " lport
+        validate_port "$lport" && break
+        err "端口输入无效"
+    done
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r rp _ _ _ _ <<< "$rule"
+        if [[ "$rp" == "$lport" ]]; then err "本机端口 ${lport} 规则已存在"; pause_to_menu; return; fi
+    done
+    while true; do
+        read -rp "请输入目标 IP 地址 或 目标域名: " target
+        type=$(detect_ip_type "$target")
+        if [[ "$type" == "1" ]]; then err "格式不正确"; elif [[ "$type" == "2" ]]; then
+            local rip=$(resolve_domain "$target")
+            [[ -z "$rip" ]] && warn "该域名目前解析不出 IP，系统稍后会自动重试。" || info "成功解析当前 IP 为: ${rip}"
+            break
+        else break; fi
+    done
+    while true; do
+        read -rp "请输入目标端口 [默认 $lport]: " dport
+        dport="${dport:-$lport}"
+        validate_port "$dport" && break
+        err "目标端口不合法"
+    done
+
+    while true; do
+        read -rp "$(echo -e "${GREEN}请选择协议类型 [1: TCP+UDP | 2: 仅 TCP | 3: 仅 UDP] (默认 1): ${RESET}")" proto_choice
+        proto_choice="${proto_choice:-1}"
+        case "$proto_choice" in
+            1) proto="ALL"; break ;;
+            2) proto="TCP"; break ;;
+            3) proto="UDP"; break ;;
+            *) err "选择错误，请输入 1, 2 或 3" ;;
+        esac
+    done
+
+    read -rp "请输入本条转发备注: " note
+    note=$(sanitize_note "$note")
+
+    RULES+=("${lport}|${target}|${dport}|${note}|${proto}")
+    write_and_apply_rules
+    setup_ddns_cron
+    info "规则添加并加载成功！"
+    pause_to_menu
+}
+
+do_edit() {
+    load_rules
+    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供修改。"; pause_to_menu; return; fi
+    _print_rules_list
+    echo ""
+
+    read -rp "请输入要修改的规则序号 (0 取消): " choice
+    if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
+        err "无效序号"
+        pause_to_menu
         return
     fi
 
+    local target_idx=$((choice-1))
+    local old_lport old_target old_dport old_note old_proto
+    IFS='|' read -r old_lport old_target old_dport old_note old_proto <<< "${RULES[$target_idx]}"
+    old_proto="${old_proto:-ALL}"
+
+    echo -e "\n${YELLOW}开始修改第 $choice 条规则 (直接回车保持原值):${RESET}"
+    local lport target dport note proto proto_choice type
+
+    # 1. 修改本机端口
     while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker Run备份与恢复 =====${RESET}"
-        echo -e "${GREEN}1. 备份 Docker${RESET}"
-        echo -e "${GREEN}2. 恢复 Docker${RESET}"
-        echo -e "${GREEN}3. 删除备份文件${RESET}"
-        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            1)
-                # -----------------------------
-                # 备份逻辑
-                # -----------------------------
-                while true; do
-                    echo -e "${YELLOW}选择备份类型:${RESET}"
-                    echo -e "${GREEN}1. 容器${RESET}"
-                    echo -e "${GREEN}2. 镜像${RESET}"
-                    echo -e "${GREEN}3. 卷${RESET}"
-                    echo -e "${GREEN}4. 全量${RESET}"
-                    echo -e "${GREEN}0. 返回上一级${RESET}"
-                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " btype
-                    [[ "$btype" == "0" ]] && break
+        read -rp "本机监听端口 [$old_lport]: " lport
+        lport="${lport:-$old_lport}"
+        validate_port "$lport" && break
+        err "端口输入无效"
+    done
 
-                    read -p "请输入备份文件名（默认 docker_backup_$(date +%F).tar.gz）: " backup_name
-                    backup_name=${backup_name:-docker_backup_$(date +%F).tar.gz}
-                    backup_path="$BACKUP_DIR/$backup_name"
+    # 2. 修改目标 IP 或 域名
+    while true; do
+        read -rp "目标 IP 或 域名 [$old_target]: " target
+        target="${target:-$old_target}"
+        type=$(detect_ip_type "$target")
+        if [[ "$type" == "1" ]]; then err "格式不正确"; elif [[ "$type" == "2" ]]; then
+            local rip=$(resolve_domain "$target")
+            [[ -z "$rip" ]] && warn "该域名目前解析不出 IP，系统稍后会自动重试。" || info "成功解析当前 IP 为: ${rip}"
+            break
+        else break; fi
+    done
 
-                    TMP_BACKUP_DIR=$(mktemp -d /tmp/docker_backup_XXXX)
+    # 3. 修改目标端口
+    while true; do
+        read -rp "目标端口 [$old_dport]: " dport
+        dport="${dport:-$old_dport}"
+        validate_port "$dport" && break
+        err "目标端口不合法"
+    done
 
-                    # --- 容器备份 ---
-                    if [[ "$btype" == "1" || "$btype" == "4" ]]; then
-                        echo "可用容器列表："
-                        docker ps -a --format "{{.Names}}"
-                        read -p "请输入要备份的容器名（多个用空格，留空则全部）: " selected_containers
-                        [[ -z "$selected_containers" ]] && selected_containers=$(docker ps -a --format "{{.Names}}")
-                        for cname in $selected_containers; do
-                            cid=$(docker ps -a -q -f name="^${cname}$")
-                            [[ -z "$cid" ]] && echo "容器 $cname 不存在，跳过" && continue
-                            docker inspect $cid > "$TMP_BACKUP_DIR/container_${cname}.json"
-                            docker export "$cid" -o "$TMP_BACKUP_DIR/container_${cname}.tar"
-                            echo "$(date '+%F %T') 备份容器 $cname 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    # --- 镜像备份 ---
-                    if [[ "$btype" == "2" || "$btype" == "4" ]]; then
-                        echo "可用镜像列表："
-                        docker images --format "{{.Repository}}:{{.Tag}}"
-                        read -p "请输入要备份的镜像（多个用空格，留空则全部）: " selected_images
-                        [[ -z "$selected_images" ]] && selected_images=$(docker images --format "{{.Repository}}:{{.Tag}}")
-                        for iname in $selected_images; do
-                            [[ "$iname" == "<none>:<none>" ]] && continue
-                            safe_name=$(echo "$iname" | tr '/:' '_')
-                            docker save "$iname" -o "$TMP_BACKUP_DIR/image_${safe_name}.tar"
-                            echo "$(date '+%F %T') 备份镜像 $iname 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    # --- 卷备份 ---
-                    if [[ "$btype" == "3" || "$btype" == "4" ]]; then
-                        echo "可用卷列表："
-                        docker volume ls -q
-                        read -p "请输入要备份的卷名（多个用空格，留空则全部）: " selected_volumes
-                        [[ -z "$selected_volumes" ]] && selected_volumes=$(docker volume ls -q)
-                        for vol in $selected_volumes; do
-                            [[ ! -d /var/lib/docker/volumes/"$vol"/_data ]] && echo "卷 $vol 不存在，跳过" && continue
-                            read -p "请确保卷 $vol 未被容器使用，按回车继续..."
-                            tar -czf "$TMP_BACKUP_DIR/volume_${vol}.tar.gz" -C /var/lib/docker/volumes/"$vol"/_data .
-                            echo "$(date '+%F %T') 备份卷 $vol 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    tar -czf "$backup_path" -C "$TMP_BACKUP_DIR" .
-                    rm -rf "$TMP_BACKUP_DIR"
-                    echo -e "${GREEN}备份完成: $backup_path${RESET}"
-                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                    break
-                done
-                ;;
-            2)
-                # -----------------------------
-                # 恢复逻辑（保持原有选择逻辑）并增强安全
-                # -----------------------------
-                while true; do
-                    echo -e "${YELLOW}选择恢复类型:${RESET}"
-                    echo -e "${GREEN}1. 容器${RESET}"
-                    echo -e "${GREEN}2. 镜像${RESET}"
-                    echo -e "${GREEN}3. 卷${RESET}"
-                    echo -e "${GREEN}4. 全量${RESET}"
-                    echo -e "${GREEN}0. 返回上一级${RESET}"
-                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " rtype
-                    [[ "$rtype" == "0" ]] && break
-
-                    read -p "请输入备份文件路径: " backup_file
-                    [[ ! -f "$backup_file" ]] && echo -e "${RED}备份文件不存在${RESET}" && read -p "按回车继续..." && continue
-
-                    TMP_RESTORE_DIR=$(mktemp -d /tmp/docker_restore_XXXX)
-                    tar -xzf "$backup_file" -C "$TMP_RESTORE_DIR"
-
-                    # --- 容器恢复 ---
-                    if [[ "$rtype" == "1" || "$rtype" == "4" ]]; then
-                        for cjson in "$TMP_RESTORE_DIR"/container_*.json; do
-                            [[ ! -f "$cjson" ]] && continue
-                            cname=$(basename "$cjson" | sed 's/container_\(.*\).json/\1/')
-                            image=$(jq -r '.[0].Config.Image' "$cjson")
-                            envs=$(jq -r '.[0].Config.Env | join(" -e ")' "$cjson")
-                            [[ -n "$envs" ]] && envs="-e $envs"
-                            ports=$(jq -r '.[0].HostConfig.PortBindings | to_entries | map("\(.value[0].HostPort):\(.key)") | join(" -p ")' "$cjson")
-                            [[ -n "$ports" ]] && ports="-p $ports"
-                            mounts=$(jq -r '.[0].Mounts | map("-v \(.Source):\(.Destination)") | join(" ")' "$cjson")
-                            network=$(jq -r '.[0].HostConfig.NetworkMode' "$cjson")
-                            echo "注意：如果端口已被占用，容器 $cname 启动可能失败"
-
-                            # 如果镜像不存在，尝试从备份加载
-                            safe_image_name=$(echo "$image" | tr '/:' '_')
-                            img_tar="$TMP_RESTORE_DIR/image_${safe_image_name}.tar"
-                            [[ -f "$img_tar" ]] && docker load -i "$img_tar"
-
-                            docker run -d --name "$cname" $envs $ports $mounts --network "$network" "$image"
-                            echo "$(date '+%F %T') 恢复容器 $cname 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    # --- 镜像恢复 ---
-                    if [[ "$rtype" == "2" || "$rtype" == "4" ]]; then
-                        for img_file in "$TMP_RESTORE_DIR"/image_*.tar; do
-                            [[ -f "$img_file" ]] && docker load -i "$img_file"
-                        done
-                    fi
-
-                    # --- 卷恢复 ---
-                    if [[ "$rtype" == "3" || "$rtype" == "4" ]]; then
-                        for vol_file in "$TMP_RESTORE_DIR"/volume_*.tar.gz; do
-                            vol_name=$(basename "$vol_file" | sed 's/volume_\(.*\).tar.gz/\1/')
-                            if docker volume inspect "$vol_name" &>/dev/null; then
-                                read -p "卷 $vol_name 已存在，是否覆盖? (y/N): " confirm
-                                [[ "$confirm" != "y" ]] && continue
-                            fi
-                            docker volume create "$vol_name" >/dev/null 2>&1
-                            tar -xzf "$vol_file" -C /var/lib/docker/volumes/"$vol_name"/_data
-                            echo "$(date '+%F %T') 恢复卷 $vol_name 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    rm -rf "$TMP_RESTORE_DIR"
-                    echo -e "${GREEN}恢复完成${RESET}"
-                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                    break
-                done
-                ;;
-            3)
-                # -----------------------------
-                # 删除备份文件（支持多选或通配符）
-                # -----------------------------
-                while true; do
-                    echo "当前备份目录：$BACKUP_DIR"
-                    ls "$BACKUP_DIR"
-                    read -p "请输入要删除的备份文件名（支持空格或*通配符，输入0返回）: " del_files
-                    [[ "$del_files" == "0" ]] && break
-                    rm -f $BACKUP_DIR/$del_files
-                    echo -e "${GREEN}删除完成${RESET}"
-                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                    break
-                done
-                ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}"; read -p "$(echo -e ${GREEN}按回车继续...${RESET})" ;;
+    # 4. 修改协议类型 (已补齐)
+    local proto_label
+    [[ "$old_proto" == "ALL" ]] && proto_label="TCP+UDP" || proto_label="$old_proto"
+    while true; do
+        read -rp "$(echo -e "${GREEN}请选择协议类型 [1: TCP+UDP | 2: 仅 TCP | 3: 仅 UDP] (当前: ${proto_label}, 直接回车保持不变): ${RESET}")" proto_choice
+        if [[ -z "$proto_choice" ]]; then
+            proto="$old_proto"
+            break
+        fi
+        case "$proto_choice" in
+            1) proto="ALL"; break ;;
+            2) proto="TCP"; break ;;
+            3) proto="UDP"; break ;;
+            *) err "选择错误，请输入 1, 2 或 3" ;;
         esac
     done
+
+    # 5. 修改备注
+    read -rp "本条转发备注 [$old_note]: " note
+    note="${note:-$old_note}"
+    note=$(sanitize_note "$note")
+
+    # 写入更新（使用新修改的 $proto 替换原有的 $old_proto）
+    RULES[$target_idx]="${lport}|${target}|${dport}|${note}|${proto}"
+    write_and_apply_rules
+    info "规则修改并应用成功！"
+    pause_to_menu
 }
 
-monitor_docker_containers() {
-    clear
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}          🐳 Docker 容器监控${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+do_delete() {
+    load_rules
+    if [[ ${#RULES[@]} -eq 0 ]]; then info "无规则可供删除。"; pause_to_menu; return; fi
+    _print_rules_list
+    echo ""
 
-    # 获取并处理数据 (按内存排序)
-    docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | sort -k3 -hr | while IFS=$'\t' read -r name cpu mem net; do
+    read -rp "请输入要删除的规则序号 (0 取消): " choice
+    if [[ -z "$choice" || "$choice" == "0" ]]; then return; fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#RULES[@]} )); then
+        unset 'RULES[$((choice-1))]'
+        RULES=("${RULES[@]}")
+        write_and_apply_rules
+        info "成功删除规则。"
+    else 
+        err "无效序号"
+    fi
+    pause_to_menu
+}
+
+do_clear_all() {
+    load_rules
+    if [[ ${#RULES[@]} -eq 0 ]]; then info "当前没有任何转发规则。"; pause_to_menu; return; fi
+    read -rp "确认彻底清空所有规则？[y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return
+    RULES=()
+    write_and_apply_rules
+    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
+    rm -f "${CRON_DDNS_SCRIPT}" 2>/dev/null
+    info "已全部清空。"
+    pause_to_menu
+}
+
+do_diagnose() {
+    echo -e "\n========================================"
+    echo "     Alpine Linux iptables 系统环境自检"
+    echo "========================================"
+    info "系统类型: Alpine Linux"
+    
+    local status_msg
+    status_msg=$(is_iptables_active)
+    if [[ $? -eq 0 ]]; then
+        info "iptables 服务状态: ${status_msg}"
+    else
+        warn "iptables 服务状态: 未运行"
+    fi
+
+    if crontab -l 2>/dev/null | grep -q "${CRON_DDNS_SCRIPT}"; then
+        info "域名同步守护进程: 正常激活 (每2分钟)"
+    else
+        warn "域名同步守护进程: 未配置进程"
+    fi
+    pause_to_menu
+}
+
+do_view_log() {
+    if [[ ! -f "${LOG_FILE}" ]]; then
+        info "当前暂无 DDNS 日志记录产生。"
+        pause_to_menu
+        return
+    fi
+    echo -e "\n${GREEN}正在查看实时日志，按【Ctrl + C】可以随时退出查看...${RESET}"
+    tail -n 30 -f "${LOG_FILE}"
+}
+
+do_uninstall() {
+    read -rp "确认要彻底卸载本工具并清空所有转发规则吗？[y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return
+
+    RULES=()
+    write_and_apply_rules 2>/dev/null || true
+    crontab -l 2>/dev/null | grep -v "${CRON_DDNS_SCRIPT}" | crontab - 2>/dev/null || true
+    disable_ip_forward
+    rm -f "${BIN_LINK_DIR}/A" "${BIN_LINK_DIR}/a" 2>/dev/null
+    rm -rf "${CONF_DIR}" 2>/dev/null
+    rm -rf "${LOG_FILE}" 2>/dev/null
+
+    echo -e "${GREEN}✅ Alpine 纯净卸载成功！iptables 转发规则已清除。${RESET}"
+    exit 0
+}
+
+auto_localize_and_link() {
+
+
+    # 如果本地脚本已存在，且快捷键 A 和 a 的软链接也都存在，说明已经安装过了，直接退出函数
+    if [[ -f "${LOCAL_SCRIPT_PATH}" && -L "${BIN_LINK_DIR}/A" && -L "${BIN_LINK_DIR}/a" ]]; then
+        return 0
+    fi
+
+    mkdir -p "${CONF_DIR}"
+    mkdir -p "${BIN_LINK_DIR}"
+    
+    if [[ ! -f "${LOCAL_SCRIPT_PATH}" ]]; then
+        local download_success=false
+        local base_url="https://raw.githubusercontent.com/sistarry/toolbox/main/Alpine/APiptables.sh"
         
-        # 1. 获取运行时间并深度汉化
-        local raw_status
-        raw_status=$(docker ps -a --filter "name=^/${name}$" --format "{{.Status}}")
         
-        # 汉化引擎：包含时间、单位、状态
-        local uptime
-        uptime=$(echo "$raw_status" | \
-            sed 's/Up /运行 /' | \
-            sed 's/Exited/已停止/' | \
-            sed 's/(healthy)/(健康)/' | \
-            sed 's/(unhealthy)/(非健康)/' | \
-            sed 's/(starting)/(启动中)/' | \
-            sed 's/seconds/秒/' | \
-            sed 's/second/秒/' | \
-            sed 's/minutes/分钟/' | \
-            sed 's/minute/分钟/' | \
-            sed 's/hours/小时/' | \
-            sed 's/hour/小时/' | \
-            sed 's/days/天/' | \
-            sed 's/day/天/' | \
-            sed 's/weeks/周/' | \
-            sed 's/week/周/' | \
-            sed 's/months/月/' | \
-            sed 's/month/月/' | \
-            sed 's/about //' | \
-            sed 's/ago/前/')
-        
-        # 2. 新增：获取并格式化端口信息
-        local ports
-        ports=$(docker ps -a --filter "name=^/${name}$" --format "{{.Ports}}")
-        
-        # 如果端口为空，显示“无端口映射”；否则去掉 0.0.0.0: 或 ::: 以便手机端美观显示
-        if [ -z "$ports" ]; then
-            ports="无端口映射"
-        else
-            # 将 "0.0.0.0:8080->80/tcp, :::8080->80/tcp" 简化为 "8080->80/tcp" 这样的干净格式
-            ports=$(echo "$ports" | sed 's/0.0.0.0://g' | sed 's/::://g' | sed 's/, /\n        │     /g')
+        # 遍历代理列表
+        for proxy in "${GITHUB_PROXY[@]}"; do
+            local url="${proxy}${base_url}"
+            
+            # wget 参数说明：
+            # -q: 安静模式，不输出下载进度
+            # --timeout=5: 设置连接和读取超时为 5 秒
+            # -O: 指定输出路径
+            if wget -q --timeout=5 "$url" -O "${LOCAL_SCRIPT_PATH}"; then
+                # 检查文件是否下载成功且大小大于 0（防止部分代理返回空文件）
+                if [[ -s "${LOCAL_SCRIPT_PATH}" ]]; then
+                    download_success=true
+                    break
+                fi
+            fi
+            # 如果下载失败，清理可能生成的空文件或错误残留文件
+            rm -f "${LOCAL_SCRIPT_PATH}"
+            echo -e "${RED}❌ 当前节点连接失败，尝试下一个...${RESET}"
+        done
+
+        # 如果所有代理都失败了，终止后续操作
+        if [[ "$download_success" = false ]]; then
+            echo -e "${RED}❌ 所有网络节点均无法访问，安装失败。请检查网络。${RESET}"
+            return 1
         fi
 
-        # 3. 手机端纵向块状输出
-        echo -e "${YELLOW}◈ 容器: ${RESET}${YELLOW}${name}${RESET}"
-        echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${CPU_COLOR}${cpu}${RESET}"
-        echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
-        echo -e "  ├─ ${YELLOW}网络 I/O: ${RESET}${net}"
-        echo -e "  ├─ ${YELLOW}端口映射: ${RESET}${CYAN}${ports}${RESET}"
-        echo -e "  └─ ${YELLOW}运行状态: ${RESET}${YELLOW}${uptime}${RESET}"
-        echo -e "${YELLOW}----------------------------------------${RESET}"
-    done
+        chmod +x "${LOCAL_SCRIPT_PATH}"
+    fi
+
+    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/A"
+    ln -sf "${LOCAL_SCRIPT_PATH}" "${BIN_LINK_DIR}/a"
+
+    echo -e "${GREEN}✅ 安装完成，快捷键 [A] 或 [a] 已绑定。${RESET}"
 }
 
+main_menu() {
+    check_root
+    if [[ "${1:-}" == "--reload-backend" ]]; then
+        do_backend_ddns_sync
+        exit 0
+    fi
 
-# -----------------------------
-# Docker 配置修改通用函数
-# -----------------------------
-set_docker_mirror() {
-    root_use
-    mkdir -p /etc/docker
-    
-    echo -e "${CYAN}请选择或输入镜像加速源选项:${RESET}"
-    echo -e "${GREEN}1. 使用默认高速代理${RESET}"
-    echo -e "${GREEN}2. 输入自定义加速源${RESET}"
-    echo -e "${GREEN}3. 恢复默认设置(清空加速源)${RESET}"
-    echo -ne "${GREEN}请选择或输入镜像加速源选项 (默认 1): ${RESET}"
-    read mirror_choice
-    mirror_choice=${mirror_choice:-1}
+    auto_localize_and_link
 
-    local mirrors=""
-    
-    if [ "$mirror_choice" == "1" ]; then
-        mirrors='["https://gh-proxy.org/docker/","https://registry.lfree.org","https://hub.glowp.xyz","https://docker.1panel.live"]'
-    elif [ "$mirror_choice" == "2" ]; then
-        read -p "请输入完整的加速地址 (例如 https://hub.glowp.xyz , 多个用英文逗号隔开): " custom_mirror
-        # 简单转换补全为 JSON 数组格式
-        mirrors="[\"$(echo $custom_mirror | sed 's/,/","/g' | sed 's/ //g')\"]"
-    elif [ "$mirror_choice" == "3" ]; then
-        echo -e "${YELLOW}正在恢复默认设置，移除所有自定义镜像源...${RESET}"
-        # 移除配置：如果 jq 存在就删掉该 Key，否则直接覆盖为一个空配置或移出该字段
-        if command -v jq &>/dev/null && [ -f /etc/docker/daemon.json ]; then
-            jq 'del(."registry-mirrors")' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
-            if [ $? -eq 0 ]; then
-                mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+    local panel_status panel_version panel_rules_count status_msg
+    while true; do
+
+        status_msg=$(is_iptables_active)
+        if [[ $? -eq 0 ]]; then
+            panel_status="${GREEN}${status_msg}${RESET}"
+        else
+            panel_status="${RED}未运行${RESET}"
+        fi
+
+        panel_version=$(get_iptables_version)
+        load_rules
+        panel_rules_count="${#RULES[@]}"
+
+
+        # 内核识别模块，彻底修掉菜单显示“内核未知”的问题
+        if [ "$panel_status" != "${RED}未运行${RESET}" ]; then
+            if ls -l /sbin/iptables 2>/dev/null | grep -q "nft"; then
+                backend_type="${YELLOW}iptables-nft (兼容模式)${RESET}"
             else
-                echo "{}" > /etc/docker/daemon.json
+                backend_type="${YELLOW}iptables (原生内核)${RESET}"
             fi
         else
-            echo "{}" > /etc/docker/daemon.json
+            if [ -e /proc/net/ip_tables_names ]; then
+                backend_type="${YELLOW}iptables (就绪但未启动)${RESET}"
+            else
+                backend_type="${YELLOW}内核模块未加载${RESET}"
+            fi
         fi
-        echo -e "${GREEN}✅ 已成功恢复默认设置！${RESET}"
-        restart_docker
-        return
-    else
-        echo -e "${RED}无效选项，操作已取消${RESET}"
-        return
-    fi
 
-    # 写入配置逻辑 (针对 1 和 2 选项)
-    if command -v jq &>/dev/null && [ -f /etc/docker/daemon.json ]; then
-        jq --argjson m "$mirrors" '. + {"registry-mirrors": $m}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
-        if [ $? -eq 0 ]; then
-            mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-        else
-            echo "{\"registry-mirrors\": $mirrors}" > /etc/docker/daemon.json
-        fi
-    else
-        echo "{\"registry-mirrors\": $mirrors}" > /etc/docker/daemon.json
-    fi
-
-    echo -e "${GREEN}✅ 镜像加速源配置成功！当前配置为:${RESET}"
-    cat /etc/docker/daemon.json
-    restart_docker
-}
-
-# -----------------------------
-# Docker 日志管理子菜单
-# -----------------------------
-docker_log_menu() {
-    root_use
-    mkdir -p /etc/docker
-
-    while true; do
-        echo -e "${CYAN}===== Docker 日志大小限制管理 =====${RESET}"
-        echo -e "${GREEN}1. 开启日志大小限制${RESET}"
-        echo -e "${GREEN}2. 关闭日志大小限制 (恢复默认无限制)${RESET}"
-        echo -e "${GREEN}0. 返回主菜单${RESET}"
-        echo -ne "${GREEN}请选择操作: ${RESET}"
-        read log_choice
-
-        case $log_choice in
-            1)
-                echo -e "${CYAN}正在配置日志限制...${RESET}"
-                if [ ! -f /etc/docker/daemon.json ]; then echo '{}' > /etc/docker/daemon.json; fi
-                jq '. + {"log-driver": "json-file", "log-opts": {"max-size": "20m", "max-file": "3"}}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
-                mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-                echo -e "${GREEN}✅ 日志大小限制开启成功！${RESET}"
-                echo -e "${YELLOW}注意: 此限制仅对【新创建】的容器生效，老容器需重建方能生效。${RESET}"
-                restart_docker
-                read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                ;;
-            2)
-                echo -e "${YELLOW}正在解除日志限制...${RESET}"
-                if [ -f /etc/docker/daemon.json ]; then
-                    jq 'del(."log-driver") | del(."log-opts")' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
-                    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-                    echo -e "${GREEN}✅ 已关闭日志大小限制（恢复系统默认）。${RESET}"
-                else
-                    echo -e "${YELLOW}配置文件不存在，无需关闭。${RESET}"
-                fi
-                restart_docker
-                read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                ;;
-            0)
-                break
-                ;;
-            *)
-                echo -e "${RED}无效选择${RESET}" && sleep 1
-                ;;
+        echo -e "${GREEN}=====================================${RESET}"
+        echo -e "${GREEN}  ◈ iptables 转发面板${RESET} ${YELLOW}(快捷键A/a)${RESET} ${GREEN}◈${RESET}"
+        echo -e "${GREEN}=====================================${RESET}"
+        echo -e "${GREEN} 状态 :${RESET} $panel_status"
+        echo -e "${GREEN} 内核 :${RESET} $backend_type"
+        echo -e "${GREEN} 规则 : 已载入${RESET} ${YELLOW}${panel_rules_count}${RESET} ${GREEN}条转发${RESET}"
+        echo -e "${GREEN}=====================================${RESET}"
+        echo -e "${GREEN} 1. 安装 依赖环境${RESET}"
+        echo -e "${GREEN} 2. 查看 当前转发规则${RESET}"
+        echo -e "${GREEN} 3. 新增 转发规则${RESET}"
+        echo -e "${GREEN} 4. 修改 转发规则${RESET}"
+        echo -e "${GREEN} 5. 删除 转发规则${RESET}"
+        echo -e "${GREEN} 6. 清空 所有转发规则${RESET}"
+        echo -e "${GREEN} 7. 系统 环境自检${RESET}"
+        echo -e "${GREEN} 8. 导出 规则(备份)${RESET}"
+        echo -e "${GREEN} 9. 导入 规则(恢复)${RESET}"
+        echo -e "${GREEN}10. 查看 DDNS运行日志${RESET}"
+        echo -e "${GREEN}11. 卸载 面板${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        echo -e "${GREEN}=====================================${RESET}"
+        
+        read -rp "$(echo -e "${GREEN}请选择操作: ${RESET}")" menu_choice
+        case "$menu_choice" in
+            1) do_install ;;
+            2) do_list ;;
+            3) do_add ;;
+            4) do_edit ;;
+            5) do_delete ;;
+            6) do_clear_all ;;
+            7) do_diagnose ;;
+            8) do_backup_manual ;;
+            9) do_restore_manual ;;
+            10) do_view_log ;;
+            11) do_uninstall ;;
+            0) exit 0 ;;
+            *) err "输入错误" && pause_to_menu ;;
         esac
+        echo ""
     done
 }
 
-# -----------------------------
-# 主菜单显示状态
-# -----------------------------
-main_menu() {
-    root_use
-    while true; do
-        clear
-        echo -e "${CYAN}"
-        echo "  ____             _               "
-        echo " |  _ \  ___   ___| | _____ _ __   "
-        echo " | | | |/ _ \ / __| |/ / _ \ '__|  "
-        echo " | |_| | (_) | (__|   <  __/ |     "
-        echo " |____/ \___/ \___|_|\_\___|_|     "
-        echo -e "${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        # 检测 Docker 状态
-        if command -v docker &>/dev/null; then
-            docker_status=$(docker info &>/dev/null && echo "运行中" || echo "未运行")
-            total=$(docker ps -a -q 2>/dev/null | wc -l)
-            running=$(docker ps -q 2>/dev/null | wc -l)
-            echo -e "${YELLOW}🐳| Docker: $docker_status | 总容器: $total | 运行中: $running${RESET}"
-        else
-            # Docker 未安装时只显示 iptables 状态
-            echo -e "${YELLOW}🐳 iptables: $(current_iptables)${RESET}"
-        fi
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${GREEN}01. 安装/更新 Docker${RESET}"
-        echo -e "${GREEN}02. 安装/更新 Docker Compose${RESET}"
-        echo -e "${GREEN}03. 卸载 Docker & Compose${RESET}"
-        echo -e "${GREEN}04. 容器管理${RESET}"
-        echo -e "${GREEN}05. 镜像管理${RESET}"
-        echo -e "${GREEN}06. 开启 IPv6${RESET}"
-        echo -e "${GREEN}07. 关闭 IPv6${RESET}"
-        echo -e "${GREEN}08. 开放所有端口${RESET}"
-        echo -e "${GREEN}09. 网络管理${RESET}"
-        echo -e "${GREEN}10. 切换 iptables-legacy${RESET}"
-        echo -e "${GREEN}11. 切换 iptables-nft${RESET}"
-        echo -e "${GREEN}12. Docker 备份/恢复${RESET}"
-        echo -e "${GREEN}13. 重启 Docker${RESET}"
-        echo -e "${GREEN}14. 卷管理 ${RESET}"
-        echo -e "${GREEN}15. 设置Docker镜像加速源${RESET}"
-        echo -e "${GREEN}16. 设置Docker日志限制${RESET}"
-        echo -e "${GREEN}17.${RESET} ${YELLOW}一键清理所有未使用容器/镜像/卷${RESET}"
-        echo -e "${GREEN}18. Docker监控${RESET}"
-        echo -e "${GREEN}00. 退出${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            01|1) docker_install_update ;;
-            02|2) docker_compose_install_update ;;
-            03|3) docker_uninstall ;;
-            04|4) check_docker_running && docker_ps ;;
-            05|5) check_docker_running && docker_image ;;
-            06|6) check_docker_running && docker_ipv6_on ;;
-            07|7) check_docker_running && docker_ipv6_off ;;
-            08|8) open_all_ports ;;
-            09|9) check_docker_running && docker_network ;;
-            10) switch_iptables_legacy ;;
-            11) switch_iptables_nft ;;
-            12) check_docker_running && docker_backup_menu ;;
-            13|13) check_docker_running && restart_docker ;;
-            14|14) check_docker_running && docker_volume ;;
-            15|15) check_docker_running && set_docker_mirror ;;
-            16|16) docker_log_menu ;;
-            17|17) check_docker_running && docker_cleanup ;;
-            18|18) monitor_docker_containers ;;
-             00|0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-
-
-
-# 启动脚本
-main_menu
+main_menu "$@"

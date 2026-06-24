@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# KaraKeep 服务 Docker Compose 管理面板 
+# BiliLive-Tools 服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,7 +10,7 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/karakeep"
+BASE_DIR="/opt/bililive-tools"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -24,27 +24,29 @@ check_dependencies() {
 
 # 动态获取多个容器的状态、映射端口和数据目录
 get_status_info() {
-    # 1. 检查核心容器状态
-    local k_status="未部署"
-    local m_status="未部署"
-    local c_status="未部署"
+    # 1. 检查各个容器状态
+    w_status="${RED}已停止/未部署${RESET}"
+    a_status="${RED}已停止/未部署${RESET}"
 
-    if [ "$(docker ps -q -f name=karakeep-karakeep-1)" ] || [ "$(docker ps -q -f name=karakeep-1)" ]; then k_status="运行中"; fi
-    if [ "$(docker ps -q -f name=karakeep-meilisearch-1)" ] || [ "$(docker ps -f name=meilisearch-1)" ]; then m_status="运行中"; fi
-    if [ "$(docker ps -q -f name=karakeep-chrome-1)" ] || [ "$(docker ps -q -f name=chrome-1)" ]; then c_status="运行中"; fi
-
-    status="[KaraKeep:${k_status}] [Meili:${m_status}] [Chrome:${c_status}]"
+    if [ "$(docker ps -q -f name=bililive-tools-webui-1)" ] || [ "$(docker ps -q -f name=webui-1)" ]; then w_status="${YELLOW}运行中${RESET}"; fi
+    if [ "$(docker ps -q -f name=bililive-tools-api-1)" ] || [ "$(docker ps -q -f name=api-1)" ]; then a_status="${YELLOW}运行中${RESET}"; fi
 
     # 2. 从 .env 文件中提取配置信息（如果存在）
     if [ -f "$ENV_FILE" ]; then
-        webui_port=$(grep "NEXTAUTH_URL=" "$ENV_FILE" | awk -F':' '{print $3}' | sed 's/\r//g')
-        [[ -z "$webui_port" ]] && webui_port="8088"
-        img_version=$(grep "KARAKEEP_VERSION=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
-        [[ -z "$img_version" ]] && img_version="release"
-        data_dir="$BASE_DIR/data"
+        web_port=$(grep "^WEB_PORT=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
+        api_port=$(grep "^API_PORT=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
+        [[ -z "$web_port" ]] && web_port="3000"
+        [[ -z "$api_port" ]] && api_port="18010"
+        
+        # 从 docker-compose.yml 中提取实际挂载的宿主机数据根目录
+        if [ -f "$COMPOSE_FILE" ]; then
+            local raw_dir=$(grep "\- " "$COMPOSE_FILE" | grep ":/app/data" | awk -F':' '{print $1}' | sed 's/-//g' | sed 's/^[ \t]*//' | head -n 1)
+            data_dir="${raw_dir%/data}"
+        fi
+        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR"
     else
-        webui_port="N/A"
-        img_version="${RED}未安装${RESET}"
+        web_port="N/A"
+        api_port="N/A"
         data_dir="N/A"
     fi
 }
@@ -73,7 +75,7 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 KaraKeep
+# 部署 BiliLive-Tools
 install_translate() {
     check_dependencies
     
@@ -81,92 +83,89 @@ install_translate() {
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -ne "${YELLOW}请输入 KaraKeep 访问端口 (宿主机端口) [默认: 8088]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8088"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
+    # 1. 配置映射端口
+    echo -ne "${YELLOW}请输入前端 WEB UI 访问端口 [默认: 3000]: ${RESET}"
+    read -r custom_web_port
+    [[ -z "$custom_web_port" ]] && custom_web_port="3000"
 
-    # 自动获取外网/局域网 IP 作为默认的 Auth URL
-    DETECT_IP=$(get_public_ip)
-    echo -ne "${YELLOW}请输入外部访问的完整 URL (用于 Auth 认证) [默认: http://${DETECT_IP}:${custom_port}]: ${RESET}"
-    read -r custom_url
-    [[ -z "$custom_url" ]] && custom_url="http://${DETECT_IP}:${custom_port}"
+    echo -ne "${YELLOW}请输入后端 API 接口服务端口 [默认: 18010]: ${RESET}"
+    read -r custom_api_port
+    [[ -z "$custom_api_port" ]] && custom_api_port="18010"
 
-    # 随机生成安全密钥
-    rand_secret=$(date +%s | sha256sum | base64 | head -c 32)
-    rand_meili=$(date +%s | sha256sum | head -c 16)
+    # 2. 配置数据存储目录
+    echo -ne "${YELLOW}请输入宿主机数据挂载根路径 [默认: /opt/bililive-tools]: ${RESET}"
+    read -r custom_data
+    [[ -z "$custom_data" ]] && custom_data="/opt/bililive-tools"
 
-    # 1. 创建所需的数据持久化目录
-    mkdir -p "$BASE_DIR/data/karakeep" "$BASE_DIR/data/meilisearch"
-    chmod -R 777 "$BASE_DIR"
+    # 3. 配置安全密钥（不输入则自动随机生成）
+    rand_pass=$(date +%s | sha256sum | head -c 16)
+    rand_bili=$(date +%s | sha256sum | base64 | head -c 24)
 
-    # 2. 生成 .env 配置文件
+    echo -ne "${YELLOW}请设置登录密钥 PASSKEY (留空自动生成随机串): ${RESET}"
+    read -r custom_pass
+    [[ -z "$custom_pass" ]] && custom_pass="${rand_pass}"
+
+    echo -ne "${YELLOW}请设置加密密钥 BILIKEY (留空自动生成随机串): ${RESET}"
+    read -r custom_bili
+    [[ -z "$custom_bili" ]] && custom_bili="${rand_bili}"
+
+    # 创建必要的子挂载目录
+    mkdir -p "${custom_data}/data" "${custom_data}/video" "${custom_data}/fonts"
+    chmod -R 777 "$BASE_DIR" "${custom_data}"
+
+    # 生成环境变量 .env 配置文件
     echo -e "${YELLOW}正在生成环境变量 .env 配置文件...${RESET}"
     cat <<EOF > "$ENV_FILE"
-KARAKEEP_VERSION=release
-NEXTAUTH_SECRET=${rand_secret}
-MEILI_MASTER_KEY=${rand_meili}
-NEXTAUTH_URL=${custom_url}
+TZ=Asia/Shanghai
+WEB_PORT=${custom_web_port}
+API_PORT=${custom_api_port}
+DATA_ROOT=${custom_data}
+PASSKEY=${custom_pass}
+BILIKEY=${custom_bili}
 EOF
 
-    # 3. 动态生成 docker-compose.yml 配置文件
+    # 动态生成 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  karakeep:
-    image: ghcr.io/karakeep-app/karakeep:\${KARAKEEP_VERSION:-release}
-    restart: unless-stopped
+  webui:
+    image: renmu1234/bililive-tools-frontend
     ports:
-      - "${custom_port}:3000"
-    volumes:
-      - ./data/karakeep:/data
-    environment:
-      - DATA_DIR=/data
-      - MEILI_ADDR=http://meilisearch:7700
-      - MEILI_MASTER_KEY=\${MEILI_MASTER_KEY}
-      - BROWSER_WEB_URL=http://chrome:9222
-      - NEXTAUTH_URL=\${NEXTAUTH_URL}
-      - NEXTAUTH_SECRET=\${NEXTAUTH_SECRET}
-    depends_on:
-      - meilisearch
-      - chrome
-
-  meilisearch:
-    image: getmeili/meilisearch:v1.13.3
+      - "\${WEB_PORT:-3000}:3000"
     restart: unless-stopped
-    volumes:
-      - ./data/meilisearch:/meili_data
-    environment:
-      - MEILI_MASTER_KEY=\${MEILI_MASTER_KEY}
-      - MEILI_NO_ANALYTICS=true
 
-  chrome:
-    image: ghcr.io/zenika/alpine-chrome:124
+  api:
+    image: renmu1234/bililive-tools-backend
+    ports:
+      - "\${API_PORT:-18010}:18010"
+    volumes:
+      - \${DATA_ROOT}/data:/app/data
+      - \${DATA_ROOT}/video:/app/video
+      - \${DATA_ROOT}/fonts:/usr/local/share/fonts
+    environment:
+      - BILILIVE_TOOLS_PASSKEY=\${PASSKEY}
+      - BILILIVE_TOOLS_BILIKEY=\${BILIKEY}
+      - BILILIVE_TOOLS_DELETE_DIRS=/app/video
+      - TZ=\${TZ:-Asia/Shanghai}
     restart: unless-stopped
-    command:
-      - --no-sandbox
-      - --disable-gpu
-      - --disable-dev-shm-usage
-      - --remote-debugging-address=0.0.0.0
-      - --remote-debugging-port=9222
-      - --hide-scrollbars
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 KaraKeep 及其依赖服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 BiliLive-Tools 服务组合...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务初始化 (约5秒)...${RESET}"
-    sleep 5
+    echo -e "${YELLOW}等待服务初始化 (约3秒)...${RESET}"
+    sleep 3
+
+    DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      KaraKeep 部署成功！      ${RESET}"
+    echo -e "${GREEN}     BiliLive-Tools 部署成功！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : ${custom_url}${RESET}"
-    echo -e "${YELLOW}宿主机主目录   : $BASE_DIR${RESET}"
-    echo -e "${YELLOW}数据存储路径   : $BASE_DIR/data${RESET}"
+    echo -e "${YELLOW}前端 UI 访问地址 : http://${DETECT_IP}:${custom_web_port}${RESET}"
+    echo -e "${YELLOW}后端 API 监听地址 : http://${DETECT_IP}:${custom_api_port}${RESET}"
+    echo -e "${YELLOW}登录密钥 PASSKEY : ${custom_pass}${RESET}"
+    echo -e "${YELLOW}面板管理配置目录 : $BASE_DIR${RESET}"
+    echo -e "${YELLOW}持久化数据根路径 : ${custom_data}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -176,7 +175,7 @@ update_translate() {
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像组件...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取最新 BiliLive-Tools 镜像组件...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！所有容器已处于最新状态。${RESET}"
@@ -184,39 +183,49 @@ update_translate() {
 
 # 卸载服务
 uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除所有 KaraKeep 容器吗？(y/n): ${RESET}"
+    get_status_info
+    echo -ne "${YELLOW}确定要卸载并删除 BiliLive-Tools 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有持久化数据和配置文件？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有录制视频、配置文件和字体？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}项目目录及数据已彻底清理。${RESET}"
+                # 清理外部自定义的数据挂载路径
+                if [ -d "$data_dir" ] && [ "$data_dir" != "N/A" ]; then
+                    rm -rf "$data_dir"
+                    echo -e "${GREEN}数据挂载区 [${data_dir}] 已彻底清理。${RESET}"
+                fi
+                # 清理脚本主目录
+                if [ "$BASE_DIR" != "$data_dir" ]; then
+                    rm -rf "$BASE_DIR"
+                fi
+                echo -e "${GREEN}项目配置主目录 [${BASE_DIR}] 已彻底清理。${RESET}"
             fi
         else
             echo -e "${RED}未找到 compose 文件，尝试强制清理可能残留的容器...${RESET}"
-            docker rm -f $(docker ps -aq -f name=karakeep) 2>/dev/null
+            docker rm -f $(docker ps -aq -f name=bililive-tools) 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}所有容器已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}所有容器已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}所有容器已重启${RESET}"; }
+start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}所有组件已启动${RESET}"; }
+stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}所有组件已停止${RESET}"; }
+restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}所有组件已重启${RESET}"; }
 logs_translate() { cd "$BASE_DIR" && docker compose logs -f; }
 
 show_info() {
     get_status_info
-    local current_url=$(grep "NEXTAUTH_URL=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2)
+    local current_pass=$(grep "^PASSKEY=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2)
+    local current_bili=$(grep "^BILIKEY=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2)
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}容器当前状态   : $status"
-    echo -e "${YELLOW}应用发布版本   : ${img_version}${RESET}"
-    echo -e "${YELLOW}外部认证地址   : ${current_url:-N/A}${RESET}"
-    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
+    echo -e "${YELLOW}前端状态 (WebUI)  : ${w_status}"
+    echo -e "${YELLOW}后端状态 (API)    : ${a_status}"
+    echo -e "${YELLOW}登录密钥 PASSKEY  : ${current_pass:-N/A}"
+    echo -e "${YELLOW}加密密钥 BILIKEY  : ${current_bili:-N/A}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -224,17 +233,19 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  KaraKeep 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN} ◈  BiliLive-Tools  管理面板 ◈  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}当前状态 :${RESET} ${CYAN}$status${RESET}"
-    echo -e "${GREEN}映射端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}前端状态 (WebUI)  : ${w_status}"
+    echo -e "${GREEN}后端状态 (API)    : ${a_status}"
+    echo -e "${GREEN}前端映射端口      : ${YELLOW}${web_port}${RESET}"  
+    echo -e "${GREEN}后端映射端口      : ${YELLOW}${api_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新服务${RESET}"
-    echo -e "${GREEN}3. 卸载服务${RESET}"
-    echo -e "${GREEN}4. 启动服务${RESET}"
-    echo -e "${GREEN}5. 停止服务${RESET}"
-    echo -e "${GREEN}6. 重启服务${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"

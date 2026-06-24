@@ -1,277 +1,290 @@
 #!/bin/bash
-# =================================================================
-# BepUSDT 服务 Docker Compose 管理面板 
-# =================================================================
 
-# 颜色
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\033[0m"
+# 标准 ANSI 颜色定义
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
 
-BASE_DIR="/opt/bepusdt-panel"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
-CONTAINER_NAME="bepusdt"
+# 载入环境变量并增强 PATH 搜索（加入全局标准路径 /usr/local/bin）
+[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
+[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null
+export PATH="/usr/local/bin:$HOME/.local/bin:/root/.local/bin:$PATH"
 
-# 检测依赖
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
+# 动态定位 ReadCLI 实际安装与数据路径
+get_paths() {
+    READCLI_DATA_DIR="${READCLI_DATA_DIR:-$HOME/.readcli}"
+    CONFIG_FILE="$READCLI_DATA_DIR/config.json"
+    BOOKSHELF_FILE="$READCLI_DATA_DIR/bookshelf.json"
+    # 优先寻找全局软链，其次寻找用户本地目录
+    REAL_EXEC_PATH=$(command -v readcli 2>/dev/null)
+    if [ -z "$REAL_EXEC_PATH" ] && [ -f "$HOME/.local/bin/readcli" ]; then
+        REAL_EXEC_PATH="$HOME/.local/bin/readcli"
     fi
 }
 
-# 动态获取容器的状态、映射端口和数据目录
-get_status_info() {
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -q -f name=bepusdt-panel-bepusdt-1)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -aq -f name=bepusdt-panel-bepusdt-1)" ]; then
-        status="${RED}已停止${RESET}"
+# 获取状态与版本信息
+get_status() {
+    get_paths
+    if [ -n "$REAL_EXEC_PATH" ]; then
+        status="${GREEN}已安装 ($REAL_EXEC_PATH)${RESET}"
+        version_info=$($REAL_EXEC_PATH -v 2>/dev/null | head -n 1)
+        [ -z "$version_info" ] && version_info="v0.3.5 (或最新)"
+        readcli_version="${YELLOW}${version_info}${RESET}"
     else
-        status="${RED}未部署${RESET}"
+        status="${RED}未安装${RESET}"
+        readcli_version="${RED}-${RESET}"
     fi
 
-    # 2. 从 .env 文件中提取配置信息（如果存在）
-    if [ -f "$ENV_FILE" ]; then
-        webui_port=$(grep "^PANEL_PORT=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
-        [[ -z "$webui_port" ]] && webui_port="8080"
-        
-        pg_dsn=$(grep "^POSTGRESQL_DSN=" "$ENV_FILE" | cut -d'=' -f2- | sed 's/\r//g')
-        [[ -z "$pg_dsn" ]] && pg_dsn="${YELLOW}已彻底移除该变量 (未注入 DSN)${RESET}"
-        
-        data_dir=$(grep "\- " "$COMPOSE_FILE" 2>/dev/null | grep ":/var/lib/bepusdt" | awk -F':' '{print $1}' | sed 's/-//g' | sed 's/^[ \t]*//' | head -n 1)
-        [[ -z "$data_dir" ]] && data_dir="/opt/bepusdt"
+    # 检查书架内是否有书
+    if [ -f "$BOOKSHELF_FILE" ] && grep -q '"path"' "$BOOKSHELF_FILE" 2>/dev/null; then
+        bookshelf_status="${GREEN}已有藏书${RESET}"
     else
-        webui_port="N/A"
-        pg_dsn="N/A"
-        data_dir="N/A"
+        bookshelf_status="${YELLOW}书架空空${RESET}"
     fi
-}
 
-get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
+    # 检查是否有自定义配置
+    if [ -f "$CONFIG_FILE" ]; then
+        config_status="${YELLOW}自定义配置${RESET}"
     else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
-}
-
-# 部署 BepUSDT
-install_translate() {
-    check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    # 1. 配置映射端口
-    echo -ne "${YELLOW}请输入 BepUSDT 访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-
-    # 2. 配置数据目录
-    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/bepusdt/bepusdt]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="/opt/bepusdt/bepusdt"
-
-    # 3. 配置 PostgreSQL 数据库（改为默认不配置，输入 y 再配置）
-    echo -e "\n${CYAN}--- PostgreSQL 配置 ---${RESET}"
-    echo -ne "${YELLOW}是否配置外部 PostgreSQL 数据库？(y/n) [默认: n]: ${RESET}"
-    read -r use_db
-
-    local env_dsn_line=""
-    local compose_env_block=""
-
-    if [[ "$use_db" != "y" && "$use_db" != "Y" ]]; then
-        echo -e "${YELLOW}提示: 已选择不配置数据库，将彻底去掉 environment 块中的数据库变量。${RESET}"
-        env_dsn_line=""
-        compose_env_block=""
-    else
-        echo -e "\n${CYAN}请依次填写数据库连接信息:${RESET}"
-        echo -ne "${YELLOW}1. 用户名: ${RESET}"
-        read -r db_user
-        echo -ne "${YELLOW}2. 密码: ${RESET}"
-        read -r db_pass
-        echo -ne "${YELLOW}3. 服务器地址端口 (如 localhost:5432): ${RESET}"
-        read -r db_host
-        echo -ne "${YELLOW}4. 数据库名称: ${RESET}"
-        read -r db_name
-
-        # 动态拼接 DSN 字符串
-        local auth_part=""
-        local host_part=""
-        local db_part=""
-
-        [[ -n "$db_user" ]] && { [[ -n "$db_pass" ]] && auth_part="${db_user}:${db_pass}@" || auth_part="${db_user}@"; }
-        [[ -n "$db_host" ]] && host_part="$db_host"
-        [[ -n "$db_name" ]] && db_part="/${db_name}"
-
-        constructed_dsn="postgres://${auth_part}${host_part}${db_part}?sslmode=disable&connect_timeout=3"
-        
-        env_dsn_line="POSTGRESQL_DSN=${constructed_dsn}"
-        compose_env_block="    environment:
-      - POSTGRESQL_DSN=\${POSTGRESQL_DSN}"
-    fi
-
-    # 创建自定义持久化根目录
-    mkdir -p "${custom_data}"
-    chmod -R 777 "$BASE_DIR" "${custom_data}"
-
-    # 生成环境变量 .env 配置文件
-    echo -e "${YELLOW}正在生成环境变量 .env 配置文件...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-PANEL_PORT=${custom_port}
-${env_dsn_line}
-EOF
-
-    # 动态生成 docker-compose.yml 配置文件 (无变量则完全不写 environment 结构，保持干净)
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  bepusdt:
-    image: v03413/bepusdt:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "\${PANEL_PORT:-8080}:8080"
-${compose_env_block}
-    volumes:
-      - ${custom_data}:/var/lib/bepusdt
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-EOF
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 BepUSDT 服务...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待服务初始化 (约3秒)...${RESET}"
-    sleep 3
-
-    DETECT_IP=$(get_public_ip)
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      BepUSDT 部署成功！      ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    if [[ -n "$env_dsn_line" ]]; then
-        echo -e "${YELLOW}当前注入 DSN : ${constructed_dsn}${RESET}"
-    else
-        echo -e "${YELLOW}当前注入 DSN : 已经彻底从全局环境中拿掉数据库配置项${RESET}"
-    fi
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-# 更新镜像
-update_translate() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return
-    fi
-    cd "$BASE_DIR" && docker compose pull && docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！${RESET}"
-}
-
-uninstall_translate() {
-    get_status_info
-    
-    echo -ne "${YELLOW}确定要卸载并删除 BepUSDT 容器吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            
-            # 第二层确认：删除面板配置文件目录
-            echo -ne "${YELLOW}是否同时删除面板配置环境目录 [${BASE_DIR}]？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                
-                # 第三层确认：删除用户持久化数据（防止误删的核心）
-                echo -ne "${YELLOW}是否还要删除挂载在 [${data_dir}] 的实际用户交易数据？(y/n): ${RESET}"
-                read -r clean_global_data
-                if [ "$clean_global_data" = "y" ] || [ "$clean_global_data" = "Y" ]; then
-                    if [[ "$data_dir" != "N/A" && -d "$data_dir" ]]; then
-                        rm -rf "$data_dir"
-                    fi
-                fi
-                echo -e "${GREEN}选定数据目录已彻底清理。${RESET}"
-            fi
-        else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
-        fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        config_status="${GREEN}官方默认${RESET}"
     fi
 }
 
-
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}所有容器已重启${RESET}"; }
-logs_translate() { cd "$BASE_DIR" && docker compose logs -f; }
-
-show_info() {
-    get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}BepUSDT 服务状态    : ${status}"
-    echo -e "${YELLOW}当前 PostgreSQL DSN : ${pg_dsn}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-menu() {
+# 菜单面板
+show_menu() {
     clear
-    get_status_info
+    get_status
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  BepUSDT 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  ReadCLI 终端阅读管理面板 ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}服务状态  : ${status}"
-    echo -e "${GREEN}映射端口  : ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}版本 :${RESET} $readcli_version"
+    echo -e "${GREEN}书架 :${RESET} $bookshelf_status"
+    echo -e "${GREEN}配置 :${RESET} $config_status"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新服务${RESET}"
-    echo -e "${GREEN}3. 卸载服务${RESET}"
-    echo -e "${GREEN}4. 启动服务${RESET}"
-    echo -e "${GREEN}5. 停止服务${RESET}"
-    echo -e "${GREEN}6. 重启服务${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
+    echo -e "${GREEN}2. 打开书架${RESET}"
+    echo -e "${GREEN}3. 浏览并打开指定书籍 (TXT/EPUB)${RESET}"
+    echo -e "${GREEN}4. 快速配置BossKey(老板键)${RESET}"
+    echo -e "${GREEN}5. 查看系统常用快捷键指南${RESET}"
+    echo -e "${GREEN}6. 更新${RESET}"
+    echo -e "${GREEN}7. 卸载${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
-        8) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
 }
 
+# 核心下载与软链接建立函数
+download_latest_readcli() {
+    echo -e "\n${YELLOW}正在从 GitHub 检索 ReadCLI 最新版本信息...${RESET}"
+    
+    # 获取最新 release 标签
+    LATEST_TAG=$(curl -s https://api.github.com/repos/lvshp/ReadCLI/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    
+    if [ -z "$LATEST_TAG" ]; then
+        echo -e "${RED}❌ 无法获取最新版本信息，请检查网络（或 GitHub API 是否被限流）。${RESET}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}发现最新版本: ${LATEST_TAG}${RESET}"
+    
+    # 构造下载链接
+    VERSION_NUM=$(echo "$LATEST_TAG" | sed 's/^v//')
+    DOWNLOAD_URL="https://github.com/lvshp/ReadCLI/releases/download/${LATEST_TAG}/readcli-linux-amd64-v${VERSION_NUM}.tar.gz"
+    
+    TMP_DIR=$(mktemp -d)
+    echo -e "${YELLOW}正在下载: ${DOWNLOAD_URL}${RESET}"
+    
+    if curl -L "$DOWNLOAD_URL" -o "${TMP_DIR}/readcli.tar.gz"; then
+        echo -e "${GREEN}✔ 下载成功，正在解压并建立全局系统调用...${RESET}"
+        tar -zxf "${TMP_DIR}/readcli.tar.gz" -C "$TMP_DIR"
+        
+        # 确保基础目录存在
+        mkdir -p "$HOME/.local/bin"
+        mkdir -p "/usr/local/bin"
+        
+        if [ -f "${TMP_DIR}/readcli" ]; then
+            # 1. 移动原始二进制到用户目录
+            mv "${TMP_DIR}/readcli" "$HOME/.local/bin/readcli"
+            chmod +x "$HOME/.local/bin/readcli"
+            
+            # 2. 🌟 核心修复：建立至全局 /usr/local/bin 的软链接，彻底解决 sh 不认 PATH 的问题
+            rm -f /usr/local/bin/readcli
+            ln -s "$HOME/.local/bin/readcli" /usr/local/bin/readcli
+            
+            echo -e "${GREEN}✔ 最新版 ReadCLI 成功安装！${RESET}"
+            echo -e "${GREEN}✔ 全局软链接已指向: /usr/local/bin/readcli (任意 Shell 环境下均可直接运行)${RESET}"
+        else
+            echo -e "${RED}❌ 解压文件中未找到 readcli 二进制文件。${RESET}"
+            rm -rf "$TMP_DIR"
+            return 1
+        fi
+    else
+        echo -e "${RED}❌ 下载失败，请检查网络连接。${RESET}"
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
+    rm -rf "$TMP_DIR"
+
+    # 兼容性写入环境变量（备用）
+    if [ -f "$HOME/.zshrc" ] && ! grep -q "local/bin" "$HOME/.zshrc"; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
+    fi
+    if [ -f "$HOME/.bashrc" ] && ! grep -q "local/bin" "$HOME/.bashrc"; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+    fi
+}
+
+# 1. 安装
+install_readcli() {
+    download_latest_readcli
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+}
+
+# 2. 打开书架
+start_bookshelf() {
+    get_paths
+    if [ -n "$REAL_EXEC_PATH" ]; then
+        echo -e "\n${GREEN}正在调起 ReadCLI 书架...${RESET}"
+        "$REAL_EXEC_PATH"
+    else
+        echo -e "\n${RED}未检测到 readcli 命令，请先执行选项 1 进行自动安装！${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+    fi
+}
+
+# 3. 指定路径启动
+start_with_book() {
+    get_paths
+    if [ -z "$REAL_EXEC_PATH" ]; then
+        echo -e "\n${RED}未检测到已安装的 ReadCLI。${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+        return
+    fi
+
+    echo -ne "\n${GREEN}请输入书籍文件的绝对或相对路径 (支持 .txt / .epub): ${RESET}"
+    read -r book_path
+    if [ -f "$book_path" ]; then
+        echo -ne "${YELLOW}请输入阅读时的每页显示行数 (直接回车使用系统默认设置): ${RESET}"
+        read -r line_num
+        if [ -n "$line_num" ]; then
+            "$REAL_EXEC_PATH" -n "$line_num" "$book_path"
+        else
+            "$REAL_EXEC_PATH" "$book_path"
+        fi
+    else
+        echo -e "${RED}文件不存在，请检查路径！${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+    fi
+}
+
+# 4. 快速配置 Boss Key
+config_boss_key() {
+    get_paths
+    mkdir -p "$READCLI_DATA_DIR"
+    
+    echo -e "\n${GREEN}================================${RESET}"
+    echo -e "${GREEN}  ReadCLI 老板键 (Boss Key) 配置 ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "在阅读时按下 ${YELLOW}'b'${RESET} 键将立刻触发此伪装指令。"
+    
+    echo -ne "${YELLOW}请输入你想触发的外部命令 (例如: genact): ${RESET}"
+    read -r boss_cmd
+    
+    if [ -z "$boss_cmd" ]; then
+        echo -e "${RED}输入为空，取消配置。${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+        return
+    fi
+
+    cat <<EOF > "$CONFIG_FILE"
+{
+  "\$schema": "https://raw.githubusercontent.com/lvshp/ReadCLI/main/config.schema.json",
+  "boss_key_command": "$boss_cmd"
+}
+EOF
+
+    echo -e "\n${GREEN}✔ 老板键伪装指令已成功写入配置文件！${RESET}"
+    echo -e "保存路径: $CONFIG_FILE"
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+}
+
+# 5. 快捷键指南面板
+show_shortcuts() {
+    clear
+    echo -e "${YELLOW}======================================================${RESET}"
+    echo -e "${YELLOW}               ReadCLI 终端快捷键速查表                  ${RESET}"
+    echo -e "${YELLOW}======================================================${RESET}"
+    echo -e "${GREEN}[书架首页]${RESET}"
+    echo -e "  j / k 或 ↑ / ↓  : 移动光标"
+    echo -e "  Enter 或 →      : 打开选中的书籍"
+    echo -e "  i               : 导入本地书籍 (支持路径补全/拖拽/Ctrl+r递归)"
+    echo -e "  o / r           : 书籍排序与过滤"
+    echo -e "  x               : 从书架移除书籍"
+    echo -e "\n${GREEN}[阅读界面]${RESET}"
+    echo -e "  j / k 或 ↑ / ↓  : 向上/向下翻页"
+    echo -e "  [ / ] 或 ← / →  : 切换到 上一章/下一章"
+    echo -e "  /               : 唤起正文搜索 (n/N 跳转结果)"
+    echo -e "  m               : 打开书籍目录 (支持数字跳章)"
+    echo -e "  s / B           : 添加或查看书签"
+    echo -e "  , (逗号)        : 打开阅读样式个性化设置面板"
+    echo -e "  c / T           : 快速切换正文颜色预设 / 切换主题"
+    echo -e "  z               : 一键切换 [精简模式] 与 [全信息模式]"
+    echo -e "  t               : 开启 / 关闭自动翻页"
+    echo -e "  + / -           : 动态增减每页显示的正文行数"
+    echo -e "  b               : 瞬间触发 Boss Key (老板键) 伪装"
+    echo -e "  f / p           : 开关外边框 / 查看当前精确阅读进度"
+    echo -e "  q               : 返回书架或退出"
+    echo -e "${YELLOW}======================================================${RESET}"
+    echo -ne "${GREEN}按回车键返回主菜单...${RESET}" && read -r
+}
+
+# 6. 更新功能
+update_readcli() {
+    echo -e "\n${YELLOW}开始检查并强行覆盖更新至最新版...${RESET}"
+    readcli u
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+}
+
+# 7. 清理与卸载
+uninstall_readcli() {
+    get_paths
+    echo -e "\n${RED}警告：准备进入 ReadCLI 卸载与数据清理流程...${RESET}"
+    echo -ne "${RED}是否要清除包括二进制程序、书架、阅读进度在内的所有数据？(y/n): ${RESET}"
+    read -r ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        # 清理二进制与软链
+        rm -f /usr/local/bin/readcli
+        if [ -n "$REAL_EXEC_PATH" ] && [ "$REAL_EXEC_PATH" != "/usr/local/bin/readcli" ]; then
+            rm -f "$REAL_EXEC_PATH"
+        fi
+        rm -f "$HOME/.local/bin/readcli"
+        
+        # 清理数据目录
+        if [ -d "$READCLI_DATA_DIR" ]; then
+            rm -rf "$READCLI_DATA_DIR"
+        fi
+        echo -e "${GREEN}✔ 全局软链、核心程序及本地数据已全部净化！${RESET}"
+    else
+        echo "已取消卸载操作。"
+    fi
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+}
+
+# 主循环
 while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
+    show_menu
+    read -r choice
+    case $choice in
+        1) install_readcli ;;
+        2) start_bookshelf ;;
+        3) start_with_book ;;
+        4) config_boss_key ;;
+        5) show_shortcuts ;;
+        6) update_readcli ;;
+        7) uninstall_readcli ;;
+        0) clear; exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
+    esac
 done

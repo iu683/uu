@@ -1,253 +1,370 @@
 #!/bin/bash
+# =================================================================
+# Mediary Scout (Media-Track) 管理面板 
+# =================================================================
 
-# 标准 ANSI 颜色定义
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-RESET='\033[0m'
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# 载入环境变量并增强 PATH 搜索（加入全局标准路径 /usr/local/bin）
-[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
-[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null
-export PATH="/usr/local/bin:$HOME/.local/bin:/root/.local/bin:$PATH"
+APP_NAME="mediary-scout-web"
+BASE_DIR="/opt/mediatrack"
+SRC_DIR="$BASE_DIR" 
+REPO_URL="https://github.com/fancydirty/mediary-scout.git"
 
-# 动态定位 ReadCLI 实际安装与数据路径
-get_paths() {
-    READCLI_DATA_DIR="${READCLI_DATA_DIR:-$HOME/.readcli}"
-    CONFIG_FILE="$READCLI_DATA_DIR/config.json"
-    BOOKSHELF_FILE="$READCLI_DATA_DIR/bookshelf.json"
-    # 优先寻找全局软链，其次寻找用户本地目录
-    REAL_EXEC_PATH=$(command -v readcli 2>/dev/null)
-    if [ -z "$REAL_EXEC_PATH" ] && [ -f "$HOME/.local/bin/readcli" ]; then
-        REAL_EXEC_PATH="$HOME/.local/bin/readcli"
+# 检测依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
+    fi
+    if ! command -v git &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
+        exit 1
     fi
 }
 
-# 获取状态与版本信息
-get_status() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        status="${GREEN}已安装 ($REAL_EXEC_PATH)${RESET}"
-        
-        # 🌟 修复点：精准匹配 "Vv" 或大写 "V" 开头的版本号，提取出纯数字版本
-        version_info=$($REAL_EXEC_PATH -v 2>/dev/null | grep -i "ReadCLI" | sed -E 's/[Vv]/v/g' | awk '{print $2}')
-        
-        # 保底机制：如果还是没抓到，尝试直接拿第一行
-        if [ -z "$version_info" ]; then
-            version_info=$($REAL_EXEC_PATH -v 2>/dev/null | head -n 1 | sed 's/ReadCLI //I')
-        fi
-        
-        [ -z "$version_info" ] && version_info="v0.3.5"
-        readcli_version="${YELLOW}${version_info}${RESET}"
+# 动态获取服务端口与运行状态
+get_status_info() {
+    local container_id=$(docker ps -q -f "name=web" -f "status=running" 2>/dev/null)
+    [[ -z "$container_id" ]] && container_id=$(docker ps -q -f "ancestor=mediary-scout-web" -f "status=running" 2>/dev/null)
+
+    if [[ -n "$container_id" ]]; then
+        status="${GREEN}运行中${RESET}"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
     else
-        status="${RED}未安装${RESET}"
-        readcli_version="${RED}-${RESET}"
-    fi
-
-    # 检查书架内是否有书
-    if [ -f "$BOOKSHELF_FILE" ] && grep -q '"path"' "$BOOKSHELF_FILE" 2>/dev/null; then
-        bookshelf_status="${GREEN}已有藏书${RESET}"
-    else
-        bookshelf_status="${YELLOW}书架空空${RESET}"
-    fi
-
-}
-
-# 菜单面板
-show_menu() {
-    clear
-    get_status
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈  ReadCLI  终端阅读管理面板 ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} $readcli_version"
-    echo -e "${GREEN}书架 :${RESET} $bookshelf_status"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 打开书架${RESET}"
-    echo -e "${GREEN}3. 打开书籍 (TXT/EPUB)${RESET}"
-    echo -e "${GREEN}4. 快捷键指南${RESET}"
-    echo -e "${GREEN}5. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-}
-
-# 核心下载与软链接建立函数
-download_latest_readcli() {
-    echo -e "\n${YELLOW}正在从 GitHub 检索 ReadCLI 最新版本信息...${RESET}"
-    
-    # 获取最新 release 标签
-    LATEST_TAG=$(curl -s https://api.github.com/repos/lvshp/ReadCLI/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    
-    if [ -z "$LATEST_TAG" ]; then
-        echo -e "${RED}❌ 无法获取最新版本信息，请检查网络（或 GitHub API 是否被限流）。${RESET}"
-        return 1
-    fi
-    
-    echo -e "${GREEN}发现最新版本: ${LATEST_TAG}${RESET}"
-    
-    # 构造下载链接
-    VERSION_NUM=$(echo "$LATEST_TAG" | sed 's/^v//')
-    DOWNLOAD_URL="https://github.com/lvshp/ReadCLI/releases/download/${LATEST_TAG}/readcli-linux-amd64-v${VERSION_NUM}.tar.gz"
-    
-    TMP_DIR=$(mktemp -d)
-    echo -e "${YELLOW}正在下载: ${DOWNLOAD_URL}${RESET}"
-    
-    if curl -L "$DOWNLOAD_URL" -o "${TMP_DIR}/readcli.tar.gz"; then
-        echo -e "${GREEN}✔ 下载成功，正在解压并建立全局系统调用...${RESET}"
-        tar -zxf "${TMP_DIR}/readcli.tar.gz" -C "$TMP_DIR"
-        
-        # 确保基础目录存在
-        mkdir -p "$HOME/.local/bin"
-        mkdir -p "/usr/local/bin"
-        
-        if [ -f "${TMP_DIR}/readcli" ]; then
-            # 1. 移动原始二进制到用户目录
-            mv "${TMP_DIR}/readcli" "$HOME/.local/bin/readcli"
-            chmod +x "$HOME/.local/bin/readcli"
-            
-            # 2. 🌟 核心修复：建立至全局 /usr/local/bin 的软链接，彻底解决 sh 不认 PATH 的问题
-            rm -f /usr/local/bin/readcli
-            ln -s "$HOME/.local/bin/readcli" /usr/local/bin/readcli
-            
-            echo -e "${GREEN}✔ 最新版 ReadCLI 成功安装！${RESET}"
-            echo -e "${GREEN}✔ 全局软链接已指向: /usr/local/bin/readcli (任意 Shell 环境下均可直接运行)${RESET}"
+        if [ -d "$SRC_DIR/.git" ]; then
+            status="${RED}已停止${RESET}"
         else
-            echo -e "${RED}❌ 解压文件中未找到 readcli 二进制文件。${RESET}"
-            rm -rf "$TMP_DIR"
-            return 1
+            status="${RED}未部署${RESET}"
+        fi
+        webui_port="N/A"
+    fi
+}
+
+get_public_ip() {
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
+}
+# 部署核心逻辑
+install_translate() {
+    check_dependencies
+
+    echo -e "${CYAN}====== 1. 端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Media-Track 映射端口 (WEB_PORT) [默认: 3000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3000"
+
+    echo -e "\n${CYAN}====== 2. PostgreSQL 数据库配置 ======${RESET}"
+    echo -e "${YELLOW}请选择你要使用的 PostgreSQL 数据库类型:${RESET}"
+    echo -e "  ${CYAN}1.${RESET} 使用集群自带内置数据库容器 (自动创建)"
+    echo -e "  ${CYAN}2.${RESET} 使用外部独立/远程 PostgreSQL 数据库"
+    echo -ne "${YELLOW}请选择 (1-2) [默认: 1]: ${RESET}"
+    read -r db_choice
+
+    local db_url="postgres://mediatrack:mediatrack@postgres:5432/mediatrack"
+    local use_builtin_db="true"
+
+    if [[ "$db_choice" == "2" ]]; then
+        use_builtin_db="false"
+        
+        echo -e "\n${CYAN}--- 远程 PostgreSQL 数据库连接配置 ---${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库 主机IP/域名: ${RESET}"
+        read -r remote_host
+        while [[ -z "$remote_host" ]]; do
+            echo -ne "${RED}错误: 主机IP/域名不能为空，请重新输入: ${RESET}"
+            read -r remote_host
+        done
+
+        echo -ne "${YELLOW}请输入远程数据库 端口 [默认: 5432]: ${RESET}"
+        read -r remote_port
+        [[ -z "$remote_port" ]] && remote_port="5432"
+
+        echo -ne "${YELLOW}请输入远程数据库 用户名: ${RESET}"
+        read -r remote_user
+        while [[ -z "$remote_user" ]]; do
+            echo -ne "${RED}错误: 用户名不能为空，请重新输入: ${RESET}"
+            read -r remote_user
+        done
+
+        echo -ne "${YELLOW}请输入远程数据库 密码: ${RESET}"
+        read -r remote_pass
+        while [[ -z "$remote_pass" ]]; do
+            echo -ne "${RED}错误: 密码不能为空，请重新输入: ${RESET}"
+            read -r remote_pass
+        done
+
+        echo -ne "${YELLOW}请输入远程数据库 数据库名: ${RESET}"
+        read -r remote_dbname
+        while [[ -z "$remote_dbname" ]]; do
+            echo -ne "${RED}错误: 数据库名不能为空，请重新输入: ${RESET}"
+            read -r remote_dbname
+        done
+
+        # 底层完美封装为通用标准的 Postgres 连接 URL
+        db_url="postgres://${remote_user}:${remote_pass}@${remote_host}:${remote_port}/${remote_dbname}"
+        echo -e "${GREEN}提示: 外部数据库参数组装成功！${RESET}"
+    else
+        echo -e "${GREEN}提示: 已选择内置容器数据库模式。${RESET}"
+    fi
+
+    # 克隆官方仓库到当前工作目录
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "\n${YELLOW}正在克隆官方 GitHub 仓库...${RESET}"
+        mkdir -p "$SRC_DIR"
+        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
+        if [ $? -eq 0 ]; then
+            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
+            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
+            rm -rf "$SRC_DIR/tmp_repo"
+        else
+            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
+            exit 1
         fi
     else
-        echo -e "${RED}❌ 下载失败，请检查网络连接。${RESET}"
-        rm -rf "$TMP_DIR"
-        return 1
+        echo -e "\n${GREEN}检测到本地已存在官方仓库，正在同步最新代码...${RESET}"
+        cd "$SRC_DIR" && git pull
     fi
-    rm -rf "$TMP_DIR"
 
-    # 兼容性写入环境变量（备用）
-    if [ -f "$HOME/.zshrc" ] && ! grep -q "local/bin" "$HOME/.zshrc"; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
-    fi
-    if [ -f "$HOME/.bashrc" ] && ! grep -q "local/bin" "$HOME/.bashrc"; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
-    fi
-}
+    # 回到仓库根目录
+    cd "$SRC_DIR"
 
-# 1. 安装
-install_readcli() {
-    download_latest_readcli
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
+    # 动态组装完美对齐原厂环境的 .env 文件
+    cat <<EOF > "$SRC_DIR/.env"
+# Required runtime configuration
+WEB_PORT=${custom_port}
+MEDIA_TRACK_POSTGRES_URL=${db_url}
+TMDB_READ_TOKEN=
+MEDIA_TRACK_SEARCH_PROVIDER=tmdb
+MEDIA_TRACK_DEMO_SEED=0
+MEDIA_TRACK_DEFAULT_QUALITY=4K
+MEDIA_TRACK_DEFAULT_TV_STORAGE_DIRECTORY_ID=
+MEDIA_TRACK_TV_PARENT_CID=
+MEDIA_TRACK_WORKFLOW_ADAPTER=pansou
+MEDIA_TRACK_AGENT_ADAPTER=vercel-ai
+MEDIA_TRACK_STORAGE_ADAPTER=115
+PANSOU_BASE_URL=http://pansou
+PAN115_COOKIE=""
+MEDIA_TRACK_115_TEST_ROOT_CID=
+MEDIA_TRACK_115_WRITE_SCOPE_CIDS=
+MEDIA_TRACK_115_PROTECTED_CIDS=
+TUNNEL_TOKEN=
+TUNNEL_TRANSPORT_PROTOCOL=
+XIAOMI_MIMO_API_KEY=
+XIAOMI_MIMO_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
+XIAOMI_MIMO_MODEL_ID=mimo-v2.5-pro
+CLAWD_MEDIA_ROOT_CID=
+MOVIES_CID=
+TV_SHOWS_CID=
+ANIME_CID=
+EOF
 
-# 2. 打开书架
-start_bookshelf() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${GREEN}正在调起 ReadCLI 书架...${RESET}"
-        "$REAL_EXEC_PATH"
+    # 动态裁剪和组装原生的 docker-compose.yml 
+    if [[ "$use_builtin_db" == "true" ]]; then
+        cat <<EOF > "$SRC_DIR/docker-compose.yml"
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mediatrack
+      POSTGRES_USER: mediatrack
+      POSTGRES_PASSWORD: mediatrack
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mediatrack -d mediatrack"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  pansou:
+    image: ghcr.io/fish2018/pansou-web:latest
+    restart: unless-stopped
+
+  web:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pansou:
+        condition: service_started
+    environment:
+      MEDIA_TRACK_POSTGRES_URL: ${db_url}
+      PANSOU_BASE_URL: http://pansou
+      MEDIA_TRACK_SEARCH_PROVIDER: tmdb
+      MEDIA_TRACK_WORKFLOW_ADAPTER: pansou
+      MEDIA_TRACK_STORAGE_ADAPTER: "115"
+      MEDIA_TRACK_AGENT_ADAPTER: vercel-ai
+      MEDIA_TRACK_DEMO_SEED: "0"
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "\${WEB_PORT:-3000}:3000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+EOF
     else
-        echo -e "\n${RED}未检测到 readcli 命令，请先执行选项 1 进行自动安装！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+        cat <<EOF > "$SRC_DIR/docker-compose.yml"
+services:
+  pansou:
+    image: ghcr.io/fish2018/pansou-web:latest
+    restart: unless-stopped
+
+  web:
+    build: .
+    depends_on:
+      pansou:
+        condition: service_started
+    environment:
+      MEDIA_TRACK_POSTGRES_URL: ${db_url}
+      PANSOU_BASE_URL: http://pansou
+      MEDIA_TRACK_SEARCH_PROVIDER: tmdb
+      MEDIA_TRACK_WORKFLOW_ADAPTER: pansou
+      MEDIA_TRACK_STORAGE_ADAPTER: "115"
+      MEDIA_TRACK_AGENT_ADAPTER: vercel-ai
+      MEDIA_TRACK_DEMO_SEED: "0"
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "\${WEB_PORT:-3000}:3000"
+    restart: unless-stopped
+EOF
     fi
+
+    echo -e "\n${YELLOW}正在执行独立编译启动命令 (WEB_PORT=${custom_port} docker compose up -d --build)...${RESET}"
+    WEB_PORT=$custom_port docker compose up -d --build
+
+    echo -e "${YELLOW}正在等待容器集群 Build 编译并拉起服务...${RESET}"
+    sleep 5
+
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}       Media-Track 官方原生集群编译并启动成功！        ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}默认访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}当前存储后端 : 外部 PostgreSQL 托管中${RESET}"
+    echo -e "${YELLOW}仓库所在路径 : ${SRC_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 3. 指定路径启动
-start_with_book() {
-    get_paths
-    if [ -z "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${RED}未检测到已安装的 ReadCLI。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+# 原生更新
+update_translate() {
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
         return
     fi
+    get_status_info
+    local current_port=$webui_port
+    [[ "$current_port" == "N/A" ]] && current_port="3000"
 
-    echo -ne "\n${GREEN}请输入书籍文件的绝对或相对路径 (支持 .txt / .epub): ${RESET}"
-    read -r book_path
-    if [ -f "$book_path" ]; then
-        echo -ne "${YELLOW}请输入阅读时的每页显示行数 (直接回车使用系统默认设置): ${RESET}"
-        read -r line_num
-        if [ -n "$line_num" ]; then
-            "$REAL_EXEC_PATH" -n "$line_num" "$book_path"
+    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
+    cd "$SRC_DIR" && git pull
+    
+    echo -e "${YELLOW}正在使用原厂命令重编镜像并热更新...${RESET}"
+    WEB_PORT=$current_port docker compose up -d --build --remove-orphans
+    echo -e "${GREEN}官方集群更新并重编完成！${RESET}"
+}
+
+# 彻底卸载
+uninstall_translate() {
+    echo -ne "${RED}确定要停止并卸载 Media-Track 官方容器集群吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -d "$SRC_DIR/.git" ]; then
+            cd "$SRC_DIR" && docker compose down
+            echo -e "${GREEN}官方业务容器已被安全停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同步连根拔除本地克隆的【全部源码及本地缓存卷】？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}本地所有源码与持久化数据已被彻底清除！${RESET}"
+            fi
         else
-            "$REAL_EXEC_PATH" "$book_path"
+            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
         fi
-    else
-        echo -e "${RED}文件不存在，请检查路径！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
     fi
 }
 
+start_translate() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}原生集群已全面启动${RESET}"; }
+stop_translate() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}原生集群已安全停止${RESET}"; }
+restart_translate() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}原生集群已平滑重启${RESET}"; }
+logs_translate() { cd "$SRC_DIR" && docker compose logs -f web --tail=100; }
 
+show_info() {
+    get_status_info
+    local DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}集群运行状态     : $status"
+    echo -e "${YELLOW}前端访问地址     : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}源码绝对路径     : ${SRC_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+}
 
-# 4. 快捷键指南面板
-show_shortcuts() {
+menu() {
     clear
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -e "${YELLOW}               ReadCLI 终端快捷键速查表                  ${RESET}"
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -e "${GREEN}[书架首页]${RESET}"
-    echo -e "  j / k 或 ↑ / ↓  : 移动光标"
-    echo -e "  Enter 或 →      : 打开选中的书籍"
-    echo -e "  i               : 导入本地书籍 (支持路径补全/拖拽/Ctrl+r递归)"
-    echo -e "  o / r           : 书籍排序与过滤"
-    echo -e "  x               : 从书架移除书籍"
-    echo -e "\n${GREEN}[阅读界面]${RESET}"
-    echo -e "  j / k 或 ↑ / ↓  : 向上/向下翻页"
-    echo -e "  [ / ] 或 ← / →  : 切换到 上一章/下一章"
-    echo -e "  /               : 唤起正文搜索 (n/N 跳转结果)"
-    echo -e "  m               : 打开书籍目录 (支持数字跳章)"
-    echo -e "  s / B           : 添加或查看书签"
-    echo -e "  , (逗号)        : 打开阅读样式个性化设置面板"
-    echo -e "  c / T           : 快速切换正文颜色预设 / 切换主题"
-    echo -e "  z               : 一键切换 [精简模式] 与 [全信息模式]"
-    echo -e "  t               : 开启 / 关闭自动翻页"
-    echo -e "  + / -           : 动态增减每页显示的正文行数"
-    echo -e "  b               : 瞬间触发 Boss Key (老板键) 伪装"
-    echo -e "  f / p           : 开关外边框 / 查看当前精确阅读进度"
-    echo -e "  q               : 返回书架或退出"
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -ne "${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
-
-
-
-# 5. 清理与卸载
-uninstall_readcli() {
-    get_paths
-    echo -e "\n${RED}警告：准备进入 ReadCLI 卸载与数据清理流程...${RESET}"
-    echo -ne "${RED}是否要清除包括二进制程序、书架、阅读进度在内的所有数据？(y/n): ${RESET}"
-    read -r ans
-    if [[ "$ans" =~ ^[Yy]$ ]]; then
-        # 清理二进制与软链
-        rm -f /usr/local/bin/readcli
-        if [ -n "$REAL_EXEC_PATH" ] && [ "$REAL_EXEC_PATH" != "/usr/local/bin/readcli" ]; then
-            rm -f "$REAL_EXEC_PATH"
-        fi
-        rm -f "$HOME/.local/bin/readcli"
-        
-        # 清理数据目录
-        if [ -d "$READCLI_DATA_DIR" ]; then
-            rm -rf "$READCLI_DATA_DIR"
-        fi
-        echo -e "${GREEN}✔ 全局软链、核心程序及本地数据已全部净化！${RESET}"
-    else
-        echo "已取消卸载操作。"
-    fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
-
-# 主循环
-while true; do
-    show_menu
+    get_status_info
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}    ◈  Media-Track 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}集群状态 :${RESET} $status"
+    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
-    case $choice in
-        1) install_readcli ;;
-        2) start_bookshelf ;;
-        3) start_with_book ;;
-        4) show_shortcuts ;;
-        5) uninstall_readcli ;;
-        0) clear; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
+    case "$choice" in
+        1) install_translate ;;
+        2) update_translate ;;
+        3) uninstall_translate ;;
+        4) start_translate ;;
+        5) stop_translate ;;
+        6) restart_translate ;;
+        7) logs_translate ;;
+        8) show_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+}
+
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
 done

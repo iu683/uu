@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Miaospeed 服务 Docker Compose 管理面板
+# Mediary Scout (Media-Track) 智能追剧系统 管理面板
 # =================================================================
 
 # 颜色
@@ -10,10 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/miaospeed-panel"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
-CONTAINER_NAME="miaospeed"
+APP_NAME="mediary-scout-web"
+BASE_DIR="/opt/mediatrack"
+SRC_DIR="$BASE_DIR" 
+REPO_URL="https://github.com/fancydirty/mediary-scout.git"
 
 # 检测依赖
 check_dependencies() {
@@ -21,28 +21,44 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
+    if ! command -v git &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
+        exit 1
+    fi
 }
 
-# 动态获取容器的状态、映射端口
+# 动态获取服务端口与运行状态
 get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -q -f name=miaospeed-panel-miaospeed-1)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -aq -f name=miaospeed-panel-miaospeed-1)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
+    local container_id=$(docker ps -q -f "name=web" -f "status=running" 2>/dev/null)
+    [[ -z "$container_id" ]] && container_id=$(docker ps -q -f "ancestor=mediary-scout-web" -f "status=running" 2>/dev/null)
 
-    if [ -f "$ENV_FILE" ]; then
-        bind_port=$(grep "^MIAO_PORT=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
-        [[ -z "$bind_port" ]] && bind_port="8765"
-        
-        miao_token=$(grep "^MIAO_TOKEN=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
-        miao_path=$(grep "^MIAO_PATH=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
+    if [[ -n "$container_id" ]]; then
+        status="${GREEN}运行中${RESET}"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
     else
-        bind_port="N/A"
-        miao_token="N/A"
-        miao_path="N/A"
+        if [ -d "$SRC_DIR/.git" ]; then
+            status="${RED}已停止${RESET}"
+        else
+            status="${RED}未部署${RESET}"
+        fi
+        webui_port="N/A"
+    fi
+}
+
+# 动态分析当前使用的数据库类型
+get_db_type_info() {
+    if [ -f "$SRC_DIR/.env" ]; then
+        local current_url=$(grep "MEDIA_TRACK_POSTGRES_URL=" "$SRC_DIR/.env" | cut -d'=' -f2-)
+        if [[ "$current_url" == *"@postgres:5432"* || "$current_url" == *"@postgres/"* ]]; then
+            echo -e "${GREEN}集群自带内置 PostgreSQL 容器${RESET}"
+        elif [[ -n "$current_url" ]]; then
+            echo -e "${YELLOW}外部独立/远程 PostgreSQL (${current_url:0:30}...)${RESET}"
+        else
+            echo -e "${RED}未检测到有效数据库配置${RESET}"
+        fi
+    else
+        echo -e "${RED}未部署 (.env 不存在)${RESET}"
     fi
 }
 
@@ -69,144 +85,292 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Miaospeed
+# 部署核心逻辑
 install_translate() {
     check_dependencies
-    mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    # 1. 配置监听端口
-    echo -ne "${YELLOW}请输入 Miaospeed 监听端口 [默认: 8765]: ${RESET}"
+    echo -e "${CYAN}====== 1. 基础端口与用户模式配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Media-Track 映射端口 (WEB_PORT) [默认: 3000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8765"
+    [[ -z "$custom_port" ]] && custom_port="3000"
 
-    # 2. 配置安全路径
-    echo -ne "${YELLOW}请输入 WebSocket 连接路径 (必须以 / 开头) [默认: /miaospeed]: ${RESET}"
-    read -r custom_path
-    [[ -z "$custom_path" ]] && custom_path="/miaospeed"
-
-    # 3. 配置连接 Token（默认随机，输入 y 手动指定）
-    echo -e "\n${CYAN}--- Token (连接密码) 配置 ---${RESET}"
-    echo -ne "${YELLOW}是否手动指定连接 Token？(y/n) [默认: n，将自动生成随机密码]: ${RESET}"
-    read -r miao_confirm
-
-    if [[ "$miao_confirm" != "y" && "$miao_confirm" != "Y" ]]; then
-        # 自动生成 16 位随机强密码
-        custom_token=$(tr -dc 'A-Za-z0-9{}?_' < /dev/urandom | head -c 16)
-        echo -e "${GREEN}提示: 已自动为您生成强安全 Token: ${custom_token}${RESET}"
+    echo -ne "${YELLOW}是否开启多用户模式？(开启后将显示登录/注册页) (y/n) [默认: n]: ${RESET}"
+    read -r multi_user_choice
+    local is_multi_user="0"
+    if [[ "$multi_user_choice" == "y" || "$multi_user_choice" == "Y" ]]; then
+        is_multi_user="1"
+        echo -e "${GREEN}提示: 已激活多用户注册/登录模式。${RESET}"
     else
-        echo -ne "${YELLOW}请输入您的自定义连接 Token (避免使用特殊符号): ${RESET}"
-        read -r custom_token
-        while [[ -z "$custom_token" ]]; do
-            echo -ne "${RED}错误: Token 不能为空，请重新输入: ${RESET}"
-            read -r custom_token
-        done
+        echo -e "${GREEN}提示: 已保持单用户免登录模式。${RESET}"
     fi
 
-    # 生成环境变量 .env 配置文件
-    cat <<EOF > "$ENV_FILE"
-MIAO_PORT=${custom_port}
-MIAO_PATH=${custom_path}
-MIAO_TOKEN=${custom_token}
+    echo -e "\n${CYAN}====== 2. PostgreSQL 数据库配置 ======${RESET}"
+    echo -e "${YELLOW}请选择你要使用的 PostgreSQL 数据库类型:${RESET}"
+    echo -e "  ${CYAN}1.${RESET} 使用集群自带内置数据库容器 (自动创建)"
+    echo -e "  ${CYAN}2.${RESET} 使用外部独立/远程 PostgreSQL 数据库"
+    echo -ne "${YELLOW}请选择 (1-2) [默认: 1]: ${RESET}"
+    read -r db_choice
+
+    local db_url="postgres://mediatrack:mediatrack@postgres:5432/mediatrack"
+    local use_builtin_db="true"
+
+    if [[ "$db_choice" == "2" ]]; then
+        use_builtin_db="false"
+        
+        echo -e "\n${CYAN}--- 远程 PostgreSQL 数据库连接配置 ---${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库 主机IP/域名: ${RESET}"
+        read -r remote_host
+        while [[ -z "$remote_host" ]]; do
+            echo -ne "${RED}错误: 主机IP/域名不能为空，请重新输入: ${RESET}"
+            read -r remote_host
+        done
+
+        echo -ne "${YELLOW}请输入远程数据库 端口 [默认: 5432]: ${RESET}"
+        read -r remote_port
+        [[ -z "$remote_port" ]] && remote_port="5432"
+
+        echo -ne "${YELLOW}请输入远程数据库 用户名: ${RESET}"
+        read -r remote_user
+        while [[ -z "$remote_user" ]]; do
+            echo -ne "${RED}错误: 用户名不能为空，请重新输入: ${RESET}"
+            read -r remote_user
+        done
+
+        echo -ne "${YELLOW}请输入远程数据库 密码: ${RESET}"
+        read -r remote_pass
+        while [[ -z "$remote_pass" ]]; do
+            echo -ne "${RED}错误: 密码不能为空，请重新输入: ${RESET}"
+            read -r remote_pass
+        done
+
+        echo -ne "${YELLOW}请输入远程数据库 数据库名: ${RESET}"
+        read -r remote_dbname
+        while [[ -z "$remote_dbname" ]]; do
+            echo -ne "${RED}错误: 数据库名不能为空，请重新输入: ${RESET}"
+            read -r remote_dbname
+        done
+
+        db_url="postgres://${remote_user}:${remote_pass}@${remote_host}:${remote_port}/${remote_dbname}"
+        echo -e "${GREEN}提示: 外部数据库参数组装成功！${RESET}"
+    else
+        echo -e "${GREEN}提示: 已选择内置容器数据库模式。${RESET}"
+    fi
+
+    # 克隆官方仓库到当前工作目录
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "\n${YELLOW}正在克隆官方 GitHub 仓库...${RESET}"
+        mkdir -p "$SRC_DIR"
+        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
+        if [ $? -eq 0 ]; then
+            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
+            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
+            rm -rf "$SRC_DIR/tmp_repo"
+        else
+            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
+            exit 1
+        fi
+    else
+        echo -e "\n${GREEN}检测到本地已存在官方仓库，正在同步最新代码...${RESET}"
+        cd "$SRC_DIR" && git pull
+    fi
+
+    # 回到仓库根目录
+    cd "$SRC_DIR"
+
+    # 动态组装完美对齐原厂环境的 .env 文件
+    cat <<EOF > "$SRC_DIR/.env"
+# Required runtime configuration
+WEB_PORT=${custom_port}
+MEDIA_TRACK_MULTI_USER=${is_multi_user}
+MEDIA_TRACK_POSTGRES_URL=${db_url}
+TMDB_READ_TOKEN=
+MEDIA_TRACK_SEARCH_PROVIDER=tmdb
+MEDIA_TRACK_DEMO_SEED=0
+MEDIA_TRACK_DEFAULT_QUALITY=4K
+MEDIA_TRACK_DEFAULT_TV_STORAGE_DIRECTORY_ID=
+MEDIA_TRACK_TV_PARENT_CID=
+MEDIA_TRACK_WORKFLOW_ADAPTER=pansou
+MEDIA_TRACK_AGENT_ADAPTER=vercel-ai
+MEDIA_TRACK_STORAGE_ADAPTER=115
+PANSOU_BASE_URL=http://pansou
+PAN115_COOKIE=""
+MEDIA_TRACK_115_TEST_ROOT_CID=
+MEDIA_TRACK_115_WRITE_SCOPE_CIDS=
+MEDIA_TRACK_115_PROTECTED_CIDS=
+TUNNEL_TOKEN=
+TUNNEL_TRANSPORT_PROTOCOL=
+XIAOMI_MIMO_API_KEY=
+XIAOMI_MIMO_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
+XIAOMI_MIMO_MODEL_ID=mimo-v2.5-pro
+CLAWD_MEDIA_ROOT_CID=
+MOVIES_CID=
+TV_SHOWS_CID=
+ANIME_CID=
 EOF
 
-    # 动态生成符合官方标准的 docker-compose.yml 
-    # 注意：使用 host 模式运行，端口由命令内部控制
-    cat <<EOF > "$COMPOSE_FILE"
+    # 动态裁剪和组装原生的 docker-compose.yml 
+    if [[ "$use_builtin_db" == "true" ]]; then
+        cat <<EOF > "$SRC_DIR/docker-compose.yml"
 services:
-  miaospeed:
-    stdin_open: true
-    tty: true
-    container_name: ${CONTAINER_NAME}
-    network_mode: host
-    restart: always
-    image: airportr/miaospeed:latest
-    command: server -bind 0.0.0.0:\${MIAO_PORT:-8765} -path \${MIAO_PATH:-/miaospeed} -token '\${MIAO_TOKEN}' -mtls
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mediatrack
+      POSTGRES_USER: mediatrack
+      POSTGRES_PASSWORD: mediatrack
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mediatrack -d mediatrack"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  pansou:
+    image: ghcr.io/fish2018/pansou-web:latest
+    restart: unless-stopped
+
+  web:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pansou:
+        condition: service_started
+    environment:
+      MEDIA_TRACK_POSTGRES_URL: ${db_url}
+      MEDIA_TRACK_MULTI_USER: "${is_multi_user}"
+      PANSOU_BASE_URL: http://pansou
+      MEDIA_TRACK_SEARCH_PROVIDER: tmdb
+      MEDIA_TRACK_WORKFLOW_ADAPTER: pansou
+      MEDIA_TRACK_STORAGE_ADAPTER: "115"
+      MEDIA_TRACK_AGENT_ADAPTER: vercel-ai
+      MEDIA_TRACK_DEMO_SEED: "0"
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "\${WEB_PORT:-3000}:3000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
 EOF
+    else
+        cat <<EOF > "$SRC_DIR/docker-compose.yml"
+services:
+  pansou:
+    image: ghcr.io/fish2018/pansou-web:latest
+    restart: unless-stopped
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Miaospeed 服务...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+  web:
+    build: .
+    depends_on:
+      pansou:
+        condition: service_started
+    environment:
+      MEDIA_TRACK_POSTGRES_URL: ${db_url}
+      MEDIA_TRACK_MULTI_USER: "${is_multi_user}"
+      PANSOU_BASE_URL: http://pansou
+      MEDIA_TRACK_SEARCH_PROVIDER: tmdb
+      MEDIA_TRACK_WORKFLOW_ADAPTER: pansou
+      MEDIA_TRACK_STORAGE_ADAPTER: "115"
+      MEDIA_TRACK_AGENT_ADAPTER: vercel-ai
+      MEDIA_TRACK_DEMO_SEED: "0"
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "\${WEB_PORT:-3000}:3000"
+    restart: unless-stopped
+EOF
+fi
 
-    sleep 2
-    DETECT_IP=$(get_public_ip)
+    echo -e "\n${YELLOW}正在执行独立编译启动命令 (WEB_PORT=${custom_port} docker compose up -d --build)...${RESET}"
+    WEB_PORT=$custom_port docker compose up -d --build
 
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}      Miaospeed 后端部署成功！                      ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}请将以下配置直接复制贴入您的 koipy 主控配置文件中:  ${RESET}"
-    echo -e "${CYAN}"
-    echo -e "    - type: miaospeed"
-    echo -e "      id: \"localmiaospeed\""
-    echo -e "      token: \"${custom_token}\""
-    echo -e "      address: \"127.0.0.1:${custom_port}\""
-    echo -e "      path: \"${custom_path}\""
-    echo -e "      skipCertVerify: true"
-    echo -e "      tls: true"
-    echo -e "      comment: \"本地miaospeed后端\""
-    echo -e "${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}正在等待容器集群 Build 编译并拉起服务...${RESET}"
+    sleep 3
+
+    show_info
 }
 
-# 更新镜像
+# 原生更新
 update_translate() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件！${RESET}"
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
         return
     fi
-    cd "$BASE_DIR" && docker compose pull && docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！${RESET}"
+    get_status_info
+    local current_port=$webui_port
+    [[ "$current_port" == "N/A" ]] && current_port="3000"
+
+    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
+    cd "$SRC_DIR" && git pull
+    
+    echo -e "${YELLOW}正在使用原厂命令重编镜像并热更新...${RESET}"
+    WEB_PORT=$current_port docker compose up -d --build --remove-orphans
+    echo -e "${GREEN}官方集群更新并重编完成！${RESET}"
 }
 
-# 卸载服务 (分层递进确认逻辑)
+# 彻底卸载
 uninstall_translate() {
-    get_status_info
-    
-    echo -ne "${YELLOW}确定要卸载并删除 Miaospeed 容器吗？(y/n): ${RESET}"
+    echo -ne "${RED}确定要停止并卸载 Media-Track 官方容器集群吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            
-            # 第二层确认：删除面板配置文件目录
-            echo -ne "${YELLOW}是否同时删除面板配置环境目录 [${BASE_DIR}]？(y/n): ${RESET}"
+        if [ -d "$SRC_DIR/.git" ]; then
+            cd "$SRC_DIR" && docker compose down
+            echo -e "${GREEN}官方业务容器已被安全停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同步连根拔除本地克隆的【全部源码及本地缓存卷】？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}管理目录已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有源码与持久化数据已被彻底清除！${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}所有容器已重启${RESET}"; }
-logs_translate() { cd "$BASE_DIR" && docker compose logs -f; }
+start_translate() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}原生集群已全面启动${RESET}"; }
+stop_translate() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}原生集群已安全停止${RESET}"; }
+restart_translate() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}原生集群已平滑重启${RESET}"; }
+logs_translate() { cd "$SRC_DIR" && docker compose logs -f web --tail=100; }
 
 show_info() {
     get_status_info
+    local DETECT_IP=$(get_public_ip)
+    local db_info=$(get_db_type_info)
+    
+    # 获取当前的多用户状态文案
+    local mu_status="${RED}单用户免登录模式${RESET}"
+    if [ -f "$SRC_DIR/.env" ]; then
+        local check_mu=$(grep "MEDIA_TRACK_MULTI_USER=" "$SRC_DIR/.env" | cut -d'=' -f2-)
+        [[ "$check_mu" == "1" ]] && mu_status="${GREEN}已激活多用户登录/注册机制${RESET}"
+    fi
+
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}Miaospeed 服务状态    : ${status}"
-    echo -e "${YELLOW}当前本地监听端口       : ${bind_port}"
-    echo -e "${YELLOW}当前通信安全路径       : ${miao_path}"
-    echo -e "${YELLOW}当前对接通信 Token     : ${miao_token}"
+    echo -e "${GREEN}       Media-Track 官方原生集群状态看板              ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}集群运行状态     : $status"
+    echo -e "${YELLOW}前端访问地址     : ${CYAN}http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}当前用户体系     : $mu_status"
+    echo -e "${YELLOW}当前存储后端     : $db_info"
+    echo -e "${YELLOW}源码绝对路径     : ${SRC_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈  Miaospeed 后端管理面板  ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态  : ${status}"
-    echo -e "${GREEN}端口  : ${YELLOW}${bind_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}    ◈  Media-Track 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}集群状态 :${RESET} $status"
+    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -216,7 +380,7 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in

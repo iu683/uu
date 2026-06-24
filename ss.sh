@@ -55,7 +55,7 @@ function scan_projects() {
 # 确认操作
 # ---------------------------
 function confirm_action() {
-    read -p "确认执行此操作吗？(y/N): " confirm
+    read -p "$(echo -e "${GREEN}确认执行此操作吗？(y/N): ${RESET}")" confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         return 0
     else
@@ -209,7 +209,7 @@ monitor_docker_containers() {
             echo
         done
     fi
-    read -p "按回车返回主菜单..." temp
+    read -p "$(echo -e "${GREEN}按回车返回主菜单...${RESET}")" temp
 }
 
 # ---------------------------
@@ -225,7 +225,7 @@ function select_project() {
 
     if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
         echo -e "${RED}未找到任何 Docker Compose 项目！${RESET}"
-        read -p "按回车返回主菜单..." temp
+        read -p "$(echo -e "${GREEN}按回车返回主菜单...${RESET}")" temp
         return
     fi
     
@@ -403,9 +403,9 @@ function project_menu() {
     while true; do
         clear
         local project_name=$(basename "$PROJECT_DIR")
-        echo -e "${GREEN}================================================${RESET}"
-        echo -e "${GREEN}   ◈  管理项目:${RESET} ${YELLOW}$project_name${RESET}   ${GREEN} ◈      ${RESET}"
-        echo -e "${GREEN}================================================${RESET}"
+        echo -e "${GREEN}=============================================${RESET}"
+        echo -e "${GREEN}        ◈  管理项目:${RESET} ${YELLOW}$project_name${RESET} ${GREEN} ◈      ${RESET}"
+        echo -e "${GREEN}=============================================${RESET}"
 
         echo -e "${YELLOW}[ 当前容器实时状态 ]${RESET}"
         local services=$(docker compose -f "$COMPOSE_FILE" ps --services 2>/dev/null)
@@ -427,11 +427,11 @@ function project_menu() {
                 local status_icon="${RED}❌${RESET}"
                 [[ "$raw_status" == *"Up"* ]] && status_icon="${GREEN}✅${RESET}"
                 
-                echo -e "  ${YELLOW}◈ $service${RESET} $status_icon -> $uptime"
+                echo -e "  ${YELLOW}◈ $service${RESET} $status_icon ${YELLOW}-> $uptime${RESET}"
                 echo -e "    ${YELLOW}└─ 端口:${RESET} ${GREEN}$ports${RESET}"
             done
         fi
-        echo -e "${YELLOW}------------------------------------------------${RESET}"
+        echo -e "${GREEN}---------------------------------------------${RESET}"
 
         echo -e "${GREEN} 1) 启动服务     |     2) 停止服务${RESET}"
         echo -e "${GREEN} 3) 重启服务     |     4) 查看日志${RESET}"
@@ -439,9 +439,9 @@ function project_menu() {
         echo -e "${GREEN} 7) 进入容器     |     8) 删除容器+镜像+卷${RESET}"
         echo -e "${GREEN} 9) 删除容器     |    10) 删除整个项目${RESET}"
         echo -e "${GREEN}11) 禁止公网     |    12) 允许公网${RESET}"
-        echo -e "${GREEN}================================================${RESET}"
-        echo -e "${YELLOW}13) 切换项目    |     0) 返回主菜单${RESET}"
-        echo -e "${GREEN}================================================${RESET}"
+        echo -e "${GREEN}=============================================${RESET}"
+        echo -e "${YELLOW}13) 切换项目     |     0) 返回主菜单${RESET}"
+        echo -e "${GREEN}=============================================${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
         case "$choice" in
             1) docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
@@ -469,25 +469,32 @@ function project_menu() {
 function network_menu() {
     while true; do
         clear
+        # 实时抓取系统中的所有网络状态数据
+        local total_nets=$(docker network ls -q | wc -l)
+        local net_list=$(docker network ls --format "{{.Name}} ({{.Driver}})" | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
+        
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}    ◈    Docker 网络管理    ◈   ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${YELLOW}当前总计: $total_nets 个独立网络${RESET}"
+        echo -e "${YELLOW}[网络列表] $net_list${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}1) 查看所有网络${RESET}"
         echo -e "${GREEN}2) 创建网络${RESET}"
         echo -e "${GREEN}3) 删除网络${RESET}"
         echo -e "${GREEN}4) 将容器加入网络（支持多选）${RESET}"
         echo -e "${GREEN}5) 将容器退出网络（支持多选）${RESET}"
-        echo -e "${0) 返回主菜单}${RESET}"
+        echo -e "${GREEN}0) 返回主菜单${RESET}"
         echo -e "${GREEN}================================${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
         case "$choice" in
-            1) docker network ls; read -p "按回车返回..." temp ;;
+            1) docker network ls; read -p "$(echo -e "${GREEN}按回车返回...${RESET}")" temp ;;
             2)
                 read -p "请输入网络名称: " netname
                 read -p "请输入驱动 (bridge/overlay/macvlan，默认 bridge): " netdriver
                 netdriver=${netdriver:-bridge}
                 docker network create -d "$netdriver" "$netname" && echo -e "${GREEN}网络 $netname 创建成功${RESET}"
-                read -p "按回车返回..." temp
+                read -p "$(echo -e "${GREEN}按回车返回...${RESET}")" temp
                 ;;
             3)
                 docker network ls --format "{{.Name}}" | nl
@@ -498,7 +505,7 @@ function network_menu() {
                 else
                     echo -e "${RED}无效编号${RESET}"
                 fi
-                read -p "按回车返回..." temp
+                read -p "$(echo -e "${GREEN}按回车返回...${RESET}")" temp
                 ;;
             4)
                 echo -e "${GREEN}可用网络：${RESET}"
@@ -514,7 +521,7 @@ function network_menu() {
                     cname=$(docker ps --format "{{.Names}}" | sed -n "${cnum}p")
                     [ -n "$cname" ] && docker network connect "$netname" "$cname" && echo -e "${GREEN}容器 $cname 已加入${RESET}"
                 done
-                read -p "按回车返回..." temp
+                read -p "$(echo -e "${GREEN}按回车返回...${RESET}")" temp
                 ;;
             5)
                 echo -e "${GREEN}可用网络：${RESET}"
@@ -531,7 +538,7 @@ function network_menu() {
                     cname=${containers[$((cnum-1))]}
                     [ -n "$cname" ] && docker network disconnect "$netname" "$cname" && echo -e "${GREEN}容器 $cname 已退出${RESET}"
                 done
-                read -p "按回车返回..." temp
+                read -p "$(echo -e "${GREEN}按回车返回...${RESET}")" temp
                 ;;
             0) return ;;
             *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
@@ -545,15 +552,25 @@ function network_menu() {
 function main_menu() {
     while true; do
         clear
+        local docker_ver=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "未知")
+        local compose_ver=$(docker compose version --short 2>/dev/null || echo "未知")
+        local running_containers=$(docker ps -q | wc -l)
+        local total_images=$(docker images -q | sort -u | wc -l)
+
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN} ◈  Docker Compose 项目管理  ◈ ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} Docker :${RESET} ${YELLOW}v$docker_ver${RESET}" 
+        echo -e "${GREEN}Compose :${RESET} ${YELLOW}v$compose_ver ${RESET}"
+        echo -e "${GREEN}运行容器:${RESET} ${YELLOW}$running_containers 个${RESET}"
+        echo -e "${GREEN}系统镜像:${RESET} ${YELLOW}$total_images 个${RESET}"
         echo -e "${GREEN}================================${RESET}"
         echo -e "${GREEN}1) 管理项目${RESET}"
         echo -e "${GREEN}2) 网络管理${RESET}"
         echo -e "${GREEN}3) 查看容器运行状态${RESET}"
         echo -e "${GREEN}4) 多选删除项目${RESET}"
         echo -e "${GREEN}5) 删除未运行的项目${RESET}"
-        echo -e "${0) 退出}${RESET}"
+        echo -e "${GREEN}0) 退出${RESET}"
         echo -e "${GREEN}================================${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
         case "$choice" in

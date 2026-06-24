@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# DockUP 服务 Docker Compose 管理面板 
+# BepUSDT 服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,10 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/dockup"
+BASE_DIR="/opt/bepusdt-panel"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
-CONTAINER_NAME="dockup"
+CONTAINER_NAME="bepusdt"
 
 # 检测依赖
 check_dependencies() {
@@ -26,9 +26,9 @@ check_dependencies() {
 # 动态获取容器的状态、映射端口和数据目录
 get_status_info() {
     # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -q -f name=bepusdt-panel-bepusdt-1)" ]; then
         status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -aq -f name=bepusdt-panel-bepusdt-1)" ]; then
         status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
@@ -36,28 +36,23 @@ get_status_info() {
 
     # 2. 从 .env 文件中提取配置信息（如果存在）
     if [ -f "$ENV_FILE" ]; then
-        webui_port=$(grep "^AGENT_PORT=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
-        [[ -z "$webui_port" ]] && webui_port="8748"
+        webui_port=$(grep "^PANEL_PORT=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
+        [[ -z "$webui_port" ]] && webui_port="8080"
         
-        tg_bot=$(grep "^TG_BOT_TOKEN=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
-        tg_chat=$(grep "^TG_CHAT_ID=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
+        pg_dsn=$(grep "^POSTGRESQL_DSN=" "$ENV_FILE" | cut -d'=' -f2- | sed 's/\r//g')
+        [[ -z "$pg_dsn" ]] && pg_dsn="${YELLOW}已彻底移除该变量 (未注入 DSN)${RESET}"
         
-        # 从 docker-compose.yml 中提取实际挂载的宿主机数据根目录
-        if [ -f "$COMPOSE_FILE" ]; then
-            data_dir=$(grep "\- " "$COMPOSE_FILE" | grep ":/data" | awk -F':' '{print $1}' | sed 's/-//g' | sed 's/^[ \t]*//' | head -n 1)
-        fi
-        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/data"
+        data_dir=$(grep "\- " "$COMPOSE_FILE" 2>/dev/null | grep ":/var/lib/bepusdt" | awk -F':' '{print $1}' | sed 's/-//g' | sed 's/^[ \t]*//' | head -n 1)
+        [[ -z "$data_dir" ]] && data_dir="/opt/bepusdt"
     else
         webui_port="N/A"
-        tg_bot="N/A"
-        tg_chat="N/A"
+        pg_dsn="N/A"
         data_dir="N/A"
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"}
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
@@ -79,47 +74,62 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 DockUP
+# 部署 BepUSDT
 install_translate() {
     check_dependencies
-    
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    # 1. 配置 Telegram 机器人参数
-    echo -ne "${YELLOW}请输入 TG_BOT_TOKEN [当前: ${tg_bot}]: ${RESET}"
-    read -r custom_bot
-    [[ -z "$custom_bot" ]] && custom_bot="${tg_bot}"
-    if [[ "$custom_bot" == "N/A" || -z "$custom_bot" ]]; then
-        echo -e "${RED}错误: TG_BOT_TOKEN 不能为空！${RESET}"
-        return
-    fi
-
-    echo -ne "${YELLOW}请输入 TG_CHAT_ID [当前: ${tg_chat}]: ${RESET}"
-    read -r custom_chat
-    [[ -z "$custom_chat" ]] && custom_chat="${tg_chat}"
-    if [[ "$custom_chat" == "N/A" || -z "$custom_chat" ]]; then
-        echo -e "${RED}错误: TG_CHAT_ID 不能为空！${RESET}"
-        return
-    fi
-
-    # 2. 配置映射端口
-    echo -ne "${YELLOW}请输入 DockUP 监听端口 (宿主机端口) [默认: 8748]: ${RESET}"
+    # 1. 配置映射端口
+    echo -ne "${YELLOW}请输入 BepUSDT 访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8748"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
+    [[ -z "$custom_port" ]] && custom_port="8080"
 
-    # 3. 配置数据目录（支持自定义）
-    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/dockup/data]: ${RESET}"
+    # 2. 配置数据目录
+    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/bepusdt]: ${RESET}"
     read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="/opt/dockup/data"
+    [[ -z "$custom_data" ]] && custom_data="/opt/bepusdt"
 
-    # 获取外网 IP 填充公共访问 URL
-    DETECT_IP=$(get_public_ip)
+    # 3. 配置 PostgreSQL 数据库连接信息
+    echo -e "\n${CYAN}--- PostgreSQL 配置 (如果不选/不填直接全按回车，将彻底去掉数据库变量) ---${RESET}"
+    
+    echo -ne "${YELLOW}1. 用户名: ${RESET}"
+    read -r db_user
+
+    echo -ne "${YELLOW}2. 密码: ${RESET}"
+    read -r db_pass
+
+    echo -ne "${YELLOW}3. 服务器地址端口 (如 localhost:5432): ${RESET}"
+    read -r db_host
+
+    echo -ne "${YELLOW}4. 数据库名称: ${RESET}"
+    read -r db_name
+
+    # --- 核心剥离逻辑：判断是否需要生成数据库变量块 ---
+    local env_dsn_line=""
+    local compose_env_block=""
+
+    if [[ -z "$db_user" && -z "$db_pass" && -z "$db_host" && -z "$db_name" ]]; then
+        echo -e "\n${YELLOW}提示: 检测到未输入任何数据库连接信息，已直接去掉环境块中的数据库变量。${RESET}"
+        env_dsn_line=""
+        compose_env_block=""
+    else
+        # 局部动态拼接
+        local auth_part=""
+        local host_part=""
+        local db_part=""
+
+        [[ -n "$db_user" ]] && { [[ -n "$db_pass" ]] && auth_part="${db_user}:${db_pass}@" || auth_part="${db_user}@"; }
+        [[ -n "$db_host" ]] && host_part="$db_host"
+        [[ -n "$db_name" ]] && db_part="/${db_name}"
+
+        constructed_dsn="postgres://${auth_part}${host_part}${db_part}?sslmode=disable&connect_timeout=3"
+        
+        env_dsn_line="POSTGRESQL_DSN=${constructed_dsn}"
+        compose_env_block="    environment:
+      - POSTGRESQL_DSN=\${POSTGRESQL_DSN}"
+    fi
 
     # 创建自定义持久化根目录
     mkdir -p "${custom_data}"
@@ -128,67 +138,44 @@ install_translate() {
     # 生成环境变量 .env 配置文件
     echo -e "${YELLOW}正在生成环境变量 .env 配置文件...${RESET}"
     cat <<EOF > "$ENV_FILE"
-TZ=Asia/Shanghai
-TG_BOT_TOKEN=${custom_bot}
-TG_CHAT_ID=${custom_chat}
-CHECK_INTERVAL=12h
-CHECK_LOCAL=true
-CLEANUP=true
-SETUP_TEST_MESSAGE=true
-
-# server = Telegram 中心端；agent = 远程 VPS Agent
-DOCKUP_MODE=server
-DOCKUP_AGENT_TOKEN=
-DOCKUP_PUBLIC_URL=http://${DETECT_IP}:${custom_port}
-DOCKUP_AGENTS=
-
-AGENT_LISTEN=:8748
-AGENT_PORT=${custom_port}
-DOCKUP_NAME=DockUP
-DOCKUP_DATA=/data/dockup.json
+PANEL_PORT=${custom_port}
+${env_dsn_line}
 EOF
 
-    # 动态生成 docker-compose.yml 配置文件
+    # 动态生成 docker-compose.yml 配置文件 (无变量则完全不写 environment 结构，保持干净)
     echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  dockup:
-    image: ghcr.io/shuijiao1/dockup:latest
+  bepusdt:
+    image: v03413/bepusdt:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
-    environment:
-      TZ: \${TZ:-Asia/Shanghai}
-      TG_BOT_TOKEN: \${TG_BOT_TOKEN}
-      TG_CHAT_ID: \${TG_CHAT_ID}
-      CHECK_INTERVAL: \text{\${CHECK_INTERVAL:-12h}}
-      CHECK_LOCAL: \${CHECK_LOCAL:-true}
-      CLEANUP: \${CLEANUP:-true}
-      SETUP_TEST_MESSAGE: \${SETUP_TEST_MESSAGE:-true}
-      DOCKUP_MODE: \${DOCKUP_MODE:-server}
-      DOCKUP_AGENT_TOKEN: \${DOCKUP_AGENT_TOKEN:-}
-      DOCKUP_PUBLIC_URL: \${DOCKUP_PUBLIC_URL:-}
-      DOCKUP_AGENTS: \${DOCKUP_AGENTS:-}
-      AGENT_LISTEN: \${AGENT_LISTEN:-:8748}
-      DOCKUP_NAME: \${DOCKUP_NAME:-DockUP}
     ports:
-      - "\${AGENT_PORT:-8748}:8748"
+      - "\${PANEL_PORT:-8080}:8080"
+${compose_env_block}
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${custom_data}:/data
+      - ${custom_data}:/var/lib/bepusdt
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 DockUP 服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 BepUSDT 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待服务初始化 (约3秒)...${RESET}"
     sleep 3
 
+    DETECT_IP=$(get_public_ip)
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      DockUP 部署成功！      ${RESET}"
+    echo -e "${GREEN}      BepUSDT 部署成功！      ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}中心端公网 URL : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}面板配置主目录 : $BASE_DIR${RESET}"
-    echo -e "${YELLOW}用户数据存储器 : ${custom_data}${RESET}"
+    if [[ -n "$env_dsn_line" ]]; then
+        echo -e "${YELLOW}当前注入 DSN : ${constructed_dsn}${RESET}"
+    else
+        echo -e "${YELLOW}当前注入 DSN : 已经彻底从全局环境中拿掉数据库配置项${RESET}"
+    fi
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -198,54 +185,52 @@ update_translate() {
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新 DockUP 镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+    cd "$BASE_DIR" && docker compose pull && docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！${RESET}"
 }
 
 # 卸载服务
 uninstall_translate() {
     get_status_info
-    echo -ne "${YELLOW}确定要卸载并删除 DockUP 容器吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有自定义的持久化数据和配置文件？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                # 清理自定义的数据路径
-                if [ -d "$data_dir" ] && [ "$data_dir" != "N/A" ]; then
-                    rm -rf "$data_dir"
-                    echo -e "${GREEN}外部自定义数据目录 [${data_dir}] 已彻底清理。${RESET}"
-                fi
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}项目配置主目录 [${BASE_DIR}] 已彻底清理。${RESET}"
-            fi
-        else
-            echo -e "${RED}未找到 compose 文件，尝试强制清理可能残留的容器...${RESET}"
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
-        fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+    
+    # 第一次确认
+    echo -ne "${RED}【警告】确定要停止并卸载 BepUSDT 服务吗？(y/n): ${RESET}"
+    read -r confirm1
+    if [[ "$confirm1" != "y" && "$confirm1" != "Y" ]]; then
+        echo -e "${GREEN}已取消卸载。${RESET}"
+        return
+    fi
+
+    # 第二次确认
+    echo -ne "${RED}【再次确认】该操作将清理容器及整个配置面板主目录 [${BASE_DIR}]，数据无法恢复！请输入 'y' 确认执行: ${RESET}"
+    read -r confirm2
+    if [[ "$confirm2" != "y" && "$confirm2" != "Y" ]]; then
+        echo -e "${GREEN}已取消卸载。${RESET}"
+        return
+    fi
+
+    # 执行卸载逻辑
+    if [ -f "$COMPOSE_FILE" ]; then
+        cd "$BASE_DIR" && docker compose down
+        rm -rf "$BASE_DIR"
+        echo -e "${GREEN}卸载彻底完成，管理目录已完全清理。${RESET}"
+    else
+        echo -e "${YELLOW}未找到 compose 文件，尝试强制清理容器实例...${RESET}"
+        docker rm -f "$CONTAINER_NAME" 2>/dev/null
+        echo -e "${GREEN}清理完成。${RESET}"
     fi
 }
 
 start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
 stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}所有容器已重启${RESET}"; }
 logs_translate() { cd "$BASE_DIR" && docker compose logs -f; }
 
 show_info() {
     get_status_info
-    local current_url=$(grep "DOCKUP_PUBLIC_URL=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2)
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}DockUP 服务状态       : ${status}"
-    echo -e "${YELLOW}TG_BOT_TOKEN          : ${tg_bot}"
-    echo -e "${YELLOW}TG_CHAT_ID            : ${tg_chat}"
-    echo -e "${YELLOW}中心端 Agent 访问地址 : ${current_url:-N/A}${RESET}"
-    echo -e "${YELLOW}数据实际存储路径      : ${data_dir}${RESET}"
+    echo -e "${YELLOW}BepUSDT 服务状态    : ${status}"
+    echo -e "${YELLOW}当前 PostgreSQL DSN : ${pg_dsn}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -253,7 +238,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  DockUP 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  BepUSDT 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}服务状态  : ${status}"
     echo -e "${GREEN}映射端口  : ${YELLOW}${webui_port}${RESET}"

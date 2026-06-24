@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# BepUSDT 服务 Docker Compose 管理面板 
+# Koipy 主控端 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,10 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/bepusdt-panel"
+BASE_DIR="/opt/koipy-panel"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
-CONTAINER_NAME="bepusdt"
+CONFIG_FILE="$BASE_DIR/config.yaml"
+CONTAINER_NAME="koipy-app"
 
 # 检测依赖
 check_dependencies() {
@@ -23,166 +23,317 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器的状态、映射端口和数据目录
+# 动态获取容器的状态
 get_status_info() {
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -q -f name=bepusdt-panel-bepusdt-1)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -aq -f name=bepusdt-panel-bepusdt-1)" ]; then
-        status="${RED}已停止${RESET}"
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -q -f name=koipy-panel-koipy-1)" ]; then
+        status="${GREEN}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -aq -f name=koipy-panel-koipy-1)" ]; then
+        status="${YELLOW}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 从 .env 文件中提取配置信息（如果存在）
-    if [ -f "$ENV_FILE" ]; then
-        webui_port=$(grep "^PANEL_PORT=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
-        [[ -z "$webui_port" ]] && webui_port="8080"
-        
-        pg_dsn=$(grep "^POSTGRESQL_DSN=" "$ENV_FILE" | cut -d'=' -f2- | sed 's/\r//g')
-        [[ -z "$pg_dsn" ]] && pg_dsn="${YELLOW}已彻底移除该变量 (未注入 DSN)${RESET}"
-        
-        data_dir=$(grep "\- " "$COMPOSE_FILE" 2>/dev/null | grep ":/var/lib/bepusdt" | awk -F':' '{print $1}' | sed 's/-//g' | sed 's/^[ \t]*//' | head -n 1)
-        [[ -z "$data_dir" ]] && data_dir="/opt/bepusdt"
+    if [ -f "$CONFIG_FILE" ]; then
+        bot_token=$(grep "bot-token:" "$CONFIG_FILE" | awk '{print $2}' | sed 's/"//g')
+        [[ -z "$bot_token" || "$bot_token" == "null" ]] && bot_token="${RED}未配置 (首次部署需填写)${RESET}"
     else
-        webui_port="N/A"
-        pg_dsn="N/A"
-        data_dir="N/A"
+        bot_token="N/A"
     fi
 }
 
-get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
-}
-
-# 部署 BepUSDT
-install_translate() {
+# 部署 Koipy
+install_koipy() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    echo -e "${CYAN}====== Koipy 主控参数配置 ======${RESET}"
     
-    # 1. 配置映射端口
-    echo -ne "${YELLOW}请输入 BepUSDT 访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
+    # 1. 激活码配置
+    echo -ne "${YELLOW}请输入 Koipy 激活码 (license): ${RESET}"
+    read -r miao_license
+    while [[ -z "$miao_license" ]]; do
+        echo -ne "${RED}错误: 激活码不能为空，请重新输入: ${RESET}"
+        read -r miao_license
+    done
 
-    # 2. 配置数据目录
-    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/bepusdt]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="/opt/bepusdt"
+    # 2. TG Bot Token 配置
+    echo -ne "${YELLOW}请输入 Telegram Bot Token (来自 @BotFather): ${RESET}"
+    read -r miao_bot_token
+    while [[ -z "$miao_bot_token" ]]; do
+        echo -ne "${RED}错误: Bot Token 不能为空，请重新输入: ${RESET}"
+        read -r miao_bot_token
+    done
 
-    # 3. 配置 PostgreSQL 数据库连接信息
-    echo -e "\n${CYAN}--- PostgreSQL 配置 (如果不选/不填直接全按回车，将彻底去掉数据库变量) ---${RESET}"
-    
-    echo -ne "${YELLOW}1. 用户名: ${RESET}"
-    read -r db_user
+    # 3. TG 管理员 ID 配置
+    echo -ne "${YELLOW}请输入 Telegram 管理员 UID [默认: 12345678]: ${RESET}"
+    read -r miao_admin
+    [[ -z "$miao_admin" ]] && miao_admin="12345678"
 
-    echo -ne "${YELLOW}2. 密码: ${RESET}"
-    read -r db_pass
+    # 4. 代理配置
+    echo -ne "${YELLOW}请输入 Bot 连接 TG 的 Socks5 代理 [默认: socks5://127.0.0.1:11112]: ${RESET}"
+    read -r miao_proxy
+    [[ -z "$miao_proxy" ]] && miao_proxy="socks5://127.0.0.1:11112"
 
-    echo -ne "${YELLOW}3. 服务器地址端口 (如 localhost:5432): ${RESET}"
-    read -r db_host
+    # 5. 内置 Web API 配置
+    echo -e "\n${CYAN}--- 内置 Web API 配置 ---${RESET}"
+    echo -ne "${YELLOW}是否启用内置 Web 配置 API 服务？(y/n) [默认: n]: ${RESET}"
+    read -r use_webapi
 
-    echo -ne "${YELLOW}4. 数据库名称: ${RESET}"
-    read -r db_name
+    local webapi_enable="false"
+    local webapi_addr="127.0.0.1:8899"
+    local webapi_pass=""
 
-    # --- 核心剥离逻辑：判断是否需要生成数据库变量块 ---
-    local env_dsn_line=""
-    local compose_env_block=""
+    if [[ "$use_webapi" == "y" || "$use_webapi" == "Y" ]]; then
+        webapi_enable="true"
+        echo -ne "${YELLOW}请输入 WebAPI 监听地址和端口 [默认: 127.0.0.1:8899]: ${RESET}"
+        read -r webapi_addr
+        [[ -z "$webapi_addr" ]] && webapi_addr="127.0.0.1:8899"
 
-    if [[ -z "$db_user" && -z "$db_pass" && -z "$db_host" && -z "$db_name" ]]; then
-        echo -e "\n${YELLOW}提示: 检测到未输入任何数据库连接信息，已直接去掉环境块中的数据库变量。${RESET}"
-        env_dsn_line=""
-        compose_env_block=""
-    else
-        # 局部动态拼接
-        local auth_part=""
-        local host_part=""
-        local db_part=""
-
-        [[ -n "$db_user" ]] && { [[ -n "$db_pass" ]] && auth_part="${db_user}:${db_pass}@" || auth_part="${db_user}@"; }
-        [[ -n "$db_host" ]] && host_part="$db_host"
-        [[ -n "$db_name" ]] && db_part="/${db_name}"
-
-        constructed_dsn="postgres://${auth_part}${host_part}${db_part}?sslmode=disable&connect_timeout=3"
-        
-        env_dsn_line="POSTGRESQL_DSN=${constructed_dsn}"
-        compose_env_block="    environment:
-      - POSTGRESQL_DSN=\${POSTGRESQL_DSN}"
+        echo -ne "${YELLOW}请输入 WebAPI 访问密码: ${RESET}"
+        read -r webapi_pass
+        while [[ -z "$webapi_pass" ]]; do
+            echo -ne "${RED}错误: 启用 API 必须设置密码，请重新输入: ${RESET}"
+            read -r webapi_pass
+        done
     fi
 
-    # 创建自定义持久化根目录
-    mkdir -p "${custom_data}"
-    chmod -R 777 "$BASE_DIR" "${custom_data}"
+    # 6. 订阅转换多后端配置 (新增后端地址自定义)
+    echo -e "\n${CYAN}--- 订阅转换 (Subconverter / Sub-Store) 配置 ---${RESET}"
+    echo -ne "${YELLOW}是否启用订阅转换服务？(y/n) [默认: n]: ${RESET}"
+    read -r use_subcv
 
-    # 生成环境变量 .env 配置文件
-    echo -e "${YELLOW}正在生成环境变量 .env 配置文件...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-PANEL_PORT=${custom_port}
-${env_dsn_line}
-EOF
+    local sub_enable="false"
+    local sub_mode="builtin"
+    local sub_backend="http://\$Host:\$Port/sub?target=\$Target&new_name=true&url=\$EncodedURL"
+    local sub_host="127.0.0.1"
+    local sub_port="25500"
 
-    # 动态生成 docker-compose.yml 配置文件 (无变量则完全不写 environment 结构，保持干净)
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    if [[ "$use_subcv" == "y" || "$use_subcv" == "Y" ]]; then
+        sub_enable="true"
+        echo -e "${YELLOW}请选择订阅转换后端类型:${RESET}"
+        echo -e "  ${CYAN}1.${RESET} 内置转换器 (builtin，无需额外填后端地址)"
+        echo -e "  ${CYAN}2.${RESET} 经典 Subconverter (subconverter)"
+        echo -e "  ${CYAN}3.${RESET} 高级 Sub-Store (substore)"
+        echo -ne "${YELLOW}请选择 (1-3) [默认: 1]: ${RESET}"
+        read -r sub_choice
+
+        case "$sub_choice" in
+            2)
+                sub_mode="subconverter"
+                sub_backend="http://\$Host:\$Port/sub?target=\$Target&new_name=true&url=\$EncodedURL"
+                
+                echo -ne "${YELLOW}请输入 Subconverter 后端 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+                read -r input_sub_host
+                [[ ! -z "$input_sub_host" ]] && sub_host="$input_sub_host"
+                
+                echo -ne "${YELLOW}请输入 Subconverter 端口 [默认: 25500]: ${RESET}"
+                read -r input_sub_port
+                [[ ! -z "$input_sub_port" ]] && sub_port="$input_sub_port"
+                ;;
+            3)
+                sub_mode="substore"
+                sub_backend="http://\$Host:\$Port/download/sub?target=\$Target&url=\$EncodedURL&fakeSub=true"
+                sub_port="3000" # sub-store 默认推断端口通常为 3000
+                
+                echo -ne "${YELLOW}请输入 Sub-Store 后端 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+                read -r input_sub_host
+                [[ ! -z "$input_sub_host" ]] && sub_host="$input_sub_host"
+                
+                echo -ne "${YELLOW}请输入 Sub-Store 端口 [默认: 3000]: ${RESET}"
+                read -r input_sub_port
+                [[ ! -z "$input_sub_port" ]] && sub_port="$input_sub_port"
+                ;;
+            *)
+                sub_mode="builtin"
+                sub_backend="http://\$Host:\$Port/sub?target=\$Target&new_name=true&url=\$EncodedURL"
+                ;;
+        esac
+    fi
+
+    # 7. Miaospeed 后端自定义配置
+    echo -e "\n${CYAN}--- Miaospeed 测试后端配置 ---${RESET}"
+    echo -ne "${YELLOW}是否自定义 Miaospeed 后端连接参数？(y/n) [默认: n，使用本地默认值]: ${RESET}"
+    read -r custom_slave
+
+    local slave_id="localmiaospeed"
+    local slave_addr="127.0.0.1:8765"
+    local slave_token="3R{XBBikNC{Nv01u"
+    local slave_path="/miaospeed"
+    local slave_comment="本地miaospeed后端"
+
+    if [[ "$custom_slave" == "y" || "$custom_slave" == "Y" ]]; then
+        echo -ne "${YELLOW}1. 请输入后端唯一 ID [默认: localmiaospeed]: ${RESET}"
+        read -r input_id
+        [[ ! -z "$input_id" ]] && slave_id="$input_id"
+
+        echo -ne "${YELLOW}2. 请输入后端连接地址 (host:port) [默认: 127.0.0.1:8765]: ${RESET}"
+        read -r input_addr
+        [[ ! -z "$input_addr" ]] && slave_addr="$input_addr"
+
+        echo -ne "${YELLOW}3. 请输入后端连接 Token (密码): ${RESET}"
+        read -r input_token
+        while [[ -z "$input_token" ]]; do
+            echo -ne "${RED}错误: Token 不能为空，请重新输入: ${RESET}"
+            read -r input_token
+        done
+        slave_token="$input_token"
+
+        echo -ne "${YELLOW}4. 请输入 WebSocket 连接路径 (Path) [默认: /miaospeed]: ${RESET}"
+        read -r input_path
+        [[ ! -z "$input_path" ]] && slave_path="$input_path"
+
+        echo -ne "${YELLOW}5. 请输入后端备注名称 [默认: 自定义测试后端]: ${RESET}"
+        read -r input_comment
+        if [[ -z "$input_comment" ]]; then
+            slave_comment="自定义测试后端"
+        else
+            slave_comment="$input_comment"
+        fi
+    fi
+
+    # 架构自动选择
+    local miao_image="koipy/koipy:latest"
+    if [[ "$(uname -m)" == "aarch64" ]]; then
+        miao_image="koipy/koipy:arm64"
+    fi
+
+    # 动态生成明晰干净的 docker-compose.yml 
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  bepusdt:
-    image: v03413/bepusdt:latest
+  koipy:
+    stdin_open: true
+    tty: true
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "\${PANEL_PORT:-8080}:8080"
-${compose_env_block}
+    network_mode: host
+    restart: always
     volumes:
-      - ${custom_data}:/var/lib/bepusdt
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - ${CONFIG_FILE}:/app/config.yaml
+    image: ${miao_image}
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 BepUSDT 服务...${RESET}"
+    # 自动组装精简高可读的 config.yaml
+    cat <<EOF > "$CONFIG_FILE"
+license: "${miao_license}"
+admin:
+- ${miao_admin}
+network:
+  httpProxy: ""
+  socks5Proxy: ""
+  userAgent: "ClashMetaForAndroid/2.8.9.Meta Mihomo/0.16"
+subscription:
+  age:
+    enable: false
+    secretKey: ""
+    publicKey: ""
+    publicKeyHeader: X-Age-Public-Key
+webapi:
+  enable: ${webapi_enable}
+  address: ${webapi_addr}
+  password: "${webapi_pass}"
+  tls: false
+  tlsCertFile: ""
+  tlsKeyFile: ""
+  allowOrigins:
+  - http://127.0.0.1:8899
+  - http://localhost:8899
+bot:
+  bot-token: "${miao_bot_token}"
+  api-id: null
+  api-hash: null
+  proxy: ${miao_proxy}
+  ipv6: false
+  antiGroup: false
+  strictMode: false
+  bypassMode: false
+  parseMode: MARKDOWN
+  inviteGroup: []
+  cacheTime: 60
+  echoLimit: 0.8
+image:
+  speedFormat: "byte/decimal"
+  compress: false
+  emoji:
+    enable: true
+    source: TwemojiLocalSource
+  font: ./resources/alibaba-Regular.otf
+  pixelThreshold: 2500x3500
+  title: 节点测试机器人
+  logo: true
+  showUnsafeTips: true
+  watermark:
+    enable: true
+    text: koipy
+    size: 64
+    alpha: 32
+runtime:
+  entrance: true
+  duration: 10
+  ipstack: true
+  pingURL: https://www.gstatic.com/generate_204
+  speedFiles:
+  - https://dl.google.com/dl/android/studio/install/3.4.1.0/android-studio-ide-183.5522156-windows.exe
+  speedNodes: 300
+  speedThreads: 4
+  output: image
+  realtime: false
+slaveConfig:
+  healthCheck:
+    numSamples: 10
+    showStatusStyle: "default"
+    autoHideOnFailure: false
+  showID: true
+  speedScheduling: pipeline
+  geoClustering: true
+  slaves:
+    - type: miaospeed
+      id: "${slave_id}"
+      token: "${slave_token}"
+      address: "${slave_addr}"
+      path: "${slave_path}"
+      skipCertVerify: true
+      tls: true
+      comment: "${slave_comment}"
+      hidden: false
+      option:
+        downloadDuration: 8
+        downloadThreading: 4
+        downloadURL: https://dl.google.com/dl/android/studio/install/3.4.1.0/android-studio-ide-183.5522156-windows.exe
+        pingAddress: https://cp.cloudflare.com/generate_204
+        pingAverageOver: 3
+        stunURL: udp://stun.ideasip.com:3478
+        taskRetry: 3
+subconverter:
+  enable: ${sub_enable}
+  mode: ${sub_mode}
+  template:
+    backend: "${sub_backend}"
+  defaults:
+    target: ClashMeta
+    host: "${sub_host}"
+    port: ${sub_port}
+EOF
+
+    # 防呆：建立文件并授权
+    touch "$CONFIG_FILE"
+    chmod -R 777 "$BASE_DIR"
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Koipy 主控服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务初始化 (约3秒)...${RESET}"
-    sleep 3
-
-    DETECT_IP=$(get_public_ip)
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      BepUSDT 部署成功！      ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    if [[ -n "$env_dsn_line" ]]; then
-        echo -e "${YELLOW}当前注入 DSN : ${constructed_dsn}${RESET}"
-    else
-        echo -e "${YELLOW}当前注入 DSN : 已经彻底从全局环境中拿掉数据库配置项${RESET}"
-    fi
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}=============================================${RESET}"
+    echo -e "${GREEN}      Koipy 主控部署成功！                    ${RESET}"
+    echo -e "${GREEN}=============================================${RESET}"
+    echo -e "${YELLOW}配置文件路径 : ${CONFIG_FILE}${RESET}"
+    echo -e "${YELLOW}当前转换模式 : ${sub_mode}${RESET}"
+    [[ "$sub_enable" == "true" && "$sub_mode" != "builtin" ]] && echo -e "${YELLOW}转换后端地址 : ${sub_host}:${sub_port}${RESET}"
+    echo -e "${YELLOW}已绑定后端 ID : ${slave_id} (${slave_comment})${RESET}"
+    echo -e "${GREEN}=============================================${RESET}"
 }
 
-# 更新镜像
-update_translate() {
+# 更新服务
+update_koipy() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        echo -e "${RED}错误: 未检测到配置文件！${RESET}"
         return
     fi
     cd "$BASE_DIR" && docker compose pull && docker compose up -d --remove-orphans
@@ -190,58 +341,50 @@ update_translate() {
 }
 
 # 卸载服务
-uninstall_translate() {
+uninstall_koipy() {
     get_status_info
-    
-    # 第一次确认
-    echo -ne "${RED}【警告】确定要停止并卸载 BepUSDT 服务吗？(y/n): ${RESET}"
-    read -r confirm1
-    if [[ "$confirm1" != "y" && "$confirm1" != "Y" ]]; then
-        echo -e "${GREEN}已取消卸载。${RESET}"
-        return
-    fi
-
-    # 第二次确认
-    echo -ne "${RED}【再次确认】该操作将清理容器及整个配置面板主目录 [${BASE_DIR}]，数据无法恢复！请输入 'y' 确认执行: ${RESET}"
-    read -r confirm2
-    if [[ "$confirm2" != "y" && "$confirm2" != "Y" ]]; then
-        echo -e "${GREEN}已取消卸载。${RESET}"
-        return
-    fi
-
-    # 执行卸载逻辑
-    if [ -f "$COMPOSE_FILE" ]; then
-        cd "$BASE_DIR" && docker compose down
-        rm -rf "$BASE_DIR"
-        echo -e "${GREEN}卸载彻底完成，管理目录已完全清理。${RESET}"
-    else
-        echo -e "${YELLOW}未找到 compose 文件，尝试强制清理容器实例...${RESET}"
-        docker rm -f "$CONTAINER_NAME" 2>/dev/null
-        echo -e "${GREEN}清理完成。${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Koipy 主控容器吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            
+            # 第二层确认
+            echo -ne "${YELLOW}是否同时删除主控配置文件目录 [${BASE_DIR}]？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}所有配置及文件已彻底清理干净。${RESET}"
+            fi
+        else
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}所有容器已重启${RESET}"; }
-logs_translate() { cd "$BASE_DIR" && docker compose logs -f; }
+start_koipy() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}主控已启动${RESET}"; }
+stop_koipy() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}主控已停止${RESET}"; }
+restart_koipy() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}主控已重启${RESET}"; }
+logs_koipy() { cd "$BASE_DIR" && docker compose logs -f; }
 
 show_info() {
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}BepUSDT 服务状态    : ${status}"
-    echo -e "${YELLOW}当前 PostgreSQL DSN : ${pg_dsn}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}Koipy 主控状态       : ${status}"
+    echo -e "${YELLOW}Bot Token 密文       : ${bot_token}"
+    echo -e "${YELLOW}主控环境绝对路径     : ${BASE_DIR}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  BepUSDT 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  Koipy 主控管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}服务状态  : ${status}"
-    echo -e "${GREEN}映射端口  : ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}Koipy 主控状态  : ${status}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新服务${RESET}"
@@ -256,13 +399,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
+        1) install_koipy ;;
+        2) update_koipy ;;
+        3) uninstall_koipy ;;
+        4) start_koipy ;;
+        5) stop_koipy ;;
+        6) restart_koipy ;;
+        7) logs_koipy ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

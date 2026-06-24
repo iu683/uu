@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# BepUSDT 服务 Docker Compose 管理面板 
+# LangBot 官方克隆版 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,44 +10,52 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/bepusdt-panel"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
-CONTAINER_NAME="bepusdt"
+CONTAINER_NAME="langbot"
+# 默认进入当前目录下的 LangBot/docker，如果脚本在其他地方运行，请修改此路径
+BASE_DIR="./LangBot/docker"
 
-# 检测依赖
+# 检测并修复依赖与权限
 check_dependencies() {
+    if ! command -v git &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
+        exit 1
+    fi
+
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
+    
+    # 检查当前用户是否有权限访问 Docker 守护进程
+    if ! docker info &> /dev/null; then
+        echo -e "${YELLOW}检测到当前用户无 Docker 访问权限，正在尝试修复...${RESET}"
+        sudo usermod -aG docker $USER
+        echo -e "${GREEN}已将当前用户加入 docker 组。${RESET}"
+        echo -e "${RED}由于 Linux 机制，权限变更需要重新加载组。请执行 'newgrp docker' 或重新登录终端后再次运行此脚本。${RESET}"
+        exit 1
+    fi
 }
 
-# 动态获取容器的状态、映射端口和数据目录
+# 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -q -f name=bepusdt-panel-bepusdt-1)" ]; then
+    # 1. 检查主容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ] || [ "$(docker ps -aq -f name=bepusdt-panel-bepusdt-1)" ]; then
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
-        status="${RED}未部署${RESET}"
+        status="${RED}未部署 / 未启动${RESET}"
     fi
 
-    # 2. 从 .env 文件中提取配置信息（如果存在）
-    if [ -f "$ENV_FILE" ]; then
-        webui_port=$(grep "^PANEL_PORT=" "$ENV_FILE" | cut -d'=' -f2 | sed 's/\r//g')
-        [[ -z "$webui_port" ]] && webui_port="8080"
-        
-        pg_dsn=$(grep "^POSTGRESQL_DSN=" "$ENV_FILE" | cut -d'=' -f2- | sed 's/\r//g')
-        [[ -z "$pg_dsn" ]] && pg_dsn="${YELLOW}已彻底移除该变量 (未注入 DSN)${RESET}"
-        
-        data_dir=$(grep "\- " "$COMPOSE_FILE" 2>/dev/null | grep ":/var/lib/bepusdt" | awk -F':' '{print $1}' | sed 's/-//g' | sed 's/^[ \t]*//' | head -n 1)
-        [[ -z "$data_dir" ]] && data_dir="/opt/bepusdt"
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5300/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="5300"
     else
-        webui_port="N/A"
-        pg_dsn="N/A"
-        data_dir="N/A"
+        webui_port="5300 (默认)"
     fi
 }
 
@@ -74,165 +82,134 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 BepUSDT
-install_translate() {
+# 按照官方指引克隆并部署 LangBot
+install_langbot() {
     check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    # 1. 配置映射端口
-    echo -ne "${YELLOW}请输入 BepUSDT 访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-
-    # 2. 配置数据目录
-    echo -ne "${YELLOW}请输入宿主机数据存储绝对路径 [默认: /opt/bepusdt/bepusdt]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="/opt/bepusdt/bepusdt"
-
-    # 3. 配置 PostgreSQL 数据库连接信息
-    echo -e "\n${CYAN}--- PostgreSQL 配置 (如果不选/不填直接全按回车，将彻底去掉数据库变量) ---${RESET}"
+    echo -e "${CYAN}====== 开始执行官方克隆部署 ======${RESET}"
     
-    echo -ne "${YELLOW}1. 用户名: ${RESET}"
-    read -r db_user
-
-    echo -ne "${YELLOW}2. 密码: ${RESET}"
-    read -r db_pass
-
-    echo -ne "${YELLOW}3. 服务器地址端口 (如 localhost:5432): ${RESET}"
-    read -r db_host
-
-    echo -ne "${YELLOW}4. 数据库名称: ${RESET}"
-    read -r db_name
-
-    # --- 核心剥离逻辑：判断是否需要生成数据库变量块 ---
-    local env_dsn_line=""
-    local compose_env_block=""
-
-    if [[ -z "$db_user" && -z "$db_pass" && -z "$db_host" && -z "$db_name" ]]; then
-        echo -e "\n${YELLOW}提示: 检测到未输入任何数据库连接信息，已直接去掉环境块中的数据库变量。${RESET}"
-        env_dsn_line=""
-        compose_env_block=""
+    if [ -d "LangBot" ]; then
+        echo -e "${YELLOW}提示: 检测到当前目录下已存在 LangBot 文件夹。${RESET}"
+        echo -ne "${YELLOW}是否重新克隆？(y/n) [默认: n]: ${RESET}"
+        read -r re_clone
+        if [[ "$re_clone" == "y" || "$re_clone" == "Y" ]]; then
+            rm -rf LangBot
+            git clone https://github.com/langbot-app/LangBot
+        fi
     else
-        # 局部动态拼接
-        local auth_part=""
-        local host_part=""
-        local db_part=""
-
-        [[ -n "$db_user" ]] && { [[ -n "$db_pass" ]] && auth_part="${db_user}:${db_pass}@" || auth_part="${db_user}@"; }
-        [[ -n "$db_host" ]] && host_part="$db_host"
-        [[ -n "$db_name" ]] && db_part="/${db_name}"
-
-        constructed_dsn="postgres://${auth_part}${host_part}${db_part}?sslmode=disable&connect_timeout=3"
-        
-        env_dsn_line="POSTGRESQL_DSN=${constructed_dsn}"
-        compose_env_block="    environment:
-      - POSTGRESQL_DSN=\${POSTGRESQL_DSN}"
+        git clone https://github.com/langbot-app/LangBot
     fi
 
-    # 创建自定义持久化根目录
-    mkdir -p "${custom_data}"
-    chmod -R 777 "$BASE_DIR" "${custom_data}"
+    if [ ! -d "$BASE_DIR" ]; then
+        echo -e "${RED}错误: 未找到 $BASE_DIR 目录，请检查 Git 克隆是否成功！${RESET}"
+        return
+    fi
 
-    # 生成环境变量 .env 配置文件
-    echo -e "${YELLOW}正在生成环境变量 .env 配置文件...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-PANEL_PORT=${custom_port}
-${env_dsn_line}
-EOF
+    # 中国大陆镜像替换提示
+    echo -ne "${YELLOW}是否位于中国大陆，需要一键替换为官方提供的国内镜像源？(y/n) [默认: n]: ${RESET}"
+    read -r use_mirror
+    if [[ "$use_mirror" == "y" || "$use_mirror" == "Y" ]]; then
+        echo -e "${YELLOW}正在修改 docker-compose.yaml 使用国内镜像源...${RESET}"
+        sed -i 's|rockchin/langbot:latest|docker.langbot.app/langbot-public/rockchin/langbot:latest|g' "$BASE_DIR/docker-compose.yaml"
+    fi
 
-    # 动态生成 docker-compose.yml 配置文件 (无变量则完全不写 environment 结构，保持干净)
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  bepusdt:
-    image: v03413/bepusdt:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "\${PANEL_PORT:-8080}:8080"
-${compose_env_block}
-    volumes:
-      - ${custom_data}:/var/lib/bepusdt
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-EOF
+    # 可选配置 LANGBOT_BOX_ROOT
+    echo -e "${CYAN}----------------------------------${RESET}"
+    echo -e "${YELLOW}提示: 若要改 Box 根目录，请使用绝对路径设置。${RESET}"
+    echo -ne "${YELLOW}是否设置自定义 LANGBOT_BOX_ROOT 绝对路径？(直接回车跳过使用默认值): ${RESET}"
+    read -r custom_box_root
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 BepUSDT 服务...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    cd "$BASE_DIR" || return
 
-    echo -e "${YELLOW}等待服务初始化 (约3秒)...${RESET}"
+    if [[ -n "$custom_box_root" ]]; then
+        if [[ ! "$custom_box_root" =~ ^/ ]]; then
+            echo -e "${RED}错误: Box 根目录必须使用绝对路径！部署中断。${RESET}"
+            cd - > /dev/null || return
+            return
+        fi
+        echo -e "${YELLOW}正在使用自定义路径启动官方容器...${RESET}"
+        export LANGBOT_BOX_ROOT="$custom_box_root"
+        docker compose --profile all up -d
+    else
+        echo -e "${YELLOW}正在按照官方推荐启动容器 (开启 --profile all)...${RESET}"
+        docker compose --profile all up -d
+    fi
+
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      BepUSDT 部署成功！      ${RESET}"
+    echo -e "${GREEN}      LangBot 启动命令已发送！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    if [[ -n "$env_dsn_line" ]]; then
-        echo -e "${YELLOW}当前注入 DSN : ${constructed_dsn}${RESET}"
-    else
-        echo -e "${YELLOW}当前注入 DSN : 已经彻底从全局环境中拿掉数据库配置项${RESET}"
-    fi
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}OneBot 反向端口: 2280-2285${RESET}"
+    echo -e "${RED}首次启动请注意：请观察终端输出或容器日志，按照提示继续配置文件。${RESET}"
     echo -e "${GREEN}================================${RESET}"
+    
+    cd - > /dev/null || return
 }
 
-# 更新镜像
-update_translate() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+# 更新 LangBot 官方代码与镜像
+update_langbot() {
+    if [ ! -d "$BASE_DIR" ]; then
+        echo -e "${RED}错误: 未检测到官方目录，请先执行选项 1 部署！${RESET}"
         return
     fi
-    cd "$BASE_DIR" && docker compose pull && docker compose up -d --remove-orphans
+    echo -e "${YELLOW}正在同步官方最新代码 (Git Pull)...${RESET}"
+    cd "$BASE_DIR/.." && git pull
+    cd "docker" || return
+    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
+    docker compose --profile all pull
+    docker compose --profile all up -d --remove-orphans
     echo -e "${GREEN}更新完成！${RESET}"
+    cd - > /dev/null || return
 }
 
-uninstall_translate() {
-    get_status_info
-    
-    echo -ne "${YELLOW}确定要卸载并删除 BepUSDT 容器吗？(y/n): ${RESET}"
+# 卸载 LangBot 容器
+uninstall_langbot() {
+    if [ ! -d "$BASE_DIR" ]; then
+        echo -e "${RED}错误: 未检测到官方目录！${RESET}"
+        return
+    fi
+    echo -ne "${YELLOW}确定要停止并删除 LangBot 官方容器组吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            
-            # 第二层确认：删除面板配置文件目录
-            echo -ne "${YELLOW}是否同时删除面板配置环境目录 [${BASE_DIR}]？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                
-                # 第三层确认：删除用户持久化数据（防止误删的核心）
-                echo -ne "${YELLOW}是否还要删除挂载在 [${data_dir}] 的实际用户交易数据？(y/n): ${RESET}"
-                read -r clean_global_data
-                if [ "$clean_global_data" = "y" ] || [ "$clean_global_data" = "Y" ]; then
-                    if [[ "$data_dir" != "N/A" && -d "$data_dir" ]]; then
-                        rm -rf "$data_dir"
-                    fi
-                fi
-                echo -e "${GREEN}选定数据目录已彻底清理。${RESET}"
-            fi
-        else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+        cd "$BASE_DIR" || return
+        docker compose --profile all down
+        echo -e "${GREEN}官方容器组已停止并移除。${RESET}"
+        cd - > /dev/null || return
+        
+        echo -ne "${YELLOW}是否彻底删除克隆的 LangBot 源码文件夹？(y/n): ${RESET}"
+        read -r delete_dir
+        if [ "$delete_dir" = "y" ] || [ "$delete_dir" = "Y" ]; then
+            rm -rf LangBot
+            echo -e "${GREEN}LangBot 源码目录已彻底删除。${RESET}"
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}所有容器已重启${RESET}"; }
-logs_translate() { cd "$BASE_DIR" && docker compose logs -f; }
+start_langbot() { 
+    if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose --profile all start && echo -e "${GREEN}服务已启动${RESET}" && cd - > /dev/null; fi
+}
+stop_langbot() { 
+    if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose --profile all stop && echo -e "${YELLOW}服务已停止${RESET}" && cd - > /dev/null; fi
+}
+restart_langbot() { 
+    if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose --profile all restart && echo -e "${GREEN}服务已重启${RESET}" && cd - > /dev/null; fi
+}
+logs_langbot() { 
+    if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose --profile all logs -f "$CONTAINER_NAME"; cd - > /dev/null; fi
+}
 
 show_info() {
     get_status_info
+    local DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}BepUSDT 服务状态    : ${status}"
-    echo -e "${YELLOW}当前 PostgreSQL DSN : ${pg_dsn}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}官方目录位置   : $BASE_DIR${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -240,17 +217,17 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  BepUSDT 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}     ◈  LangBot 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}服务状态  : ${status}"
-    echo -e "${GREEN}映射端口  : ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新服务${RESET}"
-    echo -e "${GREEN}3. 卸载服务${RESET}"
-    echo -e "${GREEN}4. 启动服务${RESET}"
-    echo -e "${GREEN}5. 停止服务${RESET}"
-    echo -e "${GREEN}6. 重启服务${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
@@ -258,13 +235,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
+        1) install_langbot ;;
+        2) update_langbot ;;
+        3) uninstall_langbot ;;
+        4) start_langbot ;;
+        5) stop_langbot ;;
+        6) restart_langbot ;;
+        7) logs_langbot ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

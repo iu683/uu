@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Remnawave Subscription Page Docker Compose 管理面板 
+# ForwardX 端口转发管理面板 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,10 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="remnawave-subscription-page"
-BASE_DIR="/opt/remnawave-sub"
+CONTAINER_NAME="forwardx-panel"
+BASE_DIR="/opt/forwardx"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-NETWORK_NAME="remnawave-network"
+ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -23,7 +23,7 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态和映射端口
+# 动态获取容器状态、映射端口
 get_status_info() {
     # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -34,15 +34,15 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
+    # 2. 如果容器存在，从容器状态中提取实际端口
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 3010 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3010/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3010"
+        # 从容器状态提取前端映射端口（容器内部默认监听 3000）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
@@ -73,120 +73,148 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Remnawave Subscription Page
-install_remnawave_sub() {
+# 生成随机 JWT 密钥
+generate_jwt_secret() {
+    if command -v openssl &> /dev/null; then
+        openssl_rand=$(openssl rand -hex 16 2>/dev/null)
+        if [[ -n "$openssl_rand" ]]; then echo "$openssl_rand"; return; fi
+    fi
+    echo "fwdx_$(date +%s)_$((RANDOM % 9999))"
+}
+
+# 部署 ForwardX
+install_forwardx() {
     check_dependencies
-    
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    # 场景选择
-    echo -e "${YELLOW}请选择您的部署场景:${RESET}"
-    echo -e "  ${GREEN}1. 跨服务器部署${RESET} (订阅页与面板不在同一台机器，网络各自独立)"
-    echo -e "  ${GREEN}2. 同服务器部署${RESET} (订阅页与面板在同一台机器，共享 Docker 外部网络)"
-    echo -ne "${YELLOW}请输入选项 [默认: 1]: ${RESET}"
-    read -r scene_choice
-    [[ -z "$scene_choice" ]] && scene_choice="1"
+    echo -ne "${YELLOW}请输入 ForwardX 面板访问端口 [默认: 3000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3000"
 
-    # 根据场景配置网络定义
-    local network_config=""
-    if [[ "$scene_choice" == "2" ]]; then
-        echo -e "${GREEN} -> 已选择同服务器部署。将自动尝试检测/创建外部网络 '${NETWORK_NAME}'...${RESET}"
-        docker network inspect "$NETWORK_NAME" &>/dev/null || docker network create "$NETWORK_NAME"
-        network_config="external: true"
-    else
-        echo -e "${GREEN} -> 已选择跨服务器部署。将自动在本地建立独立的网桥网络。${RESET}"
-        network_config="driver: bridge"
+    echo -ne "${YELLOW}请输入初始管理员密码 [默认: admin123]: ${RESET}"
+    read -r admin_pwd
+    [[ -z "$admin_pwd" ]] && admin_pwd="admin123"
+
+    echo -ne "${YELLOW}是否配置 Telegram 机器人通知？(y/n) [默认: n]: ${RESET}"
+    read -r tg_choice
+    local tg_token=""
+    local tg_polling="true"
+    if [[ "$tg_choice" == "y" || "$tg_choice" == "Y" ]]; then
+        echo -ne "${YELLOW}请输入 Telegram Bot Token: ${RESET}"
+        read -r tg_token
     fi
 
-    # 配置环境变量
-    echo -ne "${YELLOW}请输入 Remnawave 面板 URL (如 https://remnawave.example.com 或 http://remnawave:3000): ${RESET}"
-    read -r panel_url
-    while [[ -z "$panel_url" ]]; do
-        echo -e "${RED}错误: 面板 URL 不能为空！${RESET}"
-        echo -ne "${YELLOW}请重新输入 Remnawave 面板 URL: ${RESET}"
-        read -r panel_url
-    done
+    # 自动生成随机 JWT 安全密钥
+    local jwt_secret=$(generate_jwt_secret)
 
-    echo -ne "${YELLOW}请输入订阅页面本地访问端口 [默认: 3010]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3010"
+    # 1. 动态生成 .env 环境配置文件
+    echo -e "${YELLOW}正在创建 .env 环境变量文件...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+# ==================== 数据库配置 ====================
+SQLITE_PATH=/data/forwardx.db
 
-    echo -ne "${YELLOW}请输入页面标题 (META_TITLE) [默认: Subscription Page]: ${RESET}"
-    read -r meta_title
-    [[ -z "$meta_title" ]] && meta_title="Subscription Page"
+# ==================== 安全配置 ====================
+JWT_SECRET=${jwt_secret}
 
-    echo -ne "${YELLOW}请输入页面描述 (META_DESCRIPTION) [默认: Nodes Subscription]: ${RESET}"
-    read -r meta_desc
-    [[ -z "$meta_desc" ]] && meta_desc="Nodes Subscription"
+# ==================== 应用配置 ====================
+NODE_ENV=production
+PORT=3000
+FORWARDX_IMAGE=ghcr.io/poouo/forwardx:latest
 
-    # 动态生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在动态生成 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  remnawave-subscription-page:
-    image: remnawave/subscription-page:latest
-    container_name: ${CONTAINER_NAME}
-    hostname: ${CONTAINER_NAME}
-    restart: always
-    environment:
-      - REMNAWAVE_PANEL_URL=${panel_url}
-      - APP_PORT=3010
-      - META_TITLE=${meta_title}
-      - META_DESCRIPTION=${meta_desc}
-    ports:
-      - '${custom_port}:3010'
-    networks:
-      - ${NETWORK_NAME}
-
-networks:
-  ${NETWORK_NAME}:
-    ${network_config}
+# ==================== 管理员配置 ====================
+ADMIN_PASSWORD=${admin_pwd}
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动服务...${RESET}"
+    # 如果配置了 TG 机器人，则追加到 .env
+    if [[ -n "$tg_token" ]]; then
+        cat <<EOF >> "$ENV_FILE"
+
+# ==================== Telegram 机器人 ====================
+TELEGRAM_BOT_TOKEN=${tg_token}
+TELEGRAM_BOT_POLLING=${tg_polling}
+EOF
+    fi
+
+    # 2. 动态生成 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在创建 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+name: forwardx
+
+services:
+  forwardx:
+    image: \${FORWARDX_IMAGE:-ghcr.io/poouo/forwardx:latest}
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_CONFIG_PATH: /data/database.json
+      SQLITE_PATH: /data/forwardx.db
+      MYSQL_CONFIG_PATH: /data/mysql.json
+      POSTGRES_URL: \${POSTGRES_URL:-}
+      POSTGRES_HOST: \${POSTGRES_HOST:-}
+      POSTGRES_PORT: \${POSTGRES_PORT:-5432}
+      POSTGRES_USER: \${POSTGRES_USER:-}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-}
+      POSTGRES_DATABASE: \${POSTGRES_DATABASE:-}
+      POSTGRES_SSL: \${POSTGRES_SSL:-false}
+      JWT_SECRET: \${JWT_SECRET:-change-me-to-a-random-string}
+    volumes:
+      - forwardx-data:/data
+
+volumes:
+  forwardx-data:
+    driver: local
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 ForwardX 面板...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}等待容器初始化 (约5秒)...${RESET}"
+    sleep 5
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     订阅页面程序部署成功！     ${RESET}"
+    echo -e "${GREEN}      ForwardX 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}订阅页访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}后端面板链接   : ${panel_url}${RESET}"
-    echo -e "${YELLOW}提示: 如果你绑定的是 127.0.0.1，可能需要反向代理(如 Nginx)才能公网访问。${RESET}"
+    echo -e "${YELLOW}面板访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}管理初始密码 : ${admin_pwd}${RESET}"
+    echo -e "${YELLOW}配置文件目录 : ${BASE_DIR}${RESET}"
+    echo -e "${RED}提示: 生产环境下的 JWT 安全密钥已自动为您生成并注入到 .env。${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新镜像
-update_remnawave_sub() {
+# 更新 ForwardX
+update_forwardx() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    echo -e "${YELLOW}正在拉取 ForwardX 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+    echo -e "${GREEN}更新完成！容器已成功平滑重启。${RESET}"
 }
 
-# 卸载容器
-uninstall_remnawave_sub() {
-    echo -ne "${YELLOW}确定要卸载并删除订阅页容器吗？(y/n): ${RESET}"
+# 卸载 ForwardX
+uninstall_forwardx() {
+    echo -ne "${YELLOW}确定要卸载并删除 ForwardX 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除配置文件目录？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和挂载的数据库卷(数据会丢失)？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                cd "$BASE_DIR" && docker compose down -v
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}管理目录已彻底清理。${RESET}"
+                echo -e "${GREEN}本地数据卷及目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -195,7 +223,6 @@ uninstall_remnawave_sub() {
     fi
 }
 
-# 容器开关控制
 check_compose_exist() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
@@ -204,11 +231,11 @@ check_compose_exist() {
     return 0
 }
 
-start_remnawave_sub() { check_compose_exist && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_remnawave_sub() { check_compose_exist && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_remnawave_sub() { check_compose_exist && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+start_forwardx() { check_compose_exist && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_forwardx() { check_compose_exist && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_forwardx() { check_compose_exist && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
 
-logs_remnawave_sub() { 
+logs_forwardx() { 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         docker logs -f "$CONTAINER_NAME"
     else
@@ -222,7 +249,8 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}网页访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}面板访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}配置根目录     : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -230,7 +258,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}◈Remnawave  Subscription Panel◈ ${RESET}"
+    echo -e "${GREEN}  ◈   ForwardX 转发管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -248,13 +276,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_remnawave_sub ;;
-        2) update_remnawave_sub ;;
-        3) uninstall_remnawave_sub ;;
-        4) start_remnawave_sub ;;
-        5) stop_remnawave_sub ;;
-        6) restart_remnawave_sub ;;
-        7) logs_remnawave_sub ;;
+        1) install_forwardx ;;
+        2) update_forwardx ;;
+        3) uninstall_forwardx ;;
+        4) start_forwardx ;;
+        5) stop_forwardx ;;
+        6) restart_forwardx ;;
+        7) logs_forwardx ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

@@ -1,22 +1,30 @@
 #!/bin/bash
 # =================================================================
-# PPanel 聚合面板管理 (稳定自愈无死锁版)
+# Remnawave Docker Compose 管理面板
 # =================================================================
 
-# 颜色定义
+# 颜色
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/ppanel"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONFIG_DIR="$BASE_DIR/config"
-CONFIG_FILE="$CONFIG_DIR/ppanel.yaml"
-ENV_FILE="$BASE_DIR/ppanel.env"
+CONTAINER_NAME="remnawave"
+BASE_DIR="/opt/remnawave"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yaml"
+ENV_FILE="$BASE_DIR/.env"
 
-# 检测依赖环境
+# Nginx 路径缺省值配置
+NGINX_AVAILABLE_DIR="${NGINX_AVAILABLE_DIR:-/etc/nginx/sites-available}"
+NGINX_ENABLED_DIR="${NGINX_ENABLED_DIR:-/etc/nginx/sites-enabled}"
+USE_SITES_STRUCTURE="${USE_SITES_STRUCTURE:-true}"
+
+if [ "$USE_SITES_STRUCTURE" = false ] || [ ! -d "$NGINX_AVAILABLE_DIR" ]; then
+    NGINX_AVAILABLE_DIR="/etc/nginx/conf.d"
+fi
+
+# 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
@@ -24,417 +32,533 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器整体状态和端口
+# 动态获取容器状态和端口
 get_status_info() {
-    if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=ppanel)" ]; then
-            status="${GREEN}运行中${RESET}"
-            web_port=$(docker ps -f name=ppanel --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
-            if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
-                web_port=$(sed -n '/ppanel:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
-            fi
-        elif [ "$(docker ps -aq -f name=ppanel)" ]; then
-            status="${YELLOW}已停止${RESET}"
-            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' ppanel 2>/dev/null)
-        else
-            status="${RED}未部署${RESET}"
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 优先从容器元数据获取 3000/tcp 映射到宿主机的实际端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 如果获取失败，则尝试从本地 .env 文件读取
+        if [[ -z "$webui_port" && -f "$ENV_FILE" ]]; then
+            webui_port=$(grep "^APP_PORT=" "$ENV_FILE" | cut -d'=' -f2)
         fi
-        [[ -z "$web_port" ]] && web_port="8080"
+        [[ -z "$webui_port" ]] && webui_port="3000"
     else
-        status="${RED}未初始化${RESET}"
-        web_port="N/A"
+        webui_port="N/A"
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
-get_public_ip() {
-    local mode=${1:-"auto"}
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
-}
-
-# 部署 PPanel
-install_ppanel() {
+# 部署 Remnawave
+install_remnawave() {
     check_dependencies
-    mkdir -p "$BASE_DIR" "$CONFIG_DIR" "$BASE_DIR/web"
+    if [ -d "$BASE_DIR" ] && [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${RED}提示: 检测到目录 $BASE_DIR 已存在配置文件！${RESET}"
+        echo -ne "${YELLOW}是否覆盖重新部署？(y/n): ${RESET}"
+        read -r re_confirm
+        if [[ "$re_confirm" != "y" && "$re_confirm" != "Y" ]]; then return; fi
+    fi
 
-    # 1. 基础参数配置
-    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 PPanel 宿主机映射访问端口 [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-
-    local jwt_secret=$(openssl rand -hex 16)
-
-    # 2. MySQL 数据库运行模式选择
-    echo -e "\n${CYAN}====== MySQL 数据库运行模式选择 ======${RESET}"
-    echo -e " 1) 直接部署全新的 MySQL 8 容器 (自动高强度密码+持久化)"
-    echo -e " 2) 使用已有的外部/远程 MySQL 数据库 (需提前手动建好空库)"
+    mkdir -p "$BASE_DIR"
+    echo -e "${CYAN}====== 1. 数据库 (PostgreSQL) 类型选择 ======${RESET}"
+    echo -e "${GREEN}1. 本地容器模式 (自动创建内置的 PostgreSQL 17)${RESET}"
+    echo -e "${GREEN}2. 远程数据库模式 (连接外部/云 PostgreSQL 数据库)${RESET}"
     echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
     read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
-    local db_host="mysql"
-    local db_port="3306"
-    local db_name="ppanel"
-    local db_user="root"
-    local db_pass=""
-
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}使用全新内置 MySQL 容器，正在生成高强度随机密码...${RESET}"
-        db_pass=$(openssl rand -hex 16)
-    else
-        echo -ne "${YELLOW}请输入远程 MySQL 的 IP 或域名: ${RESET}"
-        read -r ext_db_ip
-        echo -ne "${YELLOW}请输入远程 MySQL 端口 [默认: 3306]: ${RESET}"
-        read -r ext_db_port
-        [[ -z "$ext_db_port" ]] && ext_db_port="3306"
-        db_host="$ext_db_ip"
-        db_port="$ext_db_port"
-        echo -ne "${YELLOW}请输入远程 MySQL 用户名 [默认: root]: ${RESET}"
-        read -r db_user
-        [[ -z "$db_user" ]] && db_user="root"
-        echo -ne "${YELLOW}请输入远程 MySQL 密码: ${RESET}"
-        read -r db_pass
-        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: ppanel]: ${RESET}"
-        read -r db_name
-        [[ -z "$db_name" ]] && db_name="ppanel"
-        
-        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
-            db_host="172.17.0.1"
-        fi
-    fi
-
-    # 3. Redis 运行模式与分区选择
-    echo -e "\n${CYAN}====== Redis 缓存运行模式选择 ======${RESET}"
-    echo -e " 1) 直接部署全新的 Redis 7 容器 (自动生成高强度密码)"
-    echo -e " 2) 使用已有的外部/远程 Redis 服务"
+    echo -e "${CYAN}====== 2. 缓存 (Redis) 类型选择 ======${RESET}"
+    echo -e "${GREEN}1. 本地容器模式 (自动创建内置的高性能 Valkey/Redis)${RESET}"
+    echo -e "${GREEN}2. 远程 Redis 模式 (连接外部公用/云 Redis)${RESET}"
     echo -ne "${YELLOW}请选择 Redis 模式 [默认: 1]: ${RESET}"
     read -r redis_mode
     [[ -z "$redis_mode" ]] && redis_mode="1"
 
-    local redis_host="redis"
-    local redis_port="6379"
-    local redis_pass=""
-    local redis_db="0"
+    echo -e "${CYAN}====== 3. 自定义宿主机端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入面板访问映射端口 (APP_PORT) [默认: 3000]: ${RESET}"
+    read -r custom_app_port
+    [[ -z "$custom_app_port" ]] && custom_app_port="3000"
 
-    if [[ "$redis_mode" == "1" ]]; then
-        echo -e "${YELLOW}使用全新内置 Redis 容器，正在生成高强度随机密码...${RESET}"
-        redis_pass=$(openssl rand -hex 16)
+    echo -ne "${YELLOW}请输入指标监控映射端口 (METRICS_PORT) [默认: 3001]: ${RESET}"
+    read -r custom_metrics_port
+    [[ -z "$custom_metrics_port" ]] && custom_metrics_port="3001"
+
+    echo -e "${CYAN}====== 4. 核心域名配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入面板访问域名 (FRONT_END_DOMAIN) [例如: panel.example.com]: ${RESET}"
+    read -r front_domain
+    if [[ -z "$front_domain" ]]; then echo -e "${RED}错误: 域名不能为空！${RESET}"; return; fi
+    sub_domain="${front_domain}/api/sub"
+
+    local db_url="" local has_local_db="true" local db_user="postgres"
+    local db_pass=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1) local db_name="postgres"
+
+    if [[ "$db_mode" == "2" ]]; then
+        has_local_db="false"
+        echo -e "${CYAN}====== 远程 PostgreSQL 配置 ======${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库 IP/域名: ${RESET}"
+        read -r r_host
+        echo -ne "${YELLOW}请输入远程数据库 端口 [默认: 5432]: ${RESET}"
+        read -r r_port
+        [[ -z "$r_port" ]] && r_port="5432"
+        echo -ne "${YELLOW}请输入远程数据库 用户名 [默认: postgres]: ${RESET}"
+        read -r r_user
+        [[ -z "$r_user" ]] && r_user="postgres"
+        echo -ne "${YELLOW}请输入远程数据库 密码: ${RESET}"
+        read -r r_pass
+        echo -ne "${YELLOW}请输入远程数据库 数据库名 [默认: postgres]: ${RESET}"
+        read -r r_name
+        [[ -z "$r_name" ]] && r_name="postgres"
+        if [[ -z "$r_host" || -z "$r_pass" ]]; then echo -e "${RED}错误: 远程数据库地址和密码不能为空！${RESET}"; return; fi
+        db_url="postgresql://${r_user}:${r_pass}@${r_host}:${r_port}/${r_name}"
+        db_user="$r_user"; db_pass="$r_pass"; db_name="$r_name"
     else
-        echo -ne "${YELLOW}请输入远程 Redis 的 IP 或域名: ${RESET}"
-        read -r ext_redis_ip
-        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
-        read -r ext_redis_port
-        [[ -z "$ext_redis_port" ]] && ext_redis_port="6379"
-        redis_host="$ext_redis_ip"
-        redis_port="$ext_redis_port"
-        echo -ne "${YELLOW}请输入远程 Redis 密码 (若无密码请直接回车): ${RESET}"
-        read -r redis_pass
-        
-        if [[ "$ext_redis_ip" == "127.0.0.1" || "$ext_redis_ip" == "localhost" ]]; then
-            redis_host="172.17.0.1"
-        fi
+        db_url="postgresql://postgres:${db_pass}@remnawave-db:5432/postgres"
     fi
 
-    echo -ne "${YELLOW}请输入 Redis 分区编号 (DB Index) [0-15] [默认: 0]: ${RESET}"
-    read -r redis_db
-    [[ -z "$redis_db" || ! "$redis_db" =~ ^[0-9]+$ ]] && redis_db="0"
+    local has_local_redis="true" local env_redis_cfg=""
+    if [[ "$redis_mode" == "2" ]]; then
+        has_local_redis="false"
+        echo -e "${CYAN}====== 远程 Redis 配置 ======${RESET}"
+        echo -ne "${YELLOW}请输入远程 Redis IP/域名: ${RESET}"
+        read -r rd_host
+        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r rd_port
+        [[ -z "$rd_port" ]] && rd_port="6379"
+        echo -ne "${YELLOW}请输入远程 Redis 密码 (无密码直接回车): ${RESET}"
+        read -r rd_pass
+        echo -ne "${YELLOW}请输入 Redis 分区编号 (DB Index) [0-15, 2026默认: 0]: ${RESET}"
+        read -r rd_db
+        [[ -z "$rd_db" ]] && rd_db="0"
+        if [[ -z "$rd_host" ]]; then echo -e "${RED}错误: 远程 Redis 地址不能为空！${RESET}"; return; fi
+        
+        
+        env_redis_cfg="REDIS_HOST=${rd_host}\nREDIS_PORT=${rd_port}\nREDIS_DB=${rd_db}"
+        if [[ -n "$rd_pass" ]]; then 
+            env_redis_cfg="${env_redis_cfg}\nREDIS_PASSWORD=${rd_pass}"
+        fi
+    else
+        env_redis_cfg="REDIS_SOCKET=/var/run/valkey/valkey.sock"
+    fi
 
-    # 4. 落地保存凭证凭据环境文件 ppanel.env
-    cat << EOF > "$ENV_FILE"
-PORT="${custom_port}"
-DB_MODE="${db_mode}"
-DB_HOST="${db_host}"
-DB_PORT="${db_port}"
-DB_USER="${db_user}"
-DB_PASS="${db_pass}"
-DB_NAME="${db_name}"
-REDIS_MODE="${redis_mode}"
-REDIS_HOST="${redis_host}"
-REDIS_PORT="${redis_port}"
-REDIS_PASS="${redis_pass}"
-REDIS_DB="${redis_db}"
-JWT_SECRET="${jwt_secret}"
-EOF
+    jwt_secret_1=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
+    jwt_secret_2=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
 
-    # 5. 动态生成 PPanel 专属 YAML 配置文件
-    echo -e "${YELLOW}正在渲染并同步生成 ppanel.yaml 业务配置文件...${RESET}"
-    cat << EOF > "$CONFIG_FILE"
-Host: 0.0.0.0
-Port: 8080
-TLS:
-    Enable: false
-    CertFile: ""
-    KeyFile: ""
-Debug: false
-
-Static:
-  Admin:
-    Enabled: true
-    Prefix: /admin
-    Path: ./static/admin
-  User:
-    Enabled: true
-    Prefix: /
-    Path: ./static/user
-
-JwtAuth:
-    AccessSecret: ${jwt_secret}
-    AccessExpire: 604800
-
-Logger:
-    ServiceName: ApiService
-    Mode: console
-    Encoding: plain
-    TimeFormat: "2006-01-02 15:04:05.000"
-    Path: logs
-    Level: info
-    MaxContentLength: 0
-    Compress: false
-    Stat: true
-    KeepDays: 0
-    StackCooldownMillis: 100
-    MaxBackups: 0
-    MaxSize: 0
-    Rotation: daily
-    FileTimeFormat: 2006-01-02T15:04:05.000Z07:00
-
-MySQL:
-    Addr: ${db_host}:${db_port}
-    Username: ${db_user}
-    Password: ${db_pass}
-    Dbname: ${db_name}
-    Config: charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai
-    MaxIdleConns: 10
-    MaxOpenConns: 10
-    SlowThreshold: 1000
-
-Redis:
-    Host: ${redis_host}:${redis_port}
-    Pass: ${redis_pass}
-    DB: ${redis_db}
-EOF
-
-    # 6. 生成规范化拓扑的 Docker Compose 配置文件 (采用 service_started 机制防卡死)
-    echo -e "${YELLOW}正在生成规范化 Docker Compose 拓扑配置...${RESET}"
+    echo -e "${YELLOW}正在定制创建 docker-compose.yaml...${RESET}"
     
+    local ext_remnawave_volumes=""
+    local ext_depends_on=""
+    local ext_redis_service=""
+    local ext_db_service=""
+    local ext_volumes_footer=""
+
+    if [[ "$has_local_redis" == "true" ]]; then
+        ext_remnawave_volumes="    volumes:
+      - valkey-socket:/var/run/valkey"
+        
+        ext_redis_service="  remnawave-redis:
+    image: valkey/valkey:9-alpine
+    container_name: remnawave-redis
+    hostname: remnawave-redis
+    <<: [*common, *logging]
+    volumes:
+      - valkey-socket:/var/run/valkey
+    command: >
+      valkey-server --save \"\" --appendonly no --maxmemory-policy noeviction --loglevel warning
+      --unixsocket /var/run/valkey/valkey.sock --unixsocketperm 777 --port 0
+    healthcheck:
+      test: ['CMD', 'valkey-cli', '-s', '/var/run/valkey/valkey.sock', 'ping']
+      interval: 3s
+      timeout: 3s
+      retries: 3"
+        ext_volumes_footer="${ext_volumes_footer}
+  valkey-socket:
+    name: valkey-socket
+    driver: local"
+    fi
+
+    if [[ "$has_local_db" == "true" ]]; then
+        ext_db_service="  remnawave-db:
+    image: postgres:17.6
+    container_name: remnawave-db
+    hostname: remnawave-db
+    <<: [*common, *logging, *env]
+    environment:
+      - POSTGRES_USER=\${POSTGRES_USER}
+      - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
+      - POSTGRES_DB=\${POSTGRES_DB}
+      - TZ=UTC
+    ports:
+      - 127.0.0.1:6767:5432
+    volumes:
+      - remnawave-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U \$\${POSTGRES_USER} -d \$\${POSTGRES_DB}']
+      interval: 3s
+      timeout: 10s
+      retries: 3"
+        ext_volumes_footer="${ext_volumes_footer}
+  remnawave-db-data:
+    name: remnawave-db-data
+    driver: local"
+    fi
+
+    if [[ "$has_local_db" == "true" || "$has_local_redis" == "true" ]]; then
+        ext_depends_on="    depends_on:"
+        [[ "$has_local_db" == "true" ]] && ext_depends_on="${ext_depends_on}
+      remnawave-db:
+        condition: service_healthy"
+        [[ "$has_local_redis" == "true" ]] && ext_depends_on="${ext_depends_on}
+      remnawave-redis:
+        condition: service_healthy"
+    fi
+
+    # 1. 基础编排结构写入
     cat << EOF > "$COMPOSE_FILE"
-networks:
-  ppanel-network:
-    driver: bridge
+x-common: &common
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
+  restart: always
+  networks:
+    - remnawave-network
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: 100m
+      max-file: 5
+
+x-env: &env
+  env_file: .env
 
 services:
-  ppanel:
-    image: ppanel/ppanel:latest
-    container_name: ppanel
-    restart: always
+  remnawave:
+    image: remnawave/backend:2
+    container_name: remnawave
+    hostname: remnawave
+    <<: [*common, *logging, *env]
+$(echo -e "$ext_remnawave_volumes")
     ports:
-      - "${custom_port}:8080"
-    volumes:
-      - ./config:/app/etc
-      - ./web:/app/static
-    depends_on:
+      - "127.0.0.1:\${APP_PORT:-3000}:\${APP_PORT:-3000}"
+      - "127.0.0.1:\${METRICS_PORT:-3001}:\${METRICS_PORT:-3001}"
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -f http://localhost:\${METRICS_PORT:-3001}/health']
+      interval: 3s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+$(echo -e "$ext_depends_on")
+
+$(echo -e "$ext_redis_service")
+
+$(echo -e "$ext_db_service")
+
+networks:
+  remnawave-network:
+    name: remnawave-network
+    driver: bridge
+    external: false
 EOF
 
-    # 核心修正：断言条件修改为 service_started 避开健康检查死锁
-    if [[ "$db_mode" == "1" ]]; then
-        cat << EOF >> "$COMPOSE_FILE"
-      mysql:
-        condition: service_started
-EOF
-    fi
-    if [[ "$redis_mode" == "1" ]]; then
-        cat << EOF >> "$COMPOSE_FILE"
-      redis:
-        condition: service_started
-EOF
-    fi
-    
-    # 两者均外部则裁剪掉无子项的 depends_on:
-    if [[ "$db_mode" == "2" && "$redis_mode" == "2" ]]; then
-        sed -i '/depends_on:/d' "$COMPOSE_FILE"
-    fi
-
-    # 追加网络层归属
-    cat << EOF >> "$COMPOSE_FILE"
-    networks:
-      - ppanel-network
-EOF
-
-    # 如果是内置 MySQL，注入无健康检查死锁的 MySQL 8.0 拓扑
-    if [[ "$db_mode" == "1" ]]; then
-        mkdir -p "$BASE_DIR/mysql"
+    # 【修复】只有当存在本地存储卷需要声明时，才动态追加独立的 volumes 块，杜绝全远程模式语法报错
+    if [[ -n $(echo -e "$ext_volumes_footer" | tr -d '[:space:]') ]]; then
         cat << EOF >> "$COMPOSE_FILE"
 
-  mysql:
-    image: mysql:8
-    container_name: ppanel-mysql
-    restart: always
-    environment:
-      MYSQL_DATABASE: "${db_name}"
-      MYSQL_USER: "${db_user}"
-      MYSQL_PASSWORD: "${db_pass}"
-      MYSQL_ROOT_PASSWORD: "${db_pass}"
-    volumes:
-      - ./mysql:/var/lib/mysql
-    networks:
-      - ppanel-network
+volumes:
+$(echo -e "$ext_volumes_footer")
 EOF
     fi
 
-    # 如果是内置 Redis，注入拓扑
-    if [[ "$redis_mode" == "1" ]]; then
-        mkdir -p "$BASE_DIR/redis"
-        cat << EOF >> "$COMPOSE_FILE"
-
-  redis:
-    image: redis:7
-    container_name: ppanel-redis
-    restart: always
-    command: redis-server --requirepass "${redis_pass}"
-    volumes:
-      - ./redis:/data
-    networks:
-      - ppanel-network
+    echo -e "${YELLOW}正在创建 .env 配置文件...${RESET}"
+    cat << EOF > "$ENV_FILE"
+APP_PORT=${custom_app_port}
+METRICS_PORT=${custom_metrics_port}
+API_INSTANCES=1
+DATABASE_URL="${db_url}"
+$(echo -e "$env_redis_cfg")
+JWT_AUTH_SECRET=${jwt_secret_1}
+JWT_API_TOKENS_SECRET=${jwt_secret_2}
+IS_TELEGRAM_NOTIFICATIONS_ENABLED=false
+PANEL_DOMAIN=${front_domain}
+FRONT_END_DOMAIN=${front_domain}
+SUB_PUBLIC_DOMAIN=${sub_domain}
+SWAGGER_PATH=/docs
+SCALAR_PATH=/scalar
+IS_DOCS_ENABLED=false
+METRICS_USER=admin
+METRICS_PASS=admin
+WEBHOOK_ENABLED=false
+POSTGRES_USER=${db_user}
+POSTGRES_PASSWORD=${db_pass}
+POSTGRES_DB=${db_name}
 EOF
+
+    # 1. 启动容器
+    cd "$BASE_DIR" && docker compose up -d
+
+    # 【新增优化】等待容器端口网络就绪，最多等待 5 秒
+    local current_port=""
+    for i in {1..5}; do
+        current_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' remnawave 2>/dev/null)
+        if [[ -n "$current_port" ]]; then
+            break
+        fi
+        sleep 1
+    done
+    [[ -z "$current_port" ]] && current_port="N/A"
+
+    # 2. 动态从 .env 配置文件中精准抓取域名
+    local env_file="/opt/remnawave/.env"
+    local panel_domain="N/A"
+    local sub_domain="N/A"
+
+    if [ -f "$env_file" ]; then
+        # 使用 tr -d '\r' 去除可能存在的 Windows 换行符扰乱
+        panel_domain=$(grep -E "^PANEL_DOMAIN=" "$env_file" | cut -d'=' -f2 | tr -d '\r')
+        sub_domain=$(grep -E "^SUB_PUBLIC_DOMAIN=" "$env_file" | cut -d'=' -f2 | tr -d '\r')
+        
+        [[ -z "$panel_domain" ]] && panel_domain="N/A"
+        [[ -z "$sub_domain" ]] && sub_domain="N/A"
     fi
 
-    # 7. 清理并重新拉起集群
-    echo -e "${YELLOW}正在执行容器编排拉起服务...${RESET}"
-    cd "$BASE_DIR"
-    docker compose down 2>/dev/null
-    docker compose up -d --force-recreate
+    get_status_info
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN}      Remnawave 核心服务部署成功！        ${RESET}"
+    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${CYAN}内部映射端口   :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${CYAN}面板前端域名   :${RESET} ${YELLOW}https://${panel_domain}${RESET}"
+    echo -e "${CYAN}订阅公开域名   :${RESET} ${YELLOW}https://${sub_domain}${RESET}"
+    echo -e "${GREEN}=========================================${RESET}"
+}
 
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}错误: 服务拉起失败，请检查端口 ${custom_port} 是否被占用。${RESET}"
+configure_nginx_proxy() {
+    get_status_info
+    if [[ "$webui_port" == "N/A" ]]; then
+        echo -e "${RED}错误: Remnawave 容器未运行，请先执行选项 1 部署服务！${RESET}"
         return
     fi
 
-    local detect_ip=$(get_public_ip)
+    echo -e "${CYAN}====== 配置 Remnawave 面板 Nginx 反向代理 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Remnawave 面板规划域名 (如: panel.example.com): ${RESET}"
+    read -r domain
+    if [[ -z "$domain" ]]; then echo -e "${RED}域名不能为空！${RESET}"; return; fi
 
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}           PPanel 系统架构部署成功！                ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}访问地址   : http://${detect_ip}:${custom_port}${RESET}"
-    echo -e "${YELLOW}默认账号   : admin@ppanel.dev${RESET}"
-    echo -e "${YELLOW}默认密码   : password${RESET}"
-    echo -e "----------------------------------------------------"
-    echo -e "${CYAN}[数据库与中间件拓扑状态]${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}MySQL 模式    : ${GREEN}全新内置容器 (MySQL 8)${RESET}"
-        echo -e "${YELLOW}随机高强密码   : ${GREEN}${db_pass}${RESET}"
-    else
-        echo -e "${YELLOW}MySQL 模式    : ${CYAN}外部远程目标 (${db_host}:${db_port})${RESET}"
-    fi
+    local default_cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+    local default_key="/etc/letsencrypt/live/${domain}/privkey.pem"
 
-    if [[ "$redis_mode" == "1" ]]; then
-        echo -e "${YELLOW}Redis 模式    : ${GREEN}全新内置容器 (分片区: ${redis_db})${RESET}"
-    else
-        echo -e "${YELLOW}Redis 模式    : ${CYAN}外部远程目标 (${redis_host}:${redis_port} / 分片区: ${redis_db})${RESET}"
-    fi
-    echo -e "----------------------------------------------------"
-    echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -ne "${YELLOW}请输入 SSL 证书路径 [直接回车使用默认: ${default_cert}]: ${RESET}"
+    read -r app_cert
+    [[ -z "$app_cert" ]] && app_cert="$default_cert"
+
+    echo -ne "${YELLOW}请输入 SSL 私钥路径 [直接回车使用默认: ${default_key}]: ${RESET}"
+    read -r app_key
+    [[ -z "$app_key" ]] && app_key="$default_key"
+
+    local panel_conf_file="${NGINX_AVAILABLE_DIR}/${domain}"
+    [[ "$USE_SITES_STRUCTURE" = false ]] && panel_conf_file="${panel_conf_file}.conf"
+
+    # 生成优化后的配置文件
+    cat << EOF > "$panel_conf_file"
+# =============================================================
+# 自动生成：Remnawave 面板的 Nginx 反向代理与安全配置
+# =============================================================
+upstream remnawave {
+    server 127.0.0.1:${webui_port};
 }
 
-# 交互式安全卸载
-uninstall_ppanel() {
-    echo -ne "${RED}确定要卸载并删除 PPanel 相关的容器吗？(y/n): ${RESET}"
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    server_name ${domain};
+
+    # 1. 完美的现代 Nginx 监听指令（去除 http2 警告）
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+
+    # 2. 完美的反向代理与 WebSocket 穿透
+    location / {
+        proxy_pass http://remnawave;
+        proxy_http_version 1.1;
+        
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        proxy_buffers 16 16k;
+        proxy_buffer_size 32k;
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+    ssl_protocols          TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:MozSSL:10m;
+    ssl_session_tickets    off;
+
+    ssl_certificate "${app_cert}";
+    ssl_certificate_key "${app_key}";
+
+    resolver               1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 valid=60s;
+    resolver_timeout       2s;
+
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_buffers 16 8k;
+    gzip_http_version 1.1;
+    gzip_min_length 256;
+    gzip_types
+        application/atom+xml
+        application/geo+json
+        application/javascript
+        application/x-javascript
+        application/json
+        application/ld+json
+        application/manifest+json
+        application/rdf+xml
+        application/rss+xml
+        application/xhtml+xml
+        application/xml
+        font/eot
+        font/otf
+        font/ttf
+        image/svg+xml
+        text/css
+        text/javascript
+        text/plain
+        text/xml;
+}
+EOF
+
+    if [ "$USE_SITES_STRUCTURE" = true ] && [ -d "$NGINX_ENABLED_DIR" ]; then
+        ln -sf "$panel_conf_file" "${NGINX_ENABLED_DIR}/${domain}"
+    fi
+
+    echo -e "${GREEN}Remnawave 代理配置文件已成功写入: $panel_conf_file${RESET}"
+    
+    # 打印测试期间的错误信息，更便于发现故障
+    if nginx -t; then
+        systemctl reload nginx
+        echo -e "${GREEN}Nginx 验证通过并已顺利热重载！面板代理全面上线！${RESET}"
+        echo -e "${YELLOW}面板安全访问地址: https://${domain}${RESET}"
+    else
+        echo -e "${RED}错误: Nginx 语法测试失败！请确保刚刚填写的证书路径文件存在且 Nginx 有读取权限！${RESET}"
+    fi
+}
+
+update_remnawave() { cd "$BASE_DIR" && docker compose pull && docker compose up -d --remove-orphans && echo -e "${GREEN}更新完成！${RESET}"; }
+
+
+
+uninstall_remnawave() {
+    echo -ne "${YELLOW}确定要卸载并删除 Remnawave 服务吗？(y/n): ${RESET}"
     read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        # 1. 停止并清理容器
         if [ -f "$COMPOSE_FILE" ]; then
-            echo -e "${YELLOW}正在停止并安全移除容器及网络...${RESET}"
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            
-            echo -ne "${YELLOW}是否同时删除本地所有配置文件和持久化数据目录 (含数据库文件)？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                cd /opt
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
-            else
-                echo -e "${YELLOW}已保留本地配置文件及持久化数据。${RESET}"
-            fi
+            echo -e "${GREEN}Docker Compose 容器已停止并移除。${RESET}"
         else
-            docker rm -f ppanel ppanel-mysql ppanel-redis 2>/dev/null
+            # 如果容器还在运行但缺少 Compose 文件，尝试通过默认容器名进行强删
+            docker rm -f remnawave remnawave-db remnawave-redis &>/dev/null
+            echo -e "${GREEN}Remnawave 核心容器已尝试强行停止并移除。${RESET}"
         fi
-        echo -e "${GREEN}卸载流程执行完毕！${RESET}"
+
+        # 2. 交互式询问是否删除持久化数据
+        echo -ne "${YELLOW}是否同时删除所有数据库、配置文件和缓存目录 ($BASE_DIR)？(y/n): ${RESET}"
+        read -r clean_data
+        if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
+            # 如果是 Compose 部署，顺便清理挂载的内部卷
+            if [ -f "$COMPOSE_FILE" ]; then
+                cd "$BASE_DIR" && docker compose down -v &>/dev/null
+            fi
+            rm -rf "$BASE_DIR"
+            echo -e "${GREEN}所有持久化数据与目录已彻底清理干净。${RESET}"
+        else
+            echo -e "${BLUE}已保留数据目录: $BASE_DIR，你的数据库与环境配置依然安全。${RESET}"
+        fi
+
+        echo -e "${GREEN}Remnawave 卸载程序执行完毕！${RESET}"
     fi
 }
 
-start_ppanel() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
-stop_ppanel() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
-restart_ppanel() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
-logs_ppanel() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+
+start_remnawave() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_remnawave() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_remnawave() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_remnawave() { cd "$BASE_DIR" && docker compose logs -f; }
 
 show_info() {
     get_status_info
-    local detect_ip=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}当前运行状态   : $status"
-    echo -e "${YELLOW}安全绝对路径   : ${BASE_DIR}${RESET}"
-    echo -e "${YELLOW}访问地址       : http://${detect_ip}:${web_port}${RESET}"
-    if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${YELLOW}业务配置文件   : ${CONFIG_FILE}${RESET}"
+    if [ -f "$ENV_FILE" ]; then
+        f_dom=$(grep FRONT_END_DOMAIN "$ENV_FILE" | cut -d'=' -f2)
+        s_dom=$(grep SUB_PUBLIC_DOMAIN "$ENV_FILE" | cut -d'=' -f2)
     fi
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}内部映射端口   : ${webui_port}${RESET}"
+    echo -e "${YELLOW}面板前端域名   : https://${f_dom:-N/A}${RESET}"
+    echo -e "${YELLOW}订阅公开域名   : https://${s_dom:-N/A}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 主菜单管理
 menu() {
-    clear
-    get_status_info
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}        ◈ PPanel 管理面板 ◈        ${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 当前状态 :${RESET} $status"
-    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 1. 部署启动${RESET}"
-    echo -e "${GREEN} 3. 卸载服务${RESET}" 
-    echo -e "${GREEN} 4. 启动服务${RESET}"
-    echo -e "${GREEN} 5. 停止服务${RESET}"
-    echo -e "${GREEN} 6. 重启服务${RESET}"
-    echo -e "${GREEN} 7. 查看日志${RESET}"
-    echo -e "${GREEN} 8. 查看配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
+    clear; get_status_info
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈  Remnawave 容器管理面板 ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 反向代理${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_ppanel ;;
-        3) uninstall_ppanel ;;
-        4) start_ppanel ;;
-        5) stop_ppanel ;;
-        6) restart_ppanel ;;
-        7) logs_ppanel ;;
+        1) install_remnawave ;;
+        2) update_remnawave ;;
+        3) uninstall_remnawave ;;
+        4) start_remnawave ;;
+        5) stop_remnawave ;;
+        6) restart_remnawave ;;
+        7) logs_remnawave ;;
         8) show_info ;;
+        9) configure_nginx_proxy ;;
         0) exit 0 ;;
-        *) echo -e "${RED}输入无效${RESET}" ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 
-while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
-done
+while true; do menu; echo -ne "${YELLOW}按回车键继续...${RESET}"; read -r; done

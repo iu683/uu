@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# PPanel 聚合面板管理
+# PPanel 聚合面板管理 (经典菜单 · 数据库权限隔离权限自愈版)
 # =================================================================
 
 # 颜色定义
@@ -48,34 +48,18 @@ get_status_info() {
 
 # 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"}
     local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
+    for url in "https://api.ipify.org" "https://4.ip.sb"; do
+        ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+    done
     echo "127.0.0.1" && return 0
 }
 
-# 部署 PPanel
+# 1. 部署启动 (注入原生健康检查与账户权限隔离)
 install_ppanel() {
     check_dependencies
     mkdir -p "$BASE_DIR" "$CONFIG_DIR" "$BASE_DIR/web"
 
-    # 1. 基础参数配置
     echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
     echo -ne "${YELLOW}请输入 PPanel 宿主机映射访问端口 [默认: 8080]: ${RESET}"
     read -r custom_port
@@ -83,9 +67,8 @@ install_ppanel() {
 
     local jwt_secret=$(openssl rand -hex 16)
 
-    # 2. MySQL 数据库运行模式选择
     echo -e "\n${CYAN}====== MySQL 数据库运行模式选择 ======${RESET}"
-    echo -e " 1) 直接部署全新的 MySQL 8 容器 (自动高强度密码+持久化)"
+    echo -e " 1) 直接部署全新的 MySQL 8 容器 (自动隔离高权限+持久化)"
     echo -e " 2) 使用已有的外部/远程 MySQL 数据库 (需提前手动建好空库)"
     echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
     read -r db_mode
@@ -94,12 +77,14 @@ install_ppanel() {
     local db_host="mysql"
     local db_port="3306"
     local db_name="ppanel"
-    local db_user="root"
+    local db_user="ppanel"  # 默认内置模式使用隔离的普通用户名
     local db_pass=""
+    local root_pass=""
 
     if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}使用全新内置 MySQL 容器，正在生成高强度随机密码...${RESET}"
-        db_pass=$(openssl rand -hex 16)
+        echo -e "${YELLOW}使用全新内置 MySQL 容器，正在生成高强度随机凭证密码...${RESET}"
+        db_pass=$(openssl rand -hex 16)     # 普通用户密码
+        root_pass=$(openssl rand -hex 16)   # root 超级管理员密码
     else
         echo -ne "${YELLOW}请输入远程 MySQL 的 IP 或域名: ${RESET}"
         read -r ext_db_ip
@@ -122,7 +107,6 @@ install_ppanel() {
         fi
     fi
 
-    # 3. Redis 运行模式与分区选择
     echo -e "\n${CYAN}====== Redis 缓存运行模式选择 ======${RESET}"
     echo -e " 1) 直接部署全新的 Redis 7 容器 (自动生成高强度密码)"
     echo -e " 2) 使用已有的外部/远程 Redis 服务"
@@ -158,7 +142,7 @@ install_ppanel() {
     read -r redis_db
     [[ -z "$redis_db" || ! "$redis_db" =~ ^[0-9]+$ ]] && redis_db="0"
 
-    # 4. 落地保存凭证凭据环境文件 ppanel.env
+    # 落地保存凭证
     cat << EOF > "$ENV_FILE"
 PORT="${custom_port}"
 DB_MODE="${db_mode}"
@@ -175,15 +159,12 @@ REDIS_DB="${redis_db}"
 JWT_SECRET="${jwt_secret}"
 EOF
 
-    # 5. 动态生成 PPanel 专属 YAML 配置文件
-    echo -e "${YELLOW}正在渲染并同步生成 ppanel.yaml 业务配置文件...${RESET}"
+    # 生成业务配置文件 ppanel.yaml (主程序连接使用的是安全的普通隔离账户)
     cat << EOF > "$CONFIG_FILE"
 Host: 0.0.0.0
 Port: 8080
 TLS:
     Enable: false
-    CertFile: ""
-    KeyFile: ""
 Debug: false
 
 Static:
@@ -207,15 +188,6 @@ Logger:
     TimeFormat: "2006-01-02 15:04:05.000"
     Path: logs
     Level: info
-    MaxContentLength: 0
-    Compress: false
-    Stat: true
-    KeepDays: 0
-    StackCooldownMillis: 100
-    MaxBackups: 0
-    MaxSize: 0
-    Rotation: daily
-    FileTimeFormat: 2006-01-02T15:04:05.000Z07:00
 
 MySQL:
     Addr: ${db_host}:${db_port}
@@ -223,9 +195,6 @@ MySQL:
     Password: ${db_pass}
     Dbname: ${db_name}
     Config: charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai
-    MaxIdleConns: 10
-    MaxOpenConns: 10
-    SlowThreshold: 1000
 
 Redis:
     Host: ${redis_host}:${redis_port}
@@ -233,9 +202,7 @@ Redis:
     DB: ${redis_db}
 EOF
 
-    # 6. 生成规范化拓扑的 Docker Compose 配置文件
-    echo -e "${YELLOW}正在生成规范化 Docker Compose 拓扑配置...${RESET}"
-    
+    # 生成规范化拓扑的 Docker Compose
     cat << EOF > "$COMPOSE_FILE"
 networks:
   ppanel-network:
@@ -251,35 +218,20 @@ services:
     volumes:
       - ./config:/app/etc
       - ./web:/app/static
-    depends_on:
-EOF
-
-    # 根据运行模式按需拼接 depends_on 条件断言
-    if [[ "$db_mode" == "1" ]]; then
-        cat << EOF >> "$COMPOSE_FILE"
-      mysql:
-        condition: service_healthy
-EOF
-    fi
-    if [[ "$redis_mode" == "1" ]]; then
-        cat << EOF >> "$COMPOSE_FILE"
-      redis:
-        condition: service_started
-EOF
-    fi
-    
-    # 两者均外部则裁剪掉无子项的 depends_on:
-    if [[ "$db_mode" == "2" && "$redis_mode" == "2" ]]; then
-        sed -i '/depends_on:/d' "$COMPOSE_FILE"
-    fi
-
-    # 追加网络层归属
-    cat << EOF >> "$COMPOSE_FILE"
     networks:
       - ppanel-network
 EOF
 
-    # 如果是内置 MySQL，注入标准健康状态检查（防止面板抢跑报错）
+    # 依赖注入：如果是内置MySQL，开启原生健康检查阻塞等待
+    if [[ "$db_mode" == "1" ]]; then
+        cat << EOF >> "$COMPOSE_FILE"
+    depends_on:
+      mysql:
+        condition: service_healthy
+EOF
+    fi
+
+    # 续写 MySQL 节点与健康探测 (root与普通用户进行密码隔离)
     if [[ "$db_mode" == "1" ]]; then
         mkdir -p "$BASE_DIR/mysql"
         cat << EOF >> "$COMPOSE_FILE"
@@ -289,24 +241,23 @@ EOF
     container_name: ppanel-mysql
     restart: always
     environment:
-      MYSQL_DATABASE: ${db_name}
-      MYSQL_USER: ${db_user}
+      MYSQL_DATABASE: "${db_name}"
+      MYSQL_USER: "${db_user}"
       MYSQL_PASSWORD: "${db_pass}"
-      MYSQL_ROOT_PASSWORD: "${db_pass}"
+      MYSQL_ROOT_PASSWORD: "${root_pass}"
     volumes:
       - ./mysql:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p'${db_pass}'"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${root_pass}"]
       interval: 5s
       timeout: 5s
-      retries: 12
-      start_period: 15s
+      retries: 20
     networks:
       - ppanel-network
 EOF
     fi
 
-    # 如果是内置 Redis，注入拓扑
+    # 续写 Redis 节点
     if [[ "$redis_mode" == "1" ]]; then
         mkdir -p "$BASE_DIR/redis"
         cat << EOF >> "$COMPOSE_FILE"
@@ -315,7 +266,7 @@ EOF
     image: redis:7
     container_name: ppanel-redis
     restart: always
-    command: redis-server --requirepass ${redis_pass}
+    command: redis-server --requirepass "${redis_pass}"
     volumes:
       - ./redis:/data
     networks:
@@ -323,45 +274,51 @@ EOF
 EOF
     fi
 
-    # 7. 清理并重新拉起集群
-    echo -e "${YELLOW}正在执行容器编排拉起服务...${RESET}"
+    echo -e "${YELLOW}正在执行容器编排拉起服务 (主程序将自动在后台等待 MySQL 完成初始化)...${RESET}"
     cd "$BASE_DIR"
     docker compose down 2>/dev/null
-    docker compose up -d --force-recreate
+    rm -rf ./web/admin ./web/admin_bak ./web/user 2>/dev/null
+    
+    docker compose up -d
 
     if [ $? -ne 0 ]; then
         echo -e "${RED}错误: 服务拉起失败，请检查端口 ${custom_port} 是否被占用。${RESET}"
         return
     fi
 
-    DETECT_IP=$(get_public_ip)
-
+    local detect_ip=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${GREEN}           PPanel 系统架构部署成功！                ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}默认账号   : admin@ppanel.dev${RESET}"
-    echo -e "${YELLOW}默认密码   : password${RESET}"
+    echo -e "${YELLOW}前台访问地址   : http://${detect_ip}:${custom_port}${RESET}"
+    echo -e "${YELLOW}后台管理地址   : http://${detect_ip}:${custom_port}/admin${RESET}"
+    echo -e "${YELLOW}默认账号       : admin@ppanel.dev${RESET}"
+    echo -e "${YELLOW}默认密码       : password${RESET}"
     echo -e "----------------------------------------------------"
-    echo -e "${CYAN}[数据库与中间件拓扑状态]${RESET}"
     if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}MySQL 模式    : ${GREEN}全新内置容器 (MySQL 8)${RESET}"
-        echo -e "${YELLOW}随机高强密码   : ${GREEN}${db_pass}${RESET}"
-    else
-        echo -e "${YELLOW}MySQL 模式    : ${CYAN}外部远程目标 (${db_host}:${db_port})${RESET}"
+        echo -e "${CYAN}[内置数据库安全隔离审计]${RESET}"
+        echo -e "${YELLOW}超级管理员账户 : root / 密: ${root_pass}${RESET}"
+        echo -e "${YELLOW}面板业务关联户 : ${db_user} / 密: ${db_pass}${RESET}"
     fi
-
-    if [[ "$redis_mode" == "1" ]]; then
-        echo -e "${YELLOW}Redis 模式    : ${GREEN}全新内置容器 (分片区: ${redis_db})${RESET}"
-    else
-        echo -e "${YELLOW}Redis 模式    : ${CYAN}外部远程目标 (${redis_host}:${redis_port} / 分片区: ${redis_db})${RESET}"
-    fi
-    echo -e "----------------------------------------------------"
-    echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 交互式安全卸载
+# 2. 更新容器
+update_ppanel() {
+    check_dependencies
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${YELLOW}正在从官方中心拉取最新 PPanel 核心镜像...${RESET}"
+        cd "$BASE_DIR"
+        docker compose pull
+        rm -rf ./web/admin ./web/admin_bak ./web/user 2>/dev/null
+        docker compose up -d
+        echo -e "${GREEN}✅ PPanel 镜像更新并重启完成！${RESET}"
+    else
+        echo -e "${RED}错误: 尚未检测到部署拓扑，请先执行“1. 部署启动”。${RESET}"
+    fi
+}
+
+# 3. 卸载容器
 uninstall_ppanel() {
     echo -ne "${RED}确定要卸载并删除 PPanel 相关的容器吗？(y/n): ${RESET}"
     read -r confirm
@@ -371,14 +328,11 @@ uninstall_ppanel() {
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
             
-            echo -ne "${YELLOW}是否同时删除本地所有配置文件和持久化数据目录 (含数据库文件)？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地所有配置文件和持久化数据目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                cd /opt
-                rm -rf "$BASE_DIR"
+                cd /opt && rm -rf "$BASE_DIR"
                 echo -e "${GREEN}数据目录已彻底清理。${RESET}"
-            else
-                echo -e "${YELLOW}已保留本地配置文件及持久化数据。${RESET}"
             fi
         else
             docker rm -f ppanel ppanel-mysql ppanel-redis 2>/dev/null
@@ -387,18 +341,23 @@ uninstall_ppanel() {
     fi
 }
 
-start_ppanel() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
-stop_ppanel() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
-restart_ppanel() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
+# 4. 启动容器 / 5. 停止容器 / 6. 重启容器
+start_ppanel() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}✅ 服务已整体拉起运行${RESET}"; }
+stop_ppanel() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}🛑 服务已整体停止运行${RESET}"; }
+restart_ppanel() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}✅ 服务已整体成功重启${RESET}"; }
+
+# 7. 查看日志
 logs_ppanel() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
+# 8. 查看配置
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
+    local detect_ip=$(get_public_ip)
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}当前运行状态   : $status"
     echo -e "${YELLOW}安全绝对路径   : ${BASE_DIR}${RESET}"
-    echo -e "${YELLOW}访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}前台访问地址   : http://${detect_ip}:${web_port}${RESET}"
+    echo -e "${YELLOW}后台管理地址   : http://${detect_ip}:${web_port}/admin${RESET}"
     if [ -f "$CONFIG_FILE" ]; then
         echo -e "${YELLOW}业务配置文件   : ${CONFIG_FILE}${RESET}"
     fi
@@ -416,10 +375,11 @@ menu() {
     echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
     echo -e "${GREEN}====================================${RESET}"
     echo -e "${GREEN} 1. 部署启动${RESET}"
-    echo -e "${GREEN} 3. 卸载服务${RESET}" 
-    echo -e "${GREEN} 4. 启动服务${RESET}"
-    echo -e "${GREEN} 5. 停止服务${RESET}"
-    echo -e "${GREEN} 6. 重启服务${RESET}"
+    echo -e "${GREEN} 2. 更新容器${RESET}"
+    echo -e "${GREEN} 3. 卸载容器${RESET}"
+    echo -e "${GREEN} 4. 启动容器${RESET}"
+    echo -e "${GREEN} 5. 停止容器${RESET}"
+    echo -e "${GREEN} 6. 重启容器${RESET}"
     echo -e "${GREEN} 7. 查看日志${RESET}"
     echo -e "${GREEN} 8. 查看配置${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
@@ -428,6 +388,7 @@ menu() {
     read -r choice
     case "$choice" in
         1) install_ppanel ;;
+        2) update_ppanel ;;
         3) uninstall_ppanel ;;
         4) start_ppanel ;;
         5) stop_ppanel ;;
@@ -441,6 +402,6 @@ menu() {
 
 while true; do
     menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    echo -ne "\n${YELLOW}按回车键继续...${RESET}"
     read -r
 done

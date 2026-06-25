@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Global Radio 工具箱 Docker Compose 管理面板
+# AstrBot 机器人服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="global-radio"
-BASE_DIR="/opt/global_radio"
+CONTAINER_NAME="astrbot"
+BASE_DIR="/opt/astrbot"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -24,6 +24,7 @@ check_dependencies() {
 
 # 动态获取容器状态、映射端口和数据目录
 get_status_info() {
+    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -32,16 +33,24 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
+    # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8080"
+        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 6185 端口）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "6185/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="6185"
+
+        # 从容器状态提取数据目录（挂载路径）
+        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/AstrBot/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/data"
     else
+        # 容器未安装/未部署时的返回值
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
+        data_dir="N/A"
     fi
 }
 
@@ -69,97 +78,101 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Global Radio
-install_utils() {
+# 部署 AstrBot
+install_astrbot() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自动识别系统架构 ======${RESET}"
-    
-    # 自动识别系统架构
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64 | amd64)
-            target_image="superneed/global-radio:latest"
-            echo -e "检测到系统架构为: ${GREEN}${arch}${RESET}，自动匹配 x86 镜像。"
-            ;;
-        aarch64 | arm64)
-            target_image="superneed/global-radio-arm64:latest"
-            echo -e "检测到系统架构为: ${GREEN}${arch}${RESET}，自动匹配 ARM64 镜像。"
-            ;;
-        *)
-            # 无法识别时的兜底方案，使用默认镜像
-            target_image="superneed/global-radio:latest"
-            echo -e "${YELLOW}未知架构 (${arch})，将默认尝试使用 x86 镜像。${RESET}"
-            ;;
-    esac
-    echo "------------------------------------------------"
-
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    # 端口配置
-    echo -ne "${YELLOW}请输入 Global Radio 访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
+    
+    echo -ne "${YELLOW}请输入 AstrBot WebUI 访问端口 [默认: 6185]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
+    [[ -z "$custom_port" ]] && custom_port="6185"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    echo -ne "${YELLOW}请输入 OneBot v11 Napcat WS 端口 [默认: 6199]: ${RESET}"
+    read -r custom_ws_port
+    [[ -z "$custom_ws_port" ]] && custom_ws_port="6199"
+
+    echo -ne "${YELLOW}请输入数据挂载绝对路径 [默认: $BASE_DIR/data]: ${RESET}"
+    read -r custom_data
+    [[ -z "$custom_data" ]] && custom_data="$BASE_DIR/data"
+
+    # 1. 创建所需的宿主机目录
+    mkdir -p "$custom_data"
+    chmod -R 777 "$BASE_DIR" "$custom_data"
+
+    # 2. 动态生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  global-radio:
-    image: ${target_image}
+  astrbot:
+    image: soulter/astrbot:latest
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
+    restart: always
+    security_opt:
+      - no-new-privileges:true
     ports:
-      - "${custom_port}:80"
+      - "${custom_port}:6185"
+      - "${custom_ws_port}:6199"
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ${custom_data}:/AstrBot/data
+      - /etc/localtime:/etc/localtime:ro
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Global Radio...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 AstrBot 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}等待容器初始化并生成随机初始密码 (约5秒)...${RESET}"
+    sleep 5
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Global Radio 部署成功！     ${RESET}"
+    echo -e "${GREEN}       AstrBot 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : $custom_data${RESET}"
+    echo -e "${RED}【重要提示】首次登录用户名通常为 astrbot。${RESET}"
+    echo -e "${RED}请在下方查看日志中打印出来的【随机初始密码】，登录后请立即修改！${RESET}"
     echo -e "${GREEN}================================${RESET}"
+    
+    echo -e "${CYAN}--- 截取到的初始密码日志片段 ---${RESET}"
+    docker logs "$CONTAINER_NAME" 2>&1 | grep -E "password|密码|Account" || docker logs --tail 20 "$CONTAINER_NAME"
+    echo -e "${CYAN}--------------------------------${RESET}"
 }
 
-# 更新 Global Radio 镜像
-update_utils() {
+# 更新 AstrBot 镜像
+update_astrbot() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Global Radio 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 AstrBot 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Global Radio
-uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 Global Radio 容器吗？(y/n): ${RESET}"
+# 卸载 AstrBot
+uninstall_astrbot() {
+    echo -ne "${YELLOW}确定要卸载并删除 AstrBot 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地配置文件目录？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有配置文件和数据目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}配置目录已彻底清理。${RESET}"
+                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -168,19 +181,43 @@ uninstall_utils() {
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+# 容器开关管理控制（增加文件校验）
+check_compose_exist() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return 1
+    fi
+    return 0
+}
+
+start_astrbot() { 
+    check_compose_exist && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"
+}
+
+stop_astrbot() { 
+    check_compose_exist && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"
+}
+
+restart_astrbot() { 
+    check_compose_exist && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"
+}
+
+logs_astrbot() { 
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        docker logs -f "$CONTAINER_NAME"
+    else
+        echo -e "${RED}错误: 容器未创建，无法查看日志！${RESET}"
+    fi
+}
 
 show_info() {
     get_status_info
-    local CURRENT_IP
-    CURRENT_IP=$(get_public_ip)
+    local DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${CURRENT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}宿主机数据路径 : ${data_dir}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -188,7 +225,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈  Global Radio 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}    ◈   AstrBot 管理面板   ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -206,13 +243,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_utils ;;
-        2) update_utils ;;
-        3) uninstall_utils ;;
-        4) start_utils ;;
-        5) stop_utils ;;
-        6) restart_utils ;;
-        7) logs_utils ;;
+        1) install_astrbot ;;
+        2) update_astrbot ;;
+        3) uninstall_astrbot ;;
+        4) start_astrbot ;;
+        5) stop_astrbot ;;
+        6) restart_astrbot ;;
+        7) logs_astrbot ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

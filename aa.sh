@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Remnawave Docker Compose 管理面板 
+# Remnawave Docker Compose 管理面板
 # =================================================================
 
 # 颜色
@@ -14,6 +14,15 @@ CONTAINER_NAME="remnawave"
 BASE_DIR="/opt/remnawave"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yaml"
 ENV_FILE="$BASE_DIR/.env"
+
+# Nginx 路径缺省值配置
+NGINX_AVAILABLE_DIR="${NGINX_AVAILABLE_DIR:-/etc/nginx/sites-available}"
+NGINX_ENABLED_DIR="${NGINX_ENABLED_DIR:-/etc/nginx/sites-enabled}"
+USE_SITES_STRUCTURE="${USE_SITES_STRUCTURE:-true}"
+
+if [ "$USE_SITES_STRUCTURE" = false ] || [ ! -d "$NGINX_AVAILABLE_DIR" ]; then
+    NGINX_AVAILABLE_DIR="/etc/nginx/conf.d"
+fi
 
 # 检测依赖
 check_dependencies() {
@@ -34,7 +43,12 @@ get_status_info() {
     fi
 
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 优先从容器元数据获取 3000/tcp 映射到宿主机的实际端口
         webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 如果获取失败，则尝试从本地 .env 文件读取
+        if [[ -z "$webui_port" && -f "$ENV_FILE" ]]; then
+            webui_port=$(grep "^APP_PORT=" "$ENV_FILE" | cut -d'=' -f2)
+        fi
         [[ -z "$webui_port" ]] && webui_port="3000"
     else
         webui_port="N/A"
@@ -66,7 +80,16 @@ install_remnawave() {
     read -r redis_mode
     [[ -z "$redis_mode" ]] && redis_mode="1"
 
-    echo -e "${CYAN}====== 3. 核心域名配置 ======${RESET}"
+    echo -e "${CYAN}====== 3. 自定义宿主机端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入面板访问映射端口 (APP_PORT) [默认: 3000]: ${RESET}"
+    read -r custom_app_port
+    [[ -z "$custom_app_port" ]] && custom_app_port="3000"
+
+    echo -ne "${YELLOW}请输入指标监控映射端口 (METRICS_PORT) [默认: 3001]: ${RESET}"
+    read -r custom_metrics_port
+    [[ -z "$custom_metrics_port" ]] && custom_metrics_port="3001"
+
+    echo -e "${CYAN}====== 4. 核心域名配置 ======${RESET}"
     echo -ne "${YELLOW}请输入面板访问域名 (FRONT_END_DOMAIN) [例如: panel.example.com]: ${RESET}"
     read -r front_domain
     if [[ -z "$front_domain" ]]; then echo -e "${RED}错误: 域名不能为空！${RESET}"; return; fi
@@ -123,6 +146,65 @@ install_remnawave() {
     jwt_secret_2=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
 
     echo -e "${YELLOW}正在定制创建 docker-compose.yaml...${RESET}"
+    
+    local ext_remnawave_volumes=""
+    local ext_depends_on=""
+    local ext_redis_service=""
+    local ext_db_service=""
+    local ext_volumes_footer=""
+
+    if [[ "$has_local_redis" == "true" ]]; then
+        ext_remnawave_volumes="    volumes:
+      - valkey-socket:/var/run/valkey"
+        
+        ext_redis_service="  remnawave-redis:
+    image: valkey/valkey:9-alpine
+    container_name: remnawave-redis
+    hostname: remnawave-redis
+    <<: [*common, *logging]
+    volumes:
+      - valkey-socket:/var/run/valkey
+    command: >
+      valkey-server --save \"\" --appendonly no --maxmemory-policy noeviction --loglevel warning
+      --unixsocket /var/run/valkey/valkey.sock --unixsocketperm 777 --port 0
+    healthcheck:
+      test: ['CMD', 'valkey-cli', '-s', '/var/run/valkey/valkey.sock', 'ping']
+      interval: 3s
+      timeout: 3s
+      retries: 3"
+        ext_volumes_footer="${ext_volumes_footer}\n  valkey-socket:\n    name: valkey-socket\n    driver: local"
+    fi
+
+    if [[ "$has_local_db" == "true" ]]; then
+        ext_db_service="  remnawave-db:
+    image: postgres:17.6
+    container_name: remnawave-db
+    hostname: remnawave-db
+    <<: [*common, *logging, *env]
+    environment:
+      - POSTGRES_USER=\${POSTGRES_USER}
+      - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
+      - POSTGRES_DB=\${POSTGRES_DB}
+      - TZ=UTC
+    ports:
+      - 127.0.0.1:6767:5432
+    volumes:
+      - remnawave-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U \$\${POSTGRES_USER} -d \$\${POSTGRES_DB}']
+      interval: 3s
+      timeout: 10s
+      retries: 3"
+        ext_volumes_footer="${ext_volumes_footer}\n  remnawave-db-data:\n    name: remnawave-db-data\n    driver: local"
+    fi
+
+    if [[ "$has_local_db" == "true" || "$has_local_redis" == "true" ]]; then
+        ext_depends_on="    depends_on:"
+        [[ "$has_local_db" == "true" ]] && ext_depends_on="${ext_depends_on}\n      remnawave-db:\n        condition: service_healthy"
+        [[ "$has_local_redis" == "true" ]] && ext_depends_on="${ext_depends_on}\n      remnawave-redis:\n        condition: service_healthy"
+    fi
+
+    # 最终的单次完整写入
     cat << EOF > "$COMPOSE_FILE"
 x-common: &common
   ulimits:
@@ -149,76 +231,36 @@ services:
     container_name: remnawave
     hostname: remnawave
     <<: [*common, *logging, *env]
-EOF
-
-    if [[ "$has_local_redis" == "true" ]]; then echo "    volumes: [ valkey-socket:/var/run/valkey ]" >> "$COMPOSE_FILE"; fi
-    cat << EOF >> "$COMPOSE_FILE"
+$(echo -e "$ext_remnawave_volumes")
     ports:
-      - 127.0.0.1:3000:\text{\$}APP_PORT:-3000
-      - 127.0.0.1:3001:\text{\$}METRICS_PORT:-3001
+      - 127.0.0.1:\${APP_PORT:-3000}:3000
+      - 127.0.0.1:\${METRICS_PORT:-3001}:3001
     healthcheck:
-      test: ['CMD-SHELL', 'curl -f http://localhost:\text{\$}METRICS_PORT:-3001/health']
-      interval: 30s
+      test: ['CMD-SHELL', 'curl -f http://localhost:3001/health']
+      interval: 3s
       timeout: 5s
       retries: 3
       start_period: 30s
-EOF
+$(echo -e "$ext_depends_on")
 
-    if [[ "$has_local_db" == "true" || "$has_local_redis" == "true" ]]; then
-        echo "    depends_on:" >> "$COMPOSE_FILE"
-        if [[ "$has_local_db" == "true" ]]; then echo "      remnawave-db: { condition: service_healthy }" >> "$COMPOSE_FILE"; fi
-        if [[ "$has_local_redis" == "true" ]]; then echo "      remnawave-redis: { condition: service_healthy }" >> "$COMPOSE_FILE"; fi
-    fi
+$(echo -e "$ext_redis_service")
 
-    if [[ "$has_local_redis" == "true" ]]; then
-        cat << 'EOF' >> "$COMPOSE_FILE"
-  remnawave-redis:
-    image: valkey/valkey:9-alpine
-    container_name: remnawave-redis
-    hostname: remnawave-redis
-    <<: [*common, *logging]
-    volumes: [ valkey-socket:/var/run/valkey ]
-    command: >
-      valkey-server --save "" --appendonly no --maxmemory-policy noeviction --loglevel warning
-      --unixsocket /var/run/valkey/valkey.sock --unixsocketperm 777 --port 0
-    healthcheck:
-      test: ['CMD', 'valkey-cli', '-s', '/var/run/valkey/valkey.sock', 'ping']
-      interval: 3s; timeout: 3s; retries: 3
-EOF
-    fi
+$(echo -e "$ext_db_service")
 
-    if [[ "$has_local_db" == "true" ]]; then
-        cat << 'EOF' >> "$COMPOSE_FILE"
-  remnawave-db:
-    image: postgres:17.6
-    container_name: remnawave-db
-    hostname: remnawave-db
-    <<: [*common, *logging, *env]
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - TZ=UTC
-    ports: [ 127.0.0.1:6767:5432 ]
-    volumes: [ remnawave-db-data:/var/lib/postgresql/data ]
-    healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
-      interval: 3s; timeout: 10s; retries: 3
-EOF
-    fi
-
-    cat << EOF >> "$COMPOSE_FILE"
 networks:
-  remnawave-network: { name: remnawave-network, driver: bridge, external: false }
+  remnawave-network:
+    name: remnawave-network
+    driver: bridge
+    external: false
+
 volumes:
+$(echo -e "$ext_volumes_footer")
 EOF
-    if [[ "$has_local_redis" == "true" ]]; then echo "  valkey-socket: { name: valkey-socket, driver: local }" >> "$COMPOSE_FILE"; fi
-    if [[ "$has_local_db" == "true" ]]; then echo "  remnawave-db-data: { name: remnawave-db-data, driver: local }" >> "$COMPOSE_FILE"; fi
 
     echo -e "${YELLOW}正在创建 .env 配置文件...${RESET}"
     cat << EOF > "$ENV_FILE"
-APP_PORT=3000
-METRICS_PORT=3001
+APP_PORT=${custom_app_port}
+METRICS_PORT=${custom_metrics_port}
 API_INSTANCES=1
 DATABASE_URL="${db_url}"
 $(echo -e "$env_redis_cfg")
@@ -240,9 +282,15 @@ POSTGRES_DB=${db_name}
 EOF
 
     cd "$BASE_DIR" && docker compose up -d
-    echo -e "${GREEN}Remnawave 核心服务部署成功！${RESET}"
-}
 
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    Remnawave 核心服务部署成功！ ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}内部映射端口   : ${webui_port}${RESET}"
+    echo -e "${YELLOW}面板前端域名   : ${f_dom:-N/A}${RESET}"
+    echo -e "${YELLOW}订阅公开域名   : ${s_dom:-N/A}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
 
 configure_nginx_proxy() {
     get_status_info
@@ -256,7 +304,6 @@ configure_nginx_proxy() {
     read -r domain
     if [[ -z "$domain" ]]; then echo -e "${RED}域名不能为空！${RESET}"; return; fi
 
-    # 根据输入的域名自动生成你期望的默认证书链路径限制
     local default_cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
     local default_key="/etc/letsencrypt/live/${domain}/privkey.pem"
 
@@ -268,12 +315,11 @@ configure_nginx_proxy() {
     read -r app_key
     [[ -z "$app_key" ]] && app_key="$default_key"
 
-    # 兼容你的动态路径和后缀判定逻辑
     local panel_conf_file="${NGINX_AVAILABLE_DIR}/${domain}"
     [[ "$USE_SITES_STRUCTURE" = false ]] && panel_conf_file="${panel_conf_file}.conf"
 
-    # 生成高度融合且严格对齐你提供模板的 Nginx 代理配置
-    cat <<EOF > "$panel_conf_file"
+    # 生成优化后的配置文件
+    cat << EOF > "$panel_conf_file"
 # =============================================================
 # 自动生成：Remnawave 面板的 Nginx 反向代理与安全配置
 # =============================================================
@@ -293,19 +339,31 @@ server {
 server {
     server_name ${domain};
 
-    listen 443 ssl http2 reuseport;
-    listen [::]:443 ssl http2 reuseport;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
 
     location / {
-        proxy_http_version 1.1;
         proxy_pass http://remnawave;
-        proxy_set_header Host \$host;
+        proxy_http_version 1.1;
+        
+        # 【修复】增加对 WebSocket 协议的长连接支持
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # 【优化】更精准的 Host 与请求头穿透，避免跨域和非3000端口导致的重置故障
+        proxy_set_header Host \$http_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # 【优化】增加反代缓冲区，防止数据包过大导致连接断开
+        proxy_buffers 16 16k;
+        proxy_buffer_size 32k;
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
     }
 
-    # SSL Configuration (Mozilla Intermediate Guidelines)
     ssl_protocols          TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
 
@@ -319,7 +377,6 @@ server {
     resolver               1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 valid=60s;
     resolver_timeout       2s;
 
-    # Gzip Compression
     gzip on;
     gzip_vary on;
     gzip_proxied any;
@@ -350,41 +407,65 @@ server {
 }
 EOF
 
-    # 自动处理软链接
     if [ "$USE_SITES_STRUCTURE" = true ] && [ -d "$NGINX_ENABLED_DIR" ]; then
         ln -sf "$panel_conf_file" "${NGINX_ENABLED_DIR}/${domain}"
     fi
 
     echo -e "${GREEN}Remnawave 代理配置文件已成功写入: $panel_conf_file${RESET}"
     
-    # 语法测试与热重载
-    if nginx -t &>/dev/null; then
+    # 打印测试期间的错误信息，更便于发现故障
+    if nginx -t; then
         systemctl reload nginx
         echo -e "${GREEN}Nginx 验证通过并已顺利热重载！面板代理全面上线！${RESET}"
         echo -e "${YELLOW}面板安全访问地址: https://${domain}${RESET}"
     else
-        echo -e "${RED}警告: Nginx 语法测试失败！请确保刚刚填写的证书路径文件存在且 Nginx 有读取权限！${RESET}"
+        echo -e "${RED}错误: Nginx 语法测试失败！请确保刚刚填写的证书路径文件存在且 Nginx 有读取权限！${RESET}"
     fi
 }
 
 update_remnawave() { cd "$BASE_DIR" && docker compose pull && docker compose up -d --remove-orphans && echo -e "${GREEN}更新完成！${RESET}"; }
+
+
+
 uninstall_remnawave() {
-    echo -ne "${YELLOW}确定要卸载吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Remnawave 服务吗？(y/n): ${RESET}"
     read -r confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        cd "$BASE_DIR" 2>/dev/null && docker compose down -v 2>/dev/null
-        rm -rf "$BASE_DIR"
-        echo -e "${GREEN}卸载完成！${RESET}"
+        # 1. 停止并清理容器
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}Docker Compose 容器已停止并移除。${RESET}"
+        else
+            # 如果容器还在运行但缺少 Compose 文件，尝试通过默认容器名进行强删
+            docker rm -f remnawave remnawave-db remnawave-redis &>/dev/null
+            echo -e "${GREEN}Remnawave 核心容器已尝试强行停止并移除。${RESET}"
+        fi
+
+        # 2. 交互式询问是否删除持久化数据
+        echo -ne "${YELLOW}是否同时删除所有数据库、配置文件和缓存目录 ($BASE_DIR)？(y/n): ${RESET}"
+        read -r clean_data
+        if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
+            # 如果是 Compose 部署，顺便清理挂载的内部卷
+            if [ -f "$COMPOSE_FILE" ]; then
+                cd "$BASE_DIR" && docker compose down -v &>/dev/null
+            fi
+            rm -rf "$BASE_DIR"
+            echo -e "${GREEN}所有持久化数据与目录已彻底清理干净。${RESET}"
+        else
+            echo -e "${BLUE}已保留数据目录: $BASE_DIR，你的数据库与环境配置依然安全。${RESET}"
+        fi
+
+        echo -e "${GREEN}Remnawave 卸载程序执行完毕！${RESET}"
     fi
 }
+
 
 start_remnawave() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
 stop_remnawave() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
 restart_remnawave() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
 logs_remnawave() { cd "$BASE_DIR" && docker compose logs -f; }
 
-
-how_info() {
+show_info() {
     get_status_info
     if [ -f "$ENV_FILE" ]; then
         f_dom=$(grep FRONT_END_DOMAIN "$ENV_FILE" | cut -d'=' -f2)
@@ -397,7 +478,6 @@ how_info() {
     echo -e "${YELLOW}订阅公开域名   : ${s_dom:-N/A}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
-
 
 menu() {
     clear; get_status_info

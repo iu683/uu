@@ -12,7 +12,8 @@ RESET="\033[0m"
 
 CONTAINER_NAME="xboard"
 BASE_DIR="/opt/xboard"
-COMPOSE_FILE="$BASE_DIR/compose.yaml"
+# 核心修改：将配置文件路径指定为完全符合要求的标准名称
+COMPOSE_FILE="$BASE_DIR/docker-compose.yaml"
 
 # 检测依赖
 check_dependencies() {
@@ -29,27 +30,26 @@ check_dependencies() {
 # 动态获取容器状态、映射端口和数据目录
 get_status_info() {
     # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+    if [ "$(docker ps -q -f name=xboard)" ]; then
         status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        REAL_CONTAINER=$(docker ps --format "{{.Names}}" -f name=xboard | head -n 1)
+    elif [ "$(docker ps -aq -f name=xboard)" ]; then
         status="${RED}已停止${RESET}"
+        REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
     else
         status="${RED}未部署${RESET}"
+        REAL_CONTAINER=""
     fi
 
     # 2. 如果容器存在，从容器状态中提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+    if [ -n "$REAL_CONTAINER" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$REAL_CONTAINER" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 7001 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "7001/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 兜底获取第一个绑定的端口
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "7001/tcp") 0).HostPort}}' "$REAL_CONTAINER" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$REAL_CONTAINER" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port="7001"
     else
-        # 容器未安装/未部署时的返回值
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
     fi
@@ -100,7 +100,7 @@ install_utils() {
 
     # 1. 克隆代码库
     echo -e "${YELLOW}正在从远端克隆 Xboard (compose 分支)...${RESET}"
-    rm -rf "$BASE_DIR" # 清理旧目录防止 git clone 失败
+    rm -rf "$BASE_DIR" 
     git clone -b compose --depth 1 https://github.com/cedar2025/Xboard "$BASE_DIR"
     
     if [ ! -d "$BASE_DIR" ]; then
@@ -108,12 +108,18 @@ install_utils() {
         return
     fi
 
-    # 2. 准备配置文件
+    # 2. 准备配置文件（智能识别官方各种旧/新模板，统一强制重命名为 docker-compose.yaml）
     cd "$BASE_DIR" || return
-    if [ -f "compose.sample.yaml" ]; then
-        cp compose.sample.yaml compose.yaml
+    if [ -f "compose.yaml" ]; then
+        mv compose.yaml docker-compose.yaml
+    elif [ -f "docker-compose.yml" ]; then
+        mv docker-compose.yml docker-compose.yaml
+    elif [ -f "compose.sample.yaml" ]; then
+        cp compose.sample.yaml docker-compose.yaml
+    elif [ -f "docker-compose.sample.yml" ]; then
+        cp docker-compose.sample.yml docker-compose.yaml
     else
-        echo -e "${RED}错误: 未找到 compose.sample.yaml 模板文件！${RESET}"
+        echo -e "${RED}错误: 未找到任何 Docker Compose 模板文件！${RESET}"
         return
     fi
 
@@ -122,7 +128,7 @@ install_utils() {
     echo -e "${RED}注意：请留意下方屏幕提示，可能需要您在交互中设置管理员密码！${RESET}"
     sleep 2
 
-    docker compose run -it --rm \
+    docker compose -f docker-compose.yaml run -it --rm \
         -e ENABLE_SQLITE=true \
         -e ENABLE_REDIS=true \
         -e ADMIN_ACCOUNT="$admin_email" \
@@ -130,7 +136,7 @@ install_utils() {
 
     # 4. 启动核心服务
     echo -e "${YELLOW}正在通过 Docker Compose 启动 Xboard 服务...${RESET}"
-    docker compose up -d
+    docker compose -f docker-compose.yaml up -d
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
@@ -153,8 +159,8 @@ update_utils() {
         return
     fi
     echo -e "${YELLOW}正在从远端拉取 Xboard 最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
+    cd "$BASE_DIR" && docker compose -f docker-compose.yaml pull
+    docker compose -f docker-compose.yaml up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
@@ -164,7 +170,7 @@ uninstall_utils() {
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
+            cd "$BASE_DIR" && docker compose -f docker-compose.yaml down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
             echo -ne "${YELLOW}是否同时删除本地配置文件与数据目录？(y/n): ${RESET}"
             read -r clean_data
@@ -173,16 +179,25 @@ uninstall_utils() {
                 echo -e "${GREEN}整个 Xboard 工作目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
+            [[ -n "$REAL_CONTAINER" ]] && docker rm -f "$REAL_CONTAINER" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+start_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml restart && echo -e "${GREEN}容器已重启${RESET}"; }
+
+logs_utils() { 
+    REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
+    if [ -n "$REAL_CONTAINER" ]; then
+        docker logs -f "$REAL_CONTAINER"
+    else
+        echo -e "${RED}未找到相关容器！${RESET}"
+    fi
+}
 
 show_info() {
     get_status_info
@@ -198,12 +213,12 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  Xboard 管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}    ◈  Xboard  管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动{RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
     echo -e "${GREEN}4. 启动容器${RESET}"

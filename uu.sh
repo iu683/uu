@@ -1,20 +1,22 @@
 #!/bin/bash
 # =================================================================
-# Watchtower 自动更新服务 Docker Compose 管理面板 (通用兼容汉化版)
+# PPanel 聚合面板管理
 # =================================================================
 
-# 颜色
+# 颜色定义
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="watchtower"
-BASE_DIR="/opt/watchtower"
+BASE_DIR="/opt/ppanel"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+CONFIG_DIR="$BASE_DIR/config"
+CONFIG_FILE="$CONFIG_DIR/ppanel.yaml"
+ENV_FILE="$BASE_DIR/ppanel.env"
 
-# 检测依赖
+# 检测依赖环境
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
@@ -22,194 +24,418 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、映射和数据目录
+# 动态获取容器整体状态和端口
 get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
+    if [ -f "$COMPOSE_FILE" ]; then
+        if [ "$(docker ps -q -f name=ppanel)" ]; then
+            status="${GREEN}运行中${RESET}"
+            web_port=$(docker ps -f name=ppanel --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
+            if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
+                web_port=$(sed -n '/ppanel:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+            fi
+        elif [ "$(docker ps -aq -f name=ppanel)" ]; then
+            status="${YELLOW}已停止${RESET}"
+            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' ppanel 2>/dev/null)
+        else
+            status="${RED}未部署${RESET}"
+        fi
+        [[ -z "$web_port" ]] && web_port="8080"
     else
-        status="${RED}未部署${RESET}"
-    fi
-
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-    else
-        img_version="${RED}未安装${RESET}"
+        status="${RED}未初始化${RESET}"
+        web_port="N/A"
     fi
 }
 
-# 部署 Watchtower
-install_watchtower() {
-    check_dependencies
+# 获取公网 IP (兼容双栈环境)
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
     
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入 Telegram Bot Token [必填]: ${RESET}"
-    read -r bot_token
-    while [[ -z "$bot_token" ]]; do
-        echo -e "${RED}错误: Bot Token 不能为空！${RESET}"
-        echo -ne "${YELLOW}请重新输入 Telegram Bot Token: ${RESET}"
-        read -r bot_token
-    done
-
-    echo -ne "${YELLOW}请输入 Telegram Chat ID [必填]: ${RESET}"
-    read -r chat_id
-    while [[ -z "$chat_id" ]]; do
-        echo -e "${RED}错误: Chat ID 不能为空！${RESET}"
-        echo -ne "${YELLOW}请重新输入 Telegram Chat ID: ${RESET}"
-        read -r chat_id
-    done
-
-    echo -ne "${YELLOW}请输入检查更新的 Cron 定时表达式 [默认: 0 0 0 * * * (每天零点)]: ${RESET}"
-    read -r custom_schedule
-    [[ -z "$custom_schedule" ]] && custom_schedule="0 0 0 * * *"
-
-    echo -e "${YELLOW}请选择通知策略:${RESET}"
-    echo -e "  ${GREEN}1)${RESET} 仅在【发生镜像更新/报错】时通知 (${YELLOW}推荐，防刷屏${RESET})"
-    echo -e "  ${GREEN}2)${RESET} 每次检查完都通知 (即使没有更新也会发“一切正常”)"
-    echo -ne "${YELLOW}请选择 (默认 1): ${RESET}"
-    read -r notify_policy
-    if [[ "$notify_policy" == "2" ]]; then
-        notification_level="info"
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
     else
-        notification_level="warn"
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
+}
+
+# 部署 PPanel
+install_ppanel() {
+    check_dependencies
+    mkdir -p "$BASE_DIR" "$CONFIG_DIR" "$BASE_DIR/web"
+
+    # 1. 基础参数配置
+    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 PPanel 宿主机映射访问端口 [默认: 8080]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8080"
+
+    local jwt_secret=$(openssl rand -hex 16)
+
+    # 2. MySQL 数据库运行模式选择
+    echo -e "\n${CYAN}====== MySQL 数据库运行模式选择 ======${RESET}"
+    echo -e " 1) 直接部署全新的 MySQL 8 容器 (自动高强度密码+持久化)"
+    echo -e " 2) 使用已有的外部/远程 MySQL 数据库 (需提前手动建好空库)"
+    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
+
+    local db_host="mysql"
+    local db_port="3306"
+    local db_name="ppanel"
+    local db_user="root"
+    local db_pass=""
+
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}使用全新内置 MySQL 容器，正在生成高强度随机密码...${RESET}"
+        db_pass=$(openssl rand -hex 16)
+    else
+        echo -ne "${YELLOW}请输入远程 MySQL 的 IP 或域名: ${RESET}"
+        read -r ext_db_ip
+        echo -ne "${YELLOW}请输入远程 MySQL 端口 [默认: 3306]: ${RESET}"
+        read -r ext_db_port
+        [[ -z "$ext_db_port" ]] && ext_db_port="3306"
+        db_host="$ext_db_ip"
+        db_port="$ext_db_port"
+        echo -ne "${YELLOW}请输入远程 MySQL 用户名 [默认: root]: ${RESET}"
+        read -r db_user
+        [[ -z "$db_user" ]] && db_user="root"
+        echo -ne "${YELLOW}请输入远程 MySQL 密码: ${RESET}"
+        read -r db_pass
+        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: ppanel]: ${RESET}"
+        read -r db_name
+        [[ -z "$db_name" ]] && db_name="ppanel"
+        
+        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
+            db_host="172.17.0.1"
+        fi
     fi
 
-    # 精准提取成功和失败状态
-    tg_template='{{- if . -}}
-📢 *Docker 容器自动更新报告*
-📅 时间: `{{ (index . 0).Time.Format "2006-01-02 15:04:05" }}`
- 
-{{ range . -}}
-{{- if eq .Level.String "error" -}}
-❌ *[更新失败]* ➔ `{{ .Message }}`
-{{- else if eq .Level.String "warning" -}}
-⚠️ *[系统警告]* ➔ `{{ .Message }}`
-{{- else -}}
-🚀 *[动态]* ➔ `{{ .Message }}`
-{{- end }}
-{{ end -}}
-{{- else -}}
-✨ 检查完毕，所有容器已是最新。
-{{- end -}}'
+    # 3. Redis 运行模式与分区选择
+    echo -e "\n${CYAN}====== Redis 缓存运行模式选择 ======${RESET}"
+    echo -e " 1) 直接部署全新的 Redis 7 容器 (自动生成高强度密码)"
+    echo -e " 2) 使用已有的外部/远程 Redis 服务"
+    echo -ne "${YELLOW}请选择 Redis 模式 [默认: 1]: ${RESET}"
+    read -r redis_mode
+    [[ -z "$redis_mode" ]] && redis_mode="1"
 
-    # 2. 动态生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合要求的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  watchtower:
-    image: ghcr.io/naiba-forks/watchtower
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      TZ: Asia/Shanghai
-      WATCHTOWER_LABEL_ENABLE: "true"
-      WATCHTOWER_CLEANUP: "true"
-      WATCHTOWER_INCLUDE_RESTARTING: "true"
-      WATCHTOWER_NOTIFICATIONS_LEVEL: "${notification_level}"
-      WATCHTOWER_NOTIFICATION_URL: "telegram://${bot_token}@telegram?chats=${chat_id}"
-      WATCHTOWER_NOTIFICATION_TEMPLATE: '${tg_template}'
-    command: --schedule "${custom_schedule}"
+    local redis_host="redis"
+    local redis_port="6379"
+    local redis_pass=""
+    local redis_db="0"
+
+    if [[ "$redis_mode" == "1" ]]; then
+        echo -e "${YELLOW}使用全新内置 Redis 容器，正在生成高强度随机密码...${RESET}"
+        redis_pass=$(openssl rand -hex 16)
+    else
+        echo -ne "${YELLOW}请输入远程 Redis 的 IP 或域名: ${RESET}"
+        read -r ext_redis_ip
+        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r ext_redis_port
+        [[ -z "$ext_redis_port" ]] && ext_redis_port="6379"
+        redis_host="$ext_redis_ip"
+        redis_port="$ext_redis_port"
+        echo -ne "${YELLOW}请输入远程 Redis 密码 (若无密码请直接回车): ${RESET}"
+        read -r redis_pass
+        
+        if [[ "$ext_redis_ip" == "127.0.0.1" || "$ext_redis_ip" == "localhost" ]]; then
+            redis_host="172.17.0.1"
+        fi
+    fi
+
+    echo -ne "${YELLOW}请输入 Redis 分区编号 (DB Index) [0-15] [默认: 0]: ${RESET}"
+    read -r redis_db
+    [[ -z "$redis_db" || ! "$redis_db" =~ ^[0-9]+$ ]] && redis_db="0"
+
+    # 4. 落地保存凭证凭据环境文件 ppanel.env
+    cat << EOF > "$ENV_FILE"
+PORT="${custom_port}"
+DB_MODE="${db_mode}"
+DB_HOST="${db_host}"
+DB_PORT="${db_port}"
+DB_USER="${db_user}"
+DB_PASS="${db_pass}"
+DB_NAME="${db_name}"
+REDIS_MODE="${redis_mode}"
+REDIS_HOST="${redis_host}"
+REDIS_PORT="${redis_port}"
+REDIS_PASS="${redis_pass}"
+REDIS_DB="${redis_db}"
+JWT_SECRET="${jwt_secret}"
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Watchtower 服务...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    # 5. 动态生成 PPanel 专属 YAML 配置文件
+    echo -e "${YELLOW}正在渲染并同步生成 ppanel.yaml 业务配置文件...${RESET}"
+    cat << EOF > "$CONFIG_FILE"
+Host: 0.0.0.0
+Port: 8080
+TLS:
+    Enable: false
+    CertFile: ""
+    KeyFile: ""
+Debug: false
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+Static:
+  Admin:
+    Enabled: true
+    Prefix: /admin
+    Path: ./static/admin
+  User:
+    Enabled: true
+    Prefix: /
+    Path: ./static/user
 
-    get_status_info
+JwtAuth:
+    AccessSecret: ${jwt_secret}
+    AccessExpire: 604800
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Watchtower 部署成功！     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
+Logger:
+    ServiceName: ApiService
+    Mode: console
+    Encoding: plain
+    TimeFormat: "2006-01-02 15:04:05.000"
+    Path: logs
+    Level: info
+    MaxContentLength: 0
+    Compress: false
+    Stat: true
+    KeepDays: 0
+    StackCooldownMillis: 100
+    MaxBackups: 0
+    MaxSize: 0
+    Rotation: daily
+    FileTimeFormat: 2006-01-02T15:04:05.000Z07:00
 
-# 更新 Watchtower 镜像
-update_watchtower() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+MySQL:
+    Addr: ${db_host}:${db_port}
+    Username: ${db_user}
+    Password: ${db_pass}
+    Dbname: ${db_name}
+    Config: charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai
+    MaxIdleConns: 10
+    MaxOpenConns: 10
+    SlowThreshold: 1000
+
+Redis:
+    Host: ${redis_host}:${redis_port}
+    Pass: ${redis_pass}
+    DB: ${redis_db}
+EOF
+
+    # 6. 生成规范化拓扑的 Docker Compose 配置文件
+    echo -e "${YELLOW}正在生成规范化 Docker Compose 拓扑配置...${RESET}"
+    
+    cat << EOF > "$COMPOSE_FILE"
+networks:
+  ppanel-network:
+    driver: bridge
+
+services:
+  ppanel:
+    image: ppanel/ppanel:latest
+    container_name: ppanel
+    restart: always
+    ports:
+      - "${custom_port}:8080"
+    volumes:
+      - ./config:/app/etc
+      - ./web:/app/static
+    depends_on:
+EOF
+
+    # 根据运行模式按需拼接 depends_on 条件断言
+    if [[ "$db_mode" == "1" ]]; then
+        cat << EOF >> "$COMPOSE_FILE"
+      mysql:
+        condition: service_healthy
+EOF
+    fi
+    if [[ "$redis_mode" == "1" ]]; then
+        cat << EOF >> "$COMPOSE_FILE"
+      redis:
+        condition: service_started
+EOF
+    fi
+    
+    # 两者均外部则裁剪掉无子项的 depends_on:
+    if [[ "$db_mode" == "2" && "$redis_mode" == "2" ]]; then
+        sed -i '/depends_on:/d' "$COMPOSE_FILE"
+    fi
+
+    # 追加网络层归属
+    cat << EOF >> "$COMPOSE_FILE"
+    networks:
+      - ppanel-network
+EOF
+
+    # 如果是内置 MySQL，注入标准健康状态检查（移除密码依赖，走本地协议栈探测）
+    if [[ "$db_mode" == "1" ]]; then
+        mkdir -p "$BASE_DIR/mysql"
+        cat << EOF >> "$COMPOSE_FILE"
+
+  mysql:
+    image: mysql:8
+    container_name: ppanel-mysql
+    restart: always
+    environment:
+      MYSQL_DATABASE: "${db_name}"
+      MYSQL_USER: "${db_user}"
+      MYSQL_PASSWORD: "${db_pass}"
+      MYSQL_ROOT_PASSWORD: "${db_pass}"
+    volumes:
+      - ./mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - ppanel-network
+EOF
+    fi
+
+    # 如果是内置 Redis，注入拓扑
+    if [[ "$redis_mode" == "1" ]]; then
+        mkdir -p "$BASE_DIR/redis"
+        cat << EOF >> "$COMPOSE_FILE"
+
+  redis:
+    image: redis:7
+    container_name: ppanel-redis
+    restart: always
+    command: redis-server --requirepass "${redis_pass}"
+    volumes:
+      - ./redis:/data
+    networks:
+      - ppanel-network
+EOF
+    fi
+
+    # 7. 清理并重新拉起集群
+    echo -e "${YELLOW}正在执行容器编排拉起服务...${RESET}"
+    cd "$BASE_DIR"
+    docker compose down 2>/dev/null
+    docker compose up -d --force-recreate
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}错误: 服务拉起失败，请检查端口 ${custom_port} 是否被占用。${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Watchtower 最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}           PPanel 系统架构部署成功！                ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}默认账号   : admin@ppanel.dev${RESET}"
+    echo -e "${YELLOW}默认密码   : password${RESET}"
+    echo -e "----------------------------------------------------"
+    echo -e "${CYAN}[数据库与中间件拓扑状态]${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}MySQL 模式    : ${GREEN}全新内置容器 (MySQL 8)${RESET}"
+        echo -e "${YELLOW}随机高强密码   : ${GREEN}${db_pass}${RESET}"
+    else
+        echo -e "${YELLOW}MySQL 模式    : ${CYAN}外部远程目标 (${db_host}:${db_port})${RESET}"
+    fi
+
+    if [[ "$redis_mode" == "1" ]]; then
+        echo -e "${YELLOW}Redis 模式    : ${GREEN}全新内置容器 (分片区: ${redis_db})${RESET}"
+    else
+        echo -e "${YELLOW}Redis 模式    : ${CYAN}外部远程目标 (${redis_host}:${redis_port} / 分片区: ${redis_db})${RESET}"
+    fi
+    echo -e "----------------------------------------------------"
+    echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 卸载 Watchtower
-uninstall_watchtower() {
-    echo -ne "${YELLOW}确定要卸载并删除 Watchtower 容器吗？(y/n): ${RESET}"
+# 交互式安全卸载
+uninstall_ppanel() {
+    echo -ne "${RED}确定要卸载并删除 PPanel 相关的容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
+            echo -e "${YELLOW}正在停止并安全移除容器及网络...${RESET}"
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除配置文件？(y/n): ${RESET}"
+            
+            echo -ne "${YELLOW}是否同时删除本地所有配置文件和持久化数据目录 (含数据库文件)？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                cd /opt
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}配置目录已彻底清理。${RESET}"
+                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+            else
+                echo -e "${YELLOW}已保留本地配置文件及持久化数据。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            docker rm -f ppanel ppanel-mysql ppanel-redis 2>/dev/null
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+        echo -e "${GREEN}卸载流程执行完毕！${RESET}"
     fi
 }
 
-start_watchtower() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_watchtower() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_watchtower() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_watchtower() { docker logs -f "$CONTAINER_NAME"; }
+start_ppanel() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
+stop_ppanel() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
+restart_ppanel() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
+logs_ppanel() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
 
 show_info() {
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}运行模式       : 标签过滤自动更新 (WATCHTOWER_LABEL_ENABLE=true)${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}当前运行状态   : $status"
+    echo -e "${YELLOW}安全绝对路径   : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}业务配置文件   : ${CONFIG_FILE}${RESET}"
+    fi
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
+# 主菜单管理
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  Watchtower 管理面板  ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}模式 :${RESET} ${YELLOW}标签过滤更新 (完美兼容版)${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动 (配置全中文美化通知)${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}        ◈ PPanel 管理面板 ◈        ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 当前状态 :${RESET} $status"
+    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 1. 部署启动${RESET}"
+    echo -e "${GREEN} 3. 卸载服务${RESET}" 
+    echo -e "${GREEN} 4. 启动服务${RESET}"
+    echo -e "${GREEN} 5. 停止服务${RESET}"
+    echo -e "${GREEN} 6. 重启服务${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_watchtower ;;
-        2) update_watchtower ;;
-        3) uninstall_watchtower ;;
-        4) start_watchtower ;;
-        5) stop_watchtower ;;
-        6) restart_watchtower ;;
-        7) logs_watchtower ;;
+        1) install_ppanel ;;
+        3) uninstall_ppanel ;;
+        4) start_ppanel ;;
+        5) stop_ppanel ;;
+        6) restart_ppanel ;;
+        7) logs_ppanel ;;
         8) show_info ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
+        *) echo -e "${RED}输入无效${RESET}" ;;
     esac
 }
 

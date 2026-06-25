@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Xboard Docker Compose 管理面板 
+# Remnawave Docker Compose 管理面板 (稳定修复版)
 # =================================================================
 
 # 颜色
@@ -10,9 +10,20 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="xboard"
-BASE_DIR="/opt/xboard"
+CONTAINER_NAME="remnawave"
+BASE_DIR="/opt/remnawave"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yaml"
+ENV_FILE="$BASE_DIR/.env"
+
+# Nginx 路径缺省值配置（防止外部未定义变量时报错）
+NGINX_AVAILABLE_DIR="${NGINX_AVAILABLE_DIR:-/etc/nginx/sites-available}"
+NGINX_ENABLED_DIR="${NGINX_ENABLED_DIR:-/etc/nginx/sites-enabled}"
+USE_SITES_STRUCTURE="${USE_SITES_STRUCTURE:-true}"
+
+# 如果系统使用的是 conf.d 架构而非 sites-available
+if [ "$USE_SITES_STRUCTURE" = false ] || [ ! -d "$NGINX_AVAILABLE_DIR" ]; then
+    NGINX_AVAILABLE_DIR="/etc/nginx/conf.d"
+fi
 
 # 检测依赖
 check_dependencies() {
@@ -20,216 +31,399 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-# 动态获取容器状态
+# 动态获取容器状态和端口
 get_status_info() {
-    if [ "$(docker ps -q -f name=xboard)" ]; then
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
-        REAL_CONTAINER=$(docker ps --format "{{.Names}}" -f name=xboard | head -n 1)
-    elif [ "$(docker ps -aq -f name=xboard)" ]; then
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
-        REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
     else
         status="${RED}未部署${RESET}"
-        REAL_CONTAINER=""
     fi
 
-    if [ -n "$REAL_CONTAINER" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$REAL_CONTAINER" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "7001/tcp") 0).HostPort}}' "$REAL_CONTAINER" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$REAL_CONTAINER" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="7001"
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
     else
-        img_version="${RED}未安装${RESET}"
         webui_port="N/A"
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
-get_public_ip() {
-    local mode=${1:-"auto"}
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
-}
-
-# 部署 Xboard（带模式选择）
-install_utils() {
+# 部署 Remnawave
+install_remnawave() {
     check_dependencies
-    
     if [ -d "$BASE_DIR" ] && [ -f "$COMPOSE_FILE" ]; then
         echo -e "${RED}提示: 检测到目录 $BASE_DIR 已存在配置文件！${RESET}"
         echo -ne "${YELLOW}是否覆盖重新部署？(y/n): ${RESET}"
         read -r re_confirm
-        if [[ "$re_confirm" != "y" && "$re_confirm" != "Y" ]]; then
-            return
-        fi
+        if [[ "$re_confirm" != "y" && "$re_confirm" != "Y" ]]; then return; fi
     fi
 
-    # 选择安装模式
-    echo -e "${CYAN}====== 请选择 Xboard 安装模式 ======${RESET}"
-    echo -e "${GREEN}1. 快速安装模式 (推荐：自动配置内置 SQLite + Redis)${RESET}"
-    echo -e "${GREEN}2. 高级自定义安装 (高级用户：手动配置外部 MySQL/PostgreSQL 等)${RESET}"
-    echo -ne "${YELLOW}请输入模式编号 [默认: 1]: ${RESET}"
-    read -r install_mode
-    [[ -z "$install_mode" ]] && install_mode="1"
+    mkdir -p "$BASE_DIR"
+    echo -e "${CYAN}====== 1. 数据库 (PostgreSQL) 类型选择 ======${RESET}"
+    echo -e "${GREEN}1. 本地容器模式 (自动创建内置的 PostgreSQL 17)${RESET}"
+    echo -e "${GREEN}2. 远程数据库模式 (连接外部/云 PostgreSQL 数据库)${RESET}"
+    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
 
-    if [[ "$install_mode" != "1" && "$install_mode" != "2" ]]; then
-        echo -e "${RED}错误: 无效的选择，退出安装。${RESET}"
-        return
+    echo -e "${CYAN}====== 2. 缓存 (Redis) 类型选择 ======${RESET}"
+    echo -e "${GREEN}1. 本地容器模式 (自动创建内置的高性能 Valkey/Redis)${RESET}"
+    echo -e "${GREEN}2. 远程 Redis 模式 (连接外部公用/云 Redis)${RESET}"
+    echo -ne "${YELLOW}请选择 Redis 模式 [默认: 1]: ${RESET}"
+    read -r redis_mode
+    [[ -z "$redis_mode" ]] && redis_mode="1"
+
+    echo -e "${CYAN}====== 3. 核心域名配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入面板访问域名 (FRONT_END_DOMAIN) [例如: panel.example.com]: ${RESET}"
+    read -r front_domain
+    if [[ -z "$front_domain" ]]; then echo -e "${RED}错误: 域名不能为空！${RESET}"; return; fi
+    sub_domain="${front_domain}/api/sub"
+
+    local db_url="" local has_local_db="true" local db_user="postgres"
+    local db_pass=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1) local db_name="postgres"
+
+    if [[ "$db_mode" == "2" ]]; then
+        has_local_db="false"
+        echo -e "${CYAN}====== 远程 PostgreSQL 配置 ======${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库 IP/域名: ${RESET}"
+        read -r r_host
+        echo -ne "${YELLOW}请输入远程数据库 端口 [默认: 5432]: ${RESET}"
+        read -r r_port
+        [[ -z "$r_port" ]] && r_port="5432"
+        echo -ne "${YELLOW}请输入远程数据库 用户名 [默认: postgres]: ${RESET}"
+        read -r r_user
+        [[ -z "$r_user" ]] && r_user="postgres"
+        echo -ne "${YELLOW}请输入远程数据库 密码: ${RESET}"
+        read -r r_pass
+        echo -ne "${YELLOW}请输入远程数据库 数据库名 [默认: postgres]: ${RESET}"
+        read -r r_name
+        [[ -z "$r_name" ]] && r_name="postgres"
+        if [[ -z "$r_host" || -z "$r_pass" ]]; then echo -e "${RED}错误: 远程数据库地址和密码不能为空！${RESET}"; return; fi
+        db_url="postgresql://${r_user}:${r_pass}@${r_host}:${r_port}/${r_name}"
+        db_user="$r_user"; db_pass="$r_pass"; db_name="$r_name"
+    else
+        db_url="postgresql://postgres:${db_pass}@remnawave-db:5432/postgres"
     fi
 
-    # 1. 克隆代码库
-    echo -e "${YELLOW}正在从远端克隆 Xboard (compose 分支)...${RESET}"
-    rm -rf "$BASE_DIR" 
-    git clone -b compose --depth 1 https://github.com/cedar2025/Xboard "$BASE_DIR"
+    local has_local_redis="true" local env_redis_cfg=""
+    if [[ "$redis_mode" == "2" ]]; then
+        has_local_redis="false"
+        echo -e "${CYAN}====== 远程 Redis 配置 ======${RESET}"
+        echo -ne "${YELLOW}请输入远程 Redis IP/域名: ${RESET}"
+        read -r rd_host
+        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r rd_port
+        [[ -z "$rd_port" ]] && rd_port="6379"
+        echo -ne "${YELLOW}请输入远程 Redis 密码 (无密码直接回车): ${RESET}"
+        read -r rd_pass
+        echo -ne "${YELLOW}请输入 Redis 分区编号 (DB Index) [0-15, 默认: 0]: ${RESET}"
+        read -r rd_db
+        [[ -z "$rd_db" ]] && rd_db="0"
+        if [[ -z "$rd_host" ]]; then echo -e "${RED}错误: 远程 Redis 地址不能为空！${RESET}"; return; fi
+        env_redis_cfg="REDIS_HOST=${rd_host}\nREDIS_PORT=${rd_port}\nREDIS_DB=${rd_db}"
+        if [[ -n "$rd_pass" ]]; then env_redis_cfg="${env_redis_cfg}\nREDIS_PASSWORD=${rd_pass}"; fi
+    else
+        env_redis_cfg="REDIS_SOCKET=/var/run/valkey/valkey.sock"
+    fi
+
+    jwt_secret_1=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
+    jwt_secret_2=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
+
+    echo -e "${YELLOW}正在定制创建 docker-compose.yaml...${RESET}"
     
-    if [ ! -d "$BASE_DIR" ]; then
-        echo -e "${RED}错误: 克隆 Xboard 仓库失败，请检查网络！${RESET}"
-        return
-    fi
+    # 核心修复点：将所有动态模块封装为标准 YAML 字符串，通过单次 cat 写入，规避格式破坏漏洞。
+    local ext_remnawave_volumes=""
+    local ext_depends_on=""
+    local ext_redis_service=""
+    local ext_db_service=""
+    local ext_volumes_footer=""
 
-    # 2. 准备配置文件
-    cd "$BASE_DIR" || return
-    if [ -f "compose.yaml" ]; then
-        mv compose.yaml docker-compose.yaml
-    elif [ -f "docker-compose.yml" ]; then
-        mv docker-compose.yml docker-compose.yaml
-    elif [ -f "compose.sample.yaml" ]; then
-        cp compose.sample.yaml docker-compose.yaml
-    elif [ -f "docker-compose.sample.yml" ]; then
-        cp docker-compose.sample.yml docker-compose.yaml
-    else
-        echo -e "${RED}错误: 未找到任何 Docker Compose 模板文件！${RESET}"
-        return
-    fi
-
-    # 3. 根据选择执行不同的安装向导
-    if [[ "$install_mode" == "1" ]]; then
-        # 快速模式
-        echo -e "${CYAN}====== 快速模式参数配置 ======${RESET}"
-        echo -ne "${YELLOW}请输入 Xboard 管理员邮箱 [默认: admin@demo.com]: ${RESET}"
-        read -r admin_email
-        [[ -z "$admin_email" ]] && admin_email="admin@demo.com"
-
-        echo -e "${YELLOW}正在执行快速初始化安装...${RESET}"
-        docker compose -f docker-compose.yaml run -it --rm \
-            -e ENABLE_SQLITE=true \
-            -e ENABLE_REDIS=true \
-            -e ADMIN_ACCOUNT="$admin_email" \
-            xboard php artisan xboard:install
-    else
-        # 高级自定义模式
-        echo -e "${YELLOW}正在启动高级自定义安装向导...${RESET}"
-        echo -e "${RED}注意：您需要在接下来的交互提示中，逐项手动输入您的数据库类型、地址及账号密码！${RESET}"
-        sleep 2
+    if [[ "$has_local_redis" == "true" ]]; then
+        ext_remnawave_volumes="    volumes:
+      - valkey-socket:/var/run/valkey"
         
-        docker compose -f docker-compose.yaml run -it --rm \
-            xboard php artisan xboard:install
+        ext_redis_service="  remnawave-redis:
+    image: valkey/valkey:9-alpine
+    container_name: remnawave-redis
+    hostname: remnawave-redis
+    <<: [*common, *logging]
+    volumes:
+      - valkey-socket:/var/run/valkey
+    command: >
+      valkey-server --save \"\" --appendonly no --maxmemory-policy noeviction --loglevel warning
+      --unixsocket /var/run/valkey/valkey.sock --unixsocketperm 777 --port 0
+    healthcheck:
+      test: ['CMD', 'valkey-cli', '-s', '/var/run/valkey/valkey.sock', 'ping']
+      interval: 3s
+      timeout: 3s
+      retries: 3"
+        ext_volumes_footer="${ext_volumes_footer}\n  valkey-socket:\n    name: valkey-socket\n    driver: local"
     fi
 
-    # 4. 启动核心服务
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Xboard 服务...${RESET}"
-    docker compose -f docker-compose.yaml up -d
+    if [[ "$has_local_db" == "true" ]]; then
+        ext_db_service="  remnawave-db:
+    image: postgres:17.6
+    container_name: remnawave-db
+    hostname: remnawave-db
+    <<: [*common, *logging, *env]
+    environment:
+      - POSTGRES_USER=\${POSTGRES_USER}
+      - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
+      - POSTGRES_DB=\${POSTGRES_DB}
+      - TZ=UTC
+    ports:
+      - 127.0.0.1:6767:5432
+    volumes:
+      - remnawave-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U \$\${POSTGRES_USER} -d \$\${POSTGRES_DB}']
+      interval: 3s
+      timeout: 10s
+      retries: 3"
+        ext_volumes_footer="${ext_volumes_footer}\n  remnawave-db-data:\n    name: remnawave-db-data\n    driver: local"
+    fi
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    if [[ "$has_local_db" == "true" || "$has_local_redis" == "true" ]]; then
+        ext_depends_on="    depends_on:"
+        [[ "$has_local_db" == "true" ]] && ext_depends_on="${ext_depends_on}\n      remnawave-db:\n        condition: service_healthy"
+        [[ "$has_local_redis" == "true" ]] && ext_depends_on="${ext_depends_on}\n      remnawave-redis:\n        condition: service_healthy"
+    fi
 
-    DETECT_IP=$(get_public_ip)
+    # 最终的单次完整写入
+    cat << EOF > "$COMPOSE_FILE"
+x-common: &common
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
+  restart: always
+  networks:
+    - remnawave-network
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Xboard 部署成功！         ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:7001${RESET}"
-    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: 100m
+      max-file: 5
+
+x-env: &env
+  env_file: .env
+
+services:
+  remnawave:
+    image: remnawave/backend:2
+    container_name: remnawave
+    hostname: remnawave
+    <<: [*common, *logging, *env]
+$(echo -e "$ext_remnawave_volumes")
+    ports:
+      - 127.0.0.1:3000:\${APP_PORT:-3000}
+      - 127.0.0.1:3001:\${METRICS_PORT:-3001}
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -f http://localhost:\${METRICS_PORT:-3001}/health']
+      interval: 3s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+$(echo -e "$ext_depends_on")
+
+$(echo -e "$ext_redis_service")
+
+$(echo -e "$ext_db_service")
+
+networks:
+  remnawave-network:
+    name: remnawave-network
+    driver: bridge
+    external: false
+
+volumes:
+$(echo -e "$ext_volumes_footer")
+EOF
+
+    echo -e "${YELLOW}正在创建 .env 配置文件...${RESET}"
+    cat << EOF > "$ENV_FILE"
+APP_PORT=3000
+METRICS_PORT=3001
+API_INSTANCES=1
+DATABASE_URL="${db_url}"
+$(echo -e "$env_redis_cfg")
+JWT_AUTH_SECRET=${jwt_secret_1}
+JWT_API_TOKENS_SECRET=${jwt_secret_2}
+IS_TELEGRAM_NOTIFICATIONS_ENABLED=false
+PANEL_DOMAIN=${front_domain}
+FRONT_END_DOMAIN=${front_domain}
+SUB_PUBLIC_DOMAIN=${sub_domain}
+SWAGGER_PATH=/docs
+SCALAR_PATH=/scalar
+IS_DOCS_ENABLED=false
+METRICS_USER=admin
+METRICS_PASS=admin
+WEBHOOK_ENABLED=false
+POSTGRES_USER=${db_user}
+POSTGRES_PASSWORD=${db_pass}
+POSTGRES_DB=${db_name}
+EOF
+
+    cd "$BASE_DIR" && docker compose up -d
+    echo -e "${GREEN}Remnawave 核心服务部署成功！${RESET}"
 }
 
-# 更新 Xboard 镜像
-update_utils() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+configure_nginx_proxy() {
+    get_status_info
+    if [[ "$webui_port" == "N/A" ]]; then
+        echo -e "${RED}错误: Remnawave 容器未运行，请先执行选项 1 部署服务！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Xboard 最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose -f docker-compose.yaml pull
-    docker compose -f docker-compose.yaml up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+
+    echo -e "${CYAN}====== 配置 Remnawave 面板 Nginx 反向代理 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Remnawave 面板规划域名 (如: panel.example.com): ${RESET}"
+    read -r domain
+    if [[ -z "$domain" ]]; then echo -e "${RED}域名不能为空！${RESET}"; return; fi
+
+    local default_cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+    local default_key="/etc/letsencrypt/live/${domain}/privkey.pem"
+
+    echo -ne "${YELLOW}请输入 SSL 证书路径 [直接回车使用默认: ${default_cert}]: ${RESET}"
+    read -r app_cert
+    [[ -z "$app_cert" ]] && app_cert="$default_cert"
+
+    echo -ne "${YELLOW}请输入 SSL 私钥路径 [直接回车使用默认: ${default_key}]: ${RESET}"
+    read -r app_key
+    [[ -z "$app_key" ]] && app_key="$default_key"
+
+    local panel_conf_file="${NGINX_AVAILABLE_DIR}/${domain}"
+    [[ "$USE_SITES_STRUCTURE" = false ]] && panel_conf_file="${panel_conf_file}.conf"
+
+    # 优化：剔除了过时的且容易报错的 reuseport，对内部 Nginx 原生变量正确转义
+    cat << EOF > "$panel_conf_file"
+# =============================================================
+# 自动生成：Remnawave 面板的 Nginx 反向代理与安全配置
+# =============================================================
+upstream remnawave {
+    server 127.0.0.1:${webui_port};
 }
 
-# 卸载 Xboard
-uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 Xboard 容器吗？(y/n): ${RESET}"
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    server_name ${domain};
+
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+
+    location / {
+        proxy_http_version 1.1;
+        proxy_pass http://remnawave;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    ssl_protocols          TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:MozSSL:10m;
+    ssl_session_tickets    off;
+
+    ssl_certificate "${app_cert}";
+    ssl_certificate_key "${app_key}";
+
+    resolver               1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 valid=60s;
+    resolver_timeout       2s;
+
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_buffers 16 8k;
+    gzip_http_version 1.1;
+    gzip_min_length 256;
+    gzip_types
+        application/atom+xml
+        application/geo+json
+        application/javascript
+        application/x-javascript
+        application/json
+        application/ld+json
+        application/manifest+json
+        application/rdf+xml
+        application/rss+xml
+        application/xhtml+xml
+        application/xml
+        font/eot
+        font/otf
+        font/ttf
+        image/svg+xml
+        text/css
+        text/javascript
+        text/plain
+        text/xml;
+}
+EOF
+
+    if [ "$USE_SITES_STRUCTURE" = true ] && [ -d "$NGINX_ENABLED_DIR" ]; then
+        ln -sf "$panel_conf_file" "${NGINX_ENABLED_DIR}/${domain}"
+    fi
+
+    echo -e "${GREEN}Remnawave 代理配置文件已成功写入: $panel_conf_file${RESET}"
+    
+    if nginx -t &>/dev/null; then
+        systemctl reload nginx
+        echo -e "${GREEN}Nginx 验证通过并已顺利热重载！面板代理全面上线！${RESET}"
+        echo -e "${YELLOW}面板安全访问地址: https://${domain}${RESET}"
+    else
+        echo -e "${RED}警告: Nginx 语法测试失败！请确保刚刚填写的证书路径文件存在且 Nginx 有读取权限！${RESET}"
+    fi
+}
+
+update_remnawave() { cd "$BASE_DIR" && docker compose pull && docker compose up -d --remove-orphans && echo -e "${GREEN}更新完成！${RESET}"; }
+uninstall_remnawave() {
+    echo -ne "${YELLOW}确定要卸载吗？(y/n): ${RESET}"
     read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose -f docker-compose.yaml down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地配置文件与数据目录？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}整个 Xboard 工作目录已彻底清理。${RESET}"
-            fi
-        else
-            REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
-            [[ -n "$REAL_CONTAINER" ]] && docker rm -f "$REAL_CONTAINER" 2>/dev/null
-        fi
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        cd "$BASE_DIR" 2>/dev/null && docker compose down -v 2>/dev/null
+        rm -rf "$BASE_DIR"
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml restart && echo -e "${GREEN}容器已重启${RESET}"; }
+start_remnawave() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_remnawave() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_remnawave() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+logs_remnawave() { cd "$BASE_DIR" && docker compose logs -f; }
 
-logs_utils() { 
-    REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
-    if [ -n "$REAL_CONTAINER" ]; then
-        docker logs -f "$REAL_CONTAINER"
-    else
-        echo -e "${RED}未找到相关容器！${RESET}"
-    fi
-}
-
-show_info() {
+how_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
+    if [ -f "$ENV_FILE" ]; then
+        f_dom=$(grep FRONT_END_DOMAIN "$ENV_FILE" | cut -d'=' -f2)
+        s_dom=$(grep SUB_PUBLIC_DOMAIN "$ENV_FILE" | cut -d'=' -f2)
+    fi
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:7001${RESET}"
+    echo -e "${YELLOW}内部映射端口   : ${webui_port}${RESET}"
+    echo -e "${YELLOW}面板前端域名   : ${f_dom:-N/A}${RESET}"
+    echo -e "${YELLOW}订阅公开域名   : ${s_dom:-N/A}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
 menu() {
-    clear
-    get_status_info
+    clear; get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  Xboard  管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}   ◈  Remnawave 容器管理面板 ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -242,26 +436,24 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 反向代理${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_utils ;;
-        2) update_utils ;;
-        3) uninstall_utils ;;
-        4) start_utils ;;
-        5) stop_utils ;;
-        6) restart_utils ;;
-        7) logs_utils ;;
+        1) install_remnawave ;;
+        2) update_remnawave ;;
+        3) uninstall_remnawave ;;
+        4) start_remnawave ;;
+        5) stop_remnawave ;;
+        6) restart_remnawave ;;
+        7) logs_remnawave ;;
         8) show_info ;;
+        9) configure_nginx_proxy ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 
-while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
-done
+while true; do menu; echo -ne "${YELLOW}按回车键继续...${RESET}"; read -r; done

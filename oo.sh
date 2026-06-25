@@ -12,7 +12,7 @@ RESET="\033[0m"
 
 CONTAINER_NAME="xboard"
 BASE_DIR="/opt/xboard"
-COMPOSE_FILE="$BASE_DIR/compose.yaml"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yaml"
 
 # 检测依赖
 check_dependencies() {
@@ -26,30 +26,27 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取容器状态
 get_status_info() {
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+    if [ "$(docker ps -q -f name=xboard)" ]; then
         status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        REAL_CONTAINER=$(docker ps --format "{{.Names}}" -f name=xboard | head -n 1)
+    elif [ "$(docker ps -aq -f name=xboard)" ]; then
         status="${RED}已停止${RESET}"
+        REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
     else
         status="${RED}未部署${RESET}"
+        REAL_CONTAINER=""
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+    if [ -n "$REAL_CONTAINER" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$REAL_CONTAINER" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取 WebUI 端口（容器内部默认监听的是 7001 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "7001/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 兜底获取第一个绑定的端口
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "7001/tcp") 0).HostPort}}' "$REAL_CONTAINER" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$REAL_CONTAINER" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port="7001"
     else
-        # 容器未安装/未部署时的返回值
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
     fi
@@ -79,28 +76,35 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Xboard
+# 部署 Xboard（带模式选择）
 install_utils() {
     check_dependencies
     
     if [ -d "$BASE_DIR" ] && [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${RED}提示: 检测到目录 $BASE_DIR 已存在配置文件，请确认是否覆盖重新部署？${RESET}"
-        echo -ne "${YELLOW}是否继续部署？(y/n): ${RESET}"
+        echo -e "${RED}提示: 检测到目录 $BASE_DIR 已存在配置文件！${RESET}"
+        echo -ne "${YELLOW}是否覆盖重新部署？(y/n): ${RESET}"
         read -r re_confirm
         if [[ "$re_confirm" != "y" && "$re_confirm" != "Y" ]]; then
             return
         fi
     fi
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入 Xboard 管理员邮箱 [默认: admin@demo.com]: ${RESET}"
-    read -r admin_email
-    [[ -z "$admin_email" ]] && admin_email="admin@demo.com"
+    # 选择安装模式
+    echo -e "${CYAN}====== 请选择 Xboard 安装模式 ======${RESET}"
+    echo -e "${GREEN}1. 快速安装模式 (推荐：自动配置内置 SQLite + Redis)${RESET}"
+    echo -e "${GREEN}2. 高级自定义安装 (高级用户：手动配置外部 MySQL/PostgreSQL 等)${RESET}"
+    echo -ne "${YELLOW}请输入模式编号 [默认: 1]: ${RESET}"
+    read -r install_mode
+    [[ -z "$install_mode" ]] && install_mode="1"
+
+    if [[ "$install_mode" != "1" && "$install_mode" != "2" ]]; then
+        echo -e "${RED}错误: 无效的选择，退出安装。${RESET}"
+        return
+    fi
 
     # 1. 克隆代码库
     echo -e "${YELLOW}正在从远端克隆 Xboard (compose 分支)...${RESET}"
-    rm -rf "$BASE_DIR" # 清理旧目录防止 git clone 失败
+    rm -rf "$BASE_DIR" 
     git clone -b compose --depth 1 https://github.com/cedar2025/Xboard "$BASE_DIR"
     
     if [ ! -d "$BASE_DIR" ]; then
@@ -111,34 +115,45 @@ install_utils() {
     # 2. 准备配置文件
     cd "$BASE_DIR" || return
     if [ -f "compose.yaml" ]; then
-        echo -e "${GREEN}检测到标准的 compose.yaml 已存在，跳过复制。${RESET}"
+        mv compose.yaml docker-compose.yaml
+    elif [ -f "docker-compose.yml" ]; then
+        mv docker-compose.yml docker-compose.yaml
     elif [ -f "compose.sample.yaml" ]; then
-        cp compose.sample.yaml compose.yaml
+        cp compose.sample.yaml docker-compose.yaml
     elif [ -f "docker-compose.sample.yml" ]; then
-        cp docker-compose.sample.yml compose.yaml
+        cp docker-compose.sample.yml docker-compose.yaml
     else
-        echo -e "${YELLOW}未找到模板文件，尝试直接寻找 compose.yaml...${RESET}"
-        # 兜底：如果官方直接提供了 compose.yaml 则继续，否则报错
-        if [ ! -f "compose.yaml" ]; then
-            echo -e "${RED}错误: 未找到任何 Docker Compose 配置文件！${RESET}"
-            return
-        fi
+        echo -e "${RED}错误: 未找到任何 Docker Compose 模板文件！${RESET}"
+        return
     fi
-    
-    # 3. 执行数据库初始化
-    echo -e "${YELLOW}正在执行数据库快速初始化安装 (SQLite + Redis)...${RESET}"
-    echo -e "${RED}注意：请留意下方屏幕提示，可能需要您在交互中设置管理员密码！${RESET}"
-    sleep 2
 
-    docker compose run -it --rm \
-        -e ENABLE_SQLITE=true \
-        -e ENABLE_REDIS=true \
-        -e ADMIN_ACCOUNT="$admin_email" \
-        xboard php artisan xboard:install
+    # 3. 根据选择执行不同的安装向导
+    if [[ "$install_mode" == "1" ]]; then
+        # 快速模式
+        echo -e "${CYAN}====== 快速模式参数配置 ======${RESET}"
+        echo -ne "${YELLOW}请输入 Xboard 管理员邮箱 [默认: admin@demo.com]: ${RESET}"
+        read -r admin_email
+        [[ -z "$admin_email" ]] && admin_email="admin@demo.com"
+
+        echo -e "${YELLOW}正在执行快速初始化安装...${RESET}"
+        docker compose -f docker-compose.yaml run -it --rm \
+            -e ENABLE_SQLITE=true \
+            -e ENABLE_REDIS=true \
+            -e ADMIN_ACCOUNT="$admin_email" \
+            xboard php artisan xboard:install
+    else
+        # 高级自定义模式
+        echo -e "${YELLOW}正在启动高级自定义安装向导...${RESET}"
+        echo -e "${RED}注意：您需要在接下来的交互提示中，逐项手动输入您的数据库类型、地址及账号密码！${RESET}"
+        sleep 2
+        
+        docker compose -f docker-compose.yaml run -it --rm \
+            xboard php artisan xboard:install
+    fi
 
     # 4. 启动核心服务
     echo -e "${YELLOW}正在通过 Docker Compose 启动 Xboard 服务...${RESET}"
-    docker compose up -d
+    docker compose -f docker-compose.yaml up -d
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
@@ -148,8 +163,7 @@ install_utils() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}      Xboard 部署成功！         ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}管理员账号     : ${admin_email}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:7001${RESET}"
     echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
@@ -161,8 +175,8 @@ update_utils() {
         return
     fi
     echo -e "${YELLOW}正在从远端拉取 Xboard 最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
+    cd "$BASE_DIR" && docker compose -f docker-compose.yaml pull
+    docker compose -f docker-compose.yaml up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
@@ -172,7 +186,7 @@ uninstall_utils() {
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
+            cd "$BASE_DIR" && docker compose -f docker-compose.yaml down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
             echo -ne "${YELLOW}是否同时删除本地配置文件与数据目录？(y/n): ${RESET}"
             read -r clean_data
@@ -181,16 +195,25 @@ uninstall_utils() {
                 echo -e "${GREEN}整个 Xboard 工作目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
+            [[ -n "$REAL_CONTAINER" ]] && docker rm -f "$REAL_CONTAINER" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+start_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml restart && echo -e "${GREEN}容器已重启${RESET}"; }
+
+logs_utils() { 
+    REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
+    if [ -n "$REAL_CONTAINER" ]; then
+        docker logs -f "$REAL_CONTAINER"
+    else
+        echo -e "${RED}未找到相关容器！${RESET}"
+    fi
+}
 
 show_info() {
     get_status_info
@@ -198,7 +221,7 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:7001${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -206,12 +229,12 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  Xboard 管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}    ◈  Xboard  管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动{RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
     echo -e "${GREEN}4. 启动容器${RESET}"

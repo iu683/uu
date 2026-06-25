@@ -1,572 +1,440 @@
 #!/bin/bash
-# ========================================
-# 1Panel 风格多路径 Docker Compose 管理脚本
-# ========================================
+# =================================================================
+# PPanel 聚合面板管理 (稳定自愈无死锁版)
+# =================================================================
 
+# 颜色定义
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
-ORANGE='\033[38;5;208m'
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# ---------------------------
-# 配置：需要扫描的项目根目录列表
-# ---------------------------
-SEARCH_DIRS=(
-    "/opt/flatnas"
-    "/opt/1panel/apps"
-    "/data"
-    "/date"
-    "/app"
-    "/root"
-)
+BASE_DIR="/opt/ppanel"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+CONFIG_DIR="$BASE_DIR/config"
+CONFIG_FILE="$CONFIG_DIR/ppanel.yaml"
+ENV_FILE="$BASE_DIR/ppanel.env"
 
-# ---------------------------
-# 动态搜索所有项目并存入数组（精准匹配直连或子目录文件）
-# ---------------------------
-function scan_projects() {
-    PROJECT_NAMES=()
-    PROJECT_PATHS=()
-    
-    for s_dir in "${SEARCH_DIRS[@]}"; do
-        if [ -d "$s_dir" ]; then
-            # 允许在配置目录下向深扫描 5 层
-            while IFS= read -r compose_file; do
-                [ -z "$compose_file" ] && continue
-                local app_path=$(dirname "$compose_file")
-                local app_name=""
-                
-                # 如果 compose 文件直接在扫描根目录下 (例如 /opt/flatnas/docker-compose.yml)
-                if [ "$app_path" == "$s_dir" ] || [ "$app_path" == "/" ]; then
-                    app_name=$(basename "$s_dir")
-                else
-                    # 如果在子目录下 (例如 /opt/flatnas/pve/docker-compose.yml -> 提取出 pve)
-                    app_name=$(basename "$app_path")
-                fi
-                
-                PROJECT_NAMES+=("$app_name")
-                PROJECT_PATHS+=("$app_path")
-            done < <(find "$s_dir" -maxdepth 5 \( -name "docker-compose.yml" -o -name "docker-compose.yaml" \) 2>/dev/null | sort -u)
-        fi
-    done
-}
-
-# ---------------------------
-# 确认操作
-# ---------------------------
-function confirm_action() {
-    read -p "确认执行此操作吗？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        return 0
-    else
-        echo -e "${RED}操作已取消${RESET}"
-        sleep 1
-        return 1
+# 检测依赖环境
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
     fi
 }
 
-# ---------------------------
-# 操作完成提示
-# ---------------------------
-function action_done() {
-    read -p "$(echo -e ${GREEN}操作完成！按回车返回菜单...${RESET})" temp
-}
-
-# ---------------------------
-# 状态汉化核心引擎
-# ---------------------------
-function translate_status() {
-    local raw_status="$1"
-    echo "$raw_status" | \
-        sed 's/Up /运行 /' | \
-        sed 's/Exited/已停止/' | \
-        sed 's/(healthy)/(健康)/' | \
-        sed 's/(unhealthy)/(非健康)/' | \
-        sed 's/(starting)/(启动中)/' | \
-        sed 's/seconds/秒/' | \
-        sed 's/second/秒/' | \
-        sed 's/minutes/分钟/' | \
-        sed 's/minute/分钟/' | \
-        sed 's/hours/小时/' | \
-        sed 's/hour/小时/' | \
-        sed 's/days/天/' | \
-        sed 's/day/天/' | \
-        sed 's/weeks/周/' | \
-        sed 's/week/周/' | \
-        sed 's/months/月/' | \
-        sed 's/month/月/' | \
-        sed 's/about //' | \
-        sed 's/ago/前/'
-}
-
-# ---------------------------
-# 核心功能：绑定/解绑 127.0.0.1
-# ---------------------------
-function toggle_ip_binding() {
-    local action="$1"
-    local backup_file="${COMPOSE_FILE}.bak_ip"
-
-    if [ ! -f "$COMPOSE_FILE" ]; then
-        echo -e "${RED}错误: 找不到配置文件！${RESET}"
-        sleep 1
-        return
-    fi
-
-    cp "$COMPOSE_FILE" "$backup_file"
-
-    if [ "$action" == "bind" ]; then
-        echo -e "${YELLOW}正在尝试将外部端口绑定到 127.0.0.1...${RESET}"
-        sed -i -E 's/- ("|'\''?)([0-9]+):([0-9]+)("|'\''?)/- \1127.0.0.1:\2:\3\4/g' "$COMPOSE_FILE"
-        sed -i -E 's/- ("|'\''?)0.0.0.0:([0-9]+):([0-9]+)("|'\''?)/- \1127.0.0.1:\2:\3\4/g' "$COMPOSE_FILE"
-        sed -i 's/0.0.0.0:/127.0.0.1:/g' "$COMPOSE_FILE"
-    else
-        echo -e "${YELLOW}正在尝试解绑 127.0.0.1 (恢复为全网公开)...${RESET}"
-        sed -i -E 's/- ("|'\''?)127.0.0.1:([0-9]+):([0-9]+)("|'\''?)/- \1\2:\3\4/g' "$COMPOSE_FILE"
-        sed -i 's/127.0.0.1:/0.0.0.0:/g' "$COMPOSE_FILE"
-    fi
-
-    if diff "$COMPOSE_FILE" "$backup_file" >/dev/null 2>&1; then
-        echo -e "${ORANGE}提示: 端口规则没有发生变化。${RESET}"
-        rm -f "$backup_file"
-    else
-        echo -e "${GREEN}配置已调整，正在重启容器生效...${RESET}"
-        docker compose -f "$COMPOSE_FILE" down && docker compose -f "$COMPOSE_FILE" up -d
-        rm -f "$backup_file"
-        echo -e "${GREEN}网络边界调整成功！${RESET}"
-    fi
-    action_done
-}
-
-# ---------------------------
-# 查看所有项目容器运行状态
-# ---------------------------
-monitor_docker_containers() {
-    clear
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}      🐳 Docker 项目容器状态监控        ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-
-    scan_projects
-    
-    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
-        echo -e "${RED}未在指定目录下找到任何 Docker Compose 项目！${RESET}"
-    else
-        local all_stats
-        all_stats=$(docker stats --no-stream --format "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" 2>/dev/null)
-
-        for i in "${!PROJECT_PATHS[@]}"; do
-            local proj="${PROJECT_PATHS[$i]}"
-            local project_name="${PROJECT_NAMES[$i]}"
-            
-            echo -e "${YELLOW}📁 项目名称: $project_name [根路径: $proj]${RESET}"
-            echo -e "${YELLOW}----------------------------------------${RESET}"
-            
-            local l_compose=""
-            [ -f "$proj/docker-compose.yml" ] && l_compose="$proj/docker-compose.yml"
-            [ -f "$proj/docker-compose.yaml" ] && l_compose="$proj/docker-compose.yaml"
-            
-            local services=$(docker compose -f "$l_compose" ps --services 2>/dev/null)
-            
-            if [ -z "$services" ]; then
-                echo -e "  ${YELLOW}暂无服务配置${RESET}"
-                echo -e "${YELLOW}----------------------------------------${RESET}"
-                continue
+# 动态获取容器整体状态和端口
+get_status_info() {
+    if [ -f "$COMPOSE_FILE" ]; then
+        if [ "$(docker ps -q -f name=ppanel)" ]; then
+            status="${GREEN}运行中${RESET}"
+            web_port=$(docker ps -f name=ppanel --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
+            if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
+                web_port=$(sed -n '/ppanel:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
             fi
+        elif [ "$(docker ps -aq -f name=ppanel)" ]; then
+            status="${YELLOW}已停止${RESET}"
+            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' ppanel 2>/dev/null)
+        else
+            status="${RED}未部署${RESET}"
+        fi
+        [[ -z "$web_port" ]] && web_port="8080"
+    else
+        status="${RED}未初始化${RESET}"
+        web_port="N/A"
+    fi
+}
 
-            local stats_list=()
-            for service in $services; do
-                local container_id=$(docker compose -f "$l_compose" ps -q "$service" 2>/dev/null)
-                local cpu="0.00%" mem="0B / 0B" net="0B / 0B" ports="无端口映射"
-                local raw_status="Exited (0) 0 seconds ago"
-
-                if [ -n "$container_id" ]; then
-                    local match_stats=$(echo "$all_stats" | grep "^${container_id:0:12}")
-                    if [ -n "$match_stats" ]; then
-                        cpu=$(echo "$match_stats" | cut -f2)
-                        mem=$(echo "$match_stats" | cut -f3)
-                        net=$(echo "$match_stats" | cut -f4)
-                    fi
-                    raw_status=$(docker ps -a --filter "id=$container_id" --format "{{.Status}}")
-                    local port_info=$(docker ps -a --filter "id=$container_id" --format "{{.Ports}}")
-                    [ -n "$port_info" ] && ports=$port_info
-                fi
-                stats_list+=("$service	$cpu	$mem	$net	$ports	$raw_status")
-            done
-            
-            printf "%s\n" "${stats_list[@]}" | sort -k3 -hr | while IFS=$'\t' read -r service cpu mem net ports raw_status; do
-                local uptime=$(translate_status "$raw_status")
-                local status_icon="${RED}❌${RESET}"
-                [[ "$raw_status" == *"Up"* ]] && status_icon="${GREEN}✅${RESET}"
-
-                echo -e "${YELLOW}◈ 服务: ${RESET}${YELLOW}${service}${RESET} ${status_icon}"
-                echo -e "  ├─ ${YELLOW}运行状态: ${RESET}${uptime}"
-                echo -e "  ├─ ${YELLOW}端口映射: ${RESET}${GREEN}${ports}${RESET}"
-                echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${cpu}"
-                echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
-                echo -e "  └─ ${YELLOW}网络 I/O: ${RESET}${net}"
-                echo -e "${YELLOW}----------------------------------------${RESET}"
-            done
-            echo
+# 获取公网 IP (兼容双栈环境)
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
     fi
-    read -p "按回车返回主菜单..." temp
+    echo "127.0.0.1" && return 0
 }
 
-# ---------------------------
-# 选择项目
-# ---------------------------
-function select_project() {
-    clear
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}        ◈    请选择要管理的项目    ◈     ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    
-    scan_projects
+# 部署 PPanel
+install_ppanel() {
+    check_dependencies
+    mkdir -p "$BASE_DIR" "$CONFIG_DIR" "$BASE_DIR/web"
 
-    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
-        echo -e "${RED}未找到任何 Docker Compose 项目！${RESET}"
-        read -p "按回车返回主菜单..." temp
-        return
-    fi
-    
-    for i in "${!PROJECT_NAMES[@]}"; do
-        local p_name="${PROJECT_NAMES[$i]}"
-        local p_path="${PROJECT_PATHS[$i]}"
-        echo -e "${YELLOW}$((i+1))) $p_name [$p_path]${RESET}"
-    done
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    read -p "$(echo -e ${GREEN}请输入编号: ${RESET})" choice
-    if [[ "$choice" == "0" ]]; then
-        return
-    elif [[ "$choice" =~ ^[0-9]+$ && $choice -ge 1 && $choice -le ${#PROJECT_NAMES[@]} ]]; then
-        PROJECT_DIR=${PROJECT_PATHS[$((choice-1))]}
-        if [ -f "$PROJECT_DIR/docker-compose.yml" ]; then
-            COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
-        else
-            COMPOSE_FILE="$PROJECT_DIR/docker-compose.yaml"
+    # 1. 基础参数配置
+    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 PPanel 宿主机映射访问端口 [默认: 8080]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8080"
+
+    local jwt_secret=$(openssl rand -hex 16)
+
+    # 2. MySQL 数据库运行模式选择
+    echo -e "\n${CYAN}====== MySQL 数据库运行模式选择 ======${RESET}"
+    echo -e " 1) 直接部署全新的 MySQL 8 容器 (自动高强度密码+持久化)"
+    echo -e " 2) 使用已有的外部/远程 MySQL 数据库 (需提前手动建好空库)"
+    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
+    read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
+
+    local db_host="mysql"
+    local db_port="3306"
+    local db_name="ppanel"
+    local db_user="root"
+    local db_pass=""
+
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}使用全新内置 MySQL 容器，正在生成高强度随机密码...${RESET}"
+        db_pass=$(openssl rand -hex 16)
+    else
+        echo -ne "${YELLOW}请输入远程 MySQL 的 IP 或域名: ${RESET}"
+        read -r ext_db_ip
+        echo -ne "${YELLOW}请输入远程 MySQL 端口 [默认: 3306]: ${RESET}"
+        read -r ext_db_port
+        [[ -z "$ext_db_port" ]] && ext_db_port="3306"
+        db_host="$ext_db_ip"
+        db_port="$ext_db_port"
+        echo -ne "${YELLOW}请输入远程 MySQL 用户名 [默认: root]: ${RESET}"
+        read -r db_user
+        [[ -z "$db_user" ]] && db_user="root"
+        echo -ne "${YELLOW}请输入远程 MySQL 密码: ${RESET}"
+        read -r db_pass
+        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: ppanel]: ${RESET}"
+        read -r db_name
+        [[ -z "$db_name" ]] && db_name="ppanel"
+        
+        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
+            db_host="172.17.0.1"
         fi
-        project_menu
+    fi
+
+    # 3. Redis 运行模式与分区选择
+    echo -e "\n${CYAN}====== Redis 缓存运行模式选择 ======${RESET}"
+    echo -e " 1) 直接部署全新的 Redis 7 容器 (自动生成高强度密码)"
+    echo -e " 2) 使用已有的外部/远程 Redis 服务"
+    echo -ne "${YELLOW}请选择 Redis 模式 [默认: 1]: ${RESET}"
+    read -r redis_mode
+    [[ -z "$redis_mode" ]] && redis_mode="1"
+
+    local redis_host="redis"
+    local redis_port="6379"
+    local redis_pass=""
+    local redis_db="0"
+
+    if [[ "$redis_mode" == "1" ]]; then
+        echo -e "${YELLOW}使用全新内置 Redis 容器，正在生成高强度随机密码...${RESET}"
+        redis_pass=$(openssl rand -hex 16)
     else
-        echo -e "${RED}无效选择${RESET}"
-        sleep 1
-        select_project
+        echo -ne "${YELLOW}请输入远程 Redis 的 IP 或域名: ${RESET}"
+        read -r ext_redis_ip
+        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r ext_redis_port
+        [[ -z "$ext_redis_port" ]] && ext_redis_port="6379"
+        redis_host="$ext_redis_ip"
+        redis_port="$ext_redis_port"
+        echo -ne "${YELLOW}请输入远程 Redis 密码 (若无密码请直接回车): ${RESET}"
+        read -r redis_pass
+        
+        if [[ "$ext_redis_ip" == "127.0.0.1" || "$ext_redis_ip" == "localhost" ]]; then
+            redis_host="172.17.0.1"
+        fi
     fi
-}
 
-# ---------------------------
-# 进入容器
-# ---------------------------
-function select_container() {
-    local containers=$(docker compose -f "$COMPOSE_FILE" ps --services)
-    if [ -z "$containers" ]; then
-        echo -e "${RED}没有正在运行的容器${RESET}"
-        sleep 1
-        return
-    fi
-    echo -e "${GREEN}可进入的容器：${RESET}"
-    echo -e "${GREEN}$containers${RESET}"
-    read -p "请输入容器名: " cname
-    if [[ "$containers" == *"$cname"* ]]; then
-        docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/sh || docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/bash
-        action_done
-    else
-        echo -e "${RED}容器不存在${RESET}"
-        sleep 1
-    fi
-}
+    echo -ne "${YELLOW}请输入 Redis 分区编号 (DB Index) [0-15] [默认: 0]: ${RESET}"
+    read -r redis_db
+    [[ -z "$redis_db" || ! "$redis_db" =~ ^[0-9]+$ ]] && redis_db="0"
 
-# ---------------------------
-# 删除整个项目
-# ---------------------------
-function delete_project() {
-    echo -e "${RED}注意！这将删除整个项目，包括容器、镜像、数据卷和项目文件夹${RESET}"
-    if confirm_action; then
-        docker compose -f "$COMPOSE_FILE" down --rmi all -v
-        rm -rf "$PROJECT_DIR"
-        echo -e "${GREEN}项目已删除${RESET}"
-        sleep 1
-        return
-    fi
-}
+    # 4. 落地保存凭证凭据环境文件 ppanel.env
+    cat << EOF > "$ENV_FILE"
+PORT="${custom_port}"
+DB_MODE="${db_mode}"
+DB_HOST="${db_host}"
+DB_PORT="${db_port}"
+DB_USER="${db_user}"
+DB_PASS="${db_pass}"
+DB_NAME="${db_name}"
+REDIS_MODE="${redis_mode}"
+REDIS_HOST="${redis_host}"
+REDIS_PORT="${redis_port}"
+REDIS_PASS="${redis_pass}"
+REDIS_DB="${redis_db}"
+JWT_SECRET="${jwt_secret}"
+EOF
 
-# ---------------------------
-# 多选删除项目
-# ---------------------------
-function delete_multiple_projects() {
-    clear
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}        ◈      多选删除项目     ◈          ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+    # 5. 动态生成 PPanel 专属 YAML 配置文件
+    echo -e "${YELLOW}正在渲染并同步生成 ppanel.yaml 业务配置文件...${RESET}"
+    cat << EOF > "$CONFIG_FILE"
+Host: 0.0.0.0
+Port: 8080
+TLS:
+    Enable: false
+    CertFile: ""
+    KeyFile: ""
+Debug: false
+
+Static:
+  Admin:
+    Enabled: true
+    Prefix: /admin
+    Path: ./static/admin
+  User:
+    Enabled: true
+    Prefix: /
+    Path: ./static/user
+
+JwtAuth:
+    AccessSecret: ${jwt_secret}
+    AccessExpire: 604800
+
+Logger:
+    ServiceName: ApiService
+    Mode: console
+    Encoding: plain
+    TimeFormat: "2006-01-02 15:04:05.000"
+    Path: logs
+    Level: info
+    MaxContentLength: 0
+    Compress: false
+    Stat: true
+    KeepDays: 0
+    StackCooldownMillis: 100
+    MaxBackups: 0
+    MaxSize: 0
+    Rotation: daily
+    FileTimeFormat: 2006-01-02T15:04:05.000Z07:00
+
+MySQL:
+    Addr: ${db_host}:${db_port}
+    Username: ${db_user}
+    Password: ${db_pass}
+    Dbname: ${db_name}
+    Config: charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai
+    MaxIdleConns: 10
+    MaxOpenConns: 10
+    SlowThreshold: 1000
+
+Redis:
+    Host: ${redis_host}:${redis_port}
+    Pass: ${redis_pass}
+    DB: ${redis_db}
+EOF
+
+    # 6. 生成规范化拓扑的 Docker Compose 配置文件 (采用 service_started 机制防卡死)
+    echo -e "${YELLOW}正在生成规范化 Docker Compose 拓扑配置...${RESET}"
     
-    scan_projects
+    cat << EOF > "$COMPOSE_FILE"
+networks:
+  ppanel-network:
+    driver: bridge
 
-    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
-        echo -e "${RED}未找到任何项目${RESET}"
-        sleep 1
+services:
+  ppanel:
+    image: ppanel/ppanel:latest
+    container_name: ppanel
+    restart: always
+    ports:
+      - "${custom_port}:8080"
+    volumes:
+      - ./config:/app/etc
+      - ./web:/app/static
+    depends_on:
+EOF
+
+    # 核心修正：断言条件修改为 service_started 避开健康检查死锁
+    if [[ "$db_mode" == "1" ]]; then
+        cat << EOF >> "$COMPOSE_FILE"
+      mysql:
+        condition: service_started
+EOF
+    fi
+    if [[ "$redis_mode" == "1" ]]; then
+        cat << EOF >> "$COMPOSE_FILE"
+      redis:
+        condition: service_started
+EOF
+    fi
+    
+    # 两者均外部则裁剪掉无子项的 depends_on:
+    if [[ "$db_mode" == "2" && "$redis_mode" == "2" ]]; then
+        sed -i '/depends_on:/d' "$COMPOSE_FILE"
+    fi
+
+    # 追加网络层归属
+    cat << EOF >> "$COMPOSE_FILE"
+    networks:
+      - ppanel-network
+EOF
+
+    # 如果是内置 MySQL，注入标准稳定的 MySQL 8.0 容器拓扑 (修复 root 用户配置冲突)
+    if [[ "$db_mode" == "1" ]]; then
+        mkdir -p "$BASE_DIR/mysql"
+        cat << EOF >> "$COMPOSE_FILE"
+
+  mysql:
+    image: mysql:8
+    container_name: ppanel-mysql
+    restart: always
+    environment:
+      MYSQL_DATABASE: "${db_name}"
+      MYSQL_ROOT_PASSWORD: "${db_pass}"
+    volumes:
+      - ./mysql:/var/lib/mysql
+    networks:
+      - ppanel-network
+EOF
+    fi
+
+    # 如果是内置 Redis，注入拓扑
+    if [[ "$redis_mode" == "1" ]]; then
+        mkdir -p "$BASE_DIR/redis"
+        cat << EOF >> "$COMPOSE_FILE"
+
+  redis:
+    image: redis:7
+    container_name: ppanel-redis
+    restart: always
+    command: redis-server --requirepass "${redis_pass}"
+    volumes:
+      - ./redis:/data
+    networks:
+      - ppanel-network
+EOF
+    fi
+
+    # 7. 清理并重新拉起集群
+    echo -e "${YELLOW}正在执行容器编排拉起服务...${RESET}"
+    cd "$BASE_DIR"
+    docker compose down 2>/dev/null
+    docker compose up -d --force-recreate
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}错误: 服务拉起失败，请检查端口 ${custom_port} 是否被占用。${RESET}"
         return
     fi
 
-    for i in "${!PROJECT_NAMES[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${PROJECT_NAMES[$i]} [${PROJECT_PATHS[$i]}]${RESET}"
-    done
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}输入要删除的项目编号，用空格分隔（例如: 1 3 5），0 返回主菜单${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choices
+    local detect_ip=$(get_public_ip)
 
-    if [[ "$choices" == "0" ]]; then
-        return
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}           PPanel 系统架构部署成功！                ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}前台访问地址   : http://${detect_ip}:${custom_port}${RESET}"
+    echo -e "${YELLOW}后台管理地址   : http://${detect_ip}:${custom_port}/admin${RESET}"
+    echo -e "${YELLOW}默认账号   : admin@ppanel.dev${RESET}"
+    echo -e "${YELLOW}默认密码   : password${RESET}"
+    echo -e "----------------------------------------------------"
+    echo -e "${CYAN}[数据库与中间件拓扑状态]${RESET}"
+    if [[ "$db_mode" == "1" ]]; then
+        echo -e "${YELLOW}MySQL 模式    : ${GREEN}全新内置容器 (MySQL 8)${RESET}"
+        echo -e "${YELLOW}随机高强密码   : ${GREEN}${db_pass}${RESET}"
+    else
+        echo -e "${YELLOW}MySQL 模式    : ${CYAN}外部远程目标 (${db_host}:${db_port})${RESET}"
     fi
 
-    for c in $choices; do
-        if [[ "$c" =~ ^[0-9]+$ && $c -ge 1 && $c -le ${#PROJECT_NAMES[@]} ]]; then
-            local proj="${PROJECT_PATHS[$((c-1))]}"
-            local l_compose=""
-            [ -f "$proj/docker-compose.yml" ] && l_compose="$proj/docker-compose.yml"
-            [ -f "$proj/docker-compose.yaml" ] && l_compose="$proj/docker-compose.yaml"
+    if [[ "$redis_mode" == "1" ]]; then
+        echo -e "${YELLOW}Redis 模式    : ${GREEN}全新内置容器 (分片区: ${redis_db})${RESET}"
+    else
+        echo -e "${YELLOW}Redis 模式    : ${CYAN}外部远程目标 (${redis_host}:${redis_port} / 分片区: ${redis_db})${RESET}"
+    fi
+    echo -e "----------------------------------------------------"
+    echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+}
+
+# 交互式安全卸载
+uninstall_ppanel() {
+    echo -ne "${RED}确定要卸载并删除 PPanel 相关的容器吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            echo -e "${YELLOW}正在停止并安全移除容器及网络...${RESET}"
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
             
-            local p_name="${PROJECT_NAMES[$((c-1))]}"
-            echo -e "${RED}准备删除项目: $p_name ($proj)${RESET}"
-            if confirm_action; then
-                docker compose -f "$l_compose" down --rmi all -v
-                rm -rf "$proj"
-                echo -e "${GREEN}已删除 $p_name${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地所有配置文件和持久化数据目录 (含数据库文件)？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                cd /opt
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+            else
+                echo -e "${YELLOW}已保留本地配置文件及持久化数据。${RESET}"
             fi
         else
-            echo -e "${RED}无效编号: $c${RESET}"
+            docker rm -f ppanel ppanel-mysql ppanel-redis 2>/dev/null
         fi
-    done
-    action_done
+        echo -e "${GREEN}卸载流程执行完毕！${RESET}"
+    fi
 }
 
-# ---------------------------
-# 一键删除所有未运行的项目
-# ---------------------------
-function delete_all_stopped_projects() {
+start_ppanel() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
+stop_ppanel() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
+restart_ppanel() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
+logs_ppanel() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
+
+show_info() {
+    get_status_info
+    local detect_ip=$(get_public_ip)
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}当前运行状态   : $status"
+    echo -e "${YELLOW}安全绝对路径   : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}前台访问地址   : http://${detect_ip}:${custom_port}${RESET}"
+    echo -e "${YELLOW}后台管理地址   : http://${detect_ip}:${custom_port}/admin${RESET}"
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}业务配置文件   : ${CONFIG_FILE}${RESET}"
+    fi
+    echo -e "${GREEN}====================================================${RESET}"
+}
+
+# 主菜单管理
+menu() {
     clear
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}   ◈    一键删除所有未运行项目    ◈     ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    
-    scan_projects
-
-    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
-        echo -e "${RED}未找到任何项目${RESET}"
-        sleep 1
-        return
-    fi
-
-    local deleted_any=false
-    for i in "${!PROJECT_PATHS[@]}"; do
-        local proj="${PROJECT_PATHS[$i]}"
-        local p_name="${PROJECT_NAMES[$i]}"
-        local l_compose=""
-        [ -f "$proj/docker-compose.yml" ] && l_compose="$proj/docker-compose.yml"
-        [ -f "$proj/docker-compose.yaml" ] && l_compose="$proj/docker-compose.yaml"
-        
-        local services=$(docker compose -f "$l_compose" ps --services 2>/dev/null)
-        local all_stopped=true
-        
-        for service in $services; do
-            local cid=$(docker compose -f "$l_compose" ps -q "$service" 2>/dev/null)
-            if [ -n "$cid" ]; then
-                local status=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)
-                if [[ "$status" == "true" ]]; then
-                    all_stopped=false
-                    break
-                fi
-            fi
-        done
-
-        if [ -n "$services" ] && $all_stopped; then
-            echo -e "${RED}准备删除未运行的项目: $p_name ($proj)${RESET}"
-            if confirm_action; then
-                docker compose -f "$l_compose" down --rmi all -v
-                rm -rf "$proj"
-                echo -e "${GREEN}已删除 $p_name${RESET}"
-                deleted_any=true
-            fi
-        fi
-    done
-
-    if ! $deleted_any; then
-        echo -e "${GREEN}没有未运行的项目需要删除${RESET}"
-    fi
-    action_done
+    get_status_info
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}        ◈ PPanel 管理面板 ◈        ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 当前状态 :${RESET} $status"
+    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 1. 部署启动${RESET}"
+    echo -e "${GREEN} 3. 卸载服务${RESET}" 
+    echo -e "${GREEN} 4. 启动服务${RESET}"
+    echo -e "${GREEN} 5. 停止服务${RESET}"
+    echo -e "${GREEN} 6. 重启服务${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_ppanel ;;
+        3) uninstall_ppanel ;;
+        4) start_ppanel ;;
+        5) stop_ppanel ;;
+        6) restart_ppanel ;;
+        7) logs_ppanel ;;
+        8) show_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入无效${RESET}" ;;
+    esac
 }
 
-# ---------------------------
-# 项目管理菜单
-# ---------------------------
-function project_menu() {
-    while true; do
-        clear
-        local project_name=$(basename "$PROJECT_DIR")
-        echo -e "${GREEN}=============================================${RESET}"
-        echo -e "${GREEN}        ◈  管理项目:${RESET} ${YELLOW}$project_name${RESET} ${GREEN} ◈      ${RESET}"
-        echo -e "${GREEN}=============================================${RESET}"
-
-        echo -e "${YELLOW}[ 当前容器实时状态 ]${RESET}"
-        local services=$(docker compose -f "$COMPOSE_FILE" ps --services 2>/dev/null)
-        if [ -z "$services" ]; then
-            echo -e "  ${YELLOW}暂无服务配置${RESET}"
-        else
-            for service in $services; do
-                local container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service" 2>/dev/null)
-                local ports="无端口映射"
-                local raw_status="Exited (0) 0 seconds ago"
-                
-                if [ -n "$container_id" ]; then
-                    raw_status=$(docker ps -a --filter "id=$container_id" --format "{{.Status}}")
-                    local port_info=$(docker ps -a --filter "id=$container_id" --format "{{.Ports}}")
-                    [ -n "$port_info" ] && ports=$port_info
-                fi
-                
-                local uptime=$(translate_status "$raw_status")
-                local status_icon="${RED}❌${RESET}"
-                [[ "$raw_status" == *"Up"* ]] && status_icon="${GREEN}✅${RESET}"
-                
-                echo -e "  ${YELLOW}◈ $service${RESET} $status_icon ${YELLOW}-> $uptime${RESET}"
-                echo -e "    ${YELLOW}└─ 端口:${RESET} ${GREEN}$ports${RESET}"
-            done
-        fi
-        echo -e "${GREEN}---------------------------------------------${RESET}"
-
-        echo -e "${GREEN} 1) 启动服务     |     2) 停止服务${RESET}"
-        echo -e "${GREEN} 3) 重启服务     |     4) 查看日志${RESET}"
-        echo -e "${GREEN} 5) 容器状态     |     6) 更新容器(pull&up)${RESET}"
-        echo -e "${GREEN} 7) 进入容器     |     8) 删除容器+镜像+卷${RESET}"
-        echo -e "${GREEN} 9) 删除容器     |    10) 删除整个项目${RESET}"
-        echo -e "${GREEN}11) 禁止公网     |    12) 允许公网${RESET}"
-        echo -e "${GREEN}=============================================${RESET}"
-        echo -e "${YELLOW}13) 切换项目     |     0) 返回主菜单${RESET}"
-        echo -e "${GREEN}=============================================${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case "$choice" in
-            1) docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
-            2) docker compose -f "$COMPOSE_FILE" stop && action_done ;;
-            3) docker compose -f "$COMPOSE_FILE" down && docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
-            4) docker compose -f "$COMPOSE_FILE" logs -f ; action_done ;;
-            5) docker compose -f "$COMPOSE_FILE" ps ; action_done ;;
-            6) docker compose -f "$COMPOSE_FILE" pull && docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
-            7) select_container ;;
-            8) if confirm_action; then docker compose -f "$COMPOSE_FILE" down --rmi all -v && action_done; fi ;;
-            9) if confirm_action; then docker compose -f "$COMPOSE_FILE" down && action_done; fi ;;
-            10) delete_project; return ;;
-            11) toggle_ip_binding "bind" ;;
-            12) toggle_ip_binding "unbind" ;;
-            13) select_project; return ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
-        esac
-    done
-}
-
-# ---------------------------
-# Docker 网络管理
-# ---------------------------
-function network_menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}    ◈    Docker 网络管理    ◈   ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}1) 查看所有网络${RESET}"
-        echo -e "${GREEN}2) 创建网络${RESET}"
-        echo -e "${GREEN}3) 删除网络${RESET}"
-        echo -e "${GREEN}4) 将容器加入网络（支持多选）${RESET}"
-        echo -e "${GREEN}5) 将容器退出网络（支持多选）${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case "$choice" in
-            1) docker network ls; read -p "按回车返回..." temp ;;
-            2)
-                read -p "请输入网络名称: " netname
-                read -p "请输入驱动 (bridge/overlay/macvlan，默认 bridge): " netdriver
-                netdriver=${netdriver:-bridge}
-                docker network create -d "$netdriver" "$netname" && echo -e "${GREEN}网络 $netname 创建成功${RESET}"
-                read -p "按回车返回..." temp
-                ;;
-            3)
-                docker network ls --format "{{.Name}}" | nl
-                read -p "请输入要删除的网络编号: " num
-                netname=$(docker network ls --format "{{.Name}}" | sed -n "${num}p")
-                if [ -n "$netname" ]; then
-                    docker network rm "$netname" && echo -e "${GREEN}网络 $netname 删除成功${RESET}"
-                else
-                    echo -e "${RED}无效编号${RESET}"
-                fi
-                read -p "按回车返回..." temp
-                ;;
-            4)
-                echo -e "${GREEN}可用网络：${RESET}"
-                docker network ls --format "{{.Name}}" | nl
-                read -p "请输入要加入的网络编号: " netnum
-                netname=$(docker network ls --format "{{.Name}}" | sed -n "${netnum}p")
-                if [ -z "$netname" ]; then read -p "无效编号，按回车返回..." temp; continue; fi
-
-                echo -e "${GREEN}正在运行的容器：${RESET}"
-                docker ps --format "{{.Names}}" | nl
-                read -p "请输入容器编号（空格分隔支持多选）: " cnumbers
-                for cnum in $cnumbers; do
-                    cname=$(docker ps --format "{{.Names}}" | sed -n "${cnum}p")
-                    [ -n "$cname" ] && docker network connect "$netname" "$cname" && echo -e "${GREEN}容器 $cname 已加入${RESET}"
-                done
-                read -p "按回车返回..." temp
-                ;;
-            5)
-                echo -e "${GREEN}可用网络：${RESET}"
-                docker network ls --format "{{.Name}}" | nl
-                read -p "请输入网络编号: " netnum
-                netname=$(docker network ls --format "{{.Name}}" | sed -n "${netnum}p")
-                if [ -z "$netname" ]; then read -p "无效编号，按回车返回..." temp; continue; fi
-
-                echo -e "${GREEN}已连接容器：${RESET}"
-                docker network inspect "$netname" --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | nl
-                read -p "请输入容器编号（空格分隔支持多选）: " cnumbers
-                containers=($(docker network inspect "$netname" --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n'))
-                for cnum in $cnumbers; do
-                    cname=${containers[$((cnum-1))]}
-                    [ -n "$cname" ] && docker network disconnect "$netname" "$cname" && echo -e "${GREEN}容器 $cname 已退出${RESET}"
-                done
-                read -p "按回车返回..." temp
-                ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
-        esac
-    done
-}
-
-# ---------------------------
-# 主菜单
-# ---------------------------
-function main_menu() {
-    while true; do
-        clear
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} ◈  Docker Compose 项目管理  ◈ ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}1) 管理项目${RESET}"
-        echo -e "${GREEN}2) 网络管理${RESET}"
-        echo -e "${GREEN}3) 查看容器运行状态${RESET}"
-        echo -e "${GREEN}4) 多选删除项目${RESET}"
-        echo -e "${GREEN}5) 删除未运行的项目${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case "$choice" in
-            1) select_project ;;
-            2) network_menu ;;
-            3) monitor_docker_containers ;;
-            4) delete_multiple_projects ;;
-            5) delete_all_stopped_projects ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
-        esac
-    done
-}
-
-# 启动
-main_menu
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

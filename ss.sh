@@ -135,14 +135,15 @@ login_claude() {
     fi
 }
 
-# 5. 配置高级自定义 API 模型与路径 (模型全自定义版)
+# 5. 配置高级自定义 API 模型与路径 (严格对标智谱模板版)
 config_custom_api() {
-    local CLAUDE_JSON="$HOME/.claude.json"
+    local SETTINGS_JSON="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
     
     echo -e "\n${GREEN}================================${RESET}"
     echo -e "${GREEN}      自定义 API 配置管理       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 快捷设置自定义中转与模型${RESET}"
+    echo -e "${GREEN}1. 快捷一键生成标准持久化代理环境${RESET}"
     echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
     echo -e "${GREEN}0. 返回主菜单${RESET}"
     echo -e "${GREEN}================================${RESET}"
@@ -151,55 +152,62 @@ config_custom_api() {
 
     case $api_choice in
         1)
-            echo -e "\n${YELLOW}1/3. 请输入自定义 API 中转地址/网关:${RESET}"
-            echo -ne "   (例如: https://api.deepseek.com/anthropic 或 https://www.soyenai.com/v1)\n   地址: "
+            echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关:${RESET}"
+            echo -ne "   (例如: https://open.bigmodel.cn/api/anthropic)\n   地址: "
             read input_url
             
-            echo -e "\n${YELLOW}2/3. 请输入你的 API Key / Token:${RESET}"
+            echo -e "\n${YELLOW}2/4. 请输入你的 API Key / 密钥 Token:${RESET}"
             echo -ne "   秘钥: "
             read input_key
 
-            echo -e "\n${YELLOW}3/3. 请输入你想指定的自定义模型名称:${RESET}"
-            echo -ne "   (例如: deepseek-chat 或 GLM-5)\n   模型名: "
+            echo -e "\n${YELLOW}3/4. 请输入主核心模型 (直接回车默认: glm-4.6):${RESET}"
+            echo -ne "   模型名: "
             read input_model
+            [ -z "$input_model" ] && input_model="glm-4.6"
 
-            if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ]; then
-                # 写入最新的 JSON 规范，利用内层 env 劫持自定义模型
-                cat << EOF > "$CLAUDE_JSON"
+            echo -e "\n${YELLOW}4/4. 请输入子代理模型 (直接回车默认: glm-4.5-air):${RESET}"
+            echo -ne "   模型名: "
+            read input_submodel
+            [ -z "$input_submodel" ] && input_submodel="glm-4.5-air"
+
+            if [ -n "$input_url" ] && [ -n "$input_key" ]; then
+                # 【严格对标模板】完美还原您发出来的 JSON 结构与字段名
+                # 移除了所有多余的外部参数和注释，保证格式 100% 纯净
+                cat << EOF > "$SETTINGS_JSON"
 {
-  "theme": "dark",
-  "model": "claude-3-5-sonnet",
   "env": {
-    "ANTHROPIC_BASE_URL": "$input_url",
     "ANTHROPIC_AUTH_TOKEN": "$input_key",
-    "ANTHROPIC_MODEL": "$input_model",
+    "ANTHROPIC_BASE_URL": "$input_url",
+    "API_TIMEOUT_MS": "3000000",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "$input_model",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "$input_model",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$input_model"
   }
 }
 EOF
-                # 彻底清理可能残留的外层全局系统环境变量，交由 JSON 统一接管
+                # 清理干净老脚本和环境变量的遗留影响
                 rm -f "$ENV_FILE"
+                rm -f "$HOME/.claude.json"
                 unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
                 unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
                 unset CLAUDE_CODE_SUBAGENT_MODEL
 
-                echo -e "\n${GREEN}✔ 恭喜！自定义模型与中转已成功写入 ~/.claude.json。${RESET}"
+                echo -e "\n${GREEN}✔ 成功！已严格按照模板固化配置至: $SETTINGS_JSON${RESET}"
             else
-                echo -e "${RED}输入不能为空，取消设置。${RESET}"
+                echo -e "${RED}地址和密钥不能为空，取消设置。${RESET}"
             fi
             ;;
         2)
-            cat << EOF > "$CLAUDE_JSON"
+            # 恢复初始空配置
+            cat << EOF > "$SETTINGS_JSON"
 {
-  "theme": "dark",
-  "model": "claude-3-5-sonnet"
+  "env": {}
 }
 EOF
             rm -f "$ENV_FILE"
+            rm -f "$HOME/.claude.json"
             unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-            echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复官方默认。${RESET}"
+            echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复官方初始 settings.json。${RESET}"
             ;;
         *)
             return
@@ -207,7 +215,6 @@ EOF
     esac
     echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
-
 # 主循环
 while true; do
     show_menu

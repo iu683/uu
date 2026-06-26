@@ -135,7 +135,7 @@ login_claude() {
     fi
 }
 
-# 5. 配置高级自定义 API 模型与路径 (完美解决 2.1.195 本地拦截版)
+# 5. 配置高级自定义 API 模型与路径 (严格复刻通用无错版)
 config_custom_api() {
     local SETTINGS_JSON="$HOME/.claude/settings.json"
     local ONBOARDING_JSON="$HOME/.claude.json"
@@ -144,7 +144,7 @@ config_custom_api() {
     echo -e "\n${GREEN}================================${RESET}"
     echo -e "${GREEN}      通用自定义 API 配置       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 一键快捷生成通用持久化代理环境${RESET}"
+    echo -e "${GREEN}1. 快捷一键生成通用持久化代理环境${RESET}"
     echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
     echo -e "${GREEN}0. 返回主菜单${RESET}"
     echo -e "${GREEN}================================${RESET}"
@@ -153,57 +153,46 @@ config_custom_api() {
 
     case $api_choice in
         1)
-            echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关:${RESET}"
-            echo -ne "   (例如: https://qianxing-ai.cc.cd/v1)\n   地址: "
+            echo -e "\n${YELLOW}1/3. 请输入自定义 API 中转地址/网关:${RESET}"
+            echo -ne "   (例如: https://api.deepseek.com/anthropic)\n   地址: "
             read input_url
             
-            echo -e "\n${YELLOW}2/4. 请输入你的 API Key / 密钥 Token:${RESET}"
+            echo -e "\n${YELLOW}2/3. 请输入你的 API Key / 密钥 Token:${RESET}"
             echo -ne "   秘钥: "
             read input_key
 
-            echo -e "\n${YELLOW}3/4. 请输入你想指定的主核心模型:${RESET}"
-            echo -ne "   (例如: gpt-5.4):\n   模型名: "
+            echo -e "\n${YELLOW}3/3. 请输入你想指定的目标模型名称:${RESET}"
+            echo -ne "   (例如: DeepSeek-V4-Pro 或 gpt-5.4)\n   模型名: "
             read input_model
 
-            echo -e "\n${YELLOW}4/4. 请输入你想指定的子代理快速模型:${RESET}"
-            echo -ne "   (例如: gpt-5.4):\n   模型名: "
-            read input_submodel
-
-            if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ] && [ -n "$input_submodel" ]; then
+            if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ]; then
                 
-                # 【第一步：注入绕过官方登录验证补丁】
+                # 自动注入免登录验证凭证
                 cat << EOF > "$ONBOARDING_JSON"
 {
   "hasCompletedOnboarding": true
 }
 EOF
 
-                # 【第二步：里应外合生成设置】
-                # 1. 内层严格按照说明书规范将核心、Opus、Sonnet、Haiku 全量劫持为你的自定义模型
-                # 2. 最外层强行指定 "model": "sonnet"，用来欺骗本地中间件放行请求
+                # 【100% 严格复刻你发出来的最终成功模板】
+                # 只在内层 env 里保留最纯净的 5 个核心基础字段，不夹杂任何多余结构
                 cat << EOF > "$SETTINGS_JSON"
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "$input_url",
     "ANTHROPIC_AUTH_TOKEN": "$input_key",
+    "ANTHROPIC_BASE_URL": "$input_url",
     "ANTHROPIC_MODEL": "$input_model",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$input_model",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$input_model",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel",
+    "API_TIMEOUT_MS": "3000000",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
-  },
-  "model": "sonnet",
-  "theme": "dark"
+  }
 }
 EOF
-                # 清除系统内存中可能存在的冲突变量
+                # 物理清理可能引起冲突的老变量和局部历史文件
                 unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
                 unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
-                unset CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_SMALL_FAST_MODEL
+                unset CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_CUSTOM_MODEL_OPTION
 
-                echo -e "\n${GREEN}✔ 终极配置成功！${RESET}"
-                echo -e "${GREEN}✔ 已生成验证免登文件: $ONBOARDING_JSON${RESET}"
-                echo -e "${GREEN}✔ 已写入「里应外合」防拦截配置: $SETTINGS_JSON${RESET}"
+                echo -e "\n${GREEN}✔ 成功！已严格按照最新成功模板固化配置至: $SETTINGS_JSON${RESET}"
             else
                 echo -e "${RED}所有输入均不能为空，取消设置。${RESET}"
             fi
@@ -211,13 +200,11 @@ EOF
         2)
             cat << EOF > "$SETTINGS_JSON"
 {
-  "env": {},
-  "model": "sonnet",
-  "theme": "dark"
+  "env": {}
 }
 EOF
             rm -f "$ONBOARDING_JSON"
-            echo -e "${GREEN}✔ 已彻底清除自定义配置，恢复官方基础 settings.json。${RESET}"
+            echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复初始 settings.json。${RESET}"
             ;;
         *)
             return

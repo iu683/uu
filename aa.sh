@@ -135,18 +135,15 @@ login_claude() {
     fi
 }
 
-# 5. 配置高级自定义 API 模型与路径 (精准接管全局 settings.json 版)
+# 5. 配置高级自定义 API 模型与路径 (最新通用标准环境版)
 config_custom_api() {
-    # 锁定真正的官方全局配置文件路径
     local SETTINGS_JSON="$HOME/.claude/settings.json"
-    
-    # 确保文件夹存在，防止首次配置时报错
     mkdir -p "$HOME/.claude"
     
     echo -e "\n${GREEN}================================${RESET}"
-    echo -e "${GREEN}      自定义 API 配置管理       ${RESET}"
+    echo -e "${GREEN}      通用自定义 API 配置       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 快捷设置全局自定义中转与模型${RESET}"
+    echo -e "${GREEN}1. 快捷一键生成通用持久化代理环境${RESET}"
     echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
     echo -e "${GREEN}0. 返回主菜单${RESET}"
     echo -e "${GREEN}================================${RESET}"
@@ -155,66 +152,58 @@ config_custom_api() {
 
     case $api_choice in
         1)
-            echo -e "\n${YELLOW}1/3. 请输入自定义 API 中转地址/网关:${RESET}"
-            echo -ne "   (提示: 中转通常需带 /v1，例如: https://www.soyenai.com/v1)\n   地址: "
+            echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关:${RESET}"
+            echo -ne "   (例如: https://qianxing-ai.cc.cd/v1)\n   地址: "
             read input_url
             
-            echo -e "\n${YELLOW}2/3. 请输入你的 API Key / Token:${RESET}"
+            echo -e "\n${YELLOW}2/4. 请输入你的 API Key / 密钥 Token:${RESET}"
             echo -ne "   秘钥: "
             read input_key
 
-            echo -e "\n${YELLOW}3/3. 请输入你想指定的自定义模型名称:${RESET}"
-            echo -ne "   (例如: deepseek-chat 或 GLM-5)\n   模型名: "
+            echo -e "\n${YELLOW}3/4. 请输入你想指定的主核心模型 (例如: gpt-5.4):${RESET}"
+            echo -ne "   模型名: "
             read input_model
 
-            if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ]; then
-                # 【核心修正】直接全量重写官方真正读取的 /root/.claude/settings.json
-                # 1. 规避官方客户端的模型名字白名单校验，最外层必须用符合规范的有效基础模型
-                # 2. 内层通过标准的 env 变量将请求 100% 替换为你完全自定义的模型
+            echo -e "\n${YELLOW}4/4. 请输入你想指定的子代理快速模型 (例如: gpt-5.4):${RESET}"
+            echo -ne "   模型名: "
+            read input_submodel
+
+            if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ] && [ -n "$input_submodel" ]; then
+                # 【100% 严格复刻你提供的最新标准模板】
+                # 依靠 ANTHROPIC_MODEL 和 ANTHROPIC_SMALL_FAST_MODEL 全面接管主副模型
+                # 没有外层杂质，结构极其纯净
                 cat << EOF > "$SETTINGS_JSON"
 {
   "env": {
     "ANTHROPIC_BASE_URL": "$input_url",
-    "CLAUDE_BASE_URL": "$input_url",
     "ANTHROPIC_AUTH_TOKEN": "$input_key",
     "ANTHROPIC_MODEL": "$input_model",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$input_model",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "$input_model",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1
-  },
-  "permissions": {
-    "allow": [],
-    "deny": []
+    "ANTHROPIC_SMALL_FAST_MODEL": "$input_submodel"
   }
 }
 EOF
-                # 清除历史脚本留在环境里的多余干扰文件和环境变量
+                # 全量清理可能冲突的历史环境变量与干扰局部文件
                 rm -f "$ENV_FILE"
                 rm -f "$HOME/.claude.json"
                 unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
                 unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
-                unset CLAUDE_CODE_SUBAGENT_MODEL
+                unset CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_SMALL_FAST_MODEL
 
-                echo -e "\n${GREEN}✔ 成功！已精准覆写并固化至: $SETTINGS_JSON${RESET}"
+                echo -e "\n${GREEN}✔ 成功！已严格按照最新标准模板固化配置至: $SETTINGS_JSON${RESET}"
             else
-                echo -e "${RED}输入不能为空，取消设置。${RESET}"
+                echo -e "${RED}所有输入均不能为空，取消设置。${RESET}"
             fi
             ;;
         2)
-            # 恢复默认：给它一个完全干净且合规的初始 JSON 骨架
             cat << EOF > "$SETTINGS_JSON"
 {
-  "env": {},
-  "permissions": {
-    "allow": [],
-    "deny": []
-  }
+  "env": {}
 }
 EOF
             rm -f "$ENV_FILE"
             rm -f "$HOME/.claude.json"
             unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-            echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复官方初始 settings.json。${RESET}"
+            echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复初始空配置。${RESET}"
             ;;
         *)
             return

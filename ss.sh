@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# wg-easy 工具箱 Docker Compose 管理面板 
+# LinuxServer WireGuard 工具箱 Docker Compose 管理面板
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="wg-easy"
-BASE_DIR="/opt/wg-easy"
+CONTAINER_NAME="wireguard"
+BASE_DIR="/opt/wireguard-ls"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -23,9 +23,8 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态和配置信息
+# 动态获取容器状态和端口信息
 get_status_info() {
-    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -34,12 +33,11 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 从映射获取 WebUI 端口（默认 51821）
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "51821/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="51821"
+    if [ -f "$ENV_FILE" ]; then
+        source "$ENV_FILE"
+        wg_port="$WG_SERVER_PORT"
     else
-        webui_port="N/A"
+        wg_port="19999"
     fi
 }
 
@@ -67,116 +65,109 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 wg-easy
+# 部署 WireGuard
 install_utils() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义 wg-easy 参数配置 ======${RESET}"
-    echo -e "${RED}注意: 该服务需要管理内核网络模块，确保已具备 NET_ADMIN 权限。${RESET}"
-
-    # 获取系统公网 IP 作为默认的 WG HOST
+    echo -e "${CYAN}====== 自定义 WireGuard 参数配置 ======${RESET}"
+    
+    CURRENT_UID=$(id -u)
+    CURRENT_GID=$(id -g)
     DETECT_IP=$(get_public_ip)
 
-    # 1. 配置 WG_HOST (客户端连接用的外部 IP 或域名)
-    echo -ne "${YELLOW}请输入客户端连接的公网 IP 或域名 (WG_HOST) [默认: ${DETECT_IP}]: ${RESET}"
-    read -r custom_host
-    [[ -z "$custom_host" ]] && custom_host="$DETECT_IP"
-
-    # 2. 配置 WebUI 访问端口
-    echo -ne "${YELLOW}请输入 Web 面板访问端口 [默认: 51821]: ${RESET}"
-    read -r custom_ui_port
-    [[ -z "$custom_ui_port" ]] && custom_ui_port="51821"
-    if ! [[ "$custom_ui_port" =~ ^[0-9]+$ ]]; then
+    # 1. 配置宿主机对外监听端口
+    echo -ne "${YELLOW}请输入宿主机外部监听端口 [默认: 19999]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="19999"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 3. 配置 WireGuard UDP 传输端口
-    echo -ne "${YELLOW}请输入 WireGuard UDP 传输端口 [默认: 51820]: ${RESET}"
-    read -r custom_wg_port
-    [[ -z "$custom_wg_port" ]] && custom_wg_port="51820"
-    if ! [[ "$custom_wg_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
+    # 2. 配置服务器外部 IP / 域名
+    echo -ne "${YELLOW}请输入服务器公网 IP 或域名 (SERVERURL) [默认: ${DETECT_IP}]: ${RESET}"
+    read -r custom_url
+    [[ -z "$custom_url" ]] && custom_url="$DETECT_IP"
 
-    # 4. 配置 WebUI 登录密码 (可选扩展项，官方支持 PASSWORD 变量)
-    echo -ne "${YELLOW}请输入 Web 面板登录密码 (直接回车不设置密码): ${RESET}"
-    read -r ui_password
+    # 3. 配置内部虚拟子网段 (INTERNAL_SUBNET)
+    echo -ne "${YELLOW}请输入 VPN 内部虚拟子网段 [默认: 10.13.13.0]: ${RESET}"
+    read -r custom_subnet
+    [[ -z "$custom_subnet" ]] && custom_subnet="10.13.13.0"
+
+    # 4. 配置初始生成的客户端数量
+    echo -ne "${YELLOW}请输入初始生成的客户端(Peers)数量 [默认: 3]: ${RESET}"
+    read -r custom_peers
+    [[ -z "$custom_peers" ]] && custom_peers="3"
+
+    # 5. 配置客户端使用的 DNS
+    echo -ne "${YELLOW}请输入客户端 DNS (PEERDNS) [默认: 1.1.1.1]: ${RESET}"
+    read -r custom_dns
+    [[ -z "$custom_dns" ]] && custom_dns="1.1.1.1"
+
+    # 6. 配置宿主机数据挂载路径
+    echo -ne "${YELLOW}请输入配置数据挂载路径 [默认: /opt/wireguard-ls/config]: ${RESET}"
+    read -r host_config_path
+    [[ -z "$host_config_path" ]] && host_config_path="/opt/wireguard-ls/config"
+    mkdir -p "$host_config_path"
 
     # 写入 .env 文件
     cat <<EOF > "$ENV_FILE"
-WG_HOST=${custom_host}
-WEBUI_PORT=${custom_ui_port}
-WG_PORT=${custom_wg_port}
+WG_UID=${CURRENT_UID}
+WG_GID=${CURRENT_GID}
+WG_SERVER_URL=${custom_url}
+WG_SERVER_PORT=${custom_port}
+WG_SUBNET=${custom_subnet}
+WG_PEERS=${custom_peers}
+WG_DNS=${custom_dns}
+WG_HOST_CONFIG=${host_config_path}
 EOF
 
-    # 如果输入了密码，追加到环境变量
-    local env_pass_line=""
-    if [[ -n "$ui_password" ]]; then
-        env_pass_line="      - PASSWORD=${ui_password}"
-    fi
-
-    # 5. 动态生成完全保留高级双栈网络划分的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合标准的高级网络 docker-compose.yml 配置文件...${RESET}"
+    # 动态生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
-volumes:
-  etc_wireguard:
-
 services:
-  wg-easy:
-    image: ghcr.io/wg-easy/wg-easy:15
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    environment:
-      - WG_HOST=\${WG_HOST}
-$(if [[ -n "$env_pass_line" ]]; then echo "$env_pass_line"; fi)
-    networks:
-      wg:
-        ipv4_address: 10.42.42.42
-        ipv6_address: fdcc:ad94:bacf:61a3::2a
-    volumes:
-      - etc_wireguard:/etc/wireguard
-      - /lib/modules:/lib/modules:ro
-    ports:
-      - "\${WG_PORT}:51820/udp"
-      - "\${WEBUI_PORT}:51821/tcp"
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
+    environment:
+      - PUID=\${WG_UID}
+      - PGID=\${WG_GID}
+      - TZ=Asia/Shanghai
+      - SERVERURL=\${WG_SERVER_URL}
+      - SERVERPORT=\${WG_SERVER_PORT}
+      - INTERNAL_SUBNET=\${WG_SUBNET}
+      - PEERS=\${WG_PEERS}
+      - PEERDNS=\${WG_DNS}
+      - ALLOWEDIPS=0.0.0.0/0,::/0
+    volumes:
+      - \${WG_HOST_CONFIG}:/config
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "\${WG_SERVER_PORT}:51820/udp"
     sysctls:
-      - net.ipv4.ip_forward=1
       - net.ipv4.conf.all.src_valid_mark=1
-      - net.ipv6.conf.all.disable_ipv6=0
-      - net.ipv6.conf.all.forwarding=1
-      - net.ipv6.conf.default.forwarding=1
-
-networks:
-  wg:
-    driver: bridge
-    enable_ipv6: true
-    ipam:
-      driver: default
-      config:
-        - subnet: 10.42.42.0/24
-        - subnet: fdcc:ad94:bacf:61a3::/64
+    restart: unless-stopped
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 wg-easy...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 WireGuard...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化并创建网络网卡 (约3秒)...${RESET}"
-    sleep 3
+    echo -e "${YELLOW}等待容器初始化并生成密钥文件 (约5秒)...${RESET}"
+    sleep 5
 
     echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN}          wg-easy 双栈面板部署成功！             ${RESET}"
+    echo -e "${GREEN}          WireGuard 服务部署成功！               ${RESET}"
     echo -e "${GREEN}================================================${RESET}"
-    echo -e "${YELLOW}Web 管理面板地址 : http://${DETECT_IP}:${custom_ui_port}${RESET}"
-    [[ -n "$ui_password" ]] && echo -e "${YELLOW}面板登录管理密码 : ${ui_password}${RESET}"
-    echo -e "${YELLOW}WireGuard节点端口: ${custom_wg_port} (UDP)${RESET}"
-    echo -e "${YELLOW}客户端连回宿主机 : ${custom_host}${RESET}"
-    echo -e "${YELLOW}配置文件存储路径 : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}服务监听端口   : ${custom_port} (UDP)${RESET}"
+    echo -e "${YELLOW}外部连接域名/IP : ${custom_url}${RESET}"
+    echo -e "${YELLOW}内部虚拟网段   : ${custom_subnet}${RESET}"
+    echo -e "${YELLOW}初始客户端数量 : ${custom_peers} 个${RESET}"
+    echo -e "${YELLOW}客户端配置文件 : ${host_config_path}${RESET}"
+    echo -e "${CYAN}提示：你可以在 ${host_config_path} 下找到 peer1, peer2... 的配置和二维码图片。${RESET}"
     echo -e "${GREEN}================================================${RESET}"
 }
 
@@ -194,19 +185,24 @@ update_utils() {
 
 # 卸载容器
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 wg-easy 容器及自定义双栈网络吗？(y/n) [默认: N]: ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 WireGuard 容器吗？(y/n) [默认: N]: ${RESET}"
     read -r confirm
     [[ -z "$confirm" ]] && confirm="N"
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down -v
-            echo -e "${GREEN}容器、双栈桥接网络及 Volume 临时缓存数据已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地配置文件目录？(y/n) [默认: N]: ${RESET}"
-            read -r clean_data
-            [[ -z "$clean_data" ]] && clean_data="N"
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}面板配置目录已彻底清理。${RESET}"
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            
+            if [ -f "$ENV_FILE" ]; then
+                source "$ENV_FILE"
+                echo -ne "${YELLOW}是否同时删除生成的客户端配置与密钥目录 (${WG_HOST_CONFIG})？(y/n) [默认: N]: ${RESET}"
+                read -r clean_data
+                [[ -z "$clean_data" ]] && clean_data="N"
+                if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                    rm -rf "$WG_HOST_CONFIG"
+                    rm -rf "$BASE_DIR"
+                    echo -e "${GREEN}所有客户端配置数据及管理脚本目录已彻底清理。${RESET}"
+                fi
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -224,26 +220,118 @@ show_info() {
     get_status_info
     if [ -f "$ENV_FILE" ]; then
         source "$ENV_FILE"
-        DETECT_IP=$(get_public_ip)
         echo -e "${GREEN}================================================${RESET}"
         echo -e "${YELLOW}当前状态       : $status"
-        echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${WEBUI_PORT}${RESET}"
-        echo -e "${YELLOW}WireGuard 端口 : ${WG_PORT} (UDP)"
-        echo -e "${YELLOW}下发客户端 HOST: ${WG_HOST}"
+        echo -e "${YELLOW}监听连接端口   : ${WG_SERVER_PORT} (UDP)"
+        echo -e "${YELLOW}公网公告地址   : ${WG_SERVER_URL}"
+        echo -e "${YELLOW}VPN 内部子网   : ${WG_SUBNET}"
+        echo -e "${YELLOW}配置下发数量   : ${WG_PEERS} 个"
+        echo -e "${YELLOW}配置存储路径   : ${WG_HOST_CONFIG}"
+        echo -e "${GREEN}================================================${RESET}"
+        if [ -d "$WG_HOST_CONFIG" ]; then
+            echo -e "${CYAN}当前已生成的客户端列表如下:${RESET}"
+            ls -d "$WG_HOST_CONFIG"/peer* 2>/dev/null | sed 's|.*/||' | sed 's/^/  - /'
+        fi
         echo -e "${GREEN}================================================${RESET}"
     else
         echo -e "${RED}未检测到部署配置环境。${RESET}"
     fi
 }
 
+
+# 查看特定 Peer 的连接详细信息和终端二维码（完美修复版）
+show_peer_connections() {
+    if [ ! -f "$ENV_FILE" ]; then
+        echo -e "${RED}错误: 未检测到环境配置文件，请先部署容器！${RESET}"
+        return
+    fi
+    source "$ENV_FILE"
+    
+    if [ ! -d "$WG_HOST_CONFIG" ]; then
+        echo -e "${RED}错误: 配置挂载路径不存在，请确认容器是否已正常启动并生成配置。${RESET}"
+        return
+    fi
+
+    # 获取所有 peer 目录并存入数组
+    local peers=($(ls -d "$WG_HOST_CONFIG"/peer* 2>/dev/null | sed 's|.*/||' | sort -V))
+    
+    if [ ${#peers[@]} -eq 0 ]; then
+        echo -e "${RED}未找到任何已生成的客户端 (peer) 配置。${RESET}"
+        return
+    fi
+
+    while true; do
+        clear
+        echo -e "${GREEN}=====================================${RESET}"
+        echo -e "${GREEN}    ◈  客户端 (Peer) 连接信息面板  ◈     ${RESET}"
+        echo -e "${GREEN}=====================================${RESET}"
+        echo -e "${CYAN}请选择要查看的客户端：${RESET}"
+        
+        for i in "${!peers[@]}"; do
+            echo -e "${GREEN}$((i+1)). ${peers[$i]}${RESET}"
+        done
+        echo -e "${GREEN}0. 返回主菜单${RESET}"
+        echo -e "${GREEN}=====================================${RESET}"
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read -r peer_choice
+
+        if [[ "$peer_choice" == "0" ]]; then
+            break
+        elif [[ "$peer_choice" =~ ^[0-9]+$ ]] && [ "$peer_choice" -le "${#peers[@]}" ] && [ "$peer_choice" -gt 0 ]; then
+            local target_peer="${peers[$((peer_choice-1))]}"
+            local peer_dir="$WG_HOST_CONFIG/$target_peer"
+            local conf_file="$peer_dir/${target_peer}.conf"
+            local qr_file="$peer_dir/${target_peer}.png"
+
+            clear
+            echo -e "${GREEN}======================================================================${RESET}"
+            echo -e "${YELLOW}>> 正在查看客户端: ${target_peer}${RESET}"
+            echo -e "${GREEN}======================================================================${RESET}"
+            
+            # 1. 打印文本配置
+            if [ -f "$conf_file" ]; then
+                echo -e "${CYAN}[ 配置文件内容 (${target_peer}.conf) ]${RESET}"
+                cat "$conf_file"
+                echo ""
+            else
+                echo -e "${RED}未找到文本配置文件: $conf_file${RESET}"
+            fi
+
+            echo -e "${GREEN}----------------------------------------------------------------------${RESET}"
+
+            # 2. 完美渲染：由于映射关系，宿主机的 $conf_file 对应容器内的 /config/$target_peer/${target_peer}.conf
+            echo -e "${CYAN}[ 手机扫描二维码连接 ]${RESET}"
+            if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+                # 直接让容器内部的 qrencode 读取它内部路径下的配置文件，完美解决输入流穿透导致的 ANSI 渲染失败
+                docker exec -it "$CONTAINER_NAME" qrencode -t ansiutf8 -r "/config/${target_peer}/${target_peer}.conf" 2>/dev/null
+                if [ $? -ne 0 ]; then
+                    # 备用方案：如果极少数精简版终端不支持 ansiutf8 编码，退回到标准 ansi 模式
+                    docker exec -it "$CONTAINER_NAME" qrencode -t ansi -r "/config/${target_peer}/${target_peer}.conf" 2>/dev/null
+                fi
+            else
+                echo -e "${RED}提示：容器未在运行中，无法动态生成终端二维码。${RESET}"
+                echo -e "${YELLOW}你可以直接复制上方文本配置，或前往以下路径查看二维码图片：${RESET}"
+                echo -e "${YELLOW}$qr_file${RESET}"
+            fi
+            echo -e "${GREEN}======================================================================${RESET}"
+            
+            echo -ne "${YELLOW}按回车键返回客户端列表...${RESET}"
+            read -r
+        else
+            echo -e "${RED}无效选项，请重新输入！${RESET}"
+            sleep 1
+        fi
+    done
+}
+
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  wg-easy  管理面板 ◈     ${RESET}"
+    echo -e "${GREEN}   ◈  WireGuard 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${wg_port} (UDP)${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -253,6 +341,7 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 查看客户端连接信息与二维码 🌟${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
@@ -266,6 +355,7 @@ menu() {
         6) restart_utils ;;
         7) logs_utils ;;
         8) show_info ;;
+        9) show_peer_connections ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

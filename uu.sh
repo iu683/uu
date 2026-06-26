@@ -135,13 +135,14 @@ login_claude() {
     fi
 }
 
-# 5. 配置高级自定义 API 模型与路径 (通用标准模板版)
+# 5. 配置高级自定义 API 模型与路径 (严格对标官方说明书闭环版)
 config_custom_api() {
     local SETTINGS_JSON="$HOME/.claude/settings.json"
+    local ONBOARDING_JSON="$HOME/.claude.json"
     mkdir -p "$HOME/.claude"
     
     echo -e "\n${GREEN}================================${RESET}"
-    echo -e "${GREEN}      自定义 API 配置管理       ${RESET}"
+    echo -e "${GREEN}      通用自定义 API 配置       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 快捷一键生成通用持久化代理环境${RESET}"
     echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
@@ -161,52 +162,62 @@ config_custom_api() {
             read input_key
 
             echo -e "\n${YELLOW}3/4. 请输入你想指定的主核心模型:${RESET}"
-            echo -ne "   模型名: "
+            echo -ne "   (例如: gpt-5.4)\n   模型名: "
             read input_model
 
-            echo -e "\n${YELLOW}4/4. 请输入你想指定的子代理 (Haiku) 模型:${RESET}"
-            echo -ne "   模型名: "
+            echo -e "\n${YELLOW}4/4. 请输入你想指定的子代理快速模型:${RESET}"
+            echo -ne "   (例如: gpt-5.4)\n   模型名: "
             read input_submodel
 
             if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ] && [ -n "$input_submodel" ]; then
-                # 【严格对标通用模板】
-                # 只保留一个顶层的 env 块，里面存放完全由你输入的自定义中转和模型
-                # 没有外层多余的干扰项，也没有任何带双引号的非法数字类型
+                
+                # 【第一步：强行注入免登录验证凭证（绕过 Onboarding）】
+                cat << EOF > "$ONBOARDING_JSON"
+{
+  "hasCompletedOnboarding": true
+}
+EOF
+
+                # 【第二步：严格遵循说明书别名机制生成 settings.json】
+                # 1. 最外层 model 必须使用官方合规别名 "sonnet"（欺骗客户端本地校验放行）
+                # 2. 内层 env 使用官方说明书提供的四个核心重定向别名，全量映射为用户的真实自定义模型
                 cat << EOF > "$SETTINGS_JSON"
 {
   "env": {
-    "ANTHROPIC_AUTH_TOKEN": "$input_key",
     "ANTHROPIC_BASE_URL": "$input_url",
-    "API_TIMEOUT_MS": "3000000",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel",
+    "ANTHROPIC_AUTH_TOKEN": "$input_key",
+    "ANTHROPIC_MODEL": "sonnet",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$input_model",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "$input_model",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$input_model"
-  }
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "model": "sonnet",
+  "theme": "dark"
 }
 EOF
-                # 全量物理清理老脚本和系统内存中遗留的环境变量，防冲突
-                rm -f "$ENV_FILE"
-                rm -f "$HOME/.claude.json"
+                # 物理清理老脚本和系统内存中 export 的环境变量干扰，防止别名冲突
                 unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
                 unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
-                unset CLAUDE_CODE_SUBAGENT_MODEL
+                unset CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_SMALL_FAST_MODEL
 
-                echo -e "\n${GREEN}✔ 成功！已严格按照通用模板固化配置至: $SETTINGS_JSON${RESET}"
+                echo -e "\n${GREEN}✔ 终极配置成功！${RESET}"
+                echo -e "${GREEN}✔ 已生成验证免登文件: $ONBOARDING_JSON${RESET}"
+                echo -e "${GREEN}✔ 已严格依据说明书建立别名映射: $SETTINGS_JSON${RESET}"
             else
                 echo -e "${RED}所有输入均不能为空，取消设置。${RESET}"
             fi
             ;;
         2)
-            # 恢复初始空配置
             cat << EOF > "$SETTINGS_JSON"
 {
-  "env": {}
+  "env": {},
+  "model": "sonnet",
+  "theme": "dark"
 }
 EOF
-            rm -f "$ENV_FILE"
-            rm -f "$HOME/.claude.json"
-            unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-            echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复初始空配置。${RESET}"
+            rm -f "$ONBOARDING_JSON"
+            echo -e "${GREEN}✔ 已彻底清除自定义配置，恢复官方初始状态。${RESET}"
             ;;
         *)
             return

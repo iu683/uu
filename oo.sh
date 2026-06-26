@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# ForwardX 端口转发管理面板 Docker Compose 管理面板 
+# Xboard Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="forwardx-panel"
-BASE_DIR="/opt/forwardx"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
+CONTAINER_NAME="xboard"
+BASE_DIR="/opt/xboard"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yaml"
 
 # 检测依赖
 check_dependencies() {
@@ -21,36 +20,35 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
+    if ! command -v git &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
+        exit 1
+    fi
 }
 
-# 动态获取容器状态、映射端口和挂载目录
+# 动态获取容器状态
 get_status_info() {
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+    if [ "$(docker ps -q -f name=xboard)" ]; then
         status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        REAL_CONTAINER=$(docker ps --format "{{.Names}}" -f name=xboard | head -n 1)
+    elif [ "$(docker ps -aq -f name=xboard)" ]; then
         status="${RED}已停止${RESET}"
+        REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
     else
         status="${RED}未部署${RESET}"
+        REAL_CONTAINER=""
     fi
 
-    # 2. 如果容器存在，从容器状态中提取实际端口和本地挂载路径
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+    if [ -n "$REAL_CONTAINER" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$REAL_CONTAINER" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 提取端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3000"
-
-        # 提取本地挂载路径（宿主机映射到容器内 /data 的地方）
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/data"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "7001/tcp") 0).HostPort}}' "$REAL_CONTAINER" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$REAL_CONTAINER" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="7001"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        data_dir="N/A"
     fi
 }
 
@@ -78,163 +76,152 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 生成随机 JWT 密钥
-generate_jwt_secret() {
-    if command -v openssl &> /dev/null; then
-        openssl_rand=$(openssl rand -hex 16 2>/dev/null)
-        if [[ -n "$openssl_rand" ]]; then echo "$openssl_rand"; return; fi
-    fi
-    echo "fwdx_$(date +%s)_$((RANDOM % 9999))"
-}
-
-# 部署 ForwardX
-install_forwardx() {
+# 部署 Xboard（带模式选择）
+install_utils() {
     check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -ne "${YELLOW}请输入 ForwardX 面板访问端口 [默认: 3000]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
+    if [ -d "$BASE_DIR" ] && [ -f "$COMPOSE_FILE" ]; then
+        echo -e "${RED}提示: 检测到目录 $BASE_DIR 已存在配置文件！${RESET}"
+        echo -ne "${YELLOW}是否覆盖重新部署？(y/n): ${RESET}"
+        read -r re_confirm
+        if [[ "$re_confirm" != "y" && "$re_confirm" != "Y" ]]; then
+            return
+        fi
+    fi
 
-    echo -ne "${YELLOW}请输入数据挂载的本地宿主机绝对路径 [默认: $BASE_DIR/data]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="$BASE_DIR/data"
+    # 选择安装模式
+    echo -e "${CYAN}====== 请选择 Xboard 安装模式 ======${RESET}"
+    echo -e "${GREEN}1. 快速安装模式 (推荐：自动配置内置 SQLite + Redis)${RESET}"
+    echo -e "${GREEN}2. 高级自定义安装 (高级用户：手动配置外部 MySQL/PostgreSQL 等)${RESET}"
+    echo -ne "${YELLOW}请输入模式编号 [默认: 1]: ${RESET}"
+    read -r install_mode
+    [[ -z "$install_mode" ]] && install_mode="1"
 
-    # 1. 自动创建本地挂载目录并赋予全权限防止容器读写报错
-    mkdir -p "$custom_data"
-    chmod -R 777 "$custom_data"
+    if [[ "$install_mode" != "1" && "$install_mode" != "2" ]]; then
+        echo -e "${RED}错误: 无效的选择，退出安装。${RESET}"
+        return
+    fi
 
-    # 自动生成随机 JWT 安全密钥
-    local jwt_secret=$(generate_jwt_secret)
+    # 1. 克隆代码库
+    echo -e "${YELLOW}正在从远端克隆 Xboard (compose 分支)...${RESET}"
+    rm -rf "$BASE_DIR" 
+    git clone -b compose --depth 1 https://github.com/cedar2025/Xboard "$BASE_DIR"
+    
+    if [ ! -d "$BASE_DIR" ]; then
+        echo -e "${RED}错误: 克隆 Xboard 仓库失败，请检查网络！${RESET}"
+        return
+    fi
 
-    # 2. 动态生成 .env 环境配置文件
-    echo -e "${YELLOW}正在创建 .env 环境变量文件...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-# ==================== 数据库配置 ====================
-SQLITE_PATH=/data/forwardx.db
+    # 2. 准备配置文件
+    cd "$BASE_DIR" || return
+    if [ -f "compose.yaml" ]; then
+        mv compose.yaml docker-compose.yaml
+    elif [ -f "docker-compose.yml" ]; then
+        mv docker-compose.yml docker-compose.yaml
+    elif [ -f "compose.sample.yaml" ]; then
+        cp compose.sample.yaml docker-compose.yaml
+    elif [ -f "docker-compose.sample.yml" ]; then
+        cp docker-compose.sample.yml docker-compose.yaml
+    else
+        echo -e "${RED}错误: 未找到任何 Docker Compose 模板文件！${RESET}"
+        return
+    fi
 
-# ==================== 安全配置 ====================
-JWT_SECRET=${jwt_secret}
+    # 3. 根据选择执行不同的安装向导
+    if [[ "$install_mode" == "1" ]]; then
+        # 快速模式
+        echo -e "${CYAN}====== 快速模式参数配置 ======${RESET}"
+        echo -ne "${YELLOW}请输入 Xboard 管理员邮箱 [默认: admin@demo.com]: ${RESET}"
+        read -r admin_email
+        [[ -z "$admin_email" ]] && admin_email="admin@demo.com"
 
-# ==================== 应用配置 ====================
-NODE_ENV=production
-PORT=3000
-FORWARDX_IMAGE=ghcr.io/poouo/forwardx:latest
+        echo -e "${YELLOW}正在执行快速初始化安装...${RESET}"
+        docker compose -f docker-compose.yaml run -it --rm \
+            -e ENABLE_SQLITE=true \
+            -e ENABLE_REDIS=true \
+            -e ADMIN_ACCOUNT="$admin_email" \
+            xboard php artisan xboard:install
+    else
+        # 高级自定义模式
+        echo -e "${YELLOW}正在启动高级自定义安装向导...${RESET}"
+        echo -e "${RED}注意：您需要在接下来的交互提示中，逐项手动输入您的数据库类型、地址及账号密码！${RESET}"
+        sleep 2
+        
+        docker compose -f docker-compose.yaml run -it --rm \
+            xboard php artisan xboard:install
+    fi
 
-EOF
+    # 4. 启动核心服务
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Xboard 服务...${RESET}"
+    docker compose -f docker-compose.yaml up -d
 
-
-    # 3. 动态生成 docker-compose.yml 配置文件 (已修改为本地目录挂载)
-    echo -e "${YELLOW}正在创建 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-name: forwardx
-
-services:
-  forwardx:
-    image: \${FORWARDX_IMAGE:-ghcr.io/poouo/forwardx:latest}
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:3000"
-    environment:
-      NODE_ENV: production
-      PORT: 3000
-      DATABASE_CONFIG_PATH: /data/database.json
-      SQLITE_PATH: /data/forwardx.db
-      MYSQL_CONFIG_PATH: /data/mysql.json
-      POSTGRES_URL: \${POSTGRES_URL:-}
-      POSTGRES_HOST: \${POSTGRES_HOST:-}
-      POSTGRES_PORT: \${POSTGRES_PORT:-5432}
-      POSTGRES_USER: \${POSTGRES_USER:-}
-      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-}
-      POSTGRES_DATABASE: \${POSTGRES_DATABASE:-}
-      POSTGRES_SSL: \${POSTGRES_SSL:-false}
-      JWT_SECRET: \${JWT_SECRET:-change-me-to-a-random-string}
-    volumes:
-      - ${custom_data}:/data
-EOF
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 ForwardX 面板...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待容器初始化 (约5秒)...${RESET}"
-    sleep 5
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      ForwardX 部署成功！       ${RESET}"
+    echo -e "${GREEN}      Xboard 部署成功！         ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}面板访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}本地数据挂载 : ${custom_data}${RESET}"
-    echo -e "${YELLOW}配置文件目录 : ${BASE_DIR}${RESET}"
-    echo -e "${RED}提示: 数据现在直接保存在本地，方便后续备份数据库文件 forwardx.db 。${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:7001${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 ForwardX
-update_forwardx() {
+# 更新 Xboard 镜像
+update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取 ForwardX 最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已成功平滑重启。${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Xboard 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose -f docker-compose.yaml pull
+    docker compose -f docker-compose.yaml up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 ForwardX
-uninstall_forwardx() {
-    echo -ne "${YELLOW}确定要卸载并删除 ForwardX 容器吗？(y/n): ${RESET}"
+# 卸载 Xboard
+uninstall_utils() {
+    echo -ne "${YELLOW}确定要卸载并删除 Xboard 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
+            cd "$BASE_DIR" && docker compose -f docker-compose.yaml down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地挂载的所有数据(前置机、数据库等文件)？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地配置文件与数据目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地管理目录及挂载数据已彻底清理。${RESET}"
+                echo -e "${GREEN}整个 Xboard 工作目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
+            [[ -n "$REAL_CONTAINER" ]] && docker rm -f "$REAL_CONTAINER" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-check_compose_exist() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return 1
-    fi
-    return 0
-}
+start_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose -f docker-compose.yaml restart && echo -e "${GREEN}容器已重启${RESET}"; }
 
-start_forwardx() { check_compose_exist && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
-stop_forwardx() { check_compose_exist && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
-restart_forwardx() { check_compose_exist && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
-
-logs_forwardx() { 
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        docker logs -f "$CONTAINER_NAME"
+logs_utils() { 
+    REAL_CONTAINER=$(docker ps -a --format "{{.Names}}" -f name=xboard | head -n 1)
+    if [ -n "$REAL_CONTAINER" ]; then
+        docker logs -f "$REAL_CONTAINER"
     else
-        echo -e "${RED}错误: 容器未创建，无法查看日志！${RESET}"
+        echo -e "${RED}未找到相关容器！${RESET}"
     fi
 }
 
 show_info() {
     get_status_info
-    local DETECT_IP=$(get_public_ip)
+    DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}面板访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}本地数据挂载   : ${data_dir}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:7001${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -242,7 +229,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈   ForwardX  转发管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}    ◈  Xboard  管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -260,13 +247,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_forwardx ;;
-        2) update_forwardx ;;
-        3) uninstall_forwardx ;;
-        4) start_forwardx ;;
-        5) stop_forwardx ;;
-        6) restart_forwardx ;;
-        7) logs_forwardx ;;
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

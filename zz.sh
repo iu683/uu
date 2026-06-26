@@ -1,440 +1,247 @@
 #!/bin/bash
-# =================================================================
-# PPanel 聚合面板管理 (稳定自愈无死锁版)
-# =================================================================
 
 # 颜色定义
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\033[0m"
+GREEN='\033[32m'
+RED='\033[31m'
+YELLOW='\033[33m'
+BLUE='\033[34m'
+PURPLE='\033[35m'
+PLAIN='\033[0m'
 
-BASE_DIR="/opt/ppanel"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONFIG_DIR="$BASE_DIR/config"
-CONFIG_FILE="$CONFIG_DIR/ppanel.yaml"
-ENV_FILE="$BASE_DIR/ppanel.env"
+# 提示信息
+INFO="[${GREEN}INFO${PLAIN}]"
+WARN="[${YELLOW}WARN${PLAIN}]"
+ERROR="[${RED}ERROR${PLAIN}]"
 
-# 检测依赖环境
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+# 检查是否为 root 用户
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${ERROR} 请使用 root 用户运行！"
+    exit 1
+fi
+
+# 核心安装函数
+install_xbctl() {
+    echo -e "\n${BLUE}========== 开始安装 xboard-node ==========${PLAIN}"
+    
+    # 1. 选择模式
+    read -p "请选择安装模式 [1) Node 模式 | 2) Machine 模式, 默认1]: " install_mode_choice
+    if [ "$install_mode_choice" = "2" ]; then
+        INSTALL_MODE="machine"
+        ID_TYPE="machine-id"
+    else
+        INSTALL_MODE="node"
+        ID_TYPE="node-id"
+    fi
+
+    # 2. 输入面板 URL
+    read -p "请输入面板 URL (例如 https://panel.example.com): " ins_url
+    if [ -z "$ins_url" ]; then
+        echo -e "${ERROR} 面板 URL 不能为空！"
+        return 1
+    fi
+
+    # 3. 输入 Token
+    read -p "请输入通讯 Token: " ins_token
+    if [ -z "$ins_token" ]; then
+        echo -e "${ERROR} Token 不能为空！"
+        return 1
+    fi
+
+    # 4. 输入 ID
+    read -p "请输入对应的 ID (${INSTALL_MODE} ID): " ins_id
+    if [ -z "$ins_id" ]; then
+        echo -e "${ERROR} ID 不能为空！"
+        return 1
+    fi
+
+    # 5. 执行官方在线安装命令
+    echo -e "\n${INFO} 正在从 GitHub 获取官方脚本并开始安装..."
+    curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh | \
+      sudo bash -s -- --mode "$INSTALL_MODE" --panel "$ins_url" --token "$ins_token" --$ID_TYPE "$ins_id"
+
+    if [ $? -eq 0 ]; then
+        echo -e "${INFO} xboard-node 安装成功！"
+        echo -e "${YELLOW}按任意键进入管理菜单...${PLAIN}"
+        read -n 1 -s
+        return 0
+    else
+        echo -e "${ERROR} 安装失败，请检查网络或参数是否正确！"
         exit 1
     fi
 }
 
-# 动态获取容器整体状态和端口
+# 获取状态信息的函数
 get_status_info() {
-    if [ -f "$COMPOSE_FILE" ]; then
-        if [ "$(docker ps -q -f name=ppanel)" ]; then
-            status="${GREEN}运行中${RESET}"
-            web_port=$(docker ps -f name=ppanel --format "{{.Ports}}" | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n 1)
-            if ! [[ "$web_port" =~ ^[0-9]+$ ]]; then
-                web_port=$(sed -n '/ppanel:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
-            fi
-        elif [ "$(docker ps -aq -f name=ppanel)" ]; then
-            status="${YELLOW}已停止${RESET}"
-            web_port=$(docker inspect --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' ppanel 2>/dev/null)
-        else
-            status="${RED}未部署${RESET}"
-        fi
-        [[ -z "$web_port" ]] && web_port="8080"
-    else
-        status="${RED}未初始化${RESET}"
-        web_port="N/A"
+    # 1. 获取版本
+    CURRENT_VER=$(xbctl version 2>/dev/null | awk '{print $NF}')
+    if [ -z "$CURRENT_VER" ]; then
+        CURRENT_VER="${RED}未检测到组件（未安装）${PLAIN}"
     fi
+
+    # 2. 获取运行状态
+    if systemctl is-active --quiet xbctl 2>/dev/null || xbctl status 2>/dev/null | grep -q "running"; then
+        RUN_STATUS="${GREEN}运行中${PLAIN}"
+    else
+        RUN_STATUS="${RED}已停止${PLAIN}"
+    fi
+
+    # 3. 获取绑定的 Instance ID
+    INSTANCE_ID=$(xbctl instance list --output text 2>/dev/null | awk 'NR>1 {print $1}' | head -n 1)
+    [ -z "$INSTANCE_ID" ] && INSTANCE_ID="${YELLOW}未绑定或无实例${PLAIN}"
 }
 
-# 获取公网 IP (兼容双栈环境)
-get_public_ip() {
-    local mode=${1:-"auto"}
-    local ip=""
+# 修改/初始化配置函数
+modify_config() {
+    echo -e "\n${BLUE}========== 修改/初始化配置 ==========${PLAIN}"
     
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
+    # 1. 选择模式
+    read -p "请选择绑定模式 [1) Node 模式 | 2) Machine 模式, 默认1]: " mode_choice
+    if [ "$mode_choice" = "2" ]; then
+        MODE="machine"
+        SHORTCUT_CMD="bind-machine"
+        ID_FLAG="--machine-id"
     else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
-}
-
-# 部署 PPanel
-install_ppanel() {
-    check_dependencies
-    mkdir -p "$BASE_DIR" "$CONFIG_DIR" "$BASE_DIR/web"
-
-    # 1. 基础参数配置
-    echo -e "${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 PPanel 宿主机映射访问端口 [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-
-    local jwt_secret=$(openssl rand -hex 16)
-
-    # 2. MySQL 数据库运行模式选择
-    echo -e "\n${CYAN}====== MySQL 数据库运行模式选择 ======${RESET}"
-    echo -e " 1) 直接部署全新的 MySQL 8 容器 (自动高强度密码+持久化)"
-    echo -e " 2) 使用已有的外部/远程 MySQL 数据库 (需提前手动建好空库)"
-    echo -ne "${YELLOW}请选择数据库模式 [默认: 1]: ${RESET}"
-    read -r db_mode
-    [[ -z "$db_mode" ]] && db_mode="1"
-
-    local db_host="mysql"
-    local db_port="3306"
-    local db_name="ppanel"
-    local db_user="root"
-    local db_pass=""
-
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}使用全新内置 MySQL 容器，正在生成高强度随机密码...${RESET}"
-        db_pass=$(openssl rand -hex 16)
-    else
-        echo -ne "${YELLOW}请输入远程 MySQL 的 IP 或域名: ${RESET}"
-        read -r ext_db_ip
-        echo -ne "${YELLOW}请输入远程 MySQL 端口 [默认: 3306]: ${RESET}"
-        read -r ext_db_port
-        [[ -z "$ext_db_port" ]] && ext_db_port="3306"
-        db_host="$ext_db_ip"
-        db_port="$ext_db_port"
-        echo -ne "${YELLOW}请输入远程 MySQL 用户名 [默认: root]: ${RESET}"
-        read -r db_user
-        [[ -z "$db_user" ]] && db_user="root"
-        echo -ne "${YELLOW}请输入远程 MySQL 密码: ${RESET}"
-        read -r db_pass
-        echo -ne "${YELLOW}请输入远程已存在的数据库名 [默认: ppanel]: ${RESET}"
-        read -r db_name
-        [[ -z "$db_name" ]] && db_name="ppanel"
-        
-        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
-            db_host="172.17.0.1"
-        fi
+        MODE="node"
+        SHORTCUT_CMD="bind-node"
+        ID_FLAG="--node-id"
     fi
 
-    # 3. Redis 运行模式与分区选择
-    echo -e "\n${CYAN}====== Redis 缓存运行模式选择 ======${RESET}"
-    echo -e " 1) 直接部署全新的 Redis 7 容器 (自动生成高强度密码)"
-    echo -e " 2) 使用已有的外部/远程 Redis 服务"
-    echo -ne "${YELLOW}请选择 Redis 模式 [默认: 1]: ${RESET}"
-    read -r redis_mode
-    [[ -z "$redis_mode" ]] && redis_mode="1"
-
-    local redis_host="redis"
-    local redis_port="6379"
-    local redis_pass=""
-    local redis_db="0"
-
-    if [[ "$redis_mode" == "1" ]]; then
-        echo -e "${YELLOW}使用全新内置 Redis 容器，正在生成高强度随机密码...${RESET}"
-        redis_pass=$(openssl rand -hex 16)
-    else
-        echo -ne "${YELLOW}请输入远程 Redis 的 IP 或域名: ${RESET}"
-        read -r ext_redis_ip
-        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
-        read -r ext_redis_port
-        [[ -z "$ext_redis_port" ]] && ext_redis_port="6379"
-        redis_host="$ext_redis_ip"
-        redis_port="$ext_redis_port"
-        echo -ne "${YELLOW}请输入远程 Redis 密码 (若无密码请直接回车): ${RESET}"
-        read -r redis_pass
-        
-        if [[ "$ext_redis_ip" == "127.0.0.1" || "$ext_redis_ip" == "localhost" ]]; then
-            redis_host="172.17.0.1"
-        fi
-    fi
-
-    echo -ne "${YELLOW}请输入 Redis 分区编号 (DB Index) [0-15] [默认: 0]: ${RESET}"
-    read -r redis_db
-    [[ -z "$redis_db" || ! "$redis_db" =~ ^[0-9]+$ ]] && redis_db="0"
-
-    # 4. 落地保存凭证凭据环境文件 ppanel.env
-    cat << EOF > "$ENV_FILE"
-PORT="${custom_port}"
-DB_MODE="${db_mode}"
-DB_HOST="${db_host}"
-DB_PORT="${db_port}"
-DB_USER="${db_user}"
-DB_PASS="${db_pass}"
-DB_NAME="${db_name}"
-REDIS_MODE="${redis_mode}"
-REDIS_HOST="${redis_host}"
-REDIS_PORT="${redis_port}"
-REDIS_PASS="${redis_pass}"
-REDIS_DB="${redis_db}"
-JWT_SECRET="${jwt_secret}"
-EOF
-
-    # 5. 动态生成 PPanel 专属 YAML 配置文件
-    echo -e "${YELLOW}正在渲染并同步生成 ppanel.yaml 业务配置文件...${RESET}"
-    cat << EOF > "$CONFIG_FILE"
-Host: 0.0.0.0
-Port: 8080
-TLS:
-    Enable: false
-    CertFile: ""
-    KeyFile: ""
-Debug: false
-
-Static:
-  Admin:
-    Enabled: true
-    Prefix: /admin
-    Path: ./static/admin
-  User:
-    Enabled: true
-    Prefix: /
-    Path: ./static/user
-
-JwtAuth:
-    AccessSecret: ${jwt_secret}
-    AccessExpire: 604800
-
-Logger:
-    ServiceName: ApiService
-    Mode: console
-    Encoding: plain
-    TimeFormat: "2006-01-02 15:04:05.000"
-    Path: logs
-    Level: info
-    MaxContentLength: 0
-    Compress: false
-    Stat: true
-    KeepDays: 0
-    StackCooldownMillis: 100
-    MaxBackups: 0
-    MaxSize: 0
-    Rotation: daily
-    FileTimeFormat: 2006-01-02T15:04:05.000Z07:00
-
-MySQL:
-    Addr: ${db_host}:${db_port}
-    Username: ${db_user}
-    Password: ${db_pass}
-    Dbname: ${db_name}
-    Config: charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai
-    MaxIdleConns: 10
-    MaxOpenConns: 10
-    SlowThreshold: 1000
-
-Redis:
-    Host: ${redis_host}:${redis_port}
-    Pass: ${redis_pass}
-    DB: ${redis_db}
-EOF
-
-    # 6. 生成规范化拓扑的 Docker Compose 配置文件 (采用 service_started 机制防卡死)
-    echo -e "${YELLOW}正在生成规范化 Docker Compose 拓扑配置...${RESET}"
-    
-    cat << EOF > "$COMPOSE_FILE"
-networks:
-  ppanel-network:
-    driver: bridge
-
-services:
-  ppanel:
-    image: ppanel/ppanel:latest
-    container_name: ppanel
-    restart: always
-    ports:
-      - "${custom_port}:8080"
-    volumes:
-      - ./config:/app/etc
-      - ./web:/app/static
-    depends_on:
-EOF
-
-    # 核心修正：断言条件修改为 service_started 避开健康检查死锁
-    if [[ "$db_mode" == "1" ]]; then
-        cat << EOF >> "$COMPOSE_FILE"
-      mysql:
-        condition: service_started
-EOF
-    fi
-    if [[ "$redis_mode" == "1" ]]; then
-        cat << EOF >> "$COMPOSE_FILE"
-      redis:
-        condition: service_started
-EOF
-    fi
-    
-    # 两者均外部则裁剪掉无子项的 depends_on:
-    if [[ "$db_mode" == "2" && "$redis_mode" == "2" ]]; then
-        sed -i '/depends_on:/d' "$COMPOSE_FILE"
-    fi
-
-    # 追加网络层归属
-    cat << EOF >> "$COMPOSE_FILE"
-    networks:
-      - ppanel-network
-EOF
-
-    # 如果是内置 MySQL，注入标准稳定的 MySQL 8.0 容器拓扑 (修复 root 用户配置冲突)
-    if [[ "$db_mode" == "1" ]]; then
-        mkdir -p "$BASE_DIR/mysql"
-        cat << EOF >> "$COMPOSE_FILE"
-
-  mysql:
-    image: mysql:8
-    container_name: ppanel-mysql
-    restart: always
-    environment:
-      MYSQL_DATABASE: "${db_name}"
-      MYSQL_ROOT_PASSWORD: "${db_pass}"
-    volumes:
-      - ./mysql:/var/lib/mysql
-    networks:
-      - ppanel-network
-EOF
-    fi
-
-    # 如果是内置 Redis，注入拓扑
-    if [[ "$redis_mode" == "1" ]]; then
-        mkdir -p "$BASE_DIR/redis"
-        cat << EOF >> "$COMPOSE_FILE"
-
-  redis:
-    image: redis:7
-    container_name: ppanel-redis
-    restart: always
-    command: redis-server --requirepass "${redis_pass}"
-    volumes:
-      - ./redis:/data
-    networks:
-      - ppanel-network
-EOF
-    fi
-
-    # 7. 清理并重新拉起集群
-    echo -e "${YELLOW}正在执行容器编排拉起服务...${RESET}"
-    cd "$BASE_DIR"
-    docker compose down 2>/dev/null
-    docker compose up -d --force-recreate
-
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}错误: 服务拉起失败，请检查端口 ${custom_port} 是否被占用。${RESET}"
+    # 2. 输入面板 URL
+    read -p "请输入面板 URL (例如 https://panel.com): " input_url
+    if [ -z "$input_url" ]; then
+        echo -e "${ERROR} 面板 URL 不能为空！"
         return
     fi
 
-    local detect_ip=$(get_public_ip)
+    # 3. 输入 Token
+    read -p "请输入通讯 Token: " input_token
+    if [ -z "$input_token" ]; then
+        echo -e "${ERROR} Token 不能为空！"
+        return
+    fi
 
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}           PPanel 系统架构部署成功！                ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}前台访问地址   : http://${detect_ip}:${custom_port}${RESET}"
-    echo -e "${YELLOW}后台管理地址   : http://${detect_ip}:${custom_port}/admin${RESET}"
-    echo -e "${YELLOW}默认账号   : admin@ppanel.dev${RESET}"
-    echo -e "${YELLOW}默认密码   : password${RESET}"
-    echo -e "----------------------------------------------------"
-    echo -e "${CYAN}[数据库与中间件拓扑状态]${RESET}"
-    if [[ "$db_mode" == "1" ]]; then
-        echo -e "${YELLOW}MySQL 模式    : ${GREEN}全新内置容器 (MySQL 8)${RESET}"
-        echo -e "${YELLOW}随机高强密码   : ${GREEN}${db_pass}${RESET}"
+    # 4. 输入 ID
+    read -p "请输入对应的 ID ($MODE ID): " input_id
+    if [ -z "$input_id" ]; then
+        echo -e "${ERROR} ID 不能为空！"
+        return
+    fi
+
+    # 5. 选择内核
+    read -p "请选择核心内核 [1) xray | 2) singbox, 默认1]: " kernel_choice
+    if [ "$kernel_choice" = "2" ]; then
+        KERNEL="singbox"
     else
-        echo -e "${YELLOW}MySQL 模式    : ${CYAN}外部远程目标 (${db_host}:${db_port})${RESET}"
+        KERNEL="xray"
     fi
 
-    if [[ "$redis_mode" == "1" ]]; then
-        echo -e "${YELLOW}Redis 模式    : ${GREEN}全新内置容器 (分片区: ${redis_db})${RESET}"
+    # 执行绑定配置
+    echo -e "\n${INFO} 正在执行配置绑定，请稍候..."
+    echo -e "执行命令: xbctl $SHORTCUT_CMD --panel-url $input_url --token [HIDDEN] $ID_FLAG $input_id --kernel $KERNEL"
+    
+    xbctl $SHORTCUT_CMD --panel-url "$input_url" --token "$input_token" $ID_FLAG "$input_id" --kernel "$KERNEL"
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${INFO} 配置修改并绑定成功！正在重启服务..."
+        xbctl restart
     else
-        echo -e "${YELLOW}Redis 模式    : ${CYAN}外部远程目标 (${redis_host}:${redis_port} / 分片区: ${redis_db})${RESET}"
-    fi
-    echo -e "----------------------------------------------------"
-    echo -e "${YELLOW}持久化工作目录 : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-
-# 交互式安全卸载
-uninstall_ppanel() {
-    echo -ne "${RED}确定要卸载并删除 PPanel 相关的容器吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            echo -e "${YELLOW}正在停止并安全移除容器及网络...${RESET}"
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            
-            echo -ne "${YELLOW}是否同时删除本地所有配置文件和持久化数据目录 (含数据库文件)？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                cd /opt
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
-            else
-                echo -e "${YELLOW}已保留本地配置文件及持久化数据。${RESET}"
-            fi
-        else
-            docker rm -f ppanel ppanel-mysql ppanel-redis 2>/dev/null
-        fi
-        echo -e "${GREEN}卸载流程执行完毕！${RESET}"
+        echo -e "${ERROR} 绑定失败，请检查配置信息是否正确。"
     fi
 }
 
-start_ppanel() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已拉起运行${RESET}"; }
-stop_ppanel() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止运行${RESET}"; }
-restart_ppanel() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已成功重启${RESET}"; }
-logs_ppanel() { cd "$BASE_DIR" && docker compose logs -f --tail=100; }
-
-show_info() {
-    get_status_info
-    local detect_ip=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}当前运行状态   : $status"
-    echo -e "${YELLOW}安全绝对路径   : ${BASE_DIR}${RESET}"
-    echo -e "${YELLOW}前台访问地址   : http://${detect_ip}:${custom_port}${RESET}"
-    echo -e "${YELLOW}后台管理地址   : http://${detect_ip}:${custom_port}/admin${RESET}"
-    if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${YELLOW}业务配置文件   : ${CONFIG_FILE}${RESET}"
+# --- 脚本入口检查 ---
+# 检查xbctl是否安装，如果没有则引导安装
+if ! command -v xbctl &> /dev/null; then
+    echo -e "${WARN} 检测到系统未安装 xboard-node"
+    read -p " 是否现在开始安装？[y/n]: " init_ins
+    if [[ "$init_ins" == [yY] ]]; then
+        install_xbctl
+    else
+        echo -e "${INFO} 已取消安装，退出。"
+        exit 0
     fi
-    echo -e "${GREEN}====================================================${RESET}"
-}
+fi
 
-# 主菜单管理
-menu() {
+# 主循环菜单
+while true; do
     clear
     get_status_info
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}        ◈ PPanel 管理面板 ◈        ${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 当前状态 :${RESET} $status"
-    echo -e "${GREEN} 映射端口 :${RESET} ${YELLOW}${web_port}${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN} 1. 部署启动${RESET}"
-    echo -e "${GREEN} 3. 卸载服务${RESET}" 
-    echo -e "${GREEN} 4. 启动服务${RESET}"
-    echo -e "${GREEN} 5. 停止服务${RESET}"
-    echo -e "${GREEN} 6. 重启服务${RESET}"
-    echo -e "${GREEN} 7. 查看日志${RESET}"
-    echo -e "${GREEN} 8. 查看配置${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_ppanel ;;
-        3) uninstall_ppanel ;;
-        4) start_ppanel ;;
-        5) stop_ppanel ;;
-        6) restart_ppanel ;;
-        7) logs_ppanel ;;
-        8) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入无效${RESET}" ;;
-    esac
-}
 
-while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    echo -e "${GREEN}=================================${PLAIN}"
+    echo -e "${GREEN}   ◈  Xboard-node  管理菜单 ◈   ${PLAIN}"
+    echo -e "${GREEN}=================================${PLAIN}"
+    echo -e "${GREEN}运行状态:${PLAIN} $RUN_STATUS"
+    echo -e "${GREEN}实例 ID :${PLAIN} $INSTANCE_ID"
+    echo -e "${GREEN}=================================${PLAIN}"
+    echo -e "${GREEN}1. 查看状态${PLAIN}"
+    echo -e "${GREEN}2. 启动服务${PLAIN}"
+    echo -e "${GREEN}3. 停止服务${PLAIN}"
+    echo -e "${GREEN}4. 重启服务${PLAIN}"
+    echo -e "${GREEN}5. 查看日志${PLAIN}"
+    echo -e "${GREEN}6. 检查健康${PLAIN}"
+    echo -e "${GREEN}---------------------------------${PLAIN}"
+    echo -e "${YELLOW}7. 修改配置${PLAIN}"
+    echo -e "${GREEN}8. 更新节点${PLAIN}"
+    echo -e "${RED}9. 卸载节点${PLAIN}"
+    echo -e "${GREEN}---------------------------------${PLAIN}"
+    echo -e "${GREEN}0. 退出${PLAIN}"
+    echo -e "${GREEN}=================================${PLAIN}"
+    read -p "$(echo -e " ${GREEN}请输入数字选择操作: ${PLAIN}")" choice
+    
+    case $choice in
+        1)
+            echo -e "\n${INFO} 正在查看服务状态..."
+            xbctl status
+            ;;
+        2)
+            echo -e "\n${INFO} 正在启动服务..."
+            xbctl start
+            ;;
+        3)
+            echo -e "\n${INFO} 正在停止服务..."
+            xbctl stop
+            ;;
+        4)
+            echo -e "\n${INFO} 正在重启服务..."
+            xbctl restart
+            ;;
+        5)
+            echo -e "\n${INFO} 正在查看实时日志（按 Ctrl+C 退出日志查看）..."
+            xbctl logs
+            ;;
+        6)
+            echo -e "\n${INFO} 正在检查健康状态..."
+            xbctl health
+            ;;
+        7)
+            modify_config
+            ;;
+        8)
+            echo -e "\n${INFO} 正在尝试更新 xbctl..."
+            xbctl upgrade
+            ;;
+        9)
+            echo -e "\n${WARN} 确定要完全卸载 xbctl 吗？这会清除所有数据！"
+            read -p " 输入 'y' 确认卸载，输入其他任意键取消: " confirm
+            if [[ "$confirm" == [yY] ]]; then
+                echo -e "${INFO} 正在完全卸载..."
+                xbctl uninstall --purge --yes
+                echo -e "${INFO} 卸载完成，脚本即将退出。"
+                exit 0
+            else
+                echo -e "${INFO} 已取消卸载。"
+            fi
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "\n${ERROR} 无效的选择，请重新输入！"
+            sleep 1
+            continue
+            ;;
+    esac
+    
+    echo -ne "\033[A\n${YELLOW}按回车键继续...${PLAIN}"
     read -r
 done

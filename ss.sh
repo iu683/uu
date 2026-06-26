@@ -1,368 +1,228 @@
 #!/bin/bash
-# =================================================================
-# LinuxServer WireGuard 工具箱 Docker Compose 管理面板
-# =================================================================
 
-# 颜色
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\033[0m"
+# ==========================================
+# VPS AI 工具与 Agent 检测
+# ==========================================
 
-CONTAINER_NAME="wireguard"
-BASE_DIR="/opt/wireguard-ls"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
+# 颜色定义
+G='\033;32m'   # 绿色 (Green)
+R='\033;31m'   # 红色 (Red)
+Y='\033[1;33m'   # 黄色 (Yellow)
+B='\033[0;34m'   # 蓝色 (Blue)
+NC='\033[0m'     # 无颜色 (No Color)
 
-# 检测依赖
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
-    fi
-}
+# 为 Code Whale 模块兼容你代码中的颜色变量名
+GREEN="${G}"
+RED="${R}"
+YELLOW="${Y}"
+RESET="${NC}"
 
-# 动态获取容器状态和端口信息
-get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
+echo -e "${Y}========================================${NC}"
+echo -e "${Y}        ◈      AI 工具检测      ◈        ${NC}"
+echo -e "${Y}========================================${NC}"
 
-    if [ -f "$ENV_FILE" ]; then
-        source "$ENV_FILE"
-        wg_port="$WG_SERVER_PORT"
-    else
-        wg_port="19999"
-    fi
-}
+# ==========================================
+# 环境变量与路径补全
+# ==========================================
+ensure_env_path() {
+    local common_paths=(
+        "/usr/local/bin"
+        "/usr/local/sbin"
+        "/usr/bin"
+        "/bin"
+        "$HOME/.local/bin"
+        "$HOME/.npm-global/bin"
+        "$HOME/.yarn/bin"
+        "$HOME/.cargo/bin"
+    )
 
-# 获取公网 IP (兼容双栈环境)
-get_public_ip() {
-    local mode=${1:-"auto"}
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
-}
-
-# 部署 WireGuard
-install_utils() {
-    check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 自定义 WireGuard 参数配置 ======${RESET}"
-    
-    CURRENT_UID=$(id -u)
-    CURRENT_GID=$(id -g)
-    DETECT_IP=$(get_public_ip)
-
-    # 1. 配置宿主机对外监听端口
-    echo -ne "${YELLOW}请输入宿主机外部监听端口 [默认: 19999]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="19999"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
-
-    # 2. 配置服务器外部 IP / 域名
-    echo -ne "${YELLOW}请输入服务器公网 IP 或域名 (SERVERURL) [默认: ${DETECT_IP}]: ${RESET}"
-    read -r custom_url
-    [[ -z "$custom_url" ]] && custom_url="$DETECT_IP"
-
-    # 3. 配置内部虚拟子网段 (INTERNAL_SUBNET)
-    echo -ne "${YELLOW}请输入 VPN 内部虚拟子网段 [默认: 10.13.13.0]: ${RESET}"
-    read -r custom_subnet
-    [[ -z "$custom_subnet" ]] && custom_subnet="10.13.13.0"
-
-    # 4. 配置初始生成的客户端数量
-    echo -ne "${YELLOW}请输入初始生成的客户端(Peers)数量 [默认: 3]: ${RESET}"
-    read -r custom_peers
-    [[ -z "$custom_peers" ]] && custom_peers="3"
-
-    # 5. 配置客户端使用的 DNS
-    echo -ne "${YELLOW}请输入客户端 DNS (PEERDNS) [默认: 1.1.1.1]: ${RESET}"
-    read -r custom_dns
-    [[ -z "$custom_dns" ]] && custom_dns="1.1.1.1"
-
-    # 6. 配置宿主机数据挂载路径
-    echo -ne "${YELLOW}请输入配置数据挂载路径 [默认: /opt/wireguard-ls/config]: ${RESET}"
-    read -r host_config_path
-    [[ -z "$host_config_path" ]] && host_config_path="/opt/wireguard-ls/config"
-    mkdir -p "$host_config_path"
-
-    # 写入 .env 文件
-    cat <<EOF > "$ENV_FILE"
-WG_UID=${CURRENT_UID}
-WG_GID=${CURRENT_GID}
-WG_SERVER_URL=${custom_url}
-WG_SERVER_PORT=${custom_port}
-WG_SUBNET=${custom_subnet}
-WG_PEERS=${custom_peers}
-WG_DNS=${custom_dns}
-WG_HOST_CONFIG=${host_config_path}
-EOF
-
-    # 动态生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  wireguard:
-    image: lscr.io/linuxserver/wireguard:latest
-    container_name: ${CONTAINER_NAME}
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
-    environment:
-      - PUID=\${WG_UID}
-      - PGID=\${WG_GID}
-      - TZ=Asia/Shanghai
-      - SERVERURL=\${WG_SERVER_URL}
-      - SERVERPORT=\${WG_SERVER_PORT}
-      - INTERNAL_SUBNET=\${WG_SUBNET}
-      - PEERS=\${WG_PEERS}
-      - PEERDNS=\${WG_DNS}
-      - ALLOWEDIPS=0.0.0.0/0,::/0
-    volumes:
-      - \${WG_HOST_CONFIG}:/config
-      - /lib/modules:/lib/modules:ro
-    ports:
-      - "\${WG_SERVER_PORT}:51820/udp"
-    sysctls:
-      - net.ipv4.conf.all.src_valid_mark=1
-    restart: unless-stopped
-EOF
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 WireGuard...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待容器初始化并生成密钥文件 (约5秒)...${RESET}"
-    sleep 5
-
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN}          WireGuard 服务部署成功！               ${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${YELLOW}服务监听端口   : ${custom_port} (UDP)${RESET}"
-    echo -e "${YELLOW}外部连接域名/IP : ${custom_url}${RESET}"
-    echo -e "${YELLOW}内部虚拟网段   : ${custom_subnet}${RESET}"
-    echo -e "${YELLOW}初始客户端数量 : ${custom_peers} 个${RESET}"
-    echo -e "${YELLOW}客户端配置文件 : ${host_config_path}${RESET}"
-    echo -e "${CYAN}提示：你可以在 ${host_config_path} 下找到 peer1, peer2... 的配置和二维码图片。${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-}
-
-# 更新镜像
-update_utils() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return
-    fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
-}
-
-# 卸载容器
-uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 WireGuard 容器吗？(y/n) [默认: N]: ${RESET}"
-    read -r confirm
-    [[ -z "$confirm" ]] && confirm="N"
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            
-            if [ -f "$ENV_FILE" ]; then
-                source "$ENV_FILE"
-                echo -ne "${YELLOW}是否同时删除生成的客户端配置与密钥目录 (${WG_HOST_CONFIG})？(y/n) [默认: N]: ${RESET}"
-                read -r clean_data
-                [[ -z "$clean_data" ]] && clean_data="N"
-                if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                    rm -rf "$WG_HOST_CONFIG"
-                    rm -rf "$BASE_DIR"
-                    echo -e "${GREEN}所有客户端配置数据及管理脚本目录已彻底清理。${RESET}"
-                fi
-            fi
-        else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
-        fi
-        echo -e "${GREEN}卸载完成！${RESET}"
-    fi
-}
-
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_utils() { docker logs -f "$CONTAINER_NAME"; }
-
-show_info() {
-    get_status_info
-    if [ -f "$ENV_FILE" ]; then
-        source "$ENV_FILE"
-        echo -e "${GREEN}================================================${RESET}"
-        echo -e "${YELLOW}当前状态       : $status"
-        echo -e "${YELLOW}监听连接端口   : ${WG_SERVER_PORT} (UDP)"
-        echo -e "${YELLOW}公网公告地址   : ${WG_SERVER_URL}"
-        echo -e "${YELLOW}VPN 内部子网   : ${WG_SUBNET}"
-        echo -e "${YELLOW}配置下发数量   : ${WG_PEERS} 个"
-        echo -e "${YELLOW}配置存储路径   : ${WG_HOST_CONFIG}"
-        echo -e "${GREEN}================================================${RESET}"
-        if [ -d "$WG_HOST_CONFIG" ]; then
-            echo -e "${CYAN}当前已生成的客户端列表如下:${RESET}"
-            ls -d "$WG_HOST_CONFIG"/peer* 2>/dev/null | sed 's|.*/||' | sed 's/^/  - /'
-        fi
-        echo -e "${GREEN}================================================${RESET}"
-    else
-        echo -e "${RED}未检测到部署配置环境。${RESET}"
-    fi
-}
-
-
-# 查看特定 Peer 的连接详细信息和终端二维码（完美修复版）
-show_peer_connections() {
-    if [ ! -f "$ENV_FILE" ]; then
-        echo -e "${RED}错误: 未检测到环境配置文件，请先部署容器！${RESET}"
-        return
-    fi
-    source "$ENV_FILE"
-    
-    if [ ! -d "$WG_HOST_CONFIG" ]; then
-        echo -e "${RED}错误: 配置挂载路径不存在，请确认容器是否已正常启动并生成配置。${RESET}"
-        return
-    fi
-
-    # 获取所有 peer 目录并存入数组
-    local peers=($(ls -d "$WG_HOST_CONFIG"/peer* 2>/dev/null | sed 's|.*/||' | sort -V))
-    
-    if [ ${#peers[@]} -eq 0 ]; then
-        echo -e "${RED}未找到任何已生成的客户端 (peer) 配置。${RESET}"
-        return
-    fi
-
-    while true; do
-        clear
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${GREEN}    ◈  客户端 (Peer) 连接信息面板  ◈     ${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -e "${CYAN}请选择要查看的客户端：${RESET}"
-        
-        for i in "${!peers[@]}"; do
-            echo -e "${GREEN}$((i+1)). ${peers[$i]}${RESET}"
-        done
-        echo -e "${GREEN}0. 返回主菜单${RESET}"
-        echo -e "${GREEN}=====================================${RESET}"
-        echo -ne "${GREEN}请输入选项: ${RESET}"
-        read -r peer_choice
-
-        if [[ "$peer_choice" == "0" ]]; then
-            break
-        elif [[ "$peer_choice" =~ ^[0-9]+$ ]] && [ "$peer_choice" -le "${#peers[@]}" ] && [ "$peer_choice" -gt 0 ]; then
-            local target_peer="${peers[$((peer_choice-1))]}"
-            local peer_dir="$WG_HOST_CONFIG/$target_peer"
-            local conf_file="$peer_dir/${target_peer}.conf"
-            local qr_file="$peer_dir/${target_peer}.png"
-
-            clear
-            echo -e "${GREEN}======================================================================${RESET}"
-            echo -e "${YELLOW}>> 正在查看客户端: ${target_peer}${RESET}"
-            echo -e "${GREEN}======================================================================${RESET}"
-            
-            # 1. 打印文本配置
-            if [ -f "$conf_file" ]; then
-                echo -e "${CYAN}[ 配置文件内容 (${target_peer}.conf) ]${RESET}"
-                cat "$conf_file"
-                echo ""
-            else
-                echo -e "${RED}未找到文本配置文件: $conf_file${RESET}"
-            fi
-
-            echo -e "${GREEN}----------------------------------------------------------------------${RESET}"
-
-            # 2. 完美渲染：由于映射关系，宿主机的 $conf_file 对应容器内的 /config/$target_peer/${target_peer}.conf
-            echo -e "${CYAN}[ 手机扫描二维码连接 ]${RESET}"
-            if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-                # 直接让容器内部的 qrencode 读取它内部路径下的配置文件，完美解决输入流穿透导致的 ANSI 渲染失败
-                docker exec -it "$CONTAINER_NAME" qrencode -t ansiutf8 -r "/config/${target_peer}/${target_peer}.conf" 2>/dev/null
-                if [ $? -ne 0 ]; then
-                    # 备用方案：如果极少数精简版终端不支持 ansiutf8 编码，退回到标准 ansi 模式
-                    docker exec -it "$CONTAINER_NAME" qrencode -t ansi -r "/config/${target_peer}/${target_peer}.conf" 2>/dev/null
-                fi
-            else
-                echo -e "${RED}提示：容器未在运行中，无法动态生成终端二维码。${RESET}"
-                echo -e "${YELLOW}你可以直接复制上方文本配置，或前往以下路径查看二维码图片：${RESET}"
-                echo -e "${YELLOW}$qr_file${RESET}"
-            fi
-            echo -e "${GREEN}======================================================================${RESET}"
-            
-            echo -ne "${YELLOW}按回车键返回客户端列表...${RESET}"
-            read -r
-        else
-            echo -e "${RED}无效选项，请重新输入！${RESET}"
-            sleep 1
+    for path in "${common_paths[@]}"; do
+        if [[ ":$PATH:" != *":$path:"* ]] && [ -d "$path" ]; then
+            export PATH="$PATH:$path"
         fi
     done
 }
 
-menu() {
-    clear
-    get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  WireGuard 管理面板  ◈     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${wg_port} (UDP)${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}9. 查看客户端连接信息与二维码 🌟${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_utils ;;
-        2) update_utils ;;
-        3) uninstall_utils ;;
-        4) start_utils ;;
-        5) stop_utils ;;
-        6) restart_utils ;;
-        7) logs_utils ;;
-        8) show_info ;;
-        9) show_peer_connections ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
+# 立即执行确保后续 command -v 正常识别
+ensure_env_path
+
+# ==========================================
+# 辅助函数
+# ==========================================
+
+# 树状格式化输出函数
+print_result() {
+    local name=$1
+    local location=$2
+    local version=$3
+    local status=$4
+
+    # 头部：工具名称
+    echo -e "${B}◈ 工具: ${NC}${Y}${name}${NC}"
+
+    if [ "$location" == "未安装" ]; then
+        # 未安装直接精简输出
+        echo -e "  └─ ${R}安装状态: 未安装${NC}"
+    else
+        # 已安装时的树状输出
+        echo -e "  ├─ ${G}安装路径: ${NC}${location}"
+        
+        # 处理版本号为空的情况并去除多余空白字符
+        version=$(echo "$version" | xargs)
+        echo -e "  ├─ ${G}当前版本: ${NC}${version:-未知}"
+        
+        # 状态着色逻辑
+        if [[ "$status" =~ "运行中" ]]; then
+            local STATUS_COLOR="${G}"
+        else
+            local STATUS_COLOR="${Y}"
+        fi
+        echo -e "  └─ ${G}活跃状态: ${NC}${STATUS_COLOR}${status}${NC}"
+    fi
+    echo -e "${B}----------------------------------------${NC}"
 }
 
-while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
-done
+# 安全获取命令版本函数
+get_version() {
+    local cmd=$1
+    local args=$2
+    local raw_out=""
+    
+    if command -v timeout &> /dev/null; then
+        raw_out=$(timeout 2s "$cmd" $args 2>&1)
+    fi
+    
+    if [ -z "$raw_out" ]; then
+        raw_out=$("$cmd" $args 2>&1)
+    fi
+    
+    echo "$raw_out" | grep -v '^$' | head -n 1
+}
+
+# 检查 Docker 容器状态的辅助函数 (修复了 systemctl 报错问题)
+check_docker_container() {
+    local keyword=$1
+    # 1. 先确保 docker 命令存在
+    if command -v docker &> /dev/null; then
+        # 2. 再确保 systemctl 命令存在且 docker 服务在运行；如果不存在 systemctl，直接通过 docker info 盲测
+        if command -v systemctl &> /dev/null; then
+            if ! systemctl is-active --quiet docker; then
+                return 1
+            fi
+        else
+            if ! docker info &> /dev/null; then
+                return 1
+            fi
+        fi
+
+        # 3. 执行容器获取
+        local container_info=$(docker ps --format "{{.ID}} [{{.Names}}] ({{.Image}})" | grep -i "$keyword" | head -n 1)
+        if [ -n "$container_info" ]; then
+            echo "$container_info"
+        fi
+    fi
+}
+
+# ==========================================
+# 工具检测核心逻辑
+# ==========================================
+
+# 1. Claude Code 检测
+if command -v claude &> /dev/null; then
+    loc=$(which claude)
+    ver=$(get_version "claude" "--version")
+    if pgrep -f "claude" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "Claude Code" "$loc" "$ver" "$status"
+
+# 2. Codex CLI 检测
+if command -v codex &> /dev/null; then
+    loc=$(which codex)
+    ver=$(get_version "codex" "--version")
+    if pgrep -f "codex" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "Codex CLI" "$loc" "$ver" "$status"
+
+# 3. Gemini CLI 检测
+if command -v gemini &> /dev/null; then
+    loc=$(which gemini)
+    ver=$( "$loc" --version 2>&1 | grep -E '[0-9]+\.[0-9]' | head -n 1 )
+    if pgrep -f "gemini" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "Gemini CLI" "$loc" "$ver" "$status"
+
+# 4. OpenCode 检测
+if command -v opencode &> /dev/null; then
+    loc=$(which opencode)
+    ver=$(get_version "opencode" "--version")
+    if pgrep -f "opencode" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
+elif command -v open-code &> /dev/null; then
+    loc=$(which open-code)
+    ver=$(get_version "open-code" "--version")
+    if pgrep -f "open-code" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "Open Code" "$loc" "$ver" "$status"
+
+# 5. OpenClaw 检测 (加入 Docker 联动)
+docker_res=$(check_docker_container "openclaw\|clawdbot")
+
+if [ -n "$docker_res" ]; then
+    loc="Docker Container ($docker_res)"
+    ver="Docker Managed"
+    status="运行中 (Running)"
+elif command -v openclaw &> /dev/null || command -v clawdbot &> /dev/null; then
+    loc=$(which openclaw 2>/dev/null || which clawdbot)
+    ver=$(get_version "$loc" "--version")
+    if pgrep -f "openclaw\|clawdbot" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
+elif command -v pip &> /dev/null && pip show openclaw &> /dev/null; then
+    loc="Python Pip Package"
+    ver=$(pip show openclaw | grep -i "^Version:" | cut -d' ' -f2)
+    if pgrep -f "open claw" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "OpenClaw" "$loc" "$ver" "$status"
+
+# 6. Hermes Agent 检测 (加入 Docker 联动)
+docker_res=$(check_docker_container "hermes")
+
+if [ -n "$docker_res" ]; then
+    loc="Docker Container ($docker_res)"
+    ver="Docker Managed"
+    status="运行中 (Running)"
+elif command -v hermes &> /dev/null || command -v hermes-agent &> /dev/null; then
+    loc=$(which hermes 2>/dev/null || which hermes-agent)
+    raw_ver=$(get_version "$loc" "--version")
+    ver=$(echo "$raw_ver" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "$raw_ver")
+    if pgrep -f "hermes" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
+elif command -v npm &> /dev/null && npm list -g --depth=0 hermes-agent &> /dev/null; then
+    loc="NPM Global Module"
+    ver=$(npm list -g --depth=0 hermes-agent | grep hermes-agent | awk -F@ '{print $2}')
+    status="已安装 (可通过 npm 启动)"
+elif command -v pip &> /dev/null && pip show hermes-agent &> /dev/null; then
+    loc="Python Pip Package"
+    ver=$(pip show hermes-agent | grep -i "^Version:" | cut -d' ' -f2)
+    status="已安装 (可通过 python 运行)"
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "Hermes Agent" "$loc" "$ver" "$status"
+
+# 7. Code Whale 检测 (改用 print_result 函数统一规范输出)
+if command -v codewhale &> /dev/null; then
+    loc=$(which codewhale)
+    ver=$(codewhale --version 2>/dev/null | head -n 1)
+    [ -z "$ver" ] && ver="已就绪"
+    if pgrep -f "codewhale" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
+else
+    loc="未安装"; ver=""; status=""
+fi
+print_result "Code Whale" "$loc" "$ver" "$status"

@@ -135,15 +135,16 @@ login_claude() {
     fi
 }
 
-# 5. 配置高级自定义 API 模型与路径 (终极融合完美版)
+# 5. 配置高级自定义 API 模型与路径 (严格对标官方解法完全体)
 config_custom_api() {
     local SETTINGS_JSON="$HOME/.claude/settings.json"
+    local ONBOARDING_JSON="$HOME/.claude.json"
     mkdir -p "$HOME/.claude"
     
     echo -e "\n${GREEN}================================${RESET}"
-    echo -e "${GREEN}      自定义 API 配置管理       ${RESET}"
+    echo -e "${GREEN}      通用自定义 API 配置       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 快捷一键生成标准持久化代理环境${RESET}"
+    echo -e "${GREEN}1. 一键快捷生成通用持久化代理环境${RESET}"
     echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
     echo -e "${GREEN}0. 返回主菜单${RESET}"
     echo -e "${GREEN}================================${RESET}"
@@ -152,69 +153,67 @@ config_custom_api() {
 
     case $api_choice in
         1)
-            echo -e "\n${YELLOW}1/3. 请输入自定义 API 中转地址/网关:${RESET}"
-            echo -ne "   (例如: https://qianxing-ai.cc.cd/v1)\n   地址: "
+            echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关:${RESET}"
+            echo -ne "   (例如: https://api.deepseek.com/anthropic)\n   地址: "
             read input_url
             
-            echo -e "\n${YELLOW}2/3. 请输入你的 API Key / 密钥 Token:${RESET}"
+            echo -e "\n${YELLOW}2/4. 请输入你的 API Key / 密钥 Token:${RESET}"
             echo -ne "   秘钥: "
             read input_key
 
-            echo -e "\n${YELLOW}3/3. 请输入你想指定的自定义模型名称:${RESET}"
-            echo -ne "   (例如: gpt-5.4 或 deepseek-chat)\n   模型名: "
+            echo -e "\n${YELLOW}3/4. 请输入主核心/高级模型名 (注意部分模型可能需要带后缀, 如 [1m]):${RESET}"
+            echo -ne "   (例如: deepseek-v4-pro[1m] 或 gpt-5.4):\n   模型名: "
             read input_model
 
-            if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ]; then
-                # 【终极修正】融合你发出来的最新官方混交结构
-                # 1. 移除了非必要的 CLAUDE_BASE_URL 避免死循环
-                # 2. 将流量控制开关改为纯数字 1 (去除双引号) 避免 Node 抛出异常
-                # 3. 外层保留合规的 model: sonnet 以顺利通过客户端白名单验证
+            echo -e "\n${YELLOW}4/4. 请输入轻量级/快速模型名 (通常与主模型一致即可):${RESET}"
+            echo -ne "   (例如: deepseek-v4-flash[1m] 或 gpt-5.4):\n   模型名: "
+            read input_submodel
+
+            if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ] && [ -n "$input_submodel" ]; then
+                
+                # 【第一步：强行重写/注入绕过登录验证（最关键）】
+                cat << EOF > "$ONBOARDING_JSON"
+{
+  "hasCompletedOnboarding": true
+}
+EOF
+
+                # 【第二步：严格按照说明书生成最纯净的 env 块】
+                # 全量覆盖三个级别模型，且流量控制保持字符串 "1" 的说明书规范
                 cat << EOF > "$SETTINGS_JSON"
 {
   "env": {
     "ANTHROPIC_BASE_URL": "$input_url",
     "ANTHROPIC_AUTH_TOKEN": "$input_key",
     "ANTHROPIC_MODEL": "$input_model",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$input_model",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "$input_model",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "$input_model",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1
-  },
-  "permissions": {
-    "allow": [],
-    "deny": []
-  },
-  "theme": "dark",
-  "model": "sonnet"
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
 }
 EOF
-                # 全量清理历史干扰文件与环境变量
-                rm -f "$ENV_FILE"
-                rm -f "$HOME/.claude.json"
+                # 物理清理老脚本可能在内存中 export 的环境变量干扰
                 unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
                 unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
-                unset CLAUDE_CODE_SUBAGENT_MODEL
+                unset CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_SMALL_FAST_MODEL
 
-                echo -e "\n${GREEN}✔ 终极配置成功！已完美覆写并固化至: $SETTINGS_JSON${RESET}"
+                echo -e "\n${GREEN}✔ 完美配置成功！${RESET}"
+                echo -e "${GREEN}✔ 成功生成验证补丁: $ONBOARDING_JSON${RESET}"
+                echo -e "${GREEN}✔ 成功固化通用代理: $SETTINGS_JSON${RESET}"
             else
-                echo -e "${RED}输入不能为空，取消设置。${RESET}"
+                echo -e "${RED}所有输入均不能为空，取消设置。${RESET}"
             fi
             ;;
         2)
+            # 恢复初始
             cat << EOF > "$SETTINGS_JSON"
 {
-  "env": {},
-  "permissions": {
-    "allow": [],
-    "deny": []
-  },
-  "theme": "dark",
-  "model": "sonnet"
+  "env": {}
 }
 EOF
-            rm -f "$ENV_FILE"
-            rm -f "$HOME/.claude.json"
-            unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-            echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复官方基础 settings.json。${RESET}"
+            rm -f "$ONBOARDING_JSON"
+            echo -e "${GREEN}✔ 已彻底清除自定义配置，恢复官方初始状态。${RESET}"
             ;;
         *)
             return

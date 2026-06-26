@@ -6,26 +6,44 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 RESET='\033[0m'
 
+# 自定义配置文件路径
+ENV_FILE="$HOME/.claude_custom_env"
+
+# 临时和永久确保当前脚本进程能找到最新的 PATH
+export PATH="$HOME/.local/bin:$PATH"
+
+# 自动刷新和导出自定义 API 环境配置（让主面板状态100%同步）
+refresh_env() {
+    # 先清理当前进程中的历史干扰变量
+    unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+    unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
+    unset CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_EFFORT_LEVEL
+
+    if [ -f "$ENV_FILE" ]; then
+        source "$ENV_FILE"
+    fi
+}
+
+# 首次和循环时加载环境
+refresh_env
+
 # 获取状态与版本信息
 get_status() {
-    if command -v gemini &> /dev/null; then
+    if command -v claude &> /dev/null; then
         status="${GREEN}已安装${RESET}"
-        version_info=$(gemini --version 2>/dev/null | head -n 1)
-        [ -z "$version_info" ] && version_info="已就绪"
-        gemini_version="${YELLOW}${version_info}${RESET}"
+        version_info=$(claude -v 2>/dev/null | head -n 1)
+        [ -z "$version_info" ] && version_info="未知版本"
+        claude_version="${YELLOW}${version_info}${RESET}"
     else
         status="${RED}未安装${RESET}"
-        version_info="-"
-        gemini_version="${RED}-${RESET}"
+        claude_version="${RED}-${RESET}"
     fi
 
-    # 检查当前配置的模型
-    if command -v gemini &> /dev/null; then
-        current_model=$(gemini config get model 2>/dev/null)
-        [ -z "$current_model" ] && current_model="未设置"
-        api_status="${GREEN}${current_model}${RESET}"
+    # 检查是否配置了自定义 API
+    if [ -f "$ENV_FILE" ] && ( [ -n "$CLAUDE_BASE_URL" ] || [ -n "$ANTHROPIC_BASE_URL" ] ); then
+        api_status="${YELLOW}自定义中转${RESET}"
     else
-        api_status="${RED}-${RESET}"
+        api_status="${GREEN}官方默认${RESET}"
     fi
 }
 
@@ -34,256 +52,220 @@ show_menu() {
     clear
     get_status
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈  Gemini CLI  管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  Claude Code 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} $gemini_version"
-    echo -e "${GREEN}模型 :${RESET} $api_status"
+    echo -e "${GREEN}版本 :${RESET} $claude_version"
+    echo -e "${GREEN}API  :${RESET} $api_status"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 安装${RESET}"
     echo -e "${GREEN}2. 当前目录启动${RESET}"
     echo -e "${GREEN}3. 指定路径启动${RESET}"
-    echo -e "${GREEN}4. 配置API密钥${RESET}"
-    echo -e "${GREEN}5. 调整模型与核心参数${RESET}"
-    echo -e "${GREEN}6. 查看配置列表${RESET}"
-    echo -e "${GREEN}7. 运行帮助命令${RESET}"
-    echo -e "${GREEN}8. 更新${RESET}"
-    echo -e "${GREEN}9. 卸载${RESET}"
+    echo -e "${GREEN}4. 登录/切换账户${RESET}"
+    echo -e "${GREEN}5. 设置自定义API模型/中转${RESET}"
+    echo -e "${GREEN}6. 更新${RESET}"
+    echo -e "${GREEN}7. 卸载${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
 }
 
-# 1. 安装 (集成 Node.js v24 自动配置)
-install_gemini() {
-    echo -e "\n${YELLOW}[1/3] 正在检测 Node.js 环境...${RESET}"
-    if ! command -v node &> /dev/null; then
-        echo -e "${YELLOW}未检测到 Node.js，正在通过 NodeSource 配置 Node.js v24 源...${RESET}"
-        
-        # 确保系统有 curl
-        if ! command -v curl &> /dev/null; then
-            echo -e "${YELLOW}检测到缺少 curl，正在尝试安装...${RESET}"
-            if command -v apt-get &> /dev/null; then
-                apt-get update && apt-get install -y curl
-            elif command -v dnf &> /dev/null; then
-                dnf install -y curl
-            elif command -v yum &> /dev/null; then
-                yum install -y curl
-            fi
-        fi
-
-        # 执行 NodeSource v24 脚本
-        curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
-        
-        # 根据包管理器执行安装
-        if command -v apt-get &> /dev/null; then
-            echo -e "${YELLOW}正在通过 apt 安装 nodejs...${RESET}"
-            apt-get install -y nodejs
-        elif command -v dnf &> /dev/null; then
-            echo -e "${YELLOW}正在通过 dnf 安装 nodejs...${RESET}"
-            dnf install -y nodejs
-        elif command -v yum &> /dev/null; then
-            echo -e "${YELLOW}正在通过 yum 安装 nodejs...${RESET}"
-            yum install -y nodejs
-        else
-            echo -e "${RED}❌ 未能识别系统包管理器，请手动运行：apt/dnf install -y nodejs${RESET}"
-            echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-            return
-        fi
-    fi
+# 1. 安装
+install_claude() {
+    echo -e "\n${YELLOW}正在通过官方安装 Claude Code...${RESET}"
+    curl -fsSL https://claude.ai/install.sh | bash
     
-    # 再次确认 Node 版本
-    if command -v node &> /dev/null; then
-        echo -e "${GREEN}✔ Node.js 已就绪，版本: $(node --version)${RESET}"
-        echo -e "${GREEN}✔ npm 版本: $(npm --version)${RESET}"
+    echo -e "\n${YELLOW}正在检查环境并自动修复 PATH...${RESET}"
+    local shell_config=""
+    if [ -n "$ZSH_VERSION" ] || [ -f "$HOME/.zshrc" ]; then
+        shell_config="$HOME/.zshrc"
     else
-        echo -e "${RED}❌ Node.js 安装失败，请检查网络或系统权限。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return
+        shell_config="$HOME/.bashrc"
     fi
 
-    echo -e "\n${YELLOW}[2/3] 正在通过 npm 全局安装 @google/gemini-cli...${RESET}"
-    npm install -g @google/gemini-cli
-
-    echo -e "\n${YELLOW}[3/3] 验证安装状态...${RESET}"
-    if command -v gemini &> /dev/null; then
-        echo -e "\n${GREEN}✔ Gemini CLI 成功部署并激活！${RESET}"
-        echo -e "${YELLOW}$(gemini --version)${RESET}"
+    if ! grep -q '\.local/bin' "$shell_config" 2>/dev/null; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$shell_config"
+        echo -e "${GREEN}✔ 已自动将 ~/.local/bin 写入 $shell_config${RESET}"
     else
-        echo -e "\n${RED}❌ Gemini CLI 全局安装成功但命令未找到，可能需要将 npm 全局 bin 目录加入到 PATH 中。${RESET}"
+        echo -e "${GREEN}✔ 配置文件中已存在 PATH 记录，无需重复添加。${RESET}"
     fi
+
+    export PATH="$HOME/.local/bin:$PATH"
+    echo -e "${GREEN}安装与修复完成！${RESET}"
     echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
-# 2. 配置 API 密钥
-config_api_key() {
-    if ! command -v gemini &> /dev/null; then
-        echo -e "\n${RED}❌ 请先执行选项 1 安装 Gemini CLI！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return
-    fi
-
-    echo -e "\n${YELLOW}请输入你的 Gemini API 密钥 (API Key):${RESET}"
-    echo -ne " Key: "
-    read input_key
-
-    if [ -n "$input_key" ]; then
-        gemini config set api-key "$input_key"
-        echo -e "\n${GREEN}✔ API 密钥配置成功！验证结果如下：${RESET}"
-        echo -ne "当前生效 Key: "
-        gemini config get api-key
+# 2. 当前目录启动
+start_current() {
+    if command -v claude &> /dev/null; then
+        echo -e "\n${GREEN}正在当前目录启动 Claude Code...${RESET}"
+        refresh_env
+        claude
     else
-        echo -e "${RED}输入不能为空，取消设置。${RESET}"
+        echo -e "\n${RED}未检测到 claude 命令，请先执行安装！${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
     fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
-# 3. 调整参数
-config_params() {
-    if ! command -v gemini &> /dev/null; then
-        echo -e "\n${RED}❌ 请先执行选项 1 安装 Gemini CLI！${RESET}"
+# 3. 指定路径启动
+start_path() {
+    echo -e "\n"
+    echo -ne "${GREEN}请输入你的项目绝对路径: ${RESET}"
+    read target_path
+    if [ -d "$target_path" ]; then
+        echo -e "${GREEN}正在切换到 $target_path 并启动 Claude Code...${RESET}"
+        refresh_env
+        cd "$target_path" && claude
+    else
+        echo -e "${RED}路径不存在，请检查后重试！${RESET}"
         echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return
     fi
+}
 
+# 4. 登录
+login_claude() {
+    if command -v claude &> /dev/null; then
+        echo -e "\n${YELLOW}正在启动登录程序...${RESET}"
+        echo -e "提示：如果已经在会话中，直接输入 /login 即可"
+        refresh_env
+        claude -c "/login" 2>/dev/null || claude
+    else
+        echo -e "\n${RED}未检测到已安装的 Claude Code。${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    fi
+}
+
+# 5. 配置高级自定义 API 模型路径和 Key
+config_custom_api() {
     echo -e "\n${GREEN}================================${RESET}"
-    echo -e "${GREEN}       Gemini 参数快速调整       ${RESET}"
+    echo -e "${GREEN}      自定义 API 配置管理       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    
-    # 1. 模型设置
-    echo -e "${YELLOW}1/3. 请输入默认模型名称 (直接回车默认: gemini-pro):${RESET}"
-    echo -ne " 模型名: "
-    read input_model
-    [ -z "$input_model" ] && input_model="gemini-pro"
-    gemini config set model "$input_model"
+    echo -e "${GREEN}当前保存的 Base URL:${RESET} ${YELLOW}${CLAUDE_BASE_URL:-${ANTHROPIC_BASE_URL:-官方默认}}${RESET}"
+    echo -e "${GREEN}当前保存的主模型:${RESET}    ${YELLOW}${ANTHROPIC_MODEL:-默认 (Sonnet/Opus)}${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${GREEN}1. 快捷设置 DeepSeek / 代理模型配置${RESET}"
+    echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
+    echo -e "${GREEN}0. 返回主菜单${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read api_choice
 
-    # 2. 创造性设置
-    echo -e "\n${YELLOW}2/3. 请输入创造性参数 temperature (0.0 ~ 2.0，直接回车默认: 0.7):${RESET}"
-    echo -ne " Temperature: "
-    read input_temp
-    [ -z "$input_temp" ] && input_temp="0.7"
-    gemini config set temperature "$input_temp"
+    case $api_choice in
+        1)
+            echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关:${RESET}"
+            echo -ne "   (提示: 中转通常需带 /v1，例如: https://www.soyenai.com/v1)\n   地址: "
+            read input_url
+            
+            echo -e "\n${YELLOW}2/4. 请输入你的 API Key / Token:${RESET}"
+            echo -ne "   秘钥: "
+            read input_key
+            
+            echo -e "\n${YELLOW}3/4. 请输入你想指定的主核心模型:${RESET}"
+            echo -ne "   (直接回车默认使用: deepseek-v4-pro)\n   模型名: "
+            read input_model
+            [ -z "$input_model" ] && input_model="deepseek-v4-pro"
 
-    # 3. 最大长度设置
-    echo -e "\n${YELLOW}3/3. 请输入最大输出长度 maxTokens (直接回车默认: 2000):${RESET}"
-    echo -ne " MaxTokens: "
-    read input_tokens
-    [ -z "$input_tokens" ] && input_tokens="2000"
-    gemini config set maxTokens "$input_tokens"
+            echo -e "\n${YELLOW}4/4. 请输入你想指定的子代理 (Subagent) 模型:${RESET}"
+            echo -ne "   (直接回车默认使用: deepseek-v4-flash)\n   模型名: "
+            read input_submodel
+            [ -z "$input_submodel" ] && input_submodel="deepseek-v4-flash"
 
-    echo -e "\n${GREEN}✔ 参数修改成功！${RESET}"
+            if [ -n "$input_url" ] && [ -n "$input_key" ]; then
+                # 写入本地持久化环境配置文件，全量覆盖注入
+                echo "# Claude Code 自定义代理持久化环境" > "$ENV_FILE"
+                echo "export CLAUDE_BASE_URL=\"$input_url\"" >> "$ENV_FILE"
+                echo "export ANTHROPIC_BASE_URL=\"$input_url\"" >> "$ENV_FILE"
+                
+                # 【防冲突核心】只使用 AUTH_TOKEN 并强行清除 API_KEY 规避官方客户端报错
+                echo "export ANTHROPIC_AUTH_TOKEN=\"$input_key\"" >> "$ENV_FILE"
+                echo "unset ANTHROPIC_API_KEY" >> "$ENV_FILE"
+                
+                # 模型映射劫持
+                echo "export ANTHROPIC_MODEL=\"$input_model\"" >> "$ENV_FILE"
+                echo "export ANTHROPIC_DEFAULT_OPUS_MODEL=\"$input_model\"" >> "$ENV_FILE"
+                echo "export ANTHROPIC_DEFAULT_SONNET_MODEL=\"$input_model\"" >> "$ENV_FILE"
+                
+                # 子代理（Subagent）配置
+                echo "export ANTHROPIC_DEFAULT_HAIKU_MODEL=\"$input_submodel\"" >> "$ENV_FILE"
+                echo "export CLAUDE_CODE_SUBAGENT_MODEL=\"$input_submodel\"" >> "$ENV_FILE"
+                echo "export CLAUDE_CODE_EFFORT_LEVEL=\"max\"" >> "$ENV_FILE"
+                
+                # 【避坑检查】如果存在全局 settings.json，它的 env 会覆盖这里的 export，故进行改名备份
+                if [ -f "$HOME/.claude/settings.json" ]; then
+                    mv "$HOME/.claude/settings.json" "$HOME/.claude/settings.json.bak" 2>/dev/null
+                    echo -e "${YELLOW}⚠ 检测到已存在的 settings.json 可能引发配置冲突，已自动将其备份为 settings.json.bak${RESET}"
+                fi
+
+                # 触发即时生效并刷新
+                refresh_env
+                echo -e "\n${GREEN}✔ 恭喜！高级多模型变量已成功保存。启动时将全面劫持并生效。${RESET}"
+            else
+                echo -e "${RED}输入不能为空，取消设置。${RESET}"
+            fi
+            ;;
+        2)
+            if [ -f "$ENV_FILE" ] || [ -f "$HOME/.claude/settings.json.bak" ]; then
+                rm -f "$ENV_FILE"
+                # 尝试恢复原有的 settings.json
+                if [ -f "$HOME/.claude/settings.json.bak" ]; then
+                    mv "$HOME/.claude/settings.json.bak" "$HOME/.claude/settings.json" 2>/dev/null
+                fi
+                # 全量取消变量定义
+                refresh_env
+                echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复官方默认配置。${RESET}"
+            else
+                echo -e "${YELLOW}当前本来就是官方默认配置。${RESET}"
+            fi
+            ;;
+        *)
+            return
+            ;;
+    esac
     echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
-# 4. 查看配置列表
-view_config() {
-    if ! command -v gemini &> /dev/null; then
-        echo -e "\n${RED}❌ 请先执行选项 1 安装 Gemini CLI！${RESET}"
+# 6. 更新
+update_claude() {
+    echo -e "\n${YELLOW}正在尝试更新 Claude Code...${RESET}"
+    if command -v claude &> /dev/null; then
+        claude update || claude install
     else
-        echo -e "\n${YELLOW}--- 当前 Gemini CLI 完整配置列表 ---${RESET}"
-        gemini config list
-        echo -e "${YELLOW}-----------------------------------${RESET}"
+        echo -e "${RED}未检测到已安装的 Claude Code，无法更新。${RESET}"
     fi
     echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
-# 5. 帮助命令
-show_help() {
-    if ! command -v gemini &> /dev/null; then
-        echo -e "\n${RED}❌ 请先执行选项 1 安装 Gemini CLI！${RESET}"
-    else
-        echo -e "\n${YELLOW}--- gemini --help 输出 ---${RESET}"
-        gemini --help
-        echo -e "${YELLOW}--------------------------${RESET}"
-    fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-
-# 6. 更新功能
-update_gemini() {
-    if ! command -v gemini &> /dev/null; then
-        echo -e "\n${RED}❌ 未检测到已安装的 Gemini CLI，请先执行选项 1 进行安装！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return
-    fi
-
-    echo -e "\n${YELLOW}正在检查并更新 @google/gemini-cli 至最新稳定版...${RESET}"
-    npm install -g @google/gemini-cli@latest
-
-    if [ $? -eq 0 ]; then
-        echo -e "\n${GREEN}✔ Gemini CLI 更新成功！当前最新版本为：${RESET}"
-        echo -e "${YELLOW}$(gemini --version 2>/dev/null || echo "已就绪")${RESET}"
-    else
-        echo -e "\n${RED}❌ 更新失败，请检查网络连接或 npm 全局权限。${RESET}"
-    fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 6. 整合卸载（包含配置与环境清理）
-uninstall_gemini_flow() {
-    if ! command -v gemini &> /dev/null; then
-        echo -e "\n${RED}❌ 未检测到 Gemini CLI，无需卸载。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return
-    fi
-
+# 7. 整合卸载
+uninstall_claude_flow() {
     echo -e "\n${RED}准备进入卸载流程...${RESET}"
-    echo -ne "${RED}确定要卸载 Gemini CLI 主程序吗？(y/n): ${RESET}"
+    echo -ne "${RED}确定要卸载 Claude Code 主程序吗？(y/n): ${RESET}"
     read ans
     if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
-        # 第一步：卸载 CLI 主程序
-        echo -e "${YELLOW}[步骤 1/3] 正在通过 npm 卸载全局 @google/gemini-cli...${RESET}"
-        npm uninstall -g @google/gemini-cli
-        echo -e "${GREEN}✔ 主程序卸载指令执行完毕。${RESET}"
+        # 第一步：卸载程序
+        echo -e "${YELLOW}[步骤 1/2] 正在删除主程序可执行文件...${RESET}"
+        rm -f ~/.local/bin/claude
+        rm -rf ~/.local/share/claude
+        echo -e "${GREEN}✔ 主程序卸载成功。${RESET}"
         
-        # 第二步：清除本地配置
-        echo -e "\n${RED}[步骤 2/3] 是否需要连同 Gemini CLI 的本地配置文件与历史缓存一起清除？${RESET}"
-        echo -e "${RED}注意：通常包含全局密钥和自定义的模型配置。${RESET}"
+        # 第二步：清除配置文件
+        echo -e "\n${RED}[步骤 2/2] 是否需要连同配置文件、历史记录、自定义API及MCP设置一起清除？${RESET}"
+        echo -e "${RED}注意：此操作不可逆，清除后所有本地历史将永久丢失！${RESET}"
         echo -ne "${RED}是否清除配置文件？(y/n): ${RESET}"
         read ans_config
         if [ "$ans_config" = "y" ] || [ "$ans_config" = "Y" ]; then
-            echo -e "${YELLOW}正在清理本地存储目录 ~/.gemini 及相关隐藏配置文件...${RESET}"
-            rm -rf "$HOME/.gemini"
-            rm -rf "$HOME/.config/gemini" 2>/dev/null
-            echo -e "${GREEN}✔ 配置文件与本地缓存已彻底清除。${RESET}"
+            echo -e "${YELLOW}正在清除全局、本地及API配置文件...${RESET}"
+            rm -rf ~/.claude
+            rm -f ~/.claude.json
+            rm -rf .claude
+            rm -f .mcp.json
+            rm -f "$ENV_FILE"
+            echo -e "${GREEN}✔ 配置文件清除完毕，所有数据已彻底干净！${RESET}"
         else
-            echo -e "${YELLOW}已保留本地配置文件。${RESET}"
+            echo -e "${YELLOW}已保留配置文件。你可以随时重新安装并恢复使用。${RESET}"
         fi
     else
         echo "已取消卸载操作。"
     fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 7 & 8. 启动 Gemini 核心逻辑
-start_gemini() {
-    local target_dir="$1"
-    
-    if ! command -v gemini &> /dev/null; then
-        echo -e "\n${RED}❌ 请先执行选项 1 安装 Gemini CLI 并配置密钥！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return
-    fi
-
-    # 验证目录是否存在
-    if [ ! -d "$target_dir" ]; then
-        echo -e "\n${RED}❌ 错误: 目标目录不存在 -> $target_dir${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-        return
-    fi
-
-    echo -e "\n${YELLOW}正在切换到目录: ${target_dir}${RESET}"
-    echo -e "${GREEN}🚀 启动 Gemini CLI... (输入 exit 或按下 Ctrl+C 退出)${RESET}\n"
-    
-    # 使用 subshell (子 Shell) 切换工作目录并启动 gemini，不影响管理脚本自身路径
-    (
-        cd "$target_dir" || exit
-        # 提示：如果你的 CLI 有特定的启动聊天命令，如 `gemini chat`，请把下面修改为对应命令
-        gemini 
-    )
-
-    echo -e "\n${YELLOW}已退出 Gemini 会话。${RESET}"
     echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
@@ -292,22 +274,13 @@ while true; do
     show_menu
     read choice
     case $choice in
-        1) install_gemini ;;
-        2) start_gemini "$(pwd)" ;;
-        3) 
-            echo -e "\n${YELLOW}请输入你想要启动 Gemini 的绝对路径或相对路径:${RESET}"
-            echo -ne " 路径: "
-            read input_path
-            # 如果输入为空，则使用当前工作目录
-            [ -z "$input_path" ] && input_path="$(pwd)"
-            start_gemini "$input_path"
-            ;;
-        4) config_api_key ;;
-        5) config_params ;;
-        6) view_config ;;
-        7) show_help ;;
-        8) update_gemini ;;
-        9) uninstall_gemini_flow ;;
+        1) install_claude ;;
+        2) start_current ;;
+        3) start_path ;;
+        4) login_claude ;;
+        5) config_custom_api ;;
+        6) update_claude ;;
+        7) uninstall_claude_flow ;;
         0) clear; exit 0 ;;
         *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
     esac

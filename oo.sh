@@ -135,7 +135,7 @@ login_claude() {
     fi
 }
 
-# 5. 配置高级自定义 API 模型与路径 (严格对标官方解法完全体)
+# 5. 配置高级自定义 API 模型与路径 (全平台通用免拦截版)
 config_custom_api() {
     local SETTINGS_JSON="$HOME/.claude/settings.json"
     local ONBOARDING_JSON="$HOME/.claude.json"
@@ -144,7 +144,7 @@ config_custom_api() {
     echo -e "\n${GREEN}================================${RESET}"
     echo -e "${GREEN}      通用自定义 API 配置       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 一键快捷生成通用持久化代理环境${RESET}"
+    echo -e "${GREEN}1. 一键快捷生成通用免拦截环境${RESET}"
     echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
     echo -e "${GREEN}0. 返回主菜单${RESET}"
     echo -e "${GREEN}================================${RESET}"
@@ -154,66 +154,65 @@ config_custom_api() {
     case $api_choice in
         1)
             echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关:${RESET}"
-            echo -ne "   (例如: https://api.deepseek.com/anthropic)\n   地址: "
+            echo -ne "   地址: "
             read input_url
             
             echo -e "\n${YELLOW}2/4. 请输入你的 API Key / 密钥 Token:${RESET}"
             echo -ne "   秘钥: "
             read input_key
 
-            echo -e "\n${YELLOW}3/4. 请输入主核心/高级模型名 (注意部分模型可能需要带后缀, 如 [1m]):${RESET}"
-            echo -ne "   (例如: deepseek-v4-pro[1m] 或 gpt-5.4):\n   模型名: "
+            echo -e "\n${YELLOW}3/4. 请输入你想指定的主核心模型 (例如: gpt-5.4 或 glm-5.1):${RESET}"
+            echo -ne "   模型名: "
             read input_model
 
-            echo -e "\n${YELLOW}4/4. 请输入轻量级/快速模型名 (通常与主模型一致即可):${RESET}"
-            echo -ne "   (例如: deepseek-v4-flash[1m] 或 gpt-5.4):\n   模型名: "
+            echo -e "\n${YELLOW}4/4. 请输入你想指定的子代理快速模型 (通常与主模型一致或用 haiku 级模型):${RESET}"
+            echo -ne "   模型名: "
             read input_submodel
 
             if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ] && [ -n "$input_submodel" ]; then
                 
-                # 【第一步：强行重写/注入绕过登录验证（最关键）】
+                # 1. 自动注入免登录验证凭证
                 cat << EOF > "$ONBOARDING_JSON"
 {
   "hasCompletedOnboarding": true
 }
 EOF
 
-                # 【第二步：严格按照说明书生成最纯净的 env 块】
-                # 全量覆盖三个级别模型，且流量控制保持字符串 "1" 的说明书规范
+                # 2. 严格套用成功率 100% 的智谱闭环拓扑结构
+                # 保持外层 includeCoAuthoredBy 与内外层主模型严格一致的闭环状态
                 cat << EOF > "$SETTINGS_JSON"
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "$input_url",
     "ANTHROPIC_AUTH_TOKEN": "$input_key",
-    "ANTHROPIC_MODEL": "$input_model",
+    "ANTHROPIC_BASE_URL": "$input_url",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "$input_model",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "$input_model",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
-  }
+    "ANTHROPIC_MODEL": "$input_model"
+  },
+  "includeCoAuthoredBy": false,
+  "model": "$input_model"
 }
 EOF
-                # 物理清理老脚本可能在内存中 export 的环境变量干扰
+                # 清除内存环境变量残留，防止新旧逻辑打架
                 unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
                 unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
-                unset CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_SMALL_FAST_MODEL
+                unset CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_CUSTOM_MODEL_OPTION
 
-                echo -e "\n${GREEN}✔ 完美配置成功！${RESET}"
-                echo -e "${GREEN}✔ 成功生成验证补丁: $ONBOARDING_JSON${RESET}"
-                echo -e "${GREEN}✔ 成功固化通用代理: $SETTINGS_JSON${RESET}"
+                echo -e "\n${GREEN}✔ 成功！已按照全平台通用闭环模板固化配置至: $SETTINGS_JSON${RESET}"
             else
                 echo -e "${RED}所有输入均不能为空，取消设置。${RESET}"
             fi
             ;;
         2)
-            # 恢复初始
             cat << EOF > "$SETTINGS_JSON"
 {
-  "env": {}
+  "env": {},
+  "model": "sonnet"
 }
 EOF
             rm -f "$ONBOARDING_JSON"
-            echo -e "${GREEN}✔ 已彻底清除自定义配置，恢复官方初始状态。${RESET}"
+            echo -e "${GREEN}✔ 已彻底清除自定义配置，恢复系统默认。${RESET}"
             ;;
         *)
             return

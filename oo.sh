@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# mtg (MTProto 代理) 工具箱 Docker Compose 管理面板 
+# LinuxServer WireGuard 工具箱 Docker Compose 管理面板
 # =================================================================
 
 # 颜色
@@ -10,11 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="mtg-proxy"
-BASE_DIR="/opt/mtg-proxy"
+CONTAINER_NAME="wireguard"
+BASE_DIR="/opt/wireguard-ls"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
-CONFIG_FILE="$BASE_DIR/config.toml"
 
 # 检测依赖
 check_dependencies() {
@@ -24,31 +23,8 @@ check_dependencies() {
     fi
 }
 
-# 随机端口生成函数
-random_port() {
-    local port
-    while true; do
-        port=$((RANDOM % 16383 + 49152))
-        if ! ss -tuln | grep -q ":$port "; then
-            echo "$port"
-            return 0
-        fi
-    done
-}
-
-# 检查端口是否被占用
-check_port() {
-    local port=$1
-    if ss -tuln | grep -q ":$port "; then
-        echo -e "${RED}错误: 端口 $port 已被占用，请更换端口或选择随机端口！${RESET}"
-        return 1
-    fi
-    return 0
-}
-
-# 动态获取容器状态和配置信息
+# 动态获取容器状态和端口信息
 get_status_info() {
-    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -57,12 +33,11 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 从 .env 读取关键连接参数用于菜单展示
     if [ -f "$ENV_FILE" ]; then
         source "$ENV_FILE"
-        webui_port="$MTG_PORT" # 这里借用变量回显端口
+        wg_port="$WG_SERVER_PORT"
     else
-        webui_port="N/A"
+        wg_port="19999"
     fi
 }
 
@@ -90,86 +65,109 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 mtg
+# 部署 WireGuard
 install_utils() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义 MTProto 参数配置 ======${RESET}"
-
-    # 1. 配置监听端口
-    echo -ne "${YELLOW}请输入监听端口 [默认随机]: ${RESET}"
-    read -r input_port
-    if [[ -z "$input_port" ]]; then
-        PORT=$(random_port)
-        echo -e "${GREEN}已自动生成随机端口: $PORT${RESET}"
-    else
-        PORT=$input_port
-        if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-            return
-        fi
-    fi
-
-    # 检查端口可用性
-    check_port "$PORT" || return
-
-    # 2. 配置伪装域名
-    echo -ne "${YELLOW}请输入伪装域名 [默认: bing.com]: ${RESET}"
-    read -r input_domain
-    [[ -z "$input_domain" ]] && input_domain="bing.com"
-
-    echo -e "${YELLOW}正在通过 nineseconds/mtg 镜像动态生成安全混淆密钥 (Secret)...${RESET}"
-    # 动态拉取并生成密钥
-    SECRET=$(docker run --rm nineseconds/mtg:master generate-secret --hex "$input_domain" 2>/dev/null)
+    echo -e "${CYAN}====== 自定义 WireGuard 参数配置 ======${RESET}"
     
-    if [[ -z "$SECRET" ]]; then
-        echo -e "${RED}错误: 密钥生成失败，请检查 Docker 网络是否能够拉取 nineseconds/mtg:master 镜像！${RESET}"
+    CURRENT_UID=$(id -u)
+    CURRENT_GID=$(id -g)
+    DETECT_IP=$(get_public_ip)
+
+    # 1. 配置宿主机对外监听端口
+    echo -ne "${YELLOW}请输入宿主机外部监听端口 [默认: 19999]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="19999"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
+    # 2. 配置服务器外部 IP / 域名
+    echo -ne "${YELLOW}请输入服务器公网 IP 或域名 (SERVERURL) [默认: ${DETECT_IP}]: ${RESET}"
+    read -r custom_url
+    [[ -z "$custom_url" ]] && custom_url="$DETECT_IP"
+
+    # 3. 配置内部虚拟子网段 (INTERNAL_SUBNET)
+    echo -ne "${YELLOW}请输入 VPN 内部虚拟子网段 [默认: 10.13.13.0]: ${RESET}"
+    read -r custom_subnet
+    [[ -z "$custom_subnet" ]] && custom_subnet="10.13.13.0"
+
+    # 4. 配置初始生成的客户端数量
+    echo -ne "${YELLOW}请输入初始生成的客户端(Peers)数量 [默认: 3]: ${RESET}"
+    read -r custom_peers
+    [[ -z "$custom_peers" ]] && custom_peers="3"
+
+    # 5. 配置客户端使用的 DNS
+    echo -ne "${YELLOW}请输入客户端 DNS (PEERDNS) [默认: 1.1.1.1]: ${RESET}"
+    read -r custom_dns
+    [[ -z "$custom_dns" ]] && custom_dns="1.1.1.1"
+
+    # 6. 配置宿主机数据挂载路径
+    echo -ne "${YELLOW}请输入配置数据挂载路径 [默认: /opt/wireguard-ls/config]: ${RESET}"
+    read -r host_config_path
+    [[ -z "$host_config_path" ]] && host_config_path="/opt/wireguard-ls/config"
+    mkdir -p "$host_config_path"
+
     # 写入 .env 文件
     cat <<EOF > "$ENV_FILE"
-MTG_PORT=${PORT}
-MTG_DOMAIN=${input_domain}
-MTG_SECRET=${SECRET}
+WG_UID=${CURRENT_UID}
+WG_GID=${CURRENT_GID}
+WG_SERVER_URL=${custom_url}
+WG_SERVER_PORT=${custom_port}
+WG_SUBNET=${custom_subnet}
+WG_PEERS=${custom_peers}
+WG_DNS=${custom_dns}
+WG_HOST_CONFIG=${host_config_path}
 EOF
 
-    # 3. 生成 config.toml
-    cat > "$CONFIG_FILE" <<EOF
-secret = "$SECRET"
-bind-to = "0.0.0.0:${PORT}"
-EOF
-
-    # 4. 动态生成符合要求的 docker-compose.yml 配置文件 (使用 host 网络)
+    # 动态生成符合要求的 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  mtg:
-    image: nineseconds/mtg:master
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
     container_name: ${CONTAINER_NAME}
-    restart: always
-    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - PUID=\${WG_UID}
+      - PGID=\${WG_GID}
+      - TZ=Asia/Shanghai
+      - SERVERURL=\${WG_SERVER_URL}
+      - SERVERPORT=\${WG_SERVER_PORT}
+      - INTERNAL_SUBNET=\${WG_SUBNET}
+      - PEERS=\${WG_PEERS}
+      - PEERDNS=\${WG_DNS}
+      - ALLOWEDIPS=0.0.0.0/0,::/0
     volumes:
-      - ${CONFIG_FILE}:/config.toml
+      - \${WG_HOST_CONFIG}:/config
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "\${WG_SERVER_PORT}:51820/udp"
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    restart: unless-stopped
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 mtg 服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 WireGuard...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
-
-    DETECT_IP=$(get_public_ip)
+    echo -e "${YELLOW}等待容器初始化并生成密钥文件 (约5秒)...${RESET}"
+    sleep 5
 
     echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN}          MTG MTProto 代理部署成功！             ${RESET}"
+    echo -e "${GREEN}          WireGuard 服务部署成功！               ${RESET}"
     echo -e "${GREEN}================================================${RESET}"
-    echo -e "${YELLOW}服务器端口     : ${PORT}${RESET}"
-    echo -e "${YELLOW}伪装域名       : ${input_domain}${RESET}"
-    echo -e "${YELLOW}混淆密钥 (Hex) : ${SECRET}${RESET}"
-    echo -e "${CYAN}Telegram 点击直连内置链接:${RESET}"
-    echo -e "${GREEN}tg://proxy?server=${DETECT_IP}&port=${PORT}&secret=${SECRET}${RESET}"
+    echo -e "${YELLOW}服务监听端口   : ${custom_port} (UDP)${RESET}"
+    echo -e "${YELLOW}外部连接域名/IP : ${custom_url}${RESET}"
+    echo -e "${YELLOW}内部虚拟网段   : ${custom_subnet}${RESET}"
+    echo -e "${YELLOW}初始客户端数量 : ${custom_peers} 个${RESET}"
+    echo -e "${YELLOW}客户端配置文件 : ${host_config_path}${RESET}"
+    echo -e "${CYAN}提示：你可以在 ${host_config_path} 下找到 peer1, peer2... 的配置和二维码图片。${RESET}"
     echo -e "${GREEN}================================================${RESET}"
 }
 
@@ -187,19 +185,24 @@ update_utils() {
 
 # 卸载容器
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 mtg 容器吗？(y/n) [默认: N]: ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 WireGuard 容器吗？(y/n) [默认: N]: ${RESET}"
     read -r confirm
     [[ -z "$confirm" ]] && confirm="N"
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地数据与所有配置文件？(y/n) [默认: N]: ${RESET}"
-            read -r clean_data
-            [[ -z "$clean_data" ]] && clean_data="N"
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}所有配置文件及密钥目录已彻底清理。${RESET}"
+            
+            if [ -f "$ENV_FILE" ]; then
+                source "$ENV_FILE"
+                echo -ne "${YELLOW}是否同时删除生成的客户端配置与密钥目录 (${WG_HOST_CONFIG})？(y/n) [默认: N]: ${RESET}"
+                read -r clean_data
+                [[ -z "$clean_data" ]] && clean_data="N"
+                if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                    rm -rf "$WG_HOST_CONFIG"
+                    rm -rf "$BASE_DIR"
+                    echo -e "${GREEN}所有客户端配置数据及管理脚本目录已彻底清理。${RESET}"
+                fi
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -217,28 +220,118 @@ show_info() {
     get_status_info
     if [ -f "$ENV_FILE" ]; then
         source "$ENV_FILE"
-        DETECT_IP=$(get_public_ip)
         echo -e "${GREEN}================================================${RESET}"
         echo -e "${YELLOW}当前状态       : $status"
-        echo -e "${YELLOW}代理端口       : ${MTG_PORT}"
-        echo -e "${YELLOW}伪装域名       : ${MTG_DOMAIN}"
-        echo -e "${YELLOW}混淆密钥       : ${MTG_SECRET}"
-        echo -e "${CYAN}Telegram 快捷连接链接:${RESET}"
-        echo -e "${GREEN}tg://proxy?server=${DETECT_IP}&port=${MTG_PORT}&secret=${MTG_SECRET}${RESET}"
+        echo -e "${YELLOW}监听连接端口   : ${WG_SERVER_PORT} (UDP)"
+        echo -e "${YELLOW}公网公告地址   : ${WG_SERVER_URL}"
+        echo -e "${YELLOW}VPN 内部子网   : ${WG_SUBNET}"
+        echo -e "${YELLOW}配置下发数量   : ${WG_PEERS} 个"
+        echo -e "${YELLOW}配置存储路径   : ${WG_HOST_CONFIG}"
+        echo -e "${GREEN}================================================${RESET}"
+        if [ -d "$WG_HOST_CONFIG" ]; then
+            echo -e "${CYAN}当前已生成的客户端列表如下:${RESET}"
+            ls -d "$WG_HOST_CONFIG"/peer* 2>/dev/null | sed 's|.*/||' | sed 's/^/  - /'
+        fi
         echo -e "${GREEN}================================================${RESET}"
     else
         echo -e "${RED}未检测到部署配置环境。${RESET}"
     fi
 }
 
+
+# 新增：查看特定 Peer 的连接详细信息和终端二维码
+show_peer_connections() {
+    if [ ! -f "$ENV_FILE" ]; then
+        echo -e "${RED}错误: 未检测到环境配置文件，请先部署容器！${RESET}"
+        return
+    fi
+    source "$ENV_FILE"
+    
+    if [ ! -d "$WG_HOST_CONFIG" ]; then
+        echo -e "${RED}错误: 配置挂载路径不存在，请确认容器是否已正常启动并生成配置。${RESET}"
+        return
+    fi
+
+    # 获取所有 peer 目录并存入数组
+    local peers=($(ls -d "$WG_HOST_CONFIG"/peer* 2>/dev/null | sed 's|.*/||' | sort -V))
+    
+    if [ ${#peers[@]} -eq 0 ]; then
+        echo -e "${RED}未找到任何已生成的客户端 (peer) 配置。${RESET}"
+        return
+    fi
+
+    while true; do
+        clear
+        echo -e "${GREEN}=====================================${RESET}"
+        echo -e "${GREEN}    ◈  客户端 (Peer) 连接信息面板  ◈     ${RESET}"
+        echo -e "${GREEN}=====================================${RESET}"
+        echo -e "${CYAN}请选择要查看的客户端：${RESET}"
+        
+        for i in "${!peers[@]}"; do
+            echo -e "${GREEN}$((i+1)). ${peers[$i]}${RESET}"
+        done
+        echo -e "${GREEN}0. 返回主菜单${RESET}"
+        echo -e "${GREEN}=====================================${RESET}"
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read -r peer_choice
+
+        if [[ "$peer_choice" == "0" ]]; then
+            break
+        elif [[ "$peer_choice" =~ ^[0-9]+$ ]] && [ "$peer_choice" -le "${#peers[@]}" ] && [ "$peer_choice" -gt 0 ]; then
+            local target_peer="${peers[$((peer_choice-1))]}"
+            local peer_dir="$WG_HOST_CONFIG/$target_peer"
+            local conf_file="$peer_dir/${target_peer}.conf"
+            local qr_file="$peer_dir/${target_peer}.png"
+
+            clear
+            echo -e "${GREEN}======================================================================${RESET}"
+            echo -e "${YELLOW}>> 正在查看客户端: ${target_peer}${RESET}"
+            echo -e "${GREEN}======================================================================${RESET}"
+            
+            # 1. 打印文本配置
+            if [ -f "$conf_file" ]; then
+                echo -e "${CYAN}[ 配置文件内容 (${target_peer}.conf) ]${RESET}"
+                cat "$conf_file"
+                echo ""
+            else
+                echo -e "${RED}未找到文本配置文件: $conf_file${RESET}"
+            fi
+
+            echo -e "${GREEN}----------------------------------------------------------------------${RESET}"
+
+            # 2. 调用 linuxserver 容器自带的工具在终端打印二维码
+            echo -e "${CYAN}[ 手机扫描二维码连接 ]${RESET}"
+            if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+                # 利用容器内现成的 qrencode 工具，免去宿主机安装依赖的麻烦
+                docker exec -it "$CONTAINER_NAME" qrencode -t ansiutf8 < "$conf_file" 2>/dev/null
+                if [ $? -ne 0 ]; then
+                     echo -e "${YELLOW}提示: 容器内 qrencode 渲染失败，尝试通过内置日志提取...${RESET}"
+                     docker logs "$CONTAINER_NAME" | grep -A 35 "${target_peer^^} QR code"
+                fi
+            else
+                echo -e "${RED}容器未在运行中，无法动态生成终端二维码。${RESET}"
+                echo -e "${YELLOW}你可以直接复制上方文本配置，或前往以下路径查看二维码图片：${RESET}"
+                echo -e "${YELLOW}$qr_file${RESET}"
+            fi
+            echo -e "${GREEN}======================================================================${RESET}"
+            
+            echo -ne "${YELLOW}按回车键返回客户端列表...${RESET}"
+            read -r
+        else
+            echo -e "${RED}无效选项，请重新输入！${RESET}"
+            sleep 1
+        fi
+    done
+}
+
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  MTProto 代理管理面板 ◈    ${RESET}"
+    echo -e "${GREEN}   ◈  WireGuard 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${wg_port} (UDP)${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -248,6 +341,7 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 查看客户端连接信息与二维码 🌟${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
@@ -261,6 +355,7 @@ menu() {
         6) restart_utils ;;
         7) logs_utils ;;
         8) show_info ;;
+        9) show_peer_connections ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

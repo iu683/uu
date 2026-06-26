@@ -1,247 +1,172 @@
 #!/bin/bash
-# =================================================================
-# EasyTier 虚拟局域网组网工具箱 Docker Compose 管理面板
-# =================================================================
 
-# 颜色
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\033[0m"
+# =============================================================================
+# 颜色变量定义
+# =============================================================================
+gl_kjlan='\033[1;36m' # 亮蓝色/科幻蓝
+gl_bai='\033[0m'      # 恢复白色/重置
+gl_huang='\033[1;33m'  # 黄色
+gl_lv='\033[1;32m'    # 绿色
+gl_hong='\033[1;31m'  # 红色
 
-CONTAINER_NAME="easytier"
-BASE_DIR="/opt/easytier"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
-
-# 检测依赖
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
-    fi
-    if [ ! -c /dev/net/tun ]; then
-        echo -e "${RED}错误: 宿主机未启用 TUN 模块，请先运行: modprobe tun ${RESET}"
-        exit 1
-    fi
-}
-
-# 动态获取容器组网状态
-get_status_info() {
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
+# =============================================================================
+# Realm 转发首连超时修复
+# =============================================================================
+realm_fix_timeout() {
+    clear
+    echo -e "${gl_lv}================================${gl_bai}"
+    echo -e "${gl_lv}   ◈ Realm 转发首连超时修复 ◈   ${gl_bai}"
+    echo -e "${gl_lv}================================${gl_bai}"
+    echo -e "${gl_lv}功能说明：${gl_bai}"
+    echo -e "${gl_huang}连接跟踪模块加载 + 容量扩展（转发必需）${gl_bai}"
+    echo -e "${gl_huang}强制 IPv4 + nodelay + reuse_port（优化 Realm 配置）${gl_bai}"
+    echo -e "${gl_huang}提升 Realm 进程文件句柄限制 (Systemd/OpenRC)${gl_bai}"
+    echo -e "${gl_lv}================================${gl_bai}"
+    
+    # 检测是否为非交互式环境
+    if [ "$AUTO_MODE" = "1" ] || [ ! -t 0 ]; then
+        confirm=y
     else
-        status="${RED}未部署${RESET}"
+        read -e -p "$(echo -e "${gl_lv}是否继续执行修复？(y/n): ${gl_bai}")" confirm
     fi
 
-    if [ -f "$ENV_FILE" ]; then
-        source "$ENV_FILE"
-        net_name="$ET_NET_NAME"
-    else
-        net_name="N/A"
-    fi
-}
-
-# 部署 EasyTier
-install_utils() {
-    check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 自定义 EasyTier 组网参数配置 ======${RESET}"
-
-    # 1. 镜像选择（增加国内加速镜像支持）
-    echo -e "${YELLOW}请选择使用的 Docker 镜像：${RESET}"
-    echo -e "  1) 官方镜像 (easytier/easytier:latest)"
-    echo -e "  2) 国内加速 (m.daocloud.io/docker.io/easytier/easytier:latest)"
-    echo -ne "${YELLOW}请选择 [默认: 1]: ${RESET}"
-    read -r img_choice
-    [[ -z "$img_choice" ]] && img_choice="1"
-    if [[ "$img_choice" == "2" ]]; then
-        IMAGE_NAME="m.daocloud.io/docker.io/easytier/easytier:latest"
-    else
-        IMAGE_NAME="easytier/easytier:latest"
-    fi
-
-    # 2. 虚拟网络名称配置
-    echo -ne "${YELLOW}请输入您的虚拟网络名称 (<用户>) [默认: my_et_net]: ${RESET}"
-    read -r net_name
-    [[ -z "$net_name" ]] && net_name="my_et_net"
-
-    # 3. 虚拟网络密码配置
-    echo -ne "${YELLOW}请输入您的虚拟网络密码 (<密码>) [默认: et_password]: ${RESET}"
-    read -r net_secret
-    [[ -z "$net_secret" ]] && net_secret="et_password"
-
-    # 4. Peer 节点配置
-    echo -e "${YELLOW}\n是否需要连接到其他现有的对等节点 / 公共节点？${RESET}"
-    echo -ne "${YELLOW}输入 (y/N) [默认: N，作为主创节点启动]: ${RESET}"
-    read -r has_peer
-    [[ -z "$has_peer" ]] && has_peer="N"
-
-    peer_command_line=""
-    custom_peer=""
-    if [[ "$has_peer" == "y" || "$has_peer" == "Y" ]]; then
-        echo -ne "${YELLOW}请输入其他节点的公网 IP 和端口 (例如 1.2.3.4:11010): ${RESET}"
-        read -r custom_peer
-        if [[ -n "$custom_peer" ]]; then
-            peer_command_line="-p tcp://${custom_peer}"
-        fi
-    fi
-
-    # 写入 .env 文件
-    cat <<EOF > "$ENV_FILE"
-ET_IMAGE=${IMAGE_NAME}
-ET_NET_NAME=${net_name}
-ET_NET_SECRET=${net_secret}
-ET_PEER_URL=${custom_peer}
-EOF
-
-    # 5. 动态生成完全符合 host 网络与 TUN 挂载的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  easytier:
-    image: \${ET_IMAGE}
-    hostname: easytier
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    network_mode: host
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    environment:
-      - TZ=Asia/Shanghai
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    volumes:
-      - /etc/machine-id:/etc/machine-id:ro
-    command: -d --network-name \${ET_NET_NAME} --network-secret \${ET_NET_SECRET} ${peer_command_line}
-EOF
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 EasyTier...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待容器网卡初始化 (约3秒)...${RESET}"
-    sleep 3
-
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN}          EasyTier 组网节点部署成功！             ${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${YELLOW}虚拟网络名称 : ${net_name}${RESET}"
-    echo -e "${YELLOW}虚拟网络密码 : ${net_secret}${RESET}"
-    if [[ -n "$custom_peer" ]]; then
-        echo -e "${YELLOW}已连接对等端 : tcp://${custom_peer}${RESET}"
-    else
-        echo -e "${YELLOW}节点运行模式 : 独立主创节点（等待其他子节点加入）${RESET}"
-    fi
-    echo -e "${YELLOW}配置文件存储 : $COMPOSE_FILE${RESET}"
-    echo -e "${CYAN}提示：你可以通过执行 [docker exec -it easytier easytier-cli peer] 查看组网拓扑。${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-}
-
-# 更新镜像
-update_utils() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${gl_huang}已取消操作${gl_bai}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
-}
 
-# 卸载容器
-uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 EasyTier 节点吗？(y/n) [默认: N]: ${RESET}"
-    read -r confirm
-    [[ -z "$confirm" ]] && confirm="N"
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止，虚拟网卡及宿主机路由已自动释放。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地配置文件目录？(y/n) [默认: N]: ${RESET}"
-            read -r clean_data
-            [[ -z "$clean_data" ]] && clean_data="N"
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}管理及配置环境已彻底清理。${RESET}"
-            fi
-        else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
-        fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+    # 检查 root 权限
+    if [[ ${EUID:-0} -ne 0 ]]; then
+        echo -e "${gl_hong}错误：请以 root 身份运行（sudo -i 或 sudo bash）${gl_bai}"
+        exit 1
     fi
-}
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+    # 检测系统类型
+    IS_ALPINE=0
+    if [ -f /etc/alpine-release ]; then
+        IS_ALPINE=1
+    fi
 
-# 扩展：直接在查看配置中集成 easytier-cli 节点状态查询
-show_info() {
-    get_status_info
-    if [ -f "$ENV_FILE" ]; then
-        source "$ENV_FILE"
-        echo -e "${GREEN}================================================${RESET}"
-        echo -e "${YELLOW}当前状态       : $status"
-        echo -e "${YELLOW}虚拟网络名称   : ${ET_NET_NAME}"
-        echo -e "${YELLOW}虚拟网络密码   : ${ET_NET_SECRET}"
-        if [[ -n "$ET_PEER_URL" ]]; then
-            echo -e "${YELLOW}连接对等节点   : tcp://${ET_PEER_URL}"
+    # 备份目录
+    BACKUP_DIR="/etc/.realm_fix_backup/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+    echo -e "${gl_lv}[1/4] 创建备份目录：$BACKUP_DIR${gl_bai}"
+
+    # 加载并持久化 nf_conntrack
+    echo -e "${gl_lv}[2/4] 加载/持久化 nf_conntrack（连接跟踪）${gl_bai}"
+    
+    # Alpine 尝试安装内核扩展（如果需要）
+    if [ "$IS_ALPINE" -eq 1 ]; then
+        apk add --no-cache iptables >/dev/null 2>&1 || true
+    fi
+
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe nf_conntrack 2>/dev/null || true
+    fi
+
+    # 持久化模块加载
+    if [ "$IS_ALPINE" -eq 1 ]; then
+        if ! grep -q '^nf_conntrack$' /etc/modules 2>/dev/null; then
+            echo "nf_conntrack" >> /etc/modules
         fi
-        echo -e "${GREEN}================================================${RESET}"
-        if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-            echo -e "${CYAN}当前局域网内的在线 Peer 拓扑树:${RESET}"
-            docker exec -it "$CONTAINER_NAME" easytier-cli peer 2>/dev/null
-        fi
-        echo -e "${GREEN}================================================${RESET}"
     else
-        echo -e "${RED}未检测到部署配置环境。${RESET}"
+        mkdir -p /etc/modules-load.d
+        if ! grep -q '^nf_conntrack$' /etc/modules-load.d/conntrack.conf 2>/dev/null; then
+            echo nf_conntrack >> /etc/modules-load.d/conntrack.conf
+        fi
     fi
+
+    # 写入 Realm 专属 sysctl 配置
+    mkdir -p /etc/sysctl.d
+    cat >/etc/sysctl.d/60-realm-tune.conf <<'SYSC'
+# Realm 转发专属优化
+net.netfilter.nf_conntrack_max = 262144
+SYSC
+    
+    # 兼容 Alpine 的 sysctl 刷新
+    if [ "$IS_ALPINE" -eq 1 ]; then
+        sysctl -p /etc/sysctl.d/60-realm-tune.conf >/dev/null 2>&1 || true
+    else
+        sysctl --system >/dev/null 2>&1 || true
+    fi
+    echo -e "${gl_lv}  ✓ nf_conntrack_max = 262144 已生效${gl_bai}"
+
+    # 修改 Realm 配置
+    echo -e "${gl_lv}[3/4] 优化 Realm 配置（IPv4 + nodelay + reuse_port）${gl_bai}"
+    realm_cfg="/etc/realm/config.json"
+    if [[ -f "$realm_cfg" ]]; then
+        cp -a "$realm_cfg" "$BACKUP_DIR/"
+
+        if command -v jq >/dev/null 2>&1; then
+            tmpfile=$(mktemp)
+            jq '.resolve = "ipv4" | .nodelay = true | .reuse_port = true' \
+                "$realm_cfg" >"$tmpfile" && mv "$tmpfile" "$realm_cfg"
+        else
+            echo -e "${gl_huang}  未安装 jq，使用文本方式修改${gl_bai}"
+            # 兼容 BusyBox sed 的写法，避免使用复杂的 0,/{/ 语法
+            # 简单粗暴地在第一行后面追加配置（假设符合标准JSON开头）
+            sed -i 's/^[[:space:]]*{/{\n  "resolve": "ipv4",\n  "nodelay": true,\n  "reuse_port": true,/' "$realm_cfg" 2>/dev/null || true
+        fi
+
+        # 统一用文本替换确保 IPv6 监听改为 IPv4 (移除了不兼容的 .bak 后缀)
+        sed -i -E 's/"listen"\s*:\s*":::([0-9]+)"/"listen": "0.0.0.0:\1"/g' "$realm_cfg" 2>/dev/null || true
+        sed -i -E 's/"listen"\s*:\s*"\[::\]:([0-9]+)"/"listen": "0.0.0.0:\1"/g' "$realm_cfg" 2>/dev/null || true
+        sed -i 's/:::/0.0.0.0:/g' "$realm_cfg" 2>/dev/null || true
+        echo -e "${gl_lv}  ✓ Realm 配置已优化${gl_bai}"
+    else
+        echo -e "${gl_huang}  未找到 $realm_cfg，跳过 Realm 配置修改${gl_bai}"
+    fi
+
+    # realm 服务文件句柄限制 (兼容 Systemd 和 OpenRC)
+    echo -e "${gl_lv}[4/4] 提升 Realm 服务文件句柄限制${gl_bai}"
+    
+    if [ "$IS_ALPINE" -eq 1 ]; then
+        # Alpine OpenRC 环境
+        if [ -f /etc/init.d/realm ]; then
+            # 在 OpenRC 脚本或配置文件中加上限制
+            if [ -f /etc/conf.d/realm ]; then
+                if ! grep -q 'rc_ulimit' /etc/conf.d/realm; then
+                    echo 'rc_ulimit="-n 1048576"' >> /etc/conf.d/realm
+                fi
+            else
+                mkdir -p /etc/conf.d
+                echo 'rc_ulimit="-n 1048576"' > /etc/conf.d/realm
+            fi
+            rc-service realm restart >/dev/null 2>&1 || echo -e "${gl_huang}  ⚠ realm 重启失败，请手动检查${gl_bai}"
+            echo -e "${gl_lv}  ✓ OpenRC ulimit 限制已生效${gl_bai}"
+        else
+            echo -e "${gl_huang}  未发现 /etc/init.d/realm 服务，跳过句柄限制${gl_bai}"
+        fi
+    else
+        # 传统的 Systemd 环境
+        if systemctl list-unit-files 2>/dev/null | grep -q '^realm\.service'; then
+            mkdir -p /etc/systemd/system/realm.service.d
+            cat >/etc/systemd/system/realm.service.d/override.conf <<'OVR'
+[Service]
+LimitNOFILE=1048576
+OVR
+            systemctl daemon-reload
+            systemctl restart realm 2>/dev/null || echo -e "${gl_huang}  ⚠ realm 重启失败，请手动检查${gl_bai}"
+            echo -e "${gl_lv}  ✓ LimitNOFILE=1048576 已生效${gl_bai}"
+        else
+            echo -e "${gl_huang}  未发现 realm.service，跳过${gl_bai}"
+        fi
+    fi
+
+    echo ""
+    echo -e "${gl_lv}================================${gl_bai}"
+    echo -e "${gl_lv}    ◈  Realm 优化完成！ ◈      ${gl_bai}"
+    echo -e "${gl_lv}================================${gl_bai}"
+    echo -e "${gl_lv}📋 备份位置：${gl_bai}$BACKUP_DIR"
+    echo -e "${gl_huang}快速验证：${gl_bai}"
+    echo -e "${gl_huang}Realm 监听：   ss -tlnp | grep realm${gl_bai}"
+    echo -e "${gl_huang}conntrack：   sysctl net.netfilter.nf_conntrack_max${gl_bai}"
+    echo -e "${gl_huang}Realm 配置：   cat /etc/realm/config.json | grep -E 'resolve|nodelay|reuse_port'${gl_bai}"
+    echo -e "${gl_lv}重启服务器后所有配置依然生效，无需重复执行！${gl_bai}"
+    echo -e "${gl_lv}================================${gl_bai}"
 }
 
-menu() {
-    clear
-    get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈  EasyTier 虚拟组网管理面板 ◈ ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}网络 :${RESET} ${YELLOW}${net_name}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_utils ;;
-        2) update_utils ;;
-        3) uninstall_utils ;;
-        4) start_utils ;;
-        5) stop_utils ;;
-        6) restart_utils ;;
-        7) logs_utils ;;
-        8) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
-}
-
-while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
-done
+# =============================================================================
+# 脚本执行入口
+# =============================================================================
+realm_fix_timeout

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# frp-panel-client 客户端节点 一键管理面板 
+# wg-easy 工具箱 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="frp-panel-client"
-BASE_DIR="/opt/frp-panel-client"
+CONTAINER_NAME="wg-easy"
+BASE_DIR="/opt/wg-easy"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -34,76 +34,149 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 从 .env 读取关键连接参数用于菜单展示
-    if [ -f "$ENV_FILE" ]; then
-        source "$ENV_FILE"
-        client_id="$FRPP_CLIENT_ID"
+    # 2. 从映射获取 WebUI 端口（默认 51821）
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "51821/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="51821"
     else
-        client_id="N/A"
+        webui_port="N/A"
     fi
 }
 
-# 部署 frp-panel-client
+# 获取公网 IP (兼容双栈环境)
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
+}
+
+# 部署 wg-easy
 install_utils() {
     check_dependencies
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义客户端参数配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 请确保以下参数与你 Master 主控面板中的设置完全一致。${RESET}"
+    echo -e "${CYAN}====== 自定义 wg-easy 参数配置 ======${RESET}"
+    echo -e "${RED}注意: 该服务需要管理内核网络模块，确保已具备 NET_ADMIN 权限。${RESET}"
 
-    # 1. 配置 Master 的全局通讯密钥 (APP_GLOBAL_SECRET)
-    echo -ne "${YELLOW}请输入 Master 节点的全局通信密钥 (-s) [默认: abc]: ${RESET}"
-    read -r app_secret
-    [[ -z "$app_secret" ]] && app_secret="abc"
+    # 获取系统公网 IP 作为默认的 WG HOST
+    DETECT_IP=$(get_public_ip)
 
-    # 2. 配置当前客户端节点 ID
-    echo -ne "${YELLOW}请输入该客户端的唯一 ID (-i) [默认: user.c.client1]: ${RESET}"
-    read -r client_id
-    [[ -z "$client_id" ]] && client_id="user.c.client1"
+    # 1. 配置 WG_HOST (客户端连接用的外部 IP 或域名)
+    echo -ne "${YELLOW}请输入客户端连接的公网 IP 或域名 (WG_HOST) [默认: ${DETECT_IP}]: ${RESET}"
+    read -r custom_host
+    [[ -z "$custom_host" ]] && custom_host="$DETECT_IP"
 
-    # 3. 配置 Master API 访问地址
-    echo -ne "${YELLOW}请输入 Master API/WebUI 访问地址 [默认: https://frpp.example.com:443]: ${RESET}"
-    read -r master_api_url
-    [[ -z "$master_api_url" ]] && master_api_url="https://frpp.example.com:443"
+    # 2. 配置 WebUI 访问端口
+    echo -ne "${YELLOW}请输入 Web 面板访问端口 [默认: 51821]: ${RESET}"
+    read -r custom_ui_port
+    [[ -z "$custom_ui_port" ]] && custom_ui_port="51821"
+    if ! [[ "$custom_ui_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
 
-    # 4. 配置 Master RPC 通讯地址
-    echo -ne "${YELLOW}请输入 Master RPC 连接地址 [默认: wss://frpp.example.com:443]: ${RESET}"
-    read -r master_rpc_url
-    [[ -z "$master_rpc_url" ]] && master_rpc_url="wss://frpp.example.com:443"
+    # 3. 配置 WireGuard UDP 传输端口
+    echo -ne "${YELLOW}请输入 WireGuard UDP 传输端口 [默认: 51820]: ${RESET}"
+    read -r custom_wg_port
+    [[ -z "$custom_wg_port" ]] && custom_wg_port="51820"
+    if ! [[ "$custom_wg_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
+
+    # 4. 配置 WebUI 登录密码 (可选扩展项，官方支持 PASSWORD 变量)
+    echo -ne "${YELLOW}请输入 Web 面板登录密码 (直接回车不设置密码): ${RESET}"
+    read -r ui_password
 
     # 写入 .env 文件
     cat <<EOF > "$ENV_FILE"
-FRPP_SECRET=${app_secret}
-FRPP_CLIENT_ID=${client_id}
-FRPP_MASTER_API=${master_api_url}
-FRPP_MASTER_RPC=${master_rpc_url}
+WG_HOST=${custom_host}
+WEBUI_PORT=${custom_ui_port}
+WG_PORT=${custom_wg_port}
 EOF
 
-    # 动态生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    # 如果输入了密码，追加到环境变量
+    local env_pass_line=""
+    if [[ -n "$ui_password" ]]; then
+        env_pass_line="      - PASSWORD=${ui_password}"
+    fi
+
+    # 5. 动态生成完全保留高级双栈网络划分的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合标准的高级网络 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
+volumes:
+  etc_wireguard:
+
 services:
-  frp-panel-client:
-    image: vaalacat/frp-panel:latest
+  wg-easy:
+    image: ghcr.io/wg-easy/wg-easy:15
     container_name: ${CONTAINER_NAME}
-    network_mode: host
     restart: unless-stopped
-    command: client -s \${FRPP_SECRET} -i \${FRPP_CLIENT_ID} --api-url \${FRPP_MASTER_API} --rpc-url \${FRPP_MASTER_RPC}
+    environment:
+      - WG_HOST=\${WG_HOST}
+$(if [[ -n "$env_pass_line" ]]; then echo "$env_pass_line"; fi)
+    networks:
+      wg:
+        ipv4_address: 10.42.42.42
+        ipv6_address: fdcc:ad94:bacf:61a3::2a
+    volumes:
+      - etc_wireguard:/etc/wireguard
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "\${WG_PORT}:51820/udp"
+      - "\${WEBUI_PORT}:51821/tcp"
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv6.conf.all.forwarding=1
+      - net.ipv6.conf.default.forwarding=1
+
+networks:
+  wg:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.42.42.0/24
+        - subnet: fdcc:ad94:bacf:61a3::/64
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 frp-panel-client...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 wg-easy...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    echo -e "${YELLOW}等待容器初始化并创建网络网卡 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN}      frp-panel-client 客户端部署成功！           ${RESET}"
+    echo -e "${GREEN}          wg-easy 双栈面板部署成功！             ${RESET}"
     echo -e "${GREEN}================================================${RESET}"
-    echo -e "${YELLOW}当前客户端 ID   : ${client_id}${RESET}"
-    echo -e "${YELLOW}连接主控 API    : ${master_api_url}${RESET}"
-    echo -e "${YELLOW}连接主控 RPC    : ${master_rpc_url}${RESET}"
-    echo -e "${YELLOW}配置文件路径    : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}Web 管理面板地址 : http://${DETECT_IP}:${custom_ui_port}${RESET}"
+    [[ -n "$ui_password" ]] && echo -e "${YELLOW}面板登录管理密码 : ${ui_password}${RESET}"
+    echo -e "${YELLOW}WireGuard节点端口: ${custom_wg_port} (UDP)${RESET}"
+    echo -e "${YELLOW}客户端连回宿主机 : ${custom_host}${RESET}"
+    echo -e "${YELLOW}配置文件存储路径 : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================================${RESET}"
 }
 
@@ -121,19 +194,19 @@ update_utils() {
 
 # 卸载容器
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 frp-panel-client 吗？(y/n) [默认: N]: ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 wg-easy 容器及自定义双栈网络吗？(y/n) [默认: N]: ${RESET}"
     read -r confirm
     [[ -z "$confirm" ]] && confirm="N"
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}客户端容器已停止并移除。${RESET}"
+            cd "$BASE_DIR" && docker compose down -v
+            echo -e "${GREEN}容器、双栈桥接网络及 Volume 临时缓存数据已停止并移除。${RESET}"
             echo -ne "${YELLOW}是否同时删除本地配置文件目录？(y/n) [默认: N]: ${RESET}"
             read -r clean_data
             [[ -z "$clean_data" ]] && clean_data="N"
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}客户端配置目录已彻底清理。${RESET}"
+                echo -e "${GREEN}面板配置目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -151,12 +224,12 @@ show_info() {
     get_status_info
     if [ -f "$ENV_FILE" ]; then
         source "$ENV_FILE"
+        DETECT_IP=$(get_public_ip)
         echo -e "${GREEN}================================================${RESET}"
         echo -e "${YELLOW}当前状态       : $status"
-        echo -e "${YELLOW}当前客户端 ID  : ${FRPP_CLIENT_ID}${RESET}"
-        echo -e "${YELLOW}连接主控 API   : ${FRPP_MASTER_API}${RESET}"
-        echo -e "${YELLOW}连接主控 RPC   : ${FRPP_MASTER_RPC}${RESET}"
-        echo -e "${YELLOW}通信密钥       : ${FRPP_SECRET}${RESET}"
+        echo -e "${YELLOW}WebUI 访问地址 : http://${DETECT_IP}:${WEBUI_PORT}${RESET}"
+        echo -e "${YELLOW}WireGuard 端口 : ${WG_PORT} (UDP)"
+        echo -e "${YELLOW}下发客户端 HOST: ${WG_HOST}"
         echo -e "${GREEN}================================================${RESET}"
     else
         echo -e "${RED}未检测到部署配置环境。${RESET}"
@@ -167,10 +240,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈ frp-panel  Client管理面板 ◈  ${RESET}"
+    echo -e "${GREEN}    ◈  wg-easy  管理面板 ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态     :${RESET} $status"
-    echo -e "${GREEN}客户端ID :${RESET} ${YELLOW}${client_id}${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

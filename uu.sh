@@ -1,23 +1,43 @@
-#!/bin/sh
-set -eu
-APP="mini-sb-agent"
-INSTALL_DIR="/opt/mini-sb-agent"
-RUN_DIR="/run/mini-sb-agent"
-SERVICE_NAME="mini-sb-agent"
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-  systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-  rm -f "/etc/systemd/system/$SERVICE_NAME.service"
-  systemctl daemon-reload 2>/dev/null || true
-fi
-if command -v rc-service >/dev/null 2>&1; then
-  rc-service "$SERVICE_NAME" stop 2>/dev/null || true
-  rc-update del "$SERVICE_NAME" default 2>/dev/null || true
-  rm -f "/etc/init.d/$SERVICE_NAME" "/etc/conf.d/$SERVICE_NAME"
-fi
-if [ -x "$INSTALL_DIR/$APP" ]; then
-  pkill -f "$INSTALL_DIR/$APP" 2>/dev/null || true
-fi
-rm -rf "$INSTALL_DIR" "$RUN_DIR"
-rm -f /tmp/mini-sb-agent.sock
-printf '%s\n' "mini-sb-agent 已卸载，仅移除了本安装器创建的文件。"
+#!/bin/bash
+
+GREEN='\033[0;32m'
+LIGHT_GREEN='\033[1;32m'
+NC='\033[0;0m' # 无颜色
+
+# 菜单主循环
+while true; do
+    clear
+    echo -e "${GREEN}=================================${NC}"
+    echo -e "${GREEN}  ◈  mini-sb-agent 管理菜单  ◈   ${NC}"
+    echo -e "${GREEN}=================================${NC}"
+    echo -e "${GREEN} 1. 安装 mini-sb-agent"
+    echo -e "${GREEN} 2. 卸载 mini-sb-agent"
+    echo -e "${GREEN} 0. 退出"
+    echo -e "${GREEN}=================================${NC}"
+    echo -e -n "${GREEN}请输入选项: ${NC}"
+    read -r opt
+
+    case $opt in
+        1)
+            echo -e "\n${GREEN}[*] 开始安装 mini-sb-agent...${NC}\n"
+            curl -fsSL https://raw.githubusercontent.com/ashvvvvv/mini-sb-agent/master/install.sh | sh
+            echo -e "\n${GREEN}[+] 安装流程执行完毕。${NC}"
+            echo -e -n "${LIGHT_GREEN}按任意键返回菜单...${NC}"
+            read -n 1 -s
+            ;;
+        2)
+            echo -e "\n${GREEN}[*] 开始卸载 mini-sb-agent...${NC}\n"
+            bash <(curl -sL https://raw.githubusercontent.com/sistarry/toolbox/main/PROXY/uninstallminisb.sh)
+            echo -e "\n${GREEN}[+] 卸载流程执行完毕。${NC}"
+            echo -e -n "${LIGHT_GREEN}按任意键返回菜单...${NC}"
+            read -n 1 -s
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "\n${GREEN}无效选项，请重新输入${NC}"
+            sleep 2
+            ;;
+    esac
+done

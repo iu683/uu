@@ -1,223 +1,249 @@
 #!/bin/bash
 
-# ==========================================
-# VPS AI 工具与 Agent 检测
-# ==========================================
+# 颜色定义
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
 
-# 颜色定义 (已修正缺失的 [ 符号)
-G='\033[0;32m'   # 绿色 (Green)
-R='\033[0;31m'   # 红色 (Red)
-Y='\033[1;33m'   # 黄色 (Yellow)
-B='\033[0;34m'   # 蓝色 (Blue)
-NC='\033[0m'     # 无颜色 (No Color)
+# 自定义配置文件路径
+ENV_FILE="$HOME/.claude_custom_env"
 
-# 为 Code Whale 模块兼容你代码中的颜色变量名
-GREEN="${G}"
-RED="${R}"
-YELLOW="${Y}"
-RESET="${NC}"
+# 临时和永久确保当前脚本进程能找到最新的 PATH
+export PATH="$HOME/.local/bin:$PATH"
 
-echo -e "${Y}========================================${NC}"
-echo -e "${Y}        ◈      AI 工具检测      ◈        ${NC}"
-echo -e "${Y}========================================${NC}"
+# 自动刷新和导出自定义 API 环境配置（让主面板状态100%同步）
+refresh_env() {
+    # 先清理当前进程中的历史干扰变量
+    unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+    unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
+    unset CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_EFFORT_LEVEL
 
-# ==========================================
-# 环境变量与路径补全
-# ==========================================
-ensure_env_path() {
-    local common_paths=(
-        "/usr/local/bin"
-        "/usr/local/sbin"
-        "/usr/bin"
-        "/bin"
-        "$HOME/.local/bin"
-        "$HOME/.npm-global/bin"
-        "$HOME/.yarn/bin"
-        "$HOME/.cargo/bin"
-    )
-
-    for path in "${common_paths[@]}"; do
-        if [[ ":$PATH:" != *":$path:"* ]] && [ -d "$path" ]; then
-            export PATH="$PATH:$path"
-        fi
-    done
+    if [ -f "$ENV_FILE" ]; then
+        source "$ENV_FILE"
+    fi
 }
 
-# 立即执行确保后续 command -v 正常识别
-ensure_env_path
+# 首次和循环时加载环境
+refresh_env
 
-# ==========================================
-# 辅助函数
-# ==========================================
-
-# 树状格式化输出函数
-print_result() {
-    local name=$1
-    local location=$2
-    local version=$3
-    local status=$4
-
-    # 头部：工具名称
-    echo -e "${B}◈ 工具: ${NC}${Y}${name}${NC}"
-
-    if [ "$location" == "未安装" ]; then
-        # 未安装直接精简输出
-        echo -e "  └─ ${R}安装状态: 未安装${NC}"
+# 获取状态与版本信息
+get_status() {
+    if command -v claude &> /dev/null; then
+        status="${GREEN}已安装${RESET}"
+        version_info=$(claude -v 2>/dev/null | head -n 1)
+        [ -z "$version_info" ] && version_info="未知版本"
+        claude_version="${YELLOW}${version_info}${RESET}"
     else
-        # 已安装时的树状输出
-        echo -e "  ├─ ${G}安装路径: ${NC}${location}"
-        
-        # 处理版本号为空的情况并去除多余空白字符
-        version=$(echo "$version" | xargs)
-        echo -e "  ├─ ${G}当前版本: ${NC}${version:-未知}"
-        
-        # 状态着色逻辑
-        if [[ "$status" =~ "运行中" ]]; then
-            local STATUS_COLOR="${G}"
-        else
-            local STATUS_COLOR="${Y}"
-        fi
-        echo -e "  └─ ${G}活跃状态: ${NC}${STATUS_COLOR}${status}${NC}"
+        status="${RED}未安装${RESET}"
+        claude_version="${RED}-${RESET}"
     fi
-    echo -e "${B}----------------------------------------${NC}"
+
+    # 检查是否配置了自定义 API
+    if [ -f "$ENV_FILE" ] && ( [ -n "$CLAUDE_BASE_URL" ] || [ -n "$ANTHROPIC_BASE_URL" ] ); then
+        api_status="${YELLOW}自定义中转${RESET}"
+    else
+        api_status="${GREEN}官方默认${RESET}"
+    fi
 }
 
-# 安全获取命令版本函数
-get_version() {
-    local cmd=$1
-    local args=$2
-    local raw_out=""
-    
-    if command -v timeout &> /dev/null; then
-        raw_out=$(timeout 2s "$cmd" $args 2>&1)
-    fi
-    
-    if [ -z "$raw_out" ]; then
-        raw_out=$("$cmd" $args 2>&1)
-    fi
-    
-    echo "$raw_out" | grep -v '^$' | head -n 1
+# 菜单面板
+show_menu() {
+    clear
+    get_status
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    ◈  Claude Code 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}版本 :${RESET} $claude_version"
+    echo -e "${GREEN}API  :${RESET} $api_status"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装${RESET}"
+    echo -e "${GREEN}2. 当前目录启动${RESET}"
+    echo -e "${GREEN}3. 指定路径启动${RESET}"
+    echo -e "${GREEN}4. 登录/切换账户${RESET}"
+    echo -e "${GREEN}5. 设置自定义API模型/中转${RESET}"
+    echo -e "${GREEN}6. 更新${RESET}"
+    echo -e "${GREEN}7. 卸载${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
 }
 
-# 检查 Docker 容器状态的辅助函数 (保持免 systemctl 报错设计)
-check_docker_container() {
-    local keyword=$1
-    if command -v docker &> /dev/null; then
-        if command -v systemctl &> /dev/null; then
-            if ! systemctl is-active --quiet docker; then
-                return 1
+# 1. 安装
+install_claude() {
+    echo -e "\n${YELLOW}正在通过官方安装 Claude Code...${RESET}"
+    curl -fsSL https://claude.ai/install.sh | bash
+    
+    echo -e "\n${YELLOW}正在检查环境并自动修复 PATH...${RESET}"
+    local shell_config=""
+    if [ -n "$ZSH_VERSION" ] || [ -f "$HOME/.zshrc" ]; then
+        shell_config="$HOME/.zshrc"
+    else
+        shell_config="$HOME/.bashrc"
+    fi
+
+    if ! grep -q '\.local/bin' "$shell_config" 2>/dev/null; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$shell_config"
+        echo -e "${GREEN}✔ 已自动将 ~/.local/bin 写入 $shell_config${RESET}"
+    else
+        echo -e "${GREEN}✔ 配置文件中已存在 PATH 记录，无需重复添加。${RESET}"
+    fi
+
+    export PATH="$HOME/.local/bin:$PATH"
+    echo -e "${GREEN}安装与修复完成！${RESET}"
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+}
+
+# 2. 当前目录启动
+start_current() {
+    if command -v claude &> /dev/null; then
+        echo -e "\n${GREEN}正在当前目录启动 Claude Code...${RESET}"
+        refresh_env
+        claude
+    else
+        echo -e "\n${RED}未检测到 claude 命令，请先执行安装！${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    fi
+}
+
+# 3. 指定路径启动
+start_path() {
+    echo -e "\n"
+    echo -ne "${GREEN}请输入你的项目绝对路径: ${RESET}"
+    read target_path
+    if [ -d "$target_path" ]; then
+        echo -e "${GREEN}正在切换到 $target_path 并启动 Claude Code...${RESET}"
+        refresh_env
+        cd "$target_path" && claude
+    else
+        echo -e "${RED}路径不存在，请检查后重试！${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    fi
+}
+
+# 4. 登录
+login_claude() {
+    if command -v claude &> /dev/null; then
+        echo -e "\n${YELLOW}正在启动登录程序...${RESET}"
+        echo -e "提示：如果已经在会话中，直接输入 /login 即可"
+        refresh_env
+        claude -c "/login" 2>/dev/null || claude
+    else
+        echo -e "\n${RED}未检测到已安装的 Claude Code。${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    fi
+}
+# 5. 配置高级自定义 API 模型与路径 (100% 对标官方白皮书免校验版)
+config_custom_api() {
+    local SETTINGS_JSON="$HOME/.claude/settings.json"
+    local ONBOARDING_JSON="$HOME/.claude.json"
+    mkdir -p "$HOME/.claude"
+    
+    echo -e "\n${GREEN}================================${RESET}"
+    echo -e "${GREEN}    v2.1.195+ 官方解法通用配置   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 一键快捷生成免校验自定义持久化环境${RESET}"
+    echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
+    echo -e "${GREEN}0. 返回主菜单${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read api_choice
+
+    case $api_choice in
+        1)
+            echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关:${RESET}"
+            echo -ne "   地址: "
+            read input_url
+            
+            echo -e "\n${YELLOW}2/4. 请输入你的 API Key / 密钥 Token:${RESET}"
+            echo -ne "   秘钥: "
+            read input_key
+
+            echo -e "\n${YELLOW}3/4. 请输入主核心自定义模型 ID (可带 [1m] 后缀):${RESET}"
+            echo -ne "   (例如: gpt-5.4 或 deepseek-v4-pro[1m])\n   模型名: "
+            read input_model
+
+            echo -e "\n${YELLOW}4/4. 请输入子代理自定义模型 ID (可带 [1m] 后缀):${RESET}"
+            echo -ne "   (例如: gpt-5.4 或 deepseek-v4-flash[1m])\n   模型名: "
+            read input_submodel
+
+            if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ] && [ -n "$input_submodel" ]; then
+                
+                # 1. 强行注入官方免登补丁
+                cat << EOF > "$ONBOARDING_JSON"
+{
+  "hasCompletedOnboarding": true
+}
+EOF
+
+                # 2. 严格按照最新白皮书逻辑生成 JSON
+                # - 外层使用 ANTHROPIC_CUSTOM_MODEL_OPTION 声明自定义条目，强行让本地验证跳过验证！
+                # - 外层 model 字段指向你的自定义模型，让启动默认选中
+                # - 内层全量重定向：弃用 SMALL_FAST，全面回归 DEFAULT_HAIKU
+                cat << EOF > "$SETTINGS_JSON"
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "$input_url",
+    "ANTHROPIC_AUTH_TOKEN": "$input_key",
+    "ANTHROPIC_MODEL": "$input_model",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$input_model",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$input_model",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "$input_submodel",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "$input_model",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Custom Gateway Model",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Routed via custom third-party provider endpoint",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "model": "$input_model",
+  "theme": "dark"
+}
+EOF
+                # 物理清理可能残留在内存中的历史老旧变量
+                unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+                unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
+                unset CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_SMALL_FAST_MODEL
+                unset ANTHROPIC_CUSTOM_MODEL_OPTION ANTHROPIC_CUSTOM_MODEL_OPTION_NAME
+
+                echo -e "\n${GREEN}========================================${RESET}"
+                echo -e "${GREEN}✔ 100% 对标白皮书，终极配置成功！${RESET}"
+                echo -e "${GREEN}✔ 已跳过本地模型验证，强制解封自定义模型！${RESET}"
+                echo -e "${GREEN}========================================${RESET}"
+            else
+                echo -e "${RED}所有输入均不能为空，取消设置。${RESET}"
             fi
-        else
-            if ! docker info &> /dev/null; then
-                return 1
-            fi
-        fi
-
-        local container_info=$(docker ps --format "{{.ID}} [{{.Names}}] ({{.Image}})" | grep -i "$keyword" | head -n 1)
-        if [ -n "$container_info" ]; then
-            echo "$container_info"
-        fi
-    fi
+            ;;
+        2)
+            cat << EOF > "$SETTINGS_JSON"
+{
+  "env": {},
+  "model": "sonnet",
+  "theme": "dark"
 }
-
-# ==========================================
-# 工具检测核心逻辑
-# ==========================================
-
-# 1. Claude Code 检测
-if command -v claude &> /dev/null; then
-    loc=$(which claude)
-    ver=$(get_version "claude" "--version")
-    if pgrep -f "claude" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "Claude Code" "$loc" "$ver" "$status"
-
-# 2. Codex CLI 检测
-if command -v codex &> /dev/null; then
-    loc=$(which codex)
-    ver=$(get_version "codex" "--version")
-    if pgrep -f "codex" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "Codex CLI" "$loc" "$ver" "$status"
-
-# 3. Gemini CLI 检测
-if command -v gemini &> /dev/null; then
-    loc=$(which gemini)
-    ver=$( "$loc" --version 2>&1 | grep -E '[0-9]+\.[0-9]' | head -n 1 )
-    if pgrep -f "gemini" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "Gemini CLI" "$loc" "$ver" "$status"
-
-# 4. Open Code 检测 (精准定位绝对路径)
-if [ -f "/root/.opencode/bin/opencode" ]; then
-    loc="/root/.opencode/bin/opencode"
-    # 优先使用 -v 获取版本
-    ver=$($loc -v 2>/dev/null || $loc --version 2>/dev/null | head -n 1)
-    # 检查进程是否在后台运行
-    if pgrep -f "opencode" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "Open Code" "$loc" "$ver" "$status"
-
-# 5. OpenClaw 检测 (加入 Docker 联动)
-docker_res=$(check_docker_container "openclaw\|clawdbot")
-
-if [ -n "$docker_res" ]; then
-    loc="Docker Container ($docker_res)"
-    ver="Docker Managed"
-    status="运行中 (Running)"
-elif command -v openclaw &> /dev/null || command -v clawdbot &> /dev/null; then
-    loc=$(which openclaw 2>/dev/null || which clawdbot)
-    ver=$(get_version "$loc" "--version")
-    if pgrep -f "openclaw\|clawdbot" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-elif command -v pip &> /dev/null && pip show openclaw &> /dev/null; then
-    loc="Python Pip Package"
-    ver=$(pip show openclaw | grep -i "^Version:" | cut -d' ' -f2)
-    if pgrep -f "open claw" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "OpenClaw" "$loc" "$ver" "$status"
-
-# 6. Hermes Agent 检测 (加入 Docker 联动)
-docker_res=$(check_docker_container "hermes")
-
-if [ -n "$docker_res" ]; then
-    loc="Docker Container ($docker_res)"
-    ver="Docker Managed"
-    status="运行中 (Running)"
-elif command -v hermes &> /dev/null || command -v hermes-agent &> /dev/null; then
-    loc=$(which hermes 2>/dev/null || which hermes-agent)
-    raw_ver=$(get_version "$loc" "--version")
-    ver=$(echo "$raw_ver" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "$raw_ver")
-    if pgrep -f "hermes" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-elif command -v npm &> /dev/null && npm list -g --depth=0 hermes-agent &> /dev/null; then
-    loc="NPM Global Module"
-    ver=$(npm list -g --depth=0 hermes-agent | grep hermes-agent | awk -F@ '{print $2}')
-    status="已安装 (可通过 npm 启动)"
-elif command -v pip &> /dev/null && pip show hermes-agent &> /dev/null; then
-    loc="Python Pip Package"
-    ver=$(pip show hermes-agent | grep -i "^Version:" | cut -d' ' -f2)
-    status="已安装 (可通过 python 运行)"
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "Hermes Agent" "$loc" "$ver" "$status"
-
-# 7. Code Whale 检测
-if command -v codewhale &> /dev/null; then
-    loc=$(which codewhale)
-    ver=$(codewhale --version 2>/dev/null | head -n 1)
-    [ -z "$ver" ] && ver="已就绪"
-    if pgrep -f "codewhale" > /dev/null; then status="运行中"; else status="已安装/闲置"; fi
-else
-    loc="未安装"; ver=""; status=""
-fi
-print_result "Code Whale" "$loc" "$ver" "$status"
+EOF
+            rm -f "$ONBOARDING_JSON"
+            echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复官方初始状态。${RESET}"
+            ;;
+        *)
+            return
+            ;;
+    esac
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+}
+# 主循环
+while true; do
+    show_menu
+    read choice
+    case $choice in
+        1) install_claude ;;
+        2) start_current ;;
+        3) start_path ;;
+        4) login_claude ;;
+        5) config_custom_api ;;
+        6) update_claude ;;
+        7) uninstall_claude_flow ;;
+        0) clear; exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
+    esac
+done

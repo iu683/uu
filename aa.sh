@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# ForwardX 端口转发管理面板 Docker Compose 管理面板 
+# Xboard Node 后端 Docker Compose 运维管理面板 
 # =================================================================
 
 # 颜色
@@ -10,10 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="forwardx-panel"
-BASE_DIR="/opt/forwardx"
+CONTAINER_NAME="xboard-node"
+BASE_DIR="/opt/xboard-node"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
+CONFIG_FILE="$BASE_DIR/config/config.yml"
 
 # 检测依赖
 check_dependencies() {
@@ -23,7 +23,7 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、映射端口
+# 动态获取容器状态、Node ID 及镜像信息
 get_status_info() {
     # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -34,18 +34,23 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取实际端口
+    # 2. 从本地配置文件中动态抓取 Node ID 和对接域名
+    if [[ -f "$CONFIG_FILE" ]]; then
+        panel_url=$(grep -E '^[[:space:]]*url:' "$CONFIG_FILE" | awk -F'"' '{print $2}')
+        node_id=$(grep -E '^[[:space:]]*node_id:' "$CONFIG_FILE" | awk '{print $2}')
+        [[ -z "$node_id" ]] && node_id="未知"
+        [[ -z "$panel_url" ]] && panel_url="未知"
+    else
+        node_id="N/A"
+        panel_url="N/A"
+    fi
+
+    # 3. 如果容器存在，获取镜像版本
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 从容器状态提取前端映射端口（容器内部默认监听 3000）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3000"
     else
         img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
     fi
 }
 
@@ -73,148 +78,113 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 生成随机 JWT 密钥
-generate_jwt_secret() {
-    if command -v openssl &> /dev/null; then
-        openssl_rand=$(openssl rand -hex 16 2>/dev/null)
-        if [[ -n "$openssl_rand" ]]; then echo "$openssl_rand"; return; fi
-    fi
-    echo "fwdx_$(date +%s)_$((RANDOM % 9999))"
-}
-
-# 部署 ForwardX
-install_forwardx() {
+# 部署 Xboard Node
+install_utils() {
     check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -ne "${YELLOW}请输入 ForwardX 面板访问端口 [默认: 3000]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
+    mkdir -p "$BASE_DIR/config"
+    mkdir -p "$BASE_DIR/certs"
 
-    echo -ne "${YELLOW}请输入初始管理员密码 [默认: admin123]: ${RESET}"
-    read -r admin_pwd
-    [[ -z "$admin_pwd" ]] && admin_pwd="admin123"
+    echo -e "${CYAN}====== 对接参数配置 ======${RESET}"
+    
+    echo -ne "${YELLOW}请输入 Xboard 面板 URL (如 https://xxx.com): ${RESET}"
+    read -r custom_url
+    [[ -z "$custom_url" ]] && echo -e "${RED}错误: 面板 URL 不能为空！${RESET}" && return
 
-    echo -ne "${YELLOW}是否配置 Telegram 机器人通知？(y/n) [默认: n]: ${RESET}"
-    read -r tg_choice
-    local tg_token=""
-    local tg_polling="true"
-    if [[ "$tg_choice" == "y" || "$tg_choice" == "Y" ]]; then
-        echo -ne "${YELLOW}请输入 Telegram Bot Token: ${RESET}"
-        read -r tg_token
+    echo -ne "${YELLOW}请输入 面板通讯 Token (通讯密钥): ${RESET}"
+    read -r custom_token
+    [[ -z "$custom_token" ]] && echo -e "${RED}错误: 通讯 Token 不能为空！${RESET}" && return
+
+    echo -ne "${YELLOW}请输入 节点 ID (Node ID) [默认: 8]: ${RESET}"
+    read -r custom_node_id
+    [[ -z "$custom_node_id" ]] && custom_node_id="8"
+    if ! [[ "$custom_node_id" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 节点 ID 必须是纯数字！${RESET}"
+        return
     fi
 
-    # 自动生成随机 JWT 安全密钥
-    local jwt_secret=$(generate_jwt_secret)
+    # 1. 动态生成后端专用的 config.yml
+    echo -e "${YELLOW}正在生成 config.yml 配置文件...${RESET}"
+    cat <<EOF > "$CONFIG_FILE"
+panel:
+  url: "${custom_url}"
+  token: "${custom_token}"
+  node_id: ${custom_node_id}
 
-    # 1. 动态生成 .env 环境配置文件
-    echo -e "${YELLOW}正在创建 .env 环境变量文件...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-# ==================== 数据库配置 ====================
-SQLITE_PATH=/data/forwardx.db
+kernel:
+  type: "singbox"
+  config_dir: "/etc/xboard-node"
+  log_level: "warn"
 
-# ==================== 安全配置 ====================
-JWT_SECRET=${jwt_secret}
-
-# ==================== 应用配置 ====================
-NODE_ENV=production
-PORT=3000
-FORWARDX_IMAGE=ghcr.io/poouo/forwardx:latest
-
-# ==================== 管理员配置 ====================
-ADMIN_PASSWORD=${admin_pwd}
+log:
+  level: "info"
+  output: "stdout"
 EOF
 
-    # 如果配置了 TG 机器人，则追加到 .env
-    if [[ -n "$tg_token" ]]; then
-        cat <<EOF >> "$ENV_FILE"
-
-# ==================== Telegram 机器人 ====================
-TELEGRAM_BOT_TOKEN=${tg_token}
-TELEGRAM_BOT_POLLING=${tg_polling}
-EOF
-    fi
-
-    # 2. 动态生成 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在创建 docker-compose.yml 配置文件...${RESET}"
+    # 2. 动态生成 docker-compose.yml 配置文件 (采用 host 网络模式)
+    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
-name: forwardx
-
 services:
-  forwardx:
-    image: \${FORWARDX_IMAGE:-ghcr.io/poouo/forwardx:latest}
+  xboard-node:
+    image: ghcr.io/cedar2025/xboard-node:latest
     container_name: ${CONTAINER_NAME}
+    network_mode: host
     restart: unless-stopped
-    ports:
-      - "${custom_port}:3000"
-    environment:
-      NODE_ENV: production
-      PORT: 3000
-      DATABASE_CONFIG_PATH: /data/database.json
-      SQLITE_PATH: /data/forwardx.db
-      MYSQL_CONFIG_PATH: /data/mysql.json
-      POSTGRES_URL: \${POSTGRES_URL:-}
-      POSTGRES_HOST: \${POSTGRES_HOST:-}
-      POSTGRES_PORT: \${POSTGRES_PORT:-5432}
-      POSTGRES_USER: \${POSTGRES_USER:-}
-      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-}
-      POSTGRES_DATABASE: \${POSTGRES_DATABASE:-}
-      POSTGRES_SSL: \${POSTGRES_SSL:-false}
-      JWT_SECRET: \${JWT_SECRET:-change-me-to-a-random-string}
     volumes:
-      - forwardx-data:/data
-
-volumes:
-  forwardx-data:
-    driver: local
+      - ./config:/etc/xboard-node
+      - ./certs:/etc/xboard-node/certs
+    command: ["-c", "/etc/xboard-node/config.yml"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 ForwardX 面板...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Xboard Node...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约5秒)...${RESET}"
-    sleep 5
+    echo -e "${YELLOW}等待容器初始化并建立同步 (约3秒)...${RESET}"
+    sleep 3
 
     DETECT_IP=$(get_public_ip)
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      ForwardX 部署成功！       ${RESET}"
+    echo -e "${GREEN}      Xboard Node 部署成功！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}面板访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}管理初始密码 : ${admin_pwd}${RESET}"
-    echo -e "${YELLOW}配置文件目录 : ${BASE_DIR}${RESET}"
-    echo -e "${RED}提示: 生产环境下的 JWT 安全密钥已自动为您生成并注入到 .env。${RESET}"
+    echo -e "${YELLOW}面板域名   : ${custom_url}${RESET}"
+    echo -e "${YELLOW}绑定节点 ID: ${custom_node_id}${RESET}"
+    echo -e "${YELLOW}节点公网 IP: ${DETECT_IP}${RESET}"
+    echo -e "${YELLOW}配置目录   : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}================================${RESET}"
+    echo -e "${CYAN}提示: 使用 host 网络模式，请确保面板端指定的下发端口已在当前机器放行。${RESET}"
 }
 
-# 更新 ForwardX
-update_forwardx() {
+# 更新 Xboard Node 镜像
+update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取 ForwardX 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Xboard Node 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已成功平滑重启。${RESET}"
+    echo -e "${GREEN}更新完成！后端已处于最新状态。${RESET}"
 }
 
-# 卸载 ForwardX
-uninstall_forwardx() {
-    echo -ne "${YELLOW}确定要卸载并删除 ForwardX 容器吗？(y/n): ${RESET}"
+# 卸载 Xboard Node
+uninstall_utils() {
+    echo -ne "${YELLOW}确定要卸载并删除 Xboard Node 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和挂载的数据库卷(数据会丢失)？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地所有配置及证书文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                cd "$BASE_DIR" && docker compose down -v
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地数据卷及目录已彻底清理。${RESET}"
+                echo -e "${GREEN}配置及证书目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -223,34 +193,18 @@ uninstall_forwardx() {
     fi
 }
 
-check_compose_exist() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return 1
-    fi
-    return 0
-}
-
-start_forwardx() { check_compose_exist && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务已启动${RESET}"; }
-stop_forwardx() { check_compose_exist && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
-restart_forwardx() { check_compose_exist && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
-
-logs_forwardx() { 
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        docker logs -f "$CONTAINER_NAME"
-    else
-        echo -e "${RED}错误: 容器未创建，无法查看日志！${RESET}"
-    fi
-}
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    local DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}面板访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}配置根目录     : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}后端镜像     : ${img_version}${RESET}"
+    echo -e "${YELLOW}对接面板     : ${panel_url}${RESET}"
+    echo -e "${YELLOW}绑定节点 ID  : ${node_id}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -258,10 +212,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈   ForwardX 转发管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}   ◈  Xboard Node 管理面板 ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}节点 :${RESET} 节点 ID [ ${YELLOW}${node_id}${RESET} ]"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -276,13 +230,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_forwardx ;;
-        2) update_forwardx ;;
-        3) uninstall_forwardx ;;
-        4) start_forwardx ;;
-        5) stop_forwardx ;;
-        6) restart_forwardx ;;
-        7) logs_forwardx ;;
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

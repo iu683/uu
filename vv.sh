@@ -1,248 +1,251 @@
 #!/bin/bash
+# =================================================================
+# sui-traffic-reset 工具箱 Docker Compose 管理面板 
+# =================================================================
 
-# 颜色定义
-GREEN='\033[32m'
-RED='\033[31m'
-YELLOW='\033[33m'
-BLUE='\033[34m'
-PURPLE='\033[35m'
-PLAIN='\033[0m'
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# 提示信息
-INFO="[${GREEN}INFO${PLAIN}]"
-WARN="[${YELLOW}WARN${PLAIN}]"
-ERROR="[${RED}ERROR${PLAIN}]"
+CONTAINER_NAME="sui-traffic-reset"
+BASE_DIR="/opt/sui-traffic-reset"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
-# 检查是否为 root 用户
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${ERROR} 请使用 root 用户运行！"
-    exit 1
-fi
-
-# 核心安装函数
-install_xbctl() {
-    echo -e "\n${BLUE}========== 开始安装 xboard-node ==========${PLAIN}"
-    
-    # 1. 选择模式
-    read -p "请选择安装模式 [1) Node 模式 | 2) Machine 模式, 默认1]: " install_mode_choice
-    if [ "$install_mode_choice" = "2" ]; then
-        INSTALL_MODE="machine"
-        ID_TYPE="machine-id"
-    else
-        INSTALL_MODE="node"
-        ID_TYPE="node-id"
-    fi
-
-    # 2. 输入面板 URL
-    read -p "请输入面板 URL (例如 https://panel.example.com): " ins_url
-    if [ -z "$ins_url" ]; then
-        echo -e "${ERROR} 面板 URL 不能为空！"
-        return 1
-    fi
-
-    # 3. 输入 Token
-    read -p "请输入通讯 Token: " ins_token
-    if [ -z "$ins_token" ]; then
-        echo -e "${ERROR} Token 不能为空！"
-        return 1
-    fi
-
-    # 4. 输入 ID
-    read -p "请输入对应的 ID (${INSTALL_MODE} ID): " ins_id
-    if [ -z "$ins_id" ]; then
-        echo -e "${ERROR} ID 不能为空！"
-        return 1
-    fi
-
-    # 5. 执行官方在线安装命令
-    echo -e "\n${INFO} 正在从 GitHub 获取官方脚本并开始安装..."
-    curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh | \
-      sudo bash -s -- --mode "$INSTALL_MODE" --panel "$ins_url" --token "$ins_token" --$ID_TYPE "$ins_id"
-
-    if [ $? -eq 0 ]; then
-        echo -e "${INFO} xboard-node 安装成功！"
-        echo -e "${YELLOW}按任意键进入管理菜单...${PLAIN}"
-        read -n 1 -s
-        return 0
-    else
-        echo -e "${ERROR} 安装失败，请检查网络或参数是否正确！"
+# 检测依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
 }
 
-# 获取状态信息的函数
+# 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    # 1. 获取版本
-    CURRENT_VER=$(xbctl version 2>/dev/null | awk '{print $NF}')
-    if [ -z "$CURRENT_VER" ]; then
-        CURRENT_VER="${RED}未检测到组件（未安装）${PLAIN}"
-    fi
-
-    # 2. 获取运行状态
-    if systemctl is-active --quiet xbctl 2>/dev/null || xbctl status 2>/dev/null | grep -q "running"; then
-        RUN_STATUS="${GREEN}运行中${PLAIN}"
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
     else
-        RUN_STATUS="${RED}已停止${PLAIN}"
+        status="${RED}未部署${RESET}"
     fi
 
-    # 3. 获取绑定的 Instance ID
-    INSTANCE_ID=$(xbctl instance list --output text 2>/dev/null | awk 'NR>1 {print $1}' | head -n 1)
-    [ -z "$INSTANCE_ID" ] && INSTANCE_ID="${YELLOW}未绑定或无实例${PLAIN}"
-}
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
 
-# 修改/初始化配置函数
-modify_config() {
-    echo -e "\n${BLUE}========== 修改/初始化配置 ==========${PLAIN}"
-    
-    # 1. 选择模式
-    read -p "请选择绑定模式 [1) Node 模式 | 2) Machine 模式, 默认1]: " mode_choice
-    if [ "$mode_choice" = "2" ]; then
-        MODE="machine"
-        SHORTCUT_CMD="bind-machine"
-        ID_FLAG="--machine-id"
+        # 提取宿主机映射出来的端口（容器内部默认监听的是 8080）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8787"
     else
-        MODE="node"
-        SHORTCUT_CMD="bind-node"
-        ID_FLAG="--node-id"
-    fi
-
-    # 2. 输入面板 URL
-    read -p "请输入面板 URL (例如 https://panel.com): " input_url
-    if [ -z "$input_url" ]; then
-        echo -e "${ERROR} 面板 URL 不能为空！"
-        return
-    fi
-
-    # 3. 输入 Token
-    read -p "请输入通讯 Token: " input_token
-    if [ -z "$input_token" ]; then
-        echo -e "${ERROR} Token 不能为空！"
-        return
-    fi
-
-    # 4. 输入 ID
-    read -p "请输入对应的 ID ($MODE ID): " input_id
-    if [ -z "$input_id" ]; then
-        echo -e "${ERROR} ID 不能为空！"
-        return
-    fi
-
-    # 5. 选择内核
-    read -p "请选择核心内核 [1) xray | 2) singbox, 默认1]: " kernel_choice
-    if [ "$kernel_choice" = "2" ]; then
-        KERNEL="singbox"
-    else
-        KERNEL="xray"
-    fi
-
-    # 执行绑定配置
-    echo -e "\n${INFO} 正在执行配置绑定，请稍候..."
-    echo -e "执行命令: xbctl $SHORTCUT_CMD --panel-url $input_url --token [HIDDEN] $ID_FLAG $input_id --kernel $KERNEL"
-    
-    xbctl $SHORTCUT_CMD --panel-url "$input_url" --token "$input_token" $ID_FLAG "$input_id" --kernel "$KERNEL"
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${INFO} 配置修改并绑定成功！正在重启服务..."
-        xbctl restart
-    else
-        echo -e "${ERROR} 绑定失败，请检查配置信息是否正确。"
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
     fi
 }
 
-# --- 脚本入口检查 ---
-# 检查xbctl是否安装，如果没有则引导安装
-if ! command -v xbctl &> /dev/null; then
-    echo -e "${WARN} 检测到系统未安装 xboard-node (xbctl)"
-    read -p " 是否现在开始安装？[y/n]: " init_ins
-    if [[ "$init_ins" == [yY] ]]; then
-        install_xbctl
+# 获取公网 IP (兼容双栈环境)
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
     else
-        echo -e "${INFO} 已取消安装，退出。"
-        exit 0
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
-fi
+    echo "127.0.0.1" && return 0
+}
 
-# 主循环菜单
-while true; do
+# 部署 sui-traffic-reset
+install_utils() {
+    check_dependencies
+    mkdir -p "$BASE_DIR"
+
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    # 1. 配置 Web 面板宿主机端口
+    echo -ne "${YELLOW}请输入流量重置面板访问端口 [默认: 8787]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8787"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
+
+    # 2. 配置 s-ui 宿主机数据库路径
+    echo -ne "${YELLOW}请输入宿主机 s-ui 数据库目录路径 [默认: /usr/local/s-ui/db]: ${RESET}"
+    read -r host_db_path
+    [[ -z "$host_db_path" ]] && host_db_path="/usr/local/s-ui/db"
+
+    # 3. 配置管理员账号密码
+    echo -ne "${YELLOW}请输入面板管理员用户名 [默认: admin]: ${RESET}"
+    read -r admin_user
+    [[ -z "$admin_user" ]] && admin_user="admin"
+
+    echo -ne "${YELLOW}请输入面板管理员密码 [默认: admin123]: ${RESET}"
+    read -r admin_pass
+    [[ -z "$admin_pass" ]] && admin_pass="admin123"
+
+    # 写入 .env 文件
+    cat <<EOF > "$ENV_FILE"
+WEB_PORT=${custom_port}
+HOST_DB_PATH=${host_db_path}
+ADMIN_USER=${admin_user}
+ADMIN_PASS=${admin_pass}
+EOF
+
+    # 动态生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  sui-traffic-reset:
+    image: ghcr.io/oldwangnewbe/sui-traffic-reset:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    environment:
+      SUI_DB: /data/s-ui.db
+      CHECK_INTERVAL: 60
+      TZ: Asia/Shanghai
+      RESET_ADMIN_USER: \${ADMIN_USER}
+      RESET_ADMIN_PASSWORD: \${ADMIN_PASS}
+      RESET_SESSION_TTL: 604800
+      RESET_LOGIN_MAX_ATTEMPTS: 8
+      RESET_LOGIN_WINDOW: 600
+      RESET_COOKIE_SECURE: 0
+      RESET_WEB_PORT: 8080
+    ports:
+      - "\${WEB_PORT}:8080"
+    volumes:
+      - "\${HOST_DB_PATH}:/data"
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 sui-traffic-reset...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${GREEN}      sui-traffic-reset 部署成功！              ${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}管理员账号     : ${admin_user}${RESET}"
+    echo -e "${YELLOW}管理员密码     : ${admin_pass}${RESET}"
+    echo -e "${YELLOW}挂载数据库路径 : ${host_db_path}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
+}
+
+# 更新镜像
+update_utils() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+}
+
+# 卸载容器
+uninstall_utils() {
+    echo -ne "${YELLOW}确定要卸载并删除 sui-traffic-reset 容器吗？(y/n): ${RESET}"
+    read -r confirm
+    [[ -z "$confirm" ]] && confirm="N"
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地配置文件目录？(y/n) [默认: N]: ${RESET}"
+            read -r clean_data
+            [[ -z "$clean_data" ]] && clean_data="N"
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}面板配置目录已彻底清理（不影响原始 s-ui 数据库）。${RESET}"
+            fi
+        else
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
+}
+
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+
+show_info() {
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    if [ -f "$ENV_FILE" ]; then
+        source "$ENV_FILE"
+        echo -e "${YELLOW}挂载数据库路径 : ${HOST_DB_PATH}${RESET}"
+        echo -e "${YELLOW}当前管理账号   : ${ADMIN_USER} / ${ADMIN_PASS}${RESET}"
+    fi
+    echo -e "${GREEN}================================${RESET}"
+}
+
+menu() {
     clear
     get_status_info
-
-    echo -e "${GREEN}=================================${PLAIN}"
-    echo -e "${GREEN}     xboard-node  管理菜单        ${PLAIN}"
-    echo -e "${GREEN}=================================${PLAIN}"
-    echo -e "${GREEN}组件版本:${PLAIN} $CURRENT_VER"
-    echo -e "${GREEN}运行状态:${PLAIN} $RUN_STATUS"
-    echo -e "${GREEN}实例 ID :${PLAIN} $INSTANCE_ID"
-    echo -e "${GREEN}=================================${PLAIN}"
-    echo -e "${GREEN}1.查看状态${PLAIN}"
-    echo -e "${GREEN}2.启动服务${PLAIN}"
-    echo -e "${GREEN}3.停止服务${PLAIN}"
-    echo -e "${GREEN}4.重启服务${PLAIN}"
-    echo -e "${GREEN}5.查看日志${PLAIN}"
-    echo -e "${GREEN}6.检查健康${PLAIN}"
-    echo -e "${GREEN}---------------------------------${PLAIN}"
-    echo -e "${YELLOW}7.修改配置${PLAIN}"
-    echo -e "${GREEN}8.更新节点${PLAIN}"
-    echo -e "${RED}9.卸载节点${PLAIN}"
-    echo -e "${GREEN}---------------------------------${PLAIN}"
-    echo -e "${GREEN}0.退出${PLAIN}"
-    echo -e "${GREEN}=================================${PLAIN}"
-    read -p " 请输入数字选择操作 [0-9]: " choice
-    
-    case $choice in
-        1)
-            echo -e "\n${INFO} 正在查看服务状态..."
-            xbctl status
-            ;;
-        2)
-            echo -e "\n${INFO} 正在启动服务..."
-            xbctl start
-            ;;
-        3)
-            echo -e "\n${INFO} 正在停止服务..."
-            xbctl stop
-            ;;
-        4)
-            echo -e "\n${INFO} 正在重启服务..."
-            xbctl restart
-            ;;
-        5)
-            echo -e "\n${INFO} 正在查看实时日志（按 Ctrl+C 退出日志查看）..."
-            xbctl logs
-            ;;
-        6)
-            echo -e "\n${INFO} 正在检查健康状态..."
-            xbctl health
-            ;;
-        7)
-            modify_config
-            ;;
-        8)
-            echo -e "\n${INFO} 正在尝试更新 xbctl..."
-            xbctl upgrade
-            ;;
-        9)
-            echo -e "\n${WARN} 确定要完全卸载 xbctl 吗？这会清除所有数据！"
-            read -p " 输入 'y' 确认卸载，输入其他任意键取消: " confirm
-            if [[ "$confirm" == [yY] ]]; then
-                echo -e "${INFO} 正在完全卸载..."
-                xbctl uninstall --purge --yes
-                echo -e "${INFO} 卸载完成，脚本即将退出。"
-                exit 0
-            else
-                echo -e "${INFO} 已取消卸载。"
-            fi
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "\n${ERROR} 无效的选择，请重新输入！"
-            sleep 1
-            continue
-            ;;
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}◈ sui-traffic-reset  管理面板 ◈  ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
+        8) show_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
-    
-    echo -e "\n${YELLOW}按任意键返回主菜单...${PLAIN}"
-    read -n 1 -s
+}
+
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
 done

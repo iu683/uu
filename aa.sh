@@ -135,15 +135,16 @@ login_claude() {
     fi
 }
 
-# 5. 配置高级自定义 API 模型与路径 (最新通用标准环境版)
+# 5. 配置高级自定义 API 模型与路径 (官方白名单强解版)
 config_custom_api() {
     local SETTINGS_JSON="$HOME/.claude/settings.json"
+    local ONBOARDING_JSON="$HOME/.claude.json"
     mkdir -p "$HOME/.claude"
     
     echo -e "\n${GREEN}================================${RESET}"
-    echo -e "${GREEN}      通用自定义 API 配置       ${RESET}"
+    echo -e "${GREEN}    v2.1.195+ 终极白名单强解配置   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 快捷一键生成通用持久化代理环境${RESET}"
+    echo -e "${GREEN}1. 一键快捷生成免拦截持久化环境${RESET}"
     echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
     echo -e "${GREEN}0. 返回主菜单${RESET}"
     echo -e "${GREEN}================================${RESET}"
@@ -153,7 +154,7 @@ config_custom_api() {
     case $api_choice in
         1)
             echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关:${RESET}"
-            echo -ne "   (例如: https://qianxing-ai.cc.cd/v1)\n   地址: "
+            echo -ne "   地址: "
             read input_url
             
             echo -e "\n${YELLOW}2/4. 请输入你的 API Key / 密钥 Token:${RESET}"
@@ -169,27 +170,40 @@ config_custom_api() {
             read input_submodel
 
             if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ] && [ -n "$input_submodel" ]; then
-                # 【100% 严格复刻你提供的最新标准模板】
-                # 依靠 ANTHROPIC_MODEL 和 ANTHROPIC_SMALL_FAST_MODEL 全面接管主副模型
-                # 没有外层杂质，结构极其纯净
+                
+                # 1. 注入免登录验证凭证
+                cat << EOF > "$ONBOARDING_JSON"
+{
+  "hasCompletedOnboarding": true
+}
+EOF
+
+                # 2. 强行利用 availableModels 和 enforceAvailableModels
+                # 将你的自定义模型锁死在本地白名单里，彻底粉碎本地内核的拦截！
                 cat << EOF > "$SETTINGS_JSON"
 {
   "env": {
     "ANTHROPIC_BASE_URL": "$input_url",
     "ANTHROPIC_AUTH_TOKEN": "$input_key",
     "ANTHROPIC_MODEL": "$input_model",
-    "ANTHROPIC_SMALL_FAST_MODEL": "$input_submodel"
-  }
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$input_model",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$input_model",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "$input_submodel",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "model": "$input_model",
+  "availableModels": ["$input_model", "$input_submodel", "sonnet", "haiku"],
+  "enforceAvailableModels": true,
+  "theme": "dark"
 }
 EOF
-                # 全量清理可能冲突的历史环境变量与干扰局部文件
-                rm -f "$ENV_FILE"
-                rm -f "$HOME/.claude.json"
+                # 清除内存环境变量
                 unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
                 unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
                 unset CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_SMALL_FAST_MODEL
 
-                echo -e "\n${GREEN}✔ 成功！已严格按照最新标准模板固化配置至: $SETTINGS_JSON${RESET}"
+                echo -e "\n${GREEN}✔ 强解配置成功！已强行将 $input_model 塞入本地可用模型列表。${RESET}"
             else
                 echo -e "${RED}所有输入均不能为空，取消设置。${RESET}"
             fi
@@ -197,13 +211,13 @@ EOF
         2)
             cat << EOF > "$SETTINGS_JSON"
 {
-  "env": {}
+  "env": {},
+  "model": "sonnet",
+  "theme": "dark"
 }
 EOF
-            rm -f "$ENV_FILE"
-            rm -f "$HOME/.claude.json"
-            unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-            echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复初始空配置。${RESET}"
+            rm -f "$ONBOARDING_JSON"
+            echo -e "${GREEN}✔ 已彻底清除自定义配置。${RESET}"
             ;;
         *)
             return
@@ -211,7 +225,6 @@ EOF
     esac
     echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
-
 # 主循环
 while true; do
     show_menu

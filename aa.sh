@@ -30,13 +30,10 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
+    if [ "$(docker ps -aq -f name=^/flclouds-frontend$)" ]; then
         webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "flclouds-frontend" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port="47832"
     else
-        img_version="${RED}未安装${RESET}"
         webui_port="N/A"
     fi
 }
@@ -64,15 +61,29 @@ get_public_ip() {
     fi
     echo "127.0.0.1" && return 0
 }
+
 install_utils() {
     check_dependencies
     
+    # 【修复】强制统一工作目录到 BASE_DIR，避免多处相对路径打架
+    mkdir -p "$BASE_DIR"
+    cd "$BASE_DIR" || exit 1
+
     if [ ! -d "frontend" ] || [ ! -d "backend" ]; then
-        echo -e "${YELLOW}当前目录下未检测到源码，正在从 GitHub 克隆 FlClouds 仓库...${RESET}"
+        echo -e "${YELLOW}当前目录下未检测到源码，正在从 GitHub 克隆 FlClouds 仓库到 $BASE_DIR ...${RESET}"
         git clone https://github.com/hicocos/FlClouds.git ./tmp_repo
-        mv ./tmp_repo/* ./tmp_repo/.* . 2>/dev/null
-        rm -rf ./tmp_repo
+        if [ -d "./tmp_repo" ]; then
+            cp -r ./tmp_repo/* ./ 2>/dev/null
+            cp -r ./tmp_repo/.* ./ 2>/dev/null
+            rm -rf ./tmp_repo
+        else
+            echo -e "${RED}错误: 克隆仓库失败，请检查网络！${RESET}"
+            return 1
+        fi
     fi
+
+    touch init.sql
+    chmod 644 init.sql
 
     # 修复本地挂载目录权限
     mkdir -p "$BASE_DIR/file_storage"
@@ -100,7 +111,7 @@ install_utils() {
     read -r cors_origin
     [[ -z "$cors_origin" ]] && cors_origin="https://cloud.example.com"
 
-    # 1. 自动化 Session 密钥生成 (无密钥重启会话失效警告修复)
+    # 1. 自动化 Session 密钥生成
     local session_secret=""
     if command -v openssl &> /dev/null; then
         session_secret=$(openssl rand -hex 32)
@@ -113,6 +124,7 @@ install_utils() {
     echo -ne "${YELLOW}是否配置 Telegram Bot 集成？(y/n) [默认: n]: ${RESET}"
     read -r tg_choice
     local is_tg="false"
+    local tg_bot_token="" tg_api_id="" tg_api_hash="" tg_user_api_id="" tg_user_api_hash=""
     if [[ "$tg_choice" == "y" || "$tg_choice" == "Y" ]]; then
         is_tg="true"
         echo -ne "${YELLOW}请输入 TELEGRAM_BOT_TOKEN: ${RESET}"
@@ -127,7 +139,7 @@ install_utils() {
         read -r tg_user_api_hash
     fi
 
-    # 3. 访问密码哈希控制整合 (新增)
+    # 3. 访问密码哈希控制整合
     echo -e "${CYAN}--------------------------------${RESET}"
     echo -e "${YELLOW}是否启用网页及 API 全站访问密码？(y/n) [默认: n]: ${RESET}"
     read -r pass_choice
@@ -144,14 +156,12 @@ install_utils() {
             read -r raw_access_password
         done
         
-        # 自动计算 SHA-256 哈希串值
         if command -v sha256sum &> /dev/null; then
             access_password_hash=$(printf "%s" "$raw_access_password" | sha256sum | awk '{print $1}')
         elif command -v openssl &> /dev/null; then
             access_password_hash=$(printf "%s" "$raw_access_password" | openssl dgst -sha256 | awk '{print $2}')
         else
-            # 保底手段
-            access_password_hash=$(node -e "echo(require('crypto').createHash('sha256').update('$raw_access_password').digest('hex'))" 2>/dev/null)
+            access_password_hash=$(node -e "printf(require('crypto').createHash('sha256').update('$raw_access_password').digest('hex'))" 2>/dev/null)
         fi
         echo -e "${GREEN}密码哈希计算成功: ${access_password_hash}${RESET}"
     fi
@@ -208,7 +218,7 @@ install_utils() {
         database_url="postgresql://flclouds:${db_password}@postgres:5432/flclouds"
     fi
 
-    # 写入缓存配置
+    # 写入本地缓存配置
     cat <<EOF > .env
 PORT=${custom_be_port}
 DOMAIN=${app_domain}
@@ -239,7 +249,7 @@ EOF
     echo -e "${YELLOW}正在构建后端镜像...${RESET}"
     docker build -t flclouds-backend:latest ./backend
 
-    echo -e "${YELLOW}正在生成生成环境 docker-compose.yml...${RESET}"
+    echo -e "${YELLOW}正在生成 docker-compose.yml...${RESET}"
     
     if [[ "$db_choice" == "2" ]]; then
         cat <<EOF > "$COMPOSE_FILE"
@@ -378,13 +388,14 @@ EOF
     fi
 
     echo -e "${YELLOW}正在全新启动服务堆栈...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    docker compose up -d --force-recreate
 
     DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}     FlClouds 部署成功！        ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}前端访问地址   : http://${DETECT_IP}:${custom_fe_port}${RESET}"
+    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR${RESET}"
     if [[ -n "$access_password_hash" ]]; then
        echo -e "${RED}访问控制状态   : 已启用全站密码保护 (${raw_access_password})${RESET}"
     fi
@@ -396,6 +407,7 @@ update_utils() {
         echo -e "${RED}错误: 未检测到部署配置，请先执行选项 1 部署！${RESET}"
         return
     fi
+    cd "$BASE_DIR" || return
     echo -e "${YELLOW}从远端获取最新代码...${RESET}"
     git pull origin main
     if [ -f ".env" ]; then
@@ -403,7 +415,7 @@ update_utils() {
     fi
     docker build --build-arg VITE_API_URL="${VITE_API_URL}" -t flclouds-frontend:latest ./frontend
     docker build -t flclouds-backend:latest ./backend
-    cd "$BASE_DIR" && docker compose up -d --remove-orphans
+    docker compose up -d --remove-orphans
     echo -e "${GREEN}更新成功并已重启堆栈！${RESET}"
 }
 
@@ -415,7 +427,6 @@ login_tg_user() {
     cd "$BASE_DIR" && docker compose run --rm --no-deps backend npm run login:telegram-user
 }
 
-# 卸载容器
 uninstall_utils() {
     echo -ne "${YELLOW}确定要卸载 FlClouds 容器栈吗？(y/n): ${RESET}"
     read -r confirm
@@ -423,7 +434,7 @@ uninstall_utils() {
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已全部停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时彻底清空本地配置及持久化挂载文件目录 ($BASE_DIR)？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时彻底清空本地配置及持久化挂载文件目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
@@ -436,12 +447,10 @@ uninstall_utils() {
     fi
 }
 
-
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务栈已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务栈已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务栈已重启${RESET}"; }
+start_utils() { cd "$BASE_DIR" 2>/dev/null && docker compose start && echo -e "${GREEN}服务栈已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" 2>/dev/null && docker compose stop && echo -e "${YELLOW}服务栈已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" 2>/dev/null && docker compose restart && echo -e "${GREEN}服务栈已重启${RESET}"; }
 logs_utils() { docker logs -f "$CONTAINER_NAME"; }
-
 
 show_info() {
     get_status_info
@@ -449,6 +458,11 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}前端访问端口   : ${webui_port}${RESET}"
+    echo -e "${YELLOW}前端访问地址   : http://${DETECT_IP}:${custom_fe_port}${RESET}"
+    echo -e "${YELLOW}宿主机配置路径 : $BASE_DIR${RESET}"
+    if [[ -n "$access_password_hash" ]]; then
+       echo -e "${RED}访问控制状态   : 已启用全站密码保护 (${raw_access_password})${RESET}"
+    fi
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -458,6 +472,9 @@ menu() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}    ◈  FlClouds 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新项目${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -466,8 +483,9 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看后端日志${RESET}"
     echo -e "${GREEN}8. 查看面板配置${RESET}"
-    echo -e "${CYAN}9. 生成/登录 Telegram User Session${RESET}"
+    echo -e "${GREEN}9. 生成用户账号session${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
@@ -481,6 +499,7 @@ menu() {
         8) show_info ;;
         9) login_tg_user ;;
         0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 

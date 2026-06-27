@@ -1,239 +1,335 @@
 #!/bin/bash
+# =================================================================
+# Kerkerker 工具箱 Docker Compose 管理面板 
+# =================================================================
 
-# 颜色定义
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-RESET='\033[0m'
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# 自定义配置文件路径
-ENV_FILE="$HOME/.claude_custom_env"
+CONTAINER_NAME="kerkerker-app"
+BASE_DIR="/opt/kerkerker"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
-# 临时和永久确保当前脚本进程能找到最新的 PATH
-export PATH="$HOME/.local/bin:$PATH"
-
-# 自动刷新和导出自定义 API 环境配置（让主面板状态100%同步）
-refresh_env() {
-    # 先清理当前进程中的历史干扰变量
-    unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-    unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
-    unset CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_EFFORT_LEVEL
-
-    if [ -f "$ENV_FILE" ]; then
-        source "$ENV_FILE"
+# 检测依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
     fi
 }
 
-# 首次和循环时加载环境
-refresh_env
-
-# 获取状态与版本信息
-get_status() {
-    if command -v claude &> /dev/null; then
-        status="${GREEN}已安装${RESET}"
-        version_info=$(claude -v 2>/dev/null | head -n 1)
-        [ -z "$version_info" ] && version_info="未知版本"
-        claude_version="${YELLOW}${version_info}${RESET}"
+# 动态获取容器状态、映射端口等
+get_status_info() {
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
     else
-        status="${RED}未安装${RESET}"
-        claude_version="${RED}-${RESET}"
+        status="${RED}未部署${RESET}"
     fi
 
-    # 检查是否配置了自定义 API
-    if [ -f "$ENV_FILE" ] && ( [ -n "$CLAUDE_BASE_URL" ] || [ -n "$ANTHROPIC_BASE_URL" ] ); then
-        api_status="${YELLOW}自定义中转${RESET}"
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3008"
     else
-        api_status="${GREEN}官方默认${RESET}"
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
     fi
 }
 
-# 菜单面板
-show_menu() {
-    clear
-    get_status
+# 获取公网 IP (兼容双栈环境)
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
+}
+
+# 部署 Kerkerker
+install_utils() {
+    check_dependencies
+    mkdir -p "$BASE_DIR"
+
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    # 1. 端口配置
+    echo -ne "${YELLOW}请输入 Kerkerker 访问端口 [默认: 3008]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3008"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
+
+    # 2. 管理员密码配置
+    echo -ne "${YELLOW}请设置管理员密码 (ADMIN_PASSWORD) [默认: admin123]: ${RESET}"
+    read -r admin_password
+    [[ -z "$admin_password" ]] && admin_password="admin123"
+
+    # 3. 豆瓣 API 微服务配置
+    echo -ne "${YELLOW}请输入豆瓣 API 微服务地址 (留空则不配置): ${RESET}"
+    read -r douban_api_url
+
+    # 4. 弹幕 API 配置 (新增)
+    echo -ne "${YELLOW}请输入弹幕 API 地址 [默认: https://danmuapi1-eight.vercel.app]: ${RESET}"
+    read -r danmu_api_url
+    [[ -z "$danmu_api_url" ]] && danmu_api_url="https://danmuapi1-eight.vercel.app"
+
+    echo -ne "${YELLOW}请输入弹幕 API Token (如无请留空): ${RESET}"
+    read -r danmu_api_token
+
+    # 5. 数据库模式选择
+    echo -e "${CYAN}--------------------------------${RESET}"
+    echo -e "${YELLOW}请选择 MongoDB 数据库类型:${RESET}"
+    echo -e "  ${GREEN}1) 安装本地 MongoDB (数据挂载至 $BASE_DIR/mongodb_data)${RESET}"
+    echo -e "  ${GREEN}2) 连接远程/已有 MongoDB (按指定参数交互连接)${RESET}"
+    echo -ne "${YELLOW}请选择 [默认: 1]: ${RESET}"
+    read -r db_choice
+    [[ -z "$db_choice" ]] && db_choice="1"
+
+    if [[ "$db_choice" == "2" ]]; then
+        # 远程 DB 交互逻辑
+        echo -ne "${YELLOW}请输入远程 MongoDB 的 IP 或域名: ${RESET}"
+        read -r ext_db_ip
+        if [[ -z "$ext_db_ip" ]]; then
+            echo -e "${RED}错误: 数据库 IP 或域名不能为空！${RESET}"
+            return
+        fi
+
+        echo -ne "${YELLOW}请输入远程 MongoDB 端口 [默认: 27017]: ${RESET}"
+        read -r ext_db_port
+        [[ -z "$ext_db_port" ]] && ext_db_port="27017"
+        
+        db_host="$ext_db_ip"
+        db_port="$ext_db_port"
+        
+        echo -ne "${YELLOW}请输入远程 MongoDB 用户名 [默认: root]: ${RESET}"
+        read -r db_user
+        [[ -z "$db_user" ]] && db_user="root"
+        
+        echo -ne "${YELLOW}请输入远程 MongoDB 密码: ${RESET}"
+        read -r db_pass
+        
+        echo -ne "${YELLOW}请输入远程认证数据库 authSource [默认: admin]: ${RESET}"
+        read -r db_auth_source
+        [[ -z "$db_auth_source" ]] && db_auth_source="admin"
+        
+        # 兼容本地宿主机回环网关
+        local has_extra_host="false"
+        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
+            db_host="host.docker.internal"
+            has_extra_host="true"
+        fi
+
+        # 组装安全的 MongoDB 连接 URL
+        local mongodb_uri="mongodb://${db_user}:${db_pass}@${db_host}:${db_port}/kerkerker?authSource=${db_auth_source}"
+
+        # 生成不含本地数据库的 compose 文件
+        echo -e "${YELLOW}正在生成连接远程数据库的 docker-compose.yml...${RESET}"
+        
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  app:
+    image: unilei/kerkerker:latest
+    container_name: ${CONTAINER_NAME}
+    ports:
+      - "${custom_port}:3000"
+    environment:
+      - NODE_ENV=production
+      - ADMIN_PASSWORD=${admin_password}
+      - MONGODB_URI=${mongodb_uri}
+      - NEXT_PUBLIC_DOUBAN_API_URL=${douban_api_url}
+      - NEXT_PUBLIC_DANMU_API_URL=${danmu_api_url}
+      - NEXT_PUBLIC_DANMU_API_TOKEN=${danmu_api_token}
+    restart: unless-stopped
+EOF
+
+        if [[ "$has_extra_host" == "true" ]]; then
+            cat <<EOF >> "$COMPOSE_FILE"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+EOF
+        fi
+
+    else
+        # 本地数据库流程
+        mkdir -p "$BASE_DIR/mongodb_data"
+        mkdir -p "$BASE_DIR/mongodb_config"
+        
+        echo -e "${YELLOW}正在生成含本地挂载的 docker-compose.yml...${RESET}"
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  app:
+    image: unilei/kerkerker:latest
+    container_name: ${CONTAINER_NAME}
+    ports:
+      - "${custom_port}:3000"
+    environment:
+      - NODE_ENV=production
+      - ADMIN_PASSWORD=${admin_password}
+      - MONGODB_URI=mongodb://mongodb:27017/kerkerker
+      - NEXT_PUBLIC_DOUBAN_API_URL=${douban_api_url}
+      - NEXT_PUBLIC_DANMU_API_URL=${danmu_api_url}
+      - NEXT_PUBLIC_DANMU_API_TOKEN=${danmu_api_token}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - kerkerker-network
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7
+    container_name: kerkerker-mongodb
+    ports:
+      - "27018:27017"
+    environment:
+      - MONGO_INITDB_DATABASE=kerkerker
+    volumes:
+      - ${BASE_DIR}/mongodb_data:/data/db
+      - ${BASE_DIR}/mongodb_config:/data/configdb
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kerkerker-network
+    restart: unless-stopped
+
+networks:
+  kerkerker-network:
+    driver: bridge
+EOF
+    fi
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Kerkerker 堆栈...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器群初始化与网络连接检查 (约5秒)...${RESET}"
+    sleep 5
+
+    DETECT_IP=$(get_public_ip)
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  Claude Code 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}     Kerkerker 部署成功！      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}管理员密码     : ${admin_password}${RESET}"
+    echo -e "${YELLOW}弹幕 API 地址  : ${danmu_api_url}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+# 更新 Kerkerker 镜像
+update_utils() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取最新镜像并更新...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！${RESET}"
+}
+
+# 卸载 Kerkerker
+uninstall_utils() {
+    echo -ne "${YELLOW}确定要卸载并删除 Kerkerker 容器吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时彻底删除本地配置及数据库挂载目录？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}本地目录及数据已彻底清理。${RESET}"
+            fi
+        else
+            docker rm -f "$CONTAINER_NAME" kerkerker-mongodb 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
+}
+
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+
+show_info() {
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}核心镜像       : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}管理员密码     : ${admin_password}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+menu() {
+    clear
+    get_status_info
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    ◈  Kerkerker 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} $claude_version"
-    echo -e "${GREEN}API  :${RESET} $api_status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装${RESET}"
-    echo -e "${GREEN}2. 当前目录启动${RESET}"
-    echo -e "${GREEN}3. 指定路径启动${RESET}"
-    echo -e "${GREEN}4. 登录/切换账户${RESET}"
-    echo -e "${GREEN}5. 设置自定义API模型/中转${RESET}"
-    echo -e "${GREEN}6. 更新${RESET}"
-    echo -e "${GREEN}7. 卸载${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
-}
-
-# 1. 安装
-install_claude() {
-    echo -e "\n${YELLOW}正在通过官方安装 Claude Code...${RESET}"
-    curl -fsSL https://claude.ai/install.sh | bash
-    
-    echo -e "\n${YELLOW}正在检查环境并自动修复 PATH...${RESET}"
-    local shell_config=""
-    if [ -n "$ZSH_VERSION" ] || [ -f "$HOME/.zshrc" ]; then
-        shell_config="$HOME/.zshrc"
-    else
-        shell_config="$HOME/.bashrc"
-    fi
-
-    if ! grep -q '\.local/bin' "$shell_config" 2>/dev/null; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$shell_config"
-        echo -e "${GREEN}✔ 已自动将 ~/.local/bin 写入 $shell_config${RESET}"
-    else
-        echo -e "${GREEN}✔ 配置文件中已存在 PATH 记录，无需重复添加。${RESET}"
-    fi
-
-    export PATH="$HOME/.local/bin:$PATH"
-    echo -e "${GREEN}安装与修复完成！${RESET}"
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 2. 当前目录启动
-start_current() {
-    if command -v claude &> /dev/null; then
-        echo -e "\n${GREEN}正在当前目录启动 Claude Code...${RESET}"
-        refresh_env
-        claude
-    else
-        echo -e "\n${RED}未检测到 claude 命令，请先执行安装！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 3. 指定路径启动
-start_path() {
-    echo -e "\n"
-    echo -ne "${GREEN}请输入你的项目绝对路径: ${RESET}"
-    read target_path
-    if [ -d "$target_path" ]; then
-        echo -e "${GREEN}正在切换到 $target_path 并启动 Claude Code...${RESET}"
-        refresh_env
-        cd "$target_path" && claude
-    else
-        echo -e "${RED}路径不存在，请检查后重试！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 4. 登录
-login_claude() {
-    if command -v claude &> /dev/null; then
-        echo -e "\n${YELLOW}正在启动登录程序...${RESET}"
-        echo -e "提示：如果已经在会话中，直接输入 /login 即可"
-        refresh_env
-        claude -c "/login" 2>/dev/null || claude
-    else
-        echo -e "\n${RED}未检测到已安装的 Claude Code。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 5. 配置高级自定义 API 模型与路径 (全平台通用免拦截版)
-config_custom_api() {
-    local SETTINGS_JSON="$HOME/.claude/settings.json"
-    local ONBOARDING_JSON="$HOME/.claude.json"
-    mkdir -p "$HOME/.claude"
-    
-    echo -e "\n${GREEN}================================${RESET}"
-    echo -e "${GREEN}      通用自定义 API 配置       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 一键快捷生成通用免拦截环境${RESET}"
-    echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
-    echo -e "${GREEN}0. 返回主菜单${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read api_choice
-
-    case $api_choice in
-        1)
-            echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关:${RESET}"
-            echo -ne "   地址: "
-            read input_url
-            
-            echo -e "\n${YELLOW}2/4. 请输入你的 API Key / 密钥 Token:${RESET}"
-            echo -ne "   秘钥: "
-            read input_key
-
-            echo -e "\n${YELLOW}3/4. 请输入你想指定的主核心模型 (例如: gpt-5.4 或 glm-5.1):${RESET}"
-            echo -ne "   模型名: "
-            read input_model
-
-            echo -e "\n${YELLOW}4/4. 请输入你想指定的子代理快速模型 (通常与主模型一致或用 haiku 级模型):${RESET}"
-            echo -ne "   模型名: "
-            read input_submodel
-
-            if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ] && [ -n "$input_submodel" ]; then
-                
-                # 1. 自动注入免登录验证凭证
-                cat << EOF > "$ONBOARDING_JSON"
-{
-  "hasCompletedOnboarding": true
-}
-EOF
-
-                # 2. 严格套用成功率 100% 的智谱闭环拓扑结构
-                # 保持外层 includeCoAuthoredBy 与内外层主模型严格一致的闭环状态
-                cat << EOF > "$SETTINGS_JSON"
-{
-  "env": {
-    "ANTHROPIC_AUTH_TOKEN": "$input_key",
-    "ANTHROPIC_BASE_URL": "$input_url",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$input_model",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$input_model",
-    "ANTHROPIC_MODEL": "$input_model"
-  },
-  "includeCoAuthoredBy": false,
-  "model": "$input_model"
-}
-EOF
-                # 清除内存环境变量残留，防止新旧逻辑打架
-                unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-                unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
-                unset CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_CUSTOM_MODEL_OPTION
-
-                echo -e "\n${GREEN}✔ 成功！已按照全平台通用闭环模板固化配置至: $SETTINGS_JSON${RESET}"
-            else
-                echo -e "${RED}所有输入均不能为空，取消设置。${RESET}"
-            fi
-            ;;
-        2)
-            cat << EOF > "$SETTINGS_JSON"
-{
-  "env": {},
-  "model": "sonnet"
-}
-EOF
-            rm -f "$ONBOARDING_JSON"
-            echo -e "${GREEN}✔ 已彻底清除自定义配置，恢复系统默认。${RESET}"
-            ;;
-        *)
-            return
-            ;;
+    read -r choice
+    case "$choice" in
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
+        8) show_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
-# 主循环
 while true; do
-    show_menu
-    read choice
-    case $choice in
-        1) install_claude ;;
-        2) start_current ;;
-        3) start_path ;;
-        4) login_claude ;;
-        5) config_custom_api ;;
-        6) update_claude ;;
-        7) uninstall_claude_flow ;;
-        0) clear; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
-    esac
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
 done

@@ -1,673 +1,326 @@
 #!/bin/bash
+# =================================================================
+# Kerkerker 工具箱 Docker Compose 管理面板 (本地挂载 & 精细化远程DB版)
+# =================================================================
 
-# 定义颜色变量
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-RED='\033[0;31m'
-CYAN='\033[0;36m'
-ORANGE='\033[38;5;214m'
-RESET='\033[0m'
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# 工作目录定义 (用于 Argo 等模块)
-work_dir="/etc/argo" 
+CONTAINER_NAME="kerkerker-app"
+BASE_DIR="/opt/kerkerker"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
-status_check() {
-    echo -e "${ORANGE}========================================${RESET}"
-    echo -e "${ORANGE}       ◈      代理工具检测     ◈        ${RESET}"
-    echo -e "${ORANGE}========================================${RESET}"
-    echo ""
-
-    format_status() {
-        case "$1" in
-            active) echo -e "${GREEN}运行中${RESET}" ;;
-            inactive|failed) echo -e "${YELLOW}未运行${RESET}" ;;
-            *) echo -e "${RED}未安装${RESET}" ;;
-        esac
-    }
-
-    get_ports() {
-        ss -tulnp 2>/dev/null | grep -E "$1" | awk '{print $5}' | awk -F: '{print $NF}' | sort -u
-    }
-
-    # =============================
-    # Xray
-    # =============================
-    echo -e "${YELLOW}▶ Xray${RESET}"
-    if command -v xray &>/dev/null || pgrep -f xray &>/dev/null; then
-        status=$(systemctl is-active xray 2>/dev/null)
-        [[ "$status" != "active" && $(pgrep -f xray) ]] && status="active"
-        echo -e "状态: $(format_status "$status")"
-        if command -v xray &>/dev/null; then
-            ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}')
-        else
-            ver=$(ps -ef | grep xray | grep -v grep | grep -oE 'v[0-9.]+' | head -n1)
-        fi
-        echo -e "版本: ${ver:-运行中(内置)}"
-        ports=$(get_ports xray)
-        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
-    else
-        echo -e "状态: ${RED}未安装${RESET}"
+# 检测依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
     fi
-    echo ""
-
-    # =============================
-    # Sing-box
-    # =============================
-    echo -e "${YELLOW}▶ Sing-box${RESET}"
-    if command -v sing-box &>/dev/null || pgrep -f sing-box &>/dev/null; then
-        status=$(systemctl is-active sing-box 2>/dev/null)
-        [[ "$status" != "active" && $(pgrep -f sing-box) ]] && status="active"
-        echo -e "状态: $(format_status "$status")"
-        if command -v sing-box &>/dev/null; then
-            ver=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}')
-        else
-            ver=$(ps -ef | grep sing-box | grep -v grep | grep -oE 'v[0-9.]+' | head -n1)
-        fi
-        echo -e "版本: ${ver:-运行中(内置)}"
-        ports=$(get_ports sing-box)
-        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
-    else
-        echo -e "状态: ${RED}未安装${RESET}"
-    fi
-    echo ""
-
-    # =============================
-    # Mihomo (Clash Meta)
-    # =============================
-    echo -e "${YELLOW}▶ Mihomo${RESET}"
-    mihomo_found=0
-    mi_ports=""
-    if command -v docker &>/dev/null; then
-        mi_containers=$(docker ps -a --format "{{.Names}}" | grep -iE "mihomo|clash")
-    fi
-    if command -v mihomo &>/dev/null || pgrep -iE "mihomo|clash" &>/dev/null || [[ -n "$mi_containers" ]]; then
-        mihomo_found=1
-        status=$(systemctl is-active mihomo 2>/dev/null || systemctl is-active clash 2>/dev/null)
-        if [[ "$status" != "active" ]]; then
-            if pgrep -iE "mihomo|clash" &>/dev/null; then status="active"
-            elif [[ -n "$mi_containers" ]]; then
-                for name in $mi_containers; do
-                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
-                done
-            fi
-        fi
-        echo -e "状态: $(format_status "$status")"
-        local raw_ver=""
-        if command -v mihomo &>/dev/null; then
-            raw_ver=$(mihomo -v 2>/dev/null)
-        elif [[ -n "$mi_containers" ]]; then
-            first_c=$(echo "$mi_containers" | head -n1)
-            raw_ver=$(docker exec "$first_c" mihomo -v 2>/dev/null)
-        fi
-        if [[ -n "$raw_ver" ]]; then
-            ver_num=$(echo "$raw_ver" | grep -iE "Mihomo|Clash" | awk '{print $3}' | head -n1)
-            [[ "$raw_ver" == *"gvisor"* ]] && ver_num="${ver_num} (gVisor)"
-            echo -e "版本: ${ver_num:-未知}"
-        else
-            echo -e "版本: 运行中(内置)"
-        fi
-        mi_ports=$(get_ports mihomo; get_ports clash)
-        if [[ -n "$mi_containers" ]]; then
-            d_ports=$(docker container inspect $(echo "$mi_containers") --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}} {{end}}{{end}}' | tr -s ' ' '\n' | grep -v '^$')
-            mi_ports="$mi_ports $d_ports"
-        fi
-        final_mi_ports=$(echo $mi_ports | tr ' ' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
-        [[ -n "$final_mi_ports" ]] && echo -e "端口: ${GREEN}${final_mi_ports}${RESET}" || echo -e "端口: ${YELLOW}无${RESET}"
-        if [[ -n "$mi_containers" ]]; then
-            for name in $mi_containers; do
-                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
-                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
-                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
-            done
-        fi
-    else
-        echo -e "状态: ${RED}未安装${RESET}"
-    fi
-    echo ""
-
-    # =============================
-    # 防火墙底层规则架构检测 (兼容 Alpine / 常用系统)
-    # =============================
-    echo -e "${YELLOW}▶ 防火墙状态与规则引擎检测${RESET}"
-
-    fw_engine="${RED}未知 / 未启用${RESET}"
-    nft_rules_count=0
-    ipt_rules_count=0
-
-    # 1. 检测 nftables 规则数量
-    if command -v nft >/dev/null 2>&1; then
-        # 兼容 BusyBox grep，排除空行和注释
-        nft_rules_count=$(nft list ruleset 2>/dev/null | grep -v '^$' | grep -v '^[[:space:]]*#' | wc -l)
-    fi
-
-    # 2. 检测 iptables 规则数量 (同时计算 filter, nat, mangle 表)
-    if command -v iptables >/dev/null 2>&1; then
-        ipt_rules_count=$( (iptables -S 2>/dev/null; iptables -t nat -S 2>/dev/null; iptables -t mangle -S 2>/dev/null) | grep -v '^-P' | wc -l)
-    fi
-
-    # 3. 判定当前系统服务状态 (兼容 Systemd 和 OpenRC)
-    is_nft_service_active=0
-    if command -v systemctl >/dev/null 2>&1; then
-        # Systemd 环境
-        systemctl is-active nftables >/dev/null 2>&1 && is_nft_service_active=1
-    elif command -v rc-service >/dev/null 2>&1; then
-        # Alpine OpenRC 环境
-        rc-service nftables status 2>/dev/null | grep -q "started" && is_nft_service_active=1
-    fi
-
-    # 4. 判定主要依靠哪种规则引擎
-    if [[ $is_nft_service_active -eq 1 ]] || [[ $nft_rules_count -gt $ipt_rules_count && $nft_rules_count -gt 0 ]]; then
-        fw_engine="${GREEN}nftables${RESET}"
-    elif [[ $ipt_rules_count -gt 0 ]]; then
-        # 检测是否是基于 nftables 后端的 iptables (iptables-nft)
-        if iptables -V 2>/dev/null | grep -q "nf_tables"; then
-            fw_engine="${GREEN}iptables${RESET} ${YELLOW}(nftables 兼容模式/iptables-nft)${RESET}"
-        else
-            fw_engine="${GREEN}iptables${RESET} ${YELLOW}(传统经典模式/legacy)${RESET}"
-        fi
-    fi
-
-    # 5. 打印引擎及规则结果
-    echo -e "当前活动防火墙: $fw_engine"
-    echo -e "nftables 规则条数: ${YELLOW}${nft_rules_count}${RESET}"
-    echo -e "iptables 规则条数: ${YELLOW}${ipt_rules_count}${RESET}"
-    
-    # 6. 常见高级防火墙前端管理工具检测 (兼容 Systemd / OpenRC / 基础命令)
-    front_ends=""
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl is-active ufw >/dev/null 2>&1 && front_ends+="UFW "
-        systemctl is-active firewalld >/dev/null 2>&1 && front_ends+="Firewalld "
-    elif command -v rc-service >/dev/null 2>&1; then
-        rc-service ufw status 2>/dev/null | grep -q "started" && front_ends+="UFW "
-        rc-service firewalld status 2>/dev/null | grep -q "started" && front_ends+="Firewalld "
-    fi
-    
-    # Alpine 上经常直接用 awall (Alpine Wall) 作为前端
-    if command -v awall >/dev/null 2>&1; then
-        front_ends+="awall(AlpineWall) "
-    fi
-    
-    if [[ -n "$front_ends" ]]; then
-        echo -e "系统管理前端: ${YELLOW}${front_ends% }${RESET} (正在运行)"
-    else
-        echo -e "系统管理前端: ${YELLOW}无 (直接通过原生命令或底层规则管理)${RESET}"
-    fi
-    echo ""
-
-
-    # =============================
-    # Realm
-    # =============================
-    echo -e "${YELLOW}▶ Realm${RESET}"
-    realm_containers=""
-    if command -v docker &>/dev/null; then
-        realm_containers=$(docker ps -a --format "{{.Names}}" | grep -i "realm")
-    fi
-    if command -v realm &>/dev/null || pgrep -f realm &>/dev/null || [[ -n "$realm_containers" ]]; then
-        status=$(systemctl is-active realm 2>/dev/null)
-        if [[ "$status" != "active" ]]; then
-            if pgrep -f realm &>/dev/null; then status="active"
-            elif [[ -n "$realm_containers" ]]; then
-                for name in $realm_containers; do
-                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
-                done
-            fi
-        fi
-        echo -e "状态: $(format_status "$status")"
-        if command -v realm &>/dev/null; then
-            ver=$(realm --version 2>/dev/null | awk '{print $2}')
-        elif [[ -n "$realm_containers" ]]; then
-            first_c=$(echo "$realm_containers" | head -n1)
-            ver=$(docker exec "$first_c" realm --version 2>/dev/null | awk '{print $2}')
-        fi
-        echo -e "版本: ${ver:-运行中(内置)}"
-        ports=$(get_ports realm)
-        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
-        if [[ -n "$realm_containers" ]]; then
-            for name in $realm_containers; do
-                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
-                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
-                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
-            done
-        fi
-    else
-        echo -e "状态: ${RED}未安装${RESET}"
-    fi
-    echo ""
-
-    # =============================
-    # Gost
-    # =============================
-    echo -e "${YELLOW}▶ Gost${RESET}"
-    gost_containers=""
-    if command -v docker &>/dev/null; then
-        gost_containers=$(docker ps -a --format "{{.Names}}" | grep -i "gost")
-    fi
-    if command -v gost &>/dev/null || pgrep -f gost &>/dev/null || [[ -n "$gost_containers" ]]; then
-        status="inactive"
-        if systemctl is-active gost &>/dev/null; then status="active"
-        elif pgrep -f gost &>/dev/null; then status="active"
-        elif [[ -n "$gost_containers" ]]; then
-            for name in $gost_containers; do
-                [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
-            done
-        fi
-        echo -e "状态: $(format_status "$status")"
-        ver=""
-        if command -v gost &>/dev/null; then
-            ver=$(gost -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
-        fi
-        if [[ -z "$ver" && -n "$gost_containers" ]]; then
-            first_c=$(echo "$gost_containers" | head -n1)
-            ver=$(docker exec "$first_c" gost -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
-            [[ -z "$ver" ]] && ver=$(docker exec "$first_c" /bin/gost -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
-        fi
-        echo -e "版本: ${ver:-运行中(内置)}"
-        ports=$(get_ports gost)
-        if [[ -n "$gost_containers" ]]; then
-            d_ports=$(docker container inspect $gost_containers --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}} {{end}}{{end}}' | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/^,//;s/,$//')
-            if [[ -n "$d_ports" ]]; then
-                [[ -n "$ports" ]] && ports="${ports},${d_ports}" || ports="$d_ports"
-            fi
-        fi
-        final_ports=$(echo "$ports" | tr ' ' '\n' | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//')
-        [[ -n "$final_ports" ]] && echo -e "端口: ${CYAN}${final_ports}${RESET}" || echo -e "${YELLOW}端口: 无${RESET}"
-        if [[ -n "$gost_containers" ]]; then
-            for name in $gost_containers; do
-                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
-                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
-                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
-            done
-        fi
-    else
-        echo -e "状态: ${RED}未安装${RESET}"
-    fi
-    echo ""
-
-
-    # =============================
-    # EasyTier (兼容 Alpine / 常用系统)
-    # =============================
-    echo -e "${YELLOW}▶ EasyTier${RESET}"
-    
-    # 查找 Docker 容器名包含 easytier 的容器 (不区分大小写)
-    easytier_containers=""
-    if command -v docker >/dev/null 2>&1; then
-        easytier_containers=$(docker ps -a --format "{{.Names}}" | grep -i "easytier")
-    fi
-
-    # 1. 检测是否存在（原生命令、进程、容器、或服务文件）
-    has_easytier=0
-    if command -v easytier-core >/dev/null 2>&1 || command -v easytier-cli >/dev/null 2>&1 || pgrep -x easytier-core >/dev/null 2>&1 || [[ -n "$easytier_containers" ]]; then
-        has_easytier=1
-    fi
-
-    if [[ $has_easytier -eq 1 ]]; then
-        # 判定状态：检测 Systemd 或 OpenRC
-        status="stopped"
-        
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl is-active easytier >/dev/null 2>&1 && status="active"
-            systemctl is-active easytier-core >/dev/null 2>&1 && status="active"
-        elif command -v rc-service >/dev/null 2>&1; then
-            rc-service easytier status 2>/dev/null | grep -q "started" && status="active"
-            rc-service easytier-core 2>/dev/null | grep -q "started" && status="active"
-        fi
-
-        # 如果服务没开，但进程在运行，依然算 active
-        if [[ "$status" != "active" ]]; then
-            if pgrep -x easytier-core >/dev/null 2>&1; then
-                status="active"
-            elif [[ -n "$easytier_containers" ]]; then
-                for name in $easytier_containers; do
-                    if [[ $(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null) == "running" ]]; then
-                        status="active"
-                        break
-                    fi
-                done
-            fi
-        fi
-
-        echo -e "状态: $(format_status "$status")"
-
-        # 版本获取逻辑 (统一使用标准重定向)
-        ver=""
-        if command -v easytier-core >/dev/null 2>&1; then
-            ver=$(easytier-core --version 2>/dev/null | awk '{print $2}')
-        elif command -v easytier-cli >/dev/null 2>&1; then
-            ver=$(easytier-cli --version 2>/dev/null | awk '{print $2}')
-        elif [[ -n "$easytier_containers" ]]; then
-            first_c=$(echo "$easytier_containers" | head -n1)
-            ver=$(docker exec "$first_c" easytier-core --version 2>/dev/null | awk '{print $2}')
-        fi
-        echo -e "版本: ${ver:-运行中(未知版本)}"
-
-        # 端口获取
-        ports=$(get_ports easytier-core 2>/dev/null)
-        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
-
-        # 如果有 Docker 容器，列出所有相关容器名
-        if [[ -n "$easytier_containers" ]]; then
-            for name in $easytier_containers; do
-                raw_s=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)
-                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
-                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
-            done
-        fi
-
-    else
-        echo -e "状态: ${RED}未安装${RESET}"
-    fi
-    echo ""
-
-    # =============================
-    # FRP (frpc/frps)
-    # =============================
-    echo -e "${YELLOW}▶ FRP${RESET}"
-    frp_containers=""
-    if command -v docker &>/dev/null; then
-        frp_containers=$(docker ps -a --format "{{.Names}}" | grep -i "frp")
-    fi
-    if command -v frpc &>/dev/null || command -v frps &>/dev/null || pgrep -x frpc &>/dev/null || pgrep -x frps &>/dev/null || [[ -n "$frp_containers" ]]; then
-        status=$(systemctl is-active frpc 2>/dev/null || systemctl is-active frps 2>/dev/null)
-        if [[ "$status" != "active" ]]; then
-            if pgrep -x frpc &>/dev/null || pgrep -x frps &>/dev/null; then status="active"
-            elif [[ -n "$frp_containers" ]]; then
-                for name in $frp_containers; do
-                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
-                done
-            fi
-        fi
-        echo -e "状态: $(format_status "$status")"
-        if command -v frpc &>/dev/null; then ver=$(frpc -v 2>/dev/null)
-        elif command -v frps &>/dev/null; then ver=$(frps -v 2>/dev/null)
-        elif [[ -n "$frp_containers" ]]; then
-            first_c=$(echo "$frp_containers" | head -n1)
-            ver=$(docker exec "$first_c" frpc -v 2>/dev/null || docker exec "$first_c" frps -v 2>/dev/null)
-        fi
-        echo -e "版本: ${ver:-运行中(内置)}"
-        ports=$( (get_ports frpc; get_ports frps) | sort -u )
-        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
-        if [[ -n "$frp_containers" ]]; then
-            for name in $frp_containers; do
-                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
-                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
-                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
-            done
-        fi
-    else
-        echo -e "状态: ${RED}未安装${RESET}"
-    fi
-    echo ""
-
-    # =============================
-    # Nginx
-    # =============================
-    echo -e "${YELLOW}▶ Nginx${RESET}"
-    nginx_found=0
-    all_ports=""
-    if command -v nginx &>/dev/null; then
-        nginx_found=1
-        status=$(systemctl is-active nginx 2>/dev/null)
-        [[ "$status" != "active" ]] && pgrep -x nginx &>/dev/null && status="active"
-        echo -e "状态: $(format_status "$status")"
-        ver=$(nginx -v 2>&1 | awk -F/ '{print $2}')
-        echo -e "版本: ${ver:-内置}"
-        all_ports=$(get_ports nginx)
-    fi
-    if command -v docker &>/dev/null; then
-        nginx_containers=$(docker ps -a --format "{{.Names}}" | grep -iE "nginx|npm")
-        if [[ -n "$nginx_containers" ]]; then
-            [[ $nginx_found -eq 0 ]] && echo -e "状态: ${GREEN}Docker 运行中${RESET}"
-            nginx_found=1
-            for name in $nginx_containers; do
-                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
-                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
-                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
-                d_ports=$(docker container inspect "$name" --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}} {{end}}{{end}}' | tr -s ' ' '\n' | grep -v '^$')
-                all_ports="$all_ports $d_ports"
-            done
-        fi
-    fi
-    if [[ $nginx_found -eq 1 ]]; then
-        final_ports=$(echo $all_ports | tr ' ' '\n' | grep -v '^$' | sort -un | tr '\n' ',' | sed 's/,$//')
-        [[ -n "$final_ports" ]] && echo -e "端口: ${GREEN}${final_ports}${RESET}" || echo -e "端口: ${YELLOW}未发现映射端口${RESET}"
-    else
-        echo -e "状态: ${RED}未安装${RESET}"
-    fi
-    echo ""
-
-    # =============================
-    # Caddy
-    # =============================
-    echo -e "${YELLOW}▶ Caddy${RESET}"
-    caddy_containers=""
-    if command -v docker &>/dev/null; then
-        caddy_containers=$(docker ps -a --format "{{.Names}}" | grep -i "caddy")
-    fi
-    if command -v caddy &>/dev/null || pgrep -x caddy &>/dev/null || [[ -n "$caddy_containers" ]]; then
-        status=$(systemctl is-active caddy 2>/dev/null)
-        if [[ "$status" != "active" ]]; then
-            if pgrep -x caddy &>/dev/null; then status="active"
-            elif [[ -n "$caddy_containers" ]]; then
-                for name in $caddy_containers; do
-                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
-                done
-            fi
-        fi
-        echo -e "状态: $(format_status "$status")"
-        if command -v caddy &>/dev/null; then
-            ver=$(caddy version 2>/dev/null | awk '{print $1}')
-        elif [[ -n "$caddy_containers" ]]; then
-            first_c=$(echo "$caddy_containers" | head -n1)
-            ver=$(docker exec "$first_c" caddy version 2>/dev/null | awk '{print $1}')
-        fi
-        echo -e "版本: ${ver:-运行中(内置)}"
-        ports=$(get_ports caddy)
-        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
-        if [[ -n "$caddy_containers" ]]; then
-            for name in $caddy_containers; do
-                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
-                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
-                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
-            done
-        fi
-    else
-        echo -e "状态: ${RED}未安装${RESET}"
-    fi
-    echo ""
-
-    # =============================
-    # ACME
-    # =============================
-    echo -e "${YELLOW}▶ ACME${RESET}"
-    if command -v acme.sh &>/dev/null || [[ -f ~/.acme.sh/acme.sh ]] || (command -v docker &>/dev/null && docker ps -a --format '{{.Names}}' | grep -qi "acme"); then
-        if command -v acme.sh &>/dev/null || [[ -f ~/.acme.sh/acme.sh ]]; then echo -e "状态: ${GREEN}已安装${RESET}"
-        else echo -e "状态: ${GREEN}已安装(Docker)${RESET}"; fi
-        if command -v acme.sh &>/dev/null; then ver=$(acme.sh --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-        elif [[ -f ~/.acme.sh/acme.sh ]]; then ver=$(~/.acme.sh/acme.sh --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-        elif command -v docker &>/dev/null; then
-            container_id=$(docker ps -a --format "{{.Names}}" | grep -i "acme" | head -n1)
-            ver=$(docker exec "$container_id" acme.sh --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-        fi
-        echo -e "版本: ${ver:-内置}"
-    else
-        echo -e "状态: ${RED}未安装${RESET}"
-    fi
-    echo ""
-
-    # =============================
-    # CF WARP
-    # =============================
-    echo -e "${YELLOW}▶ Cloudflare WARP${RESET}"
-    warp_found=0
-    if command -v warp-cli &>/dev/null; then
-        warp_found=1
-        if warp-cli status 2>/dev/null | grep -qi 'Connected'; then echo -e "状态: ${GREEN}已连接${RESET}"
-        else echo -e "状态: ${YELLOW}已安装(未连接)${RESET}"; fi
-    fi
-    if command -v warp-go &>/dev/null || command -v warpgo &>/dev/null; then warp_found=1; echo -e "状态: ${GREEN}WarpGo已安装${RESET}"; fi
-    if systemctl list-unit-files 2>/dev/null | grep -q warp-go; then
-        warp_found=1
-        if systemctl is-active warp-go &>/dev/null; then echo -e "状态: ${GREEN}WarpGo服务运行中${RESET}"
-        else echo -e "状态: ${YELLOW}WarpGo已安装(未运行)${RESET}"; fi
-    fi
-    if command -v wgcf &>/dev/null || ip a 2>/dev/null | grep -q 'wgcf'; then warp_found=1; echo -e "状态: ${GREEN}WGCF已安装${RESET}"; fi
-    if systemctl list-unit-files 2>/dev/null | grep -q warp-svc; then
-        warp_found=1
-        if systemctl is-active warp-svc &>/dev/null; then echo -e "状态: ${GREEN}服务运行中${RESET}"
-        else echo -e "状态: ${YELLOW}服务已安装${RESET}"; fi
-    fi
-    if command -v warp &>/dev/null; then
-        warp_found=1
-        if warp status 2>/dev/null | grep -q "WARP 网络接口已开启"; then echo -e "状态: ${GREEN}已开启${RESET}"
-        else echo -e "状态: ${YELLOW}已安装${RESET}"; fi
-    fi
-    if command -v docker &>/dev/null; then
-        warp_containers=$(docker ps -a --format "{{.Names}}" | grep -i "warp")
-        if [[ -n "$warp_containers" ]]; then
-            warp_found=1
-            for name in $warp_containers; do
-                raw_status=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)
-                [[ "$raw_status" == "running" ]] && c_status="active" || c_status="$raw_status"
-                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_status")"
-            done
-        fi
-    fi
-    if [[ $warp_found -eq 0 ]]; then echo -e "状态: ${RED}未安装${RESET}"
-    else
-        trace=$(curl -s --max-time 2 https://www.cloudflare.com/cdn-cgi/trace)
-        if echo "$trace" | grep -q "warp=on"; then echo -e "模式: ${GREEN}WARP中${RESET}"
-        elif echo "$trace" | grep -q "warp=plus"; then echo -e "模式: ${GREEN}WARP+${RESET}"
-        else echo -e "模式: ${YELLOW}普通网络${RESET}"; fi
-    fi
-    echo ""
-
-    # =============================
-    # CF Tunnel (Argo)
-    # =============================
-    local argo_path="${work_dir}/argo"
-    echo -e "${YELLOW}▶ Cloudflare Tunnel${RESET}"
-    cf_containers=""
-    if command -v docker &>/dev/null; then
-        cf_containers=$(docker ps -a --format "{{.Names}}" | grep -iE "cloudflared|tunnel|argo")
-    fi
-    if [[ -f "$argo_path" ]] || command -v cloudflared &>/dev/null || pgrep -f "argo|cloudflared" &>/dev/null || [[ -n "$cf_containers" ]]; then
-        status=$(systemctl is-active cloudflared 2>/dev/null || systemctl is-active argo 2>/dev/null)
-        if [[ "$status" != "active" ]]; then
-            if pgrep -f "$argo_path" &>/dev/null || pgrep -f "cloudflared" &>/dev/null; then status="active"
-            elif [[ -n "$cf_containers" ]]; then
-                for name in $cf_containers; do
-                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
-                done
-            fi
-        fi
-        echo -e "状态: $(format_status "$status")"
-        if [[ -f "$argo_path" ]]; then ver=$("$argo_path" --version 2>/dev/null | awk '{print $3}')
-        elif command -v cloudflared &>/dev/null; then ver=$(cloudflared --version 2>/dev/null | awk '{print $3}')
-        elif [[ -n "$cf_containers" ]]; then
-            first_c=$(echo "$cf_containers" | head -n1)
-            ver=$(docker exec "$first_c" cloudflared --version 2>/dev/null | awk '{print $3}')
-        fi
-        echo -e "版本: ${ver:-运行中(内置)}"
-        if [[ -n "$cf_containers" ]]; then
-            for name in $cf_containers; do
-                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
-                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
-                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
-            done
-        fi
-    else
-        echo -e "状态: ${RED}未安装${RESET}"
-    fi
-    echo ""
-
-    # =============================
-    # Docker
-    # =============================
-    echo -e "${YELLOW}▶ Docker${RESET}"
-    if command -v docker &>/dev/null; then
-        containers=$(docker ps --format "{{.Names}}" | grep -Ei 'xray|sing|hysteria|tuic|snell|3xui_app|AnyTLSD|MTProto|shadowsocks|sshadow-tls|shadow-tls|Singbox-AnyReality|Singbox-AnyTLS|Singbox-TUICv5|Xray-Reality|Xray-Realityxhttp|xray-socks5|xray-vmess|xray-vmesstls|clash|mihomo|warp|glash|conflux|heki|microwarp|nodepassdash|ppanel|wg-easy|wireguard|gostpanel|vite-frontend|xboard|xtrafficdash|lumina-client|freegfw|Mihomo')
-        if [[ -n "$containers" ]]; then
-            echo -e "状态: ${GREEN}运行中${RESET}"
-            echo -e "${YELLOW}容器:${RESET} $(echo "$containers" | tr '\n' ' ')"
-        else echo -e "状态: ${GREEN}已安装${RESET}"; fi
-    else echo -e "状态: ${RED}未安装${RESET}"; fi
-    echo ""
-
-    # =============================
-    # BBR
-    # =============================
-    echo -e "${YELLOW}▶ BBR${RESET}"
-    actual_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
-    if [[ "$actual_cc" == "bbr" ]]; then echo -e "状态: ${GREEN}已启用 BBR${RESET}"
-    else echo -e "状态: ${RED}未启用 BBR${RESET}"; fi
-    echo ""
-
-    # =============================
-    # 网络出口
-    # =============================
-    echo -e "${YELLOW}▶ 网络出口${RESET}"
-    ipv4=$(curl -4 -s --max-time 3 ip.sb 2>/dev/null || curl -4 -s --max-time 3 ifconfig.me 2>/dev/null)
-    ipv6=$(curl -6 -s --max-time 3 ip.sb 2>/dev/null)
-    get_country_cn() {
-        local ip="$1"
-        local res=$(curl -s --max-time 3 "http://ip-api.com/json/$ip?lang=zh-CN")
-        local name=$(echo "$res" | grep -oP '"country":"\K[^"]+')
-        echo "${name:-未知}"
-    }
-    if [[ -n "$ipv4" ]]; then
-        country4=$(get_country_cn "$ipv4")
-        echo -e "IPv4: ${GREEN}$ipv4${RESET}         国家: ${GREEN}$country4${RESET}"
-    else echo -e "IPv4: ${RED}获取失败${RESET}"; fi
-    if [[ -n "$ipv6" ]]; then
-        country6=$(get_country_cn "$ipv6")
-        echo -e "IPv6: ${GREEN}$ipv6${RESET}  国家: ${GREEN}$country6${RESET}"
-    fi
-    echo ""
-
-  
-    # =============================
-    # DNS 检测
-    # =============================
-    echo -e "${YELLOW}▶ DNS 信息检测${RESET}"
-
-    # 确保工具存在
-    [[ ! $(command -v dig) ]] && apk add --no-cache bind-tools >/dev/null 2>&1
-
-    # 提取 DNS 列表
-    dns_all=$(grep "nameserver" /etc/resolv.conf | awk '{print $2}')
-    dns_v4=$(echo "$dns_all" | grep -v ":" | tr '\n' ' ')
-    dns_v6=$(echo "$dns_all" | grep ":" | tr '\n' ' ')
-
-    # --- IPv4 部分 ---
-    if [[ -n "$dns_v4" ]]; then
-        echo -e "DNSv4: ${CYAN}${dns_v4}${RESET}"
-        first_dns=$(echo $dns_v4 | awk '{print $1}')
-        test_v4=$(dig +short +time=2 +tries=1 google.com @$first_dns >/dev/null 2>&1 && echo "ok" || echo "fail")
-        [[ "$test_v4" == "ok" ]] && echo -e "解析: ${GREEN}IPv4 正常${RESET}" || echo -e "解析: ${RED}IPv4 失败${RESET}"
-    else
-        echo -e "DNSv4: ${RED}无${RESET}"
-    fi
-
-    # --- IPv6 部分  ---
-    if [[ -n "$dns_v6" ]]; then
-        echo -e "DNSv6: ${CYAN}${dns_v6}${RESET}"
-        first_dns6=$(echo $dns_v6 | awk '{print $1}')
-        # 测试 AAAA 记录解析
-        test_v6=$(dig +short +time=2 +tries=1 google.com AAAA @$first_dns6 >/dev/null 2>&1 && echo "ok" || echo "fail")
-        
-        if [[ "$test_v6" == "ok" ]]; then
-            echo -e "解析: ${GREEN}IPv6 正常${RESET}"
-        else
-            echo -e "解析: ${RED}IPv6 失败${RESET}"
-        fi
-    else
-        echo -e "DNSv6: ${RED}无配置${RESET}"
-    fi
-
-
 }
 
-# 运行检测
-status_check
+# 动态获取容器状态、映射端口等
+get_status_info() {
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3008"
+    else
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+    fi
+}
+
+# 获取公网 IP (兼容双栈环境)
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
+}
+
+# 部署 Kerkerker
+install_utils() {
+    check_dependencies
+    mkdir -p "$BASE_DIR"
+
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    # 1. 端口配置
+    echo -ne "${YELLOW}请输入 Kerkerker 访问端口 [默认: 3008]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3008"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
+
+    # 2. 管理员密码配置
+    echo -ne "${YELLOW}请设置管理员密码 (ADMIN_PASSWORD) [默认: admin123]: ${RESET}"
+    read -r admin_password
+    [[ -z "$admin_password" ]] && admin_password="admin123"
+
+    # 3. 豆瓣 API 微服务配置
+    echo -ne "${YELLOW}请输入豆瓣 API 微服务地址 (留空则不配置): ${RESET}"
+    read -r douban_api_url
+
+    # 4. 数据库模式选择
+    echo -e "${CYAN}--------------------------------${RESET}"
+    echo -e "${YELLOW}请选择 MongoDB 数据库类型:${RESET}"
+    echo -e "  ${GREEN}1)${RESET} 安装本地 MongoDB (数据挂载至 $BASE_DIR/mongodb_data)"
+    echo -e "  ${GREEN}2)${RESET} 连接远程/已有 MongoDB (按指定参数交互连接)"
+    echo -ne "${YELLOW}请选择 [默认: 1]: ${RESET}"
+    read -r db_choice
+    [[ -z "$db_choice" ]] && db_choice="1"
+
+    if [[ "$db_choice" == "2" ]]; then
+        # 你的自定义远程 DB 交互逻辑
+        echo -ne "${YELLOW}请输入远程 MongoDB 的 IP 或域名: ${RESET}"
+        read -r ext_db_ip
+        if [[ -z "$ext_db_ip" ]]; then
+            echo -e "${RED}错误: 数据库 IP 或域名不能为空！${RESET}"
+            return
+        fi
+
+        echo -ne "${YELLOW}请输入远程 MongoDB 端口 [默认: 27017]: ${RESET}"
+        read -r ext_db_port
+        [[ -z "$ext_db_port" ]] && ext_db_port="27017"
+        
+        db_host="$ext_db_ip"
+        db_port="$ext_db_port"
+        
+        echo -ne "${YELLOW}请输入远程 MongoDB 用户名 [默认: root]: ${RESET}"
+        read -r db_user
+        [[ -z "$db_user" ]] && db_user="root"
+        
+        echo -ne "${YELLOW}请输入远程 MongoDB 密码: ${RESET}"
+        read -r db_pass
+        
+        echo -ne "${YELLOW}请输入远程认证数据库 authSource [默认: admin]: ${RESET}"
+        read -r db_auth_source
+        [[ -z "$db_auth_source" ]] && db_auth_source="admin"
+        
+        # 兼容本地宿主机回环网关 (使用 Compose 标准的 host.docker.internal 获得更好的平台兼容性)
+        local has_extra_host="false"
+        if [[ "$ext_db_ip" == "127.0.0.1" || "$ext_db_ip" == "localhost" ]]; then
+            db_host="host.docker.internal"
+            has_extra_host="true"
+        fi
+
+        # 组装安全的 MongoDB 连接 URL
+        local mongodb_uri="mongodb://${db_user}:${db_pass}@${db_host}:${db_port}/kerkerker?authSource=${db_auth_source}"
+
+        # 生成不含本地数据库的 compose 文件
+        echo -e "${YELLOW}正在生成连接远程数据库的 docker-compose.yml...${RESET}"
+        
+        # 构建基础 Compose 结构
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  app:
+    image: unilei/kerkerker:latest
+    container_name: ${CONTAINER_NAME}
+    ports:
+      - "${custom_port}:3000"
+    environment:
+      - NODE_ENV=production
+      - ADMIN_PASSWORD=${admin_password}
+      - MONGODB_URI=${mongodb_uri}
+      - NEXT_PUBLIC_DOUBAN_API_URL=${douban_api_url}
+    restart: unless-stopped
+EOF
+
+        # 如果连接的是宿主机本地，追加 extra_hosts 字段使其网络畅通
+        if [[ "$has_extra_host" == "true" ]]; then
+            cat <<EOF >> "$COMPOSE_FILE"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+EOF
+        fi
+
+    else
+        # 本地数据库流程（含宿主机本地目录挂载）
+        mkdir -p "$BASE_DIR/mongodb_data"
+        mkdir -p "$BASE_DIR/mongodb_config"
+        
+        echo -e "${YELLOW}正在生成含本地挂载的 docker-compose.yml...${RESET}"
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  app:
+    image: unilei/kerkerker:latest
+    container_name: ${CONTAINER_NAME}
+    ports:
+      - "${custom_port}:3000"
+    environment:
+      - NODE_ENV=production
+      - ADMIN_PASSWORD=${admin_password}
+      - MONGODB_URI=mongodb://mongodb:27017/kerkerker
+      - NEXT_PUBLIC_DOUBAN_API_URL=${douban_api_url}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - kerkerker-network
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7
+    container_name: kerkerker-mongodb
+    ports:
+      - "27018:27017"
+    environment:
+      - MONGO_INITDB_DATABASE=kerkerker
+    volumes:
+      - ${BASE_DIR}/mongodb_data:/data/db
+      - ${BASE_DIR}/mongodb_config:/data/configdb
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kerkerker-network
+    restart: unless-stopped
+
+networks:
+  kerkerker-network:
+    driver: bridge
+EOF
+    fi
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Kerkerker 堆栈...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器群初始化与网络连接检查 (约5秒)...${RESET}"
+    sleep 5
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     Kerkerker 部署成功！      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}管理员密码     : ${admin_password}${RESET}"
+    [[ "$db_choice" == "1" ]] && echo -e "${YELLOW}本地数据挂载点 : $BASE_DIR/mongodb_data${RESET}"
+    [[ "$db_choice" == "2" ]] && echo -e "${YELLOW}数据库连接方式 : 远程数据库 (${db_host})${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+# 更新 Kerkerker 镜像
+update_utils() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取最新镜像并更新...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！${RESET}"
+}
+
+# 卸载 Kerkerker
+uninstall_utils() {
+    echo -ne "${YELLOW}确定要卸载并删除 Kerkerker 容器吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时彻底删除本地配置及数据库挂载目录 ($BASE_DIR)？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}本地目录及数据已彻底清理。${RESET}"
+            fi
+        else
+            docker rm -f "$CONTAINER_NAME" kerkerker-mongodb 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
+}
+
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+
+show_info() {
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}核心镜像       : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}管理员密码     : ${admin_password}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+menu() {
+    clear
+    get_status_info
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    ◈  Kerkerker 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
+        8) show_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
+    esac
+}
+
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

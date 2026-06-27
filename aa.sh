@@ -1,296 +1,673 @@
 #!/bin/bash
 
-# 颜色定义
+# 定义颜色变量
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
+YELLOW='\033[0;33m'
 RED='\033[0;31m'
+CYAN='\033[0;36m'
+ORANGE='\033[38;5;214m'
 RESET='\033[0m'
 
-# 自定义配置文件路径
-ENV_FILE="$HOME/.claude_custom_env"
+# 工作目录定义 (用于 Argo 等模块)
+work_dir="/etc/argo" 
 
-# 临时和永久确保当前脚本进程能找到最新的 PATH
-export PATH="$HOME/.local/bin:$PATH"
+status_check() {
+    echo -e "${ORANGE}========================================${RESET}"
+    echo -e "${ORANGE}       ◈      代理工具检测     ◈        ${RESET}"
+    echo -e "${ORANGE}========================================${RESET}"
+    echo ""
 
-# 自动刷新和导出自定义 API 环境配置
-refresh_env() {
-    # 优先从本地 settings.json 中解析当前状态，保证主面板状态 100% 同步
-    local SETTINGS_JSON="$HOME/.claude/settings.json"
-    if [ -f "$SETTINGS_JSON" ]; then
-        # 简单通过 grep 判定是否配置了自定义中转（免去安装 jq 的依赖）
-        if grep -q '"ANTHROPIC_BASE_URL"' "$SETTINGS_JSON" 2>/dev/null; then
-            IS_CUSTOM_API=true
-            # 从 JSON 中提取当前的 Base URL 和 Model（用于主面板展示）
-            CURRENT_URL=$(grep '"ANTHROPIC_BASE_URL"' "$SETTINGS_JSON" | sed -E 's/.*"ANTHROPIC_BASE_URL": ?"([^"]+)".*/\1/')
-            CURRENT_MODEL=$(grep -m1 '"model"' "$SETTINGS_JSON" | sed -E 's/.*"model": ?"([^"]+)".*/\1/')
+    format_status() {
+        case "$1" in
+            active) echo -e "${GREEN}运行中${RESET}" ;;
+            inactive|failed) echo -e "${YELLOW}未运行${RESET}" ;;
+            *) echo -e "${RED}未安装${RESET}" ;;
+        esac
+    }
+
+    get_ports() {
+        ss -tulnp 2>/dev/null | grep -E "$1" | awk '{print $5}' | awk -F: '{print $NF}' | sort -u
+    }
+
+    # =============================
+    # Xray
+    # =============================
+    echo -e "${YELLOW}▶ Xray${RESET}"
+    if command -v xray &>/dev/null || pgrep -f xray &>/dev/null; then
+        status=$(systemctl is-active xray 2>/dev/null)
+        [[ "$status" != "active" && $(pgrep -f xray) ]] && status="active"
+        echo -e "状态: $(format_status "$status")"
+        if command -v xray &>/dev/null; then
+            ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}')
         else
-            IS_CUSTOM_API=false
-            CURRENT_URL=""
-            CURRENT_MODEL=""
+            ver=$(ps -ef | grep xray | grep -v grep | grep -oE 'v[0-9.]+' | head -n1)
         fi
-    fi
-}
-
-# 获取状态与版本信息
-get_status() {
-    if command -v claude &> /dev/null; then
-        status="${GREEN}已安装${RESET}"
-        version_info=$(claude -v 2>/dev/null | head -n 1)
-        [ -z "$version_info" ] && version_info="未知版本"
-        claude_version="${YELLOW}${version_info}${RESET}"
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$(get_ports xray)
+        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
     else
-        status="${RED}未安装${RESET}"
-        claude_version="${RED}-${RESET}"
+        echo -e "状态: ${RED}未安装${RESET}"
     fi
+    echo ""
 
-    # 刷新并检查是否配置了自定义 API
-    refresh_env
-    if [ "$IS_CUSTOM_API" = true ]; then
-        api_status="${YELLOW}自定义中转 (${CURRENT_MODEL:-中转})${RESET}"
+    # =============================
+    # Sing-box
+    # =============================
+    echo -e "${YELLOW}▶ Sing-box${RESET}"
+    if command -v sing-box &>/dev/null || pgrep -f sing-box &>/dev/null; then
+        status=$(systemctl is-active sing-box 2>/dev/null)
+        [[ "$status" != "active" && $(pgrep -f sing-box) ]] && status="active"
+        echo -e "状态: $(format_status "$status")"
+        if command -v sing-box &>/dev/null; then
+            ver=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}')
+        else
+            ver=$(ps -ef | grep sing-box | grep -v grep | grep -oE 'v[0-9.]+' | head -n1)
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$(get_ports sing-box)
+        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
     else
-        api_status="${GREEN}官方默认${RESET}"
+        echo -e "状态: ${RED}未安装${RESET}"
     fi
-}
+    echo ""
 
-# 菜单面板
-show_menu() {
-    clear
-    get_status
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Claude Code 管理面板  ◈    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} $claude_version"
-    echo -e "${GREEN}API  :${RESET} $api_status"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Claude Code${RESET}"
-    echo -e "${GREEN}2. 在当前目录启动${RESET}"
-    echo -e "${GREEN}3. 指定项目路径启动${RESET}"
-    echo -e "${GREEN}4. 登录/切换账户 (官方模式)${RESET}"
-    echo -e "${GREEN}5. 设置自定义 API 模型/中转网关${RESET}"
-    echo -e "${GREEN}6. 检查更新${RESET}"
-    echo -e "${GREEN}7. 安全卸载${RESET}"
-    echo -e "${GREEN}0. 退出面板${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-}
-
-# 1. 安装
-install_claude() {
-    echo -e "\n${YELLOW}正在通过官方脚本安装 Claude Code...${RESET}"
-    curl -fsSL https://claude.ai/install.sh | bash
-    
-    echo -e "\n${YELLOW}正在检查环境并自动修复 PATH...${RESET}"
-    local shell_config=""
-    if [ -n "$ZSH_VERSION" ] || [ -f "$HOME/.zshrc" ]; then
-        shell_config="$HOME/.zshrc"
-    else
-        shell_config="$HOME/.bashrc"
+    # =============================
+    # Mihomo (Clash Meta)
+    # =============================
+    echo -e "${YELLOW}▶ Mihomo${RESET}"
+    mihomo_found=0
+    mi_ports=""
+    if command -v docker &>/dev/null; then
+        mi_containers=$(docker ps -a --format "{{.Names}}" | grep -iE "mihomo|clash")
     fi
-
-    if ! grep -q '\.local/bin' "$shell_config" 2>/dev/null; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$shell_config"
-        echo -e "${GREEN}✔ 已自动将 ~/.local/bin 写入 $shell_config${RESET}"
-    else
-        echo -e "${GREEN}✔ 配置文件中已存在 PATH 记录，无需重复添加。${RESET}"
-    fi
-
-    export PATH="$HOME/.local/bin:$PATH"
-    echo -e "${GREEN}安装与修复完成！${RESET}"
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 2. 当前目录启动
-start_current() {
-    if command -v claude &> /dev/null; then
-        echo -e "\n${GREEN}正在当前目录启动 Claude Code...${RESET}"
-        clear
-        claude
-    else
-        echo -e "\n${RED}未检测到 claude 命令，请先执行安装！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 3. 指定路径启动
-start_path() {
-    echo -e "\n"
-    echo -ne "${GREEN}请输入你的项目绝对路径: ${RESET}"
-    read target_path
-    # 替换可能存在的 ~ 为全局家目录路径
-    target_path="${target_path/#\~/$HOME}"
-    
-    if [ -d "$target_path" ]; then
-        echo -e "${GREEN}正在切换到 $target_path 并启动 Claude Code...${RESET}"
-        clear
-        cd "$target_path" && claude
-    else
-        echo -e "${RED}路径不存在或无效，请检查后重试！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 4. 登录
-login_claude() {
-    if command -v claude &> /dev/null; then
-        echo -e "\n${YELLOW}正在启动登录程序...${RESET}"
-        echo -e "提示：如果已经在会话中，直接输入 /login 即可"
-        claude -c "/login" 2>/dev/null || claude
-    else
-        echo -e "\n${RED}未检测到已安装的 Claude Code。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 5. 配置高级自定义 API 模型与路径
-config_custom_api() {
-    local SETTINGS_JSON="$HOME/.claude/settings.json"
-    local ONBOARDING_JSON="$HOME/.claude.json"
-    mkdir -p "$HOME/.claude"
-    
-    refresh_env
-    echo -e "\n${GREEN}================================${RESET}"
-    echo -e "${GREEN}      自定义 API 配置管理       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}当前 Base URL:${RESET} ${YELLOW}${CURRENT_URL:-官方默认}${RESET}"
-    echo -e "${GREEN}当前主核心模型:${RESET} ${YELLOW}${CURRENT_MODEL:-官方默认}${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${GREEN}1. 快捷设置代理模型配置${RESET}"
-    echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
-    echo -e "${GREEN}0. 返回主菜单${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read api_choice
-
-    case $api_choice in
-        1)
-            echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关 (例如: https://api.yourproxy.com/v1):${RESET}"
-            echo -ne "   地址: " && read input_url
-            
-            echo -e "\n${YELLOW}2/4. 请输入你的 API Key / 密钥 Token:${RESET}"
-            echo -ne "   秘钥: " && read input_key
-
-            echo -e "\n${YELLOW}3/4. 请输入主核心自定义模型 ID:${RESET}"
-            echo -ne "   (例如: claude-3-5-sonnet-20241022 或 deepseek-chat)\n   模型名: " && read input_model
-
-            echo -e "\n${YELLOW}4/4. 请输入子代理自定义模型 ID (TTP/工具执行模型):${RESET}"
-            echo -ne "   (例如: claude-3-5-haiku-20241022 或 deepseek-coder)\n   模型名: " && read input_submodel
-
-            if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ] && [ -n "$input_submodel" ]; then
-                
-                # 1. 强行注入官方免登补丁
-                cat << EOF > "$ONBOARDING_JSON"
-{
-  "hasCompletedOnboarding": true
-}
-EOF
-
-                # 2. 严格按照 JSON 标准格式写入本地 settings
-                cat << EOF > "$SETTINGS_JSON"
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "$input_url",
-    "ANTHROPIC_AUTH_TOKEN": "$input_key",
-    "ANTHROPIC_MODEL": "$input_model",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$input_model",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$input_model",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "$input_submodel",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION": "$input_model",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Custom Gateway Model",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Routed via custom third-party provider endpoint",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
-  },
-  "model": "$input_model",
-  "theme": "dark"
-}
-EOF
-                # 运行时环境变量同步清理，防止混淆环境
-                unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-
-                echo -e "\n${GREEN}========================================${RESET}"
-                echo -e "${GREEN}✔ 配置成功！${RESET}"
-                echo -e "${GREEN}✔ 已跳过本地模型验证，成功强制解封自定义模型！${RESET}"
-                echo -e "${GREEN}========================================${RESET}"
-            else
-                echo -e "${RED}所有输入均不能为空，取消设置。${RESET}"
+    if command -v mihomo &>/dev/null || pgrep -iE "mihomo|clash" &>/dev/null || [[ -n "$mi_containers" ]]; then
+        mihomo_found=1
+        status=$(systemctl is-active mihomo 2>/dev/null || systemctl is-active clash 2>/dev/null)
+        if [[ "$status" != "active" ]]; then
+            if pgrep -iE "mihomo|clash" &>/dev/null; then status="active"
+            elif [[ -n "$mi_containers" ]]; then
+                for name in $mi_containers; do
+                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+                done
             fi
-            ;;
-        2)
-            # 恢复默认设置格式
-            cat << EOF > "$SETTINGS_JSON"
-{
-  "env": {},
-  "model": "claude-3-5-sonnet-20241022",
-  "theme": "dark"
-}
-EOF
-            rm -f "$ONBOARDING_JSON"
-            echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复官方初始状态。${RESET}"
-            ;;
-        *)
-            return
-            ;;
-    esac
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 6. 更新
-update_claude() {
-    echo -e "\n${YELLOW}正在尝试更新 Claude Code...${RESET}"
-    if command -v claude &> /dev/null; then
-        claude update || npm update -g @anthropic-ai/claude-code
-    else
-        echo -e "${RED}未检测到已安装的 Claude Code，无法更新。${RESET}"
-    fi
-    echo -ne "\n${GREEN}按回会车键返回主菜单...${RESET}" && read
-}
-
-# 7. 整合卸载
-uninstall_claude_flow() {
-    echo -e "\n${RED}准备进入卸载流程...${RESET}"
-    echo -ne "${RED}确定要卸载 Claude Code 主程序吗？(y/n): ${RESET}"
-    read ans
-    if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
-        echo -e "${YELLOW}[步骤 1/2] 正在删除主程序可执行文件及全局依赖...${RESET}"
-        rm -f ~/.local/bin/claude
-        rm -rf ~/.local/share/claude
-        echo -e "${GREEN}✔ 主程序卸载成功。${RESET}"
-        
-        echo -e "\n${RED}[步骤 2/2] 是否需要连同配置文件、历史记录、自定义API及MCP设置一起清除？${RESET}"
-        echo -e "${RED}注意：此操作不可逆，清除后所有本地历史将永久丢失！${RESET}"
-        echo -ne "${RED}是否清除配置文件？(y/n): ${RESET}"
-        read ans_config
-        if [ "$ans_config" = "y" ] || [ "$ans_config" = "Y" ]; then
-            echo -e "${YELLOW}正在清除全局、本地及API配置文件...${RESET}"
-            rm -rf ~/.claude
-            rm -f ~/.claude.json
-            rm -rf .claude
-            rm -f .mcp.json
-            rm -f "$ENV_FILE"
-            echo -e "${GREEN}✔ 配置文件清除完毕，所有数据已彻底干净！${RESET}"
+        fi
+        echo -e "状态: $(format_status "$status")"
+        local raw_ver=""
+        if command -v mihomo &>/dev/null; then
+            raw_ver=$(mihomo -v 2>/dev/null)
+        elif [[ -n "$mi_containers" ]]; then
+            first_c=$(echo "$mi_containers" | head -n1)
+            raw_ver=$(docker exec "$first_c" mihomo -v 2>/dev/null)
+        fi
+        if [[ -n "$raw_ver" ]]; then
+            ver_num=$(echo "$raw_ver" | grep -iE "Mihomo|Clash" | awk '{print $3}' | head -n1)
+            [[ "$raw_ver" == *"gvisor"* ]] && ver_num="${ver_num} (gVisor)"
+            echo -e "版本: ${ver_num:-未知}"
         else
-            echo -e "${YELLOW}已保留配置文件。你可以随时重新安装并恢复使用。${RESET}"
+            echo -e "版本: 运行中(内置)"
+        fi
+        mi_ports=$(get_ports mihomo; get_ports clash)
+        if [[ -n "$mi_containers" ]]; then
+            d_ports=$(docker container inspect $(echo "$mi_containers") --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}} {{end}}{{end}}' | tr -s ' ' '\n' | grep -v '^$')
+            mi_ports="$mi_ports $d_ports"
+        fi
+        final_mi_ports=$(echo $mi_ports | tr ' ' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
+        [[ -n "$final_mi_ports" ]] && echo -e "端口: ${GREEN}${final_mi_ports}${RESET}" || echo -e "端口: ${YELLOW}无${RESET}"
+        if [[ -n "$mi_containers" ]]; then
+            for name in $mi_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
         fi
     else
-        echo "已取消卸载操作。"
+        echo -e "状态: ${RED}未安装${RESET}"
     fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    echo ""
+
+    # =============================
+    # 防火墙底层规则架构检测 (兼容 Alpine / 常用系统)
+    # =============================
+    echo -e "${YELLOW}▶ 防火墙状态与规则引擎检测${RESET}"
+
+    fw_engine="${RED}未知 / 未启用${RESET}"
+    nft_rules_count=0
+    ipt_rules_count=0
+
+    # 1. 检测 nftables 规则数量
+    if command -v nft >/dev/null 2>&1; then
+        # 兼容 BusyBox grep，排除空行和注释
+        nft_rules_count=$(nft list ruleset 2>/dev/null | grep -v '^$' | grep -v '^[[:space:]]*#' | wc -l)
+    fi
+
+    # 2. 检测 iptables 规则数量 (同时计算 filter, nat, mangle 表)
+    if command -v iptables >/dev/null 2>&1; then
+        ipt_rules_count=$( (iptables -S 2>/dev/null; iptables -t nat -S 2>/dev/null; iptables -t mangle -S 2>/dev/null) | grep -v '^-P' | wc -l)
+    fi
+
+    # 3. 判定当前系统服务状态 (兼容 Systemd 和 OpenRC)
+    is_nft_service_active=0
+    if command -v systemctl >/dev/null 2>&1; then
+        # Systemd 环境
+        systemctl is-active nftables >/dev/null 2>&1 && is_nft_service_active=1
+    elif command -v rc-service >/dev/null 2>&1; then
+        # Alpine OpenRC 环境
+        rc-service nftables status 2>/dev/null | grep -q "started" && is_nft_service_active=1
+    fi
+
+    # 4. 判定主要依靠哪种规则引擎
+    if [[ $is_nft_service_active -eq 1 ]] || [[ $nft_rules_count -gt $ipt_rules_count && $nft_rules_count -gt 0 ]]; then
+        fw_engine="${GREEN}nftables${RESET}"
+    elif [[ $ipt_rules_count -gt 0 ]]; then
+        # 检测是否是基于 nftables 后端的 iptables (iptables-nft)
+        if iptables -V 2>/dev/null | grep -q "nf_tables"; then
+            fw_engine="${GREEN}iptables${RESET} ${YELLOW}(nftables 兼容模式/iptables-nft)${RESET}"
+        else
+            fw_engine="${GREEN}iptables${RESET} ${YELLOW}(传统经典模式/legacy)${RESET}"
+        fi
+    fi
+
+    # 5. 打印引擎及规则结果
+    echo -e "当前活动防火墙: $fw_engine"
+    echo -e "nftables 规则条数: ${YELLOW}${nft_rules_count}${RESET}"
+    echo -e "iptables 规则条数: ${YELLOW}${ipt_rules_count}${RESET}"
+    
+    # 6. 常见高级防火墙前端管理工具检测 (兼容 Systemd / OpenRC / 基础命令)
+    front_ends=""
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active ufw >/dev/null 2>&1 && front_ends+="UFW "
+        systemctl is-active firewalld >/dev/null 2>&1 && front_ends+="Firewalld "
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service ufw status 2>/dev/null | grep -q "started" && front_ends+="UFW "
+        rc-service firewalld status 2>/dev/null | grep -q "started" && front_ends+="Firewalld "
+    fi
+    
+    # Alpine 上经常直接用 awall (Alpine Wall) 作为前端
+    if command -v awall >/dev/null 2>&1; then
+        front_ends+="awall(AlpineWall) "
+    fi
+    
+    if [[ -n "$front_ends" ]]; then
+        echo -e "系统管理前端: ${YELLOW}${front_ends% }${RESET} (正在运行)"
+    else
+        echo -e "系统管理前端: ${YELLOW}无 (直接通过原生命令或底层规则管理)${RESET}"
+    fi
+    echo ""
+
+
+    # =============================
+    # Realm
+    # =============================
+    echo -e "${YELLOW}▶ Realm${RESET}"
+    realm_containers=""
+    if command -v docker &>/dev/null; then
+        realm_containers=$(docker ps -a --format "{{.Names}}" | grep -i "realm")
+    fi
+    if command -v realm &>/dev/null || pgrep -f realm &>/dev/null || [[ -n "$realm_containers" ]]; then
+        status=$(systemctl is-active realm 2>/dev/null)
+        if [[ "$status" != "active" ]]; then
+            if pgrep -f realm &>/dev/null; then status="active"
+            elif [[ -n "$realm_containers" ]]; then
+                for name in $realm_containers; do
+                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+                done
+            fi
+        fi
+        echo -e "状态: $(format_status "$status")"
+        if command -v realm &>/dev/null; then
+            ver=$(realm --version 2>/dev/null | awk '{print $2}')
+        elif [[ -n "$realm_containers" ]]; then
+            first_c=$(echo "$realm_containers" | head -n1)
+            ver=$(docker exec "$first_c" realm --version 2>/dev/null | awk '{print $2}')
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$(get_ports realm)
+        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
+        if [[ -n "$realm_containers" ]]; then
+            for name in $realm_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # Gost
+    # =============================
+    echo -e "${YELLOW}▶ Gost${RESET}"
+    gost_containers=""
+    if command -v docker &>/dev/null; then
+        gost_containers=$(docker ps -a --format "{{.Names}}" | grep -i "gost")
+    fi
+    if command -v gost &>/dev/null || pgrep -f gost &>/dev/null || [[ -n "$gost_containers" ]]; then
+        status="inactive"
+        if systemctl is-active gost &>/dev/null; then status="active"
+        elif pgrep -f gost &>/dev/null; then status="active"
+        elif [[ -n "$gost_containers" ]]; then
+            for name in $gost_containers; do
+                [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+            done
+        fi
+        echo -e "状态: $(format_status "$status")"
+        ver=""
+        if command -v gost &>/dev/null; then
+            ver=$(gost -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+        fi
+        if [[ -z "$ver" && -n "$gost_containers" ]]; then
+            first_c=$(echo "$gost_containers" | head -n1)
+            ver=$(docker exec "$first_c" gost -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+            [[ -z "$ver" ]] && ver=$(docker exec "$first_c" /bin/gost -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$(get_ports gost)
+        if [[ -n "$gost_containers" ]]; then
+            d_ports=$(docker container inspect $gost_containers --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}} {{end}}{{end}}' | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/^,//;s/,$//')
+            if [[ -n "$d_ports" ]]; then
+                [[ -n "$ports" ]] && ports="${ports},${d_ports}" || ports="$d_ports"
+            fi
+        fi
+        final_ports=$(echo "$ports" | tr ' ' '\n' | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//')
+        [[ -n "$final_ports" ]] && echo -e "端口: ${CYAN}${final_ports}${RESET}" || echo -e "${YELLOW}端口: 无${RESET}"
+        if [[ -n "$gost_containers" ]]; then
+            for name in $gost_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+
+    # =============================
+    # EasyTier (兼容 Alpine / 常用系统)
+    # =============================
+    echo -e "${YELLOW}▶ EasyTier${RESET}"
+    
+    # 查找 Docker 容器名包含 easytier 的容器 (不区分大小写)
+    easytier_containers=""
+    if command -v docker >/dev/null 2>&1; then
+        easytier_containers=$(docker ps -a --format "{{.Names}}" | grep -i "easytier")
+    fi
+
+    # 1. 检测是否存在（原生命令、进程、容器、或服务文件）
+    has_easytier=0
+    if command -v easytier-core >/dev/null 2>&1 || command -v easytier-cli >/dev/null 2>&1 || pgrep -x easytier-core >/dev/null 2>&1 || [[ -n "$easytier_containers" ]]; then
+        has_easytier=1
+    fi
+
+    if [[ $has_easytier -eq 1 ]]; then
+        # 判定状态：检测 Systemd 或 OpenRC
+        status="stopped"
+        
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl is-active easytier >/dev/null 2>&1 && status="active"
+            systemctl is-active easytier-core >/dev/null 2>&1 && status="active"
+        elif command -v rc-service >/dev/null 2>&1; then
+            rc-service easytier status 2>/dev/null | grep -q "started" && status="active"
+            rc-service easytier-core 2>/dev/null | grep -q "started" && status="active"
+        fi
+
+        # 如果服务没开，但进程在运行，依然算 active
+        if [[ "$status" != "active" ]]; then
+            if pgrep -x easytier-core >/dev/null 2>&1; then
+                status="active"
+            elif [[ -n "$easytier_containers" ]]; then
+                for name in $easytier_containers; do
+                    if [[ $(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null) == "running" ]]; then
+                        status="active"
+                        break
+                    fi
+                done
+            fi
+        fi
+
+        echo -e "状态: $(format_status "$status")"
+
+        # 版本获取逻辑 (统一使用标准重定向)
+        ver=""
+        if command -v easytier-core >/dev/null 2>&1; then
+            ver=$(easytier-core --version 2>/dev/null | awk '{print $2}')
+        elif command -v easytier-cli >/dev/null 2>&1; then
+            ver=$(easytier-cli --version 2>/dev/null | awk '{print $2}')
+        elif [[ -n "$easytier_containers" ]]; then
+            first_c=$(echo "$easytier_containers" | head -n1)
+            ver=$(docker exec "$first_c" easytier-core --version 2>/dev/null | awk '{print $2}')
+        fi
+        echo -e "版本: ${ver:-运行中(未知版本)}"
+
+        # 端口获取
+        ports=$(get_ports easytier-core 2>/dev/null)
+        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
+
+        # 如果有 Docker 容器，列出所有相关容器名
+        if [[ -n "$easytier_containers" ]]; then
+            for name in $easytier_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # FRP (frpc/frps)
+    # =============================
+    echo -e "${YELLOW}▶ FRP${RESET}"
+    frp_containers=""
+    if command -v docker &>/dev/null; then
+        frp_containers=$(docker ps -a --format "{{.Names}}" | grep -i "frp")
+    fi
+    if command -v frpc &>/dev/null || command -v frps &>/dev/null || pgrep -x frpc &>/dev/null || pgrep -x frps &>/dev/null || [[ -n "$frp_containers" ]]; then
+        status=$(systemctl is-active frpc 2>/dev/null || systemctl is-active frps 2>/dev/null)
+        if [[ "$status" != "active" ]]; then
+            if pgrep -x frpc &>/dev/null || pgrep -x frps &>/dev/null; then status="active"
+            elif [[ -n "$frp_containers" ]]; then
+                for name in $frp_containers; do
+                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+                done
+            fi
+        fi
+        echo -e "状态: $(format_status "$status")"
+        if command -v frpc &>/dev/null; then ver=$(frpc -v 2>/dev/null)
+        elif command -v frps &>/dev/null; then ver=$(frps -v 2>/dev/null)
+        elif [[ -n "$frp_containers" ]]; then
+            first_c=$(echo "$frp_containers" | head -n1)
+            ver=$(docker exec "$first_c" frpc -v 2>/dev/null || docker exec "$first_c" frps -v 2>/dev/null)
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$( (get_ports frpc; get_ports frps) | sort -u )
+        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
+        if [[ -n "$frp_containers" ]]; then
+            for name in $frp_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # Nginx
+    # =============================
+    echo -e "${YELLOW}▶ Nginx${RESET}"
+    nginx_found=0
+    all_ports=""
+    if command -v nginx &>/dev/null; then
+        nginx_found=1
+        status=$(systemctl is-active nginx 2>/dev/null)
+        [[ "$status" != "active" ]] && pgrep -x nginx &>/dev/null && status="active"
+        echo -e "状态: $(format_status "$status")"
+        ver=$(nginx -v 2>&1 | awk -F/ '{print $2}')
+        echo -e "版本: ${ver:-内置}"
+        all_ports=$(get_ports nginx)
+    fi
+    if command -v docker &>/dev/null; then
+        nginx_containers=$(docker ps -a --format "{{.Names}}" | grep -iE "nginx|npm")
+        if [[ -n "$nginx_containers" ]]; then
+            [[ $nginx_found -eq 0 ]] && echo -e "状态: ${GREEN}Docker 运行中${RESET}"
+            nginx_found=1
+            for name in $nginx_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+                d_ports=$(docker container inspect "$name" --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}} {{end}}{{end}}' | tr -s ' ' '\n' | grep -v '^$')
+                all_ports="$all_ports $d_ports"
+            done
+        fi
+    fi
+    if [[ $nginx_found -eq 1 ]]; then
+        final_ports=$(echo $all_ports | tr ' ' '\n' | grep -v '^$' | sort -un | tr '\n' ',' | sed 's/,$//')
+        [[ -n "$final_ports" ]] && echo -e "端口: ${GREEN}${final_ports}${RESET}" || echo -e "端口: ${YELLOW}未发现映射端口${RESET}"
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # Caddy
+    # =============================
+    echo -e "${YELLOW}▶ Caddy${RESET}"
+    caddy_containers=""
+    if command -v docker &>/dev/null; then
+        caddy_containers=$(docker ps -a --format "{{.Names}}" | grep -i "caddy")
+    fi
+    if command -v caddy &>/dev/null || pgrep -x caddy &>/dev/null || [[ -n "$caddy_containers" ]]; then
+        status=$(systemctl is-active caddy 2>/dev/null)
+        if [[ "$status" != "active" ]]; then
+            if pgrep -x caddy &>/dev/null; then status="active"
+            elif [[ -n "$caddy_containers" ]]; then
+                for name in $caddy_containers; do
+                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+                done
+            fi
+        fi
+        echo -e "状态: $(format_status "$status")"
+        if command -v caddy &>/dev/null; then
+            ver=$(caddy version 2>/dev/null | awk '{print $1}')
+        elif [[ -n "$caddy_containers" ]]; then
+            first_c=$(echo "$caddy_containers" | head -n1)
+            ver=$(docker exec "$first_c" caddy version 2>/dev/null | awk '{print $1}')
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        ports=$(get_ports caddy)
+        [[ -n "$ports" ]] && echo -e "端口: $(echo $ports | tr ' ' ', ')" || echo -e "${YELLOW}端口: 无${RESET}"
+        if [[ -n "$caddy_containers" ]]; then
+            for name in $caddy_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # ACME
+    # =============================
+    echo -e "${YELLOW}▶ ACME${RESET}"
+    if command -v acme.sh &>/dev/null || [[ -f ~/.acme.sh/acme.sh ]] || (command -v docker &>/dev/null && docker ps -a --format '{{.Names}}' | grep -qi "acme"); then
+        if command -v acme.sh &>/dev/null || [[ -f ~/.acme.sh/acme.sh ]]; then echo -e "状态: ${GREEN}已安装${RESET}"
+        else echo -e "状态: ${GREEN}已安装(Docker)${RESET}"; fi
+        if command -v acme.sh &>/dev/null; then ver=$(acme.sh --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        elif [[ -f ~/.acme.sh/acme.sh ]]; then ver=$(~/.acme.sh/acme.sh --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        elif command -v docker &>/dev/null; then
+            container_id=$(docker ps -a --format "{{.Names}}" | grep -i "acme" | head -n1)
+            ver=$(docker exec "$container_id" acme.sh --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        fi
+        echo -e "版本: ${ver:-内置}"
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # CF WARP
+    # =============================
+    echo -e "${YELLOW}▶ Cloudflare WARP${RESET}"
+    warp_found=0
+    if command -v warp-cli &>/dev/null; then
+        warp_found=1
+        if warp-cli status 2>/dev/null | grep -qi 'Connected'; then echo -e "状态: ${GREEN}已连接${RESET}"
+        else echo -e "状态: ${YELLOW}已安装(未连接)${RESET}"; fi
+    fi
+    if command -v warp-go &>/dev/null || command -v warpgo &>/dev/null; then warp_found=1; echo -e "状态: ${GREEN}WarpGo已安装${RESET}"; fi
+    if systemctl list-unit-files 2>/dev/null | grep -q warp-go; then
+        warp_found=1
+        if systemctl is-active warp-go &>/dev/null; then echo -e "状态: ${GREEN}WarpGo服务运行中${RESET}"
+        else echo -e "状态: ${YELLOW}WarpGo已安装(未运行)${RESET}"; fi
+    fi
+    if command -v wgcf &>/dev/null || ip a 2>/dev/null | grep -q 'wgcf'; then warp_found=1; echo -e "状态: ${GREEN}WGCF已安装${RESET}"; fi
+    if systemctl list-unit-files 2>/dev/null | grep -q warp-svc; then
+        warp_found=1
+        if systemctl is-active warp-svc &>/dev/null; then echo -e "状态: ${GREEN}服务运行中${RESET}"
+        else echo -e "状态: ${YELLOW}服务已安装${RESET}"; fi
+    fi
+    if command -v warp &>/dev/null; then
+        warp_found=1
+        if warp status 2>/dev/null | grep -q "WARP 网络接口已开启"; then echo -e "状态: ${GREEN}已开启${RESET}"
+        else echo -e "状态: ${YELLOW}已安装${RESET}"; fi
+    fi
+    if command -v docker &>/dev/null; then
+        warp_containers=$(docker ps -a --format "{{.Names}}" | grep -i "warp")
+        if [[ -n "$warp_containers" ]]; then
+            warp_found=1
+            for name in $warp_containers; do
+                raw_status=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)
+                [[ "$raw_status" == "running" ]] && c_status="active" || c_status="$raw_status"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_status")"
+            done
+        fi
+    fi
+    if [[ $warp_found -eq 0 ]]; then echo -e "状态: ${RED}未安装${RESET}"
+    else
+        trace=$(curl -s --max-time 2 https://www.cloudflare.com/cdn-cgi/trace)
+        if echo "$trace" | grep -q "warp=on"; then echo -e "模式: ${GREEN}WARP中${RESET}"
+        elif echo "$trace" | grep -q "warp=plus"; then echo -e "模式: ${GREEN}WARP+${RESET}"
+        else echo -e "模式: ${YELLOW}普通网络${RESET}"; fi
+    fi
+    echo ""
+
+    # =============================
+    # CF Tunnel (Argo)
+    # =============================
+    local argo_path="${work_dir}/argo"
+    echo -e "${YELLOW}▶ Cloudflare Tunnel${RESET}"
+    cf_containers=""
+    if command -v docker &>/dev/null; then
+        cf_containers=$(docker ps -a --format "{{.Names}}" | grep -iE "cloudflared|tunnel|argo")
+    fi
+    if [[ -f "$argo_path" ]] || command -v cloudflared &>/dev/null || pgrep -f "argo|cloudflared" &>/dev/null || [[ -n "$cf_containers" ]]; then
+        status=$(systemctl is-active cloudflared 2>/dev/null || systemctl is-active argo 2>/dev/null)
+        if [[ "$status" != "active" ]]; then
+            if pgrep -f "$argo_path" &>/dev/null || pgrep -f "cloudflared" &>/dev/null; then status="active"
+            elif [[ -n "$cf_containers" ]]; then
+                for name in $cf_containers; do
+                    [[ $(docker inspect -f '{{.State.Status}}' "$name") == "running" ]] && status="active" && break
+                done
+            fi
+        fi
+        echo -e "状态: $(format_status "$status")"
+        if [[ -f "$argo_path" ]]; then ver=$("$argo_path" --version 2>/dev/null | awk '{print $3}')
+        elif command -v cloudflared &>/dev/null; then ver=$(cloudflared --version 2>/dev/null | awk '{print $3}')
+        elif [[ -n "$cf_containers" ]]; then
+            first_c=$(echo "$cf_containers" | head -n1)
+            ver=$(docker exec "$first_c" cloudflared --version 2>/dev/null | awk '{print $3}')
+        fi
+        echo -e "版本: ${ver:-运行中(内置)}"
+        if [[ -n "$cf_containers" ]]; then
+            for name in $cf_containers; do
+                raw_s=$(docker inspect -f '{{.State.Status}}' "$name")
+                [[ "$raw_s" == "running" ]] && c_s="active" || c_s="$raw_s"
+                echo -e "容器: ${CYAN}${name}${RESET} | 状态: $(format_status "$c_s")"
+            done
+        fi
+    else
+        echo -e "状态: ${RED}未安装${RESET}"
+    fi
+    echo ""
+
+    # =============================
+    # Docker
+    # =============================
+    echo -e "${YELLOW}▶ Docker${RESET}"
+    if command -v docker &>/dev/null; then
+        containers=$(docker ps --format "{{.Names}}" | grep -Ei 'xray|sing|hysteria|tuic|snell|3xui_app|AnyTLSD|MTProto|shadowsocks|sshadow-tls|shadow-tls|Singbox-AnyReality|Singbox-AnyTLS|Singbox-TUICv5|Xray-Reality|Xray-Realityxhttp|xray-socks5|xray-vmess|xray-vmesstls|clash|mihomo|warp|glash|conflux|heki|microwarp|nodepassdash|ppanel|wg-easy|wireguard|gostpanel|vite-frontend|xboard|xtrafficdash|lumina-client|freegfw|Mihomo')
+        if [[ -n "$containers" ]]; then
+            echo -e "状态: ${GREEN}运行中${RESET}"
+            echo -e "${YELLOW}容器:${RESET} $(echo "$containers" | tr '\n' ' ')"
+        else echo -e "状态: ${GREEN}已安装${RESET}"; fi
+    else echo -e "状态: ${RED}未安装${RESET}"; fi
+    echo ""
+
+    # =============================
+    # BBR
+    # =============================
+    echo -e "${YELLOW}▶ BBR${RESET}"
+    actual_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    if [[ "$actual_cc" == "bbr" ]]; then echo -e "状态: ${GREEN}已启用 BBR${RESET}"
+    else echo -e "状态: ${RED}未启用 BBR${RESET}"; fi
+    echo ""
+
+    # =============================
+    # 网络出口
+    # =============================
+    echo -e "${YELLOW}▶ 网络出口${RESET}"
+    ipv4=$(curl -4 -s --max-time 3 ip.sb 2>/dev/null || curl -4 -s --max-time 3 ifconfig.me 2>/dev/null)
+    ipv6=$(curl -6 -s --max-time 3 ip.sb 2>/dev/null)
+    get_country_cn() {
+        local ip="$1"
+        local res=$(curl -s --max-time 3 "http://ip-api.com/json/$ip?lang=zh-CN")
+        local name=$(echo "$res" | grep -oP '"country":"\K[^"]+')
+        echo "${name:-未知}"
+    }
+    if [[ -n "$ipv4" ]]; then
+        country4=$(get_country_cn "$ipv4")
+        echo -e "IPv4: ${GREEN}$ipv4${RESET}         国家: ${GREEN}$country4${RESET}"
+    else echo -e "IPv4: ${RED}获取失败${RESET}"; fi
+    if [[ -n "$ipv6" ]]; then
+        country6=$(get_country_cn "$ipv6")
+        echo -e "IPv6: ${GREEN}$ipv6${RESET}  国家: ${GREEN}$country6${RESET}"
+    fi
+    echo ""
+
+  
+    # =============================
+    # DNS 检测
+    # =============================
+    echo -e "${YELLOW}▶ DNS 信息检测${RESET}"
+
+    # 确保工具存在
+    [[ ! $(command -v dig) ]] && apk add --no-cache bind-tools >/dev/null 2>&1
+
+    # 提取 DNS 列表
+    dns_all=$(grep "nameserver" /etc/resolv.conf | awk '{print $2}')
+    dns_v4=$(echo "$dns_all" | grep -v ":" | tr '\n' ' ')
+    dns_v6=$(echo "$dns_all" | grep ":" | tr '\n' ' ')
+
+    # --- IPv4 部分 ---
+    if [[ -n "$dns_v4" ]]; then
+        echo -e "DNSv4: ${CYAN}${dns_v4}${RESET}"
+        first_dns=$(echo $dns_v4 | awk '{print $1}')
+        test_v4=$(dig +short +time=2 +tries=1 google.com @$first_dns >/dev/null 2>&1 && echo "ok" || echo "fail")
+        [[ "$test_v4" == "ok" ]] && echo -e "解析: ${GREEN}IPv4 正常${RESET}" || echo -e "解析: ${RED}IPv4 失败${RESET}"
+    else
+        echo -e "DNSv4: ${RED}无${RESET}"
+    fi
+
+    # --- IPv6 部分  ---
+    if [[ -n "$dns_v6" ]]; then
+        echo -e "DNSv6: ${CYAN}${dns_v6}${RESET}"
+        first_dns6=$(echo $dns_v6 | awk '{print $1}')
+        # 测试 AAAA 记录解析
+        test_v6=$(dig +short +time=2 +tries=1 google.com AAAA @$first_dns6 >/dev/null 2>&1 && echo "ok" || echo "fail")
+        
+        if [[ "$test_v6" == "ok" ]]; then
+            echo -e "解析: ${GREEN}IPv6 正常${RESET}"
+        else
+            echo -e "解析: ${RED}IPv6 失败${RESET}"
+        fi
+    else
+        echo -e "DNSv6: ${RED}无配置${RESET}"
+    fi
+
+
 }
 
-# 主循环
-while true; do
-    show_menu
-    read choice
-    case $choice in
-        1) install_claude ;;
-        2) start_current ;;
-        3) start_path ;;
-        4) login_claude ;;
-        5) config_custom_api ;;
-        6) update_claude ;;
-        7) uninstall_claude_flow ;;
-        0) clear; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
-    esac
-done
+# 运行检测
+status_check

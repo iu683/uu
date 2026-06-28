@@ -1,654 +1,948 @@
 #!/bin/bash
 # ========================================
-# 多路径 Docker Compose 管理
+# 🐳 一键 VPS Docker 管理工具
 # ========================================
 
+# -----------------------------
+# 颜色
+# -----------------------------
+RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-RED="\033[31m"
-ORANGE='\033[38;5;208m'
+CYAN="\033[36m"
+BOLD="\033[1m"
 RESET="\033[0m"
+BLUE="\033[34m"
+# -----------------------------
+# 检查 root
+# -----------------------------
+root_use() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}请使用 root 用户运行脚本${RESET}"
+        exit 1
+    fi
+}
 
-# ---------------------------
-# 配置：需要扫描的项目根目录列表
-# ---------------------------
-SEARCH_DIRS=(
+# -----------------------------
+# 重启 Docker 并恢复容器端口映射
+# -----------------------------
+restart_docker() {
+    root_use
+    echo -e "${YELLOW}正在重启 Docker...${RESET}"
 
-    "/opt/1panel/apps"
-    "/data"
-    "/date"
-    "/app"
-    "/root"
-    "/opt"
-)
+    if systemctl list-unit-files | grep -q "^docker.service"; then
+        systemctl restart docker
+    else
+        pkill dockerd 2>/dev/null
+        nohup dockerd >/dev/null 2>&1 &
+        sleep 5
+    fi
 
-# ---------------------------
-# 动态搜索所有项目并存入数组（精准匹配直连或子目录文件）
-# ---------------------------
-
-function scan_projects() {
-    PROJECT_NAMES=()
-    PROJECT_PATHS=()
-    
-    for s_dir in "${SEARCH_DIRS[@]}"; do
-        if [ -d "$s_dir" ]; then
-            # 转换为绝对规范路径，消除末尾斜杠差异
-            local base_search_dir=$(readlink -f "$s_dir")
-            
-            while IFS= read -r compose_file; do
-                [ -z "$compose_file" ] && continue
-                
-                local full_compose_path=$(readlink -f "$compose_file")
-                local app_path=$(dirname "$full_compose_path")
-                local app_name=""
-                
-                # 精准判断：如果 compose 文件的父目录就是配置的扫描根目录
-                if [ "$app_path" == "$base_search_dir" ]; then
-                    app_name=$(basename "$base_search_dir")
-                else
-                    # 如果在深层子目录下（如 1Panel 风格）
-                    app_name=$(basename "$app_path")
-                fi
-                
-                PROJECT_NAMES+=("$app_name")
-                PROJECT_PATHS+=("$app_path")
-            done < <(find "$base_search_dir" -maxdepth 5 \( -name "docker-compose.yml" -o -name "docker-compose.yaml" \) 2>/dev/null | sort -u)
+    if docker info &>/dev/null; then
+        echo -e "${GREEN}✅ Docker 已成功重启${RESET}"
+        containers=$(docker ps -a -q)
+        if [ -n "$containers" ]; then
+            echo -e "${CYAN}正在重启所有容器以恢复端口映射...${RESET}"
+            docker restart $containers
+            echo -e "${GREEN}✅ 所有容器已重启并恢复端口映射${RESET}"
+        else
+            echo -e "${YELLOW}没有容器需要重启${RESET}"
         fi
+    else
+        echo -e "${RED}❌ Docker 重启失败，请检查日志${RESET}"
+    fi
+}
+
+# -----------------------------
+# 检测 Docker 是否安装并运行
+# -----------------------------
+check_docker_running() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}❌ Docker 未安装，请先安装 Docker${RESET}"
+        return 1
+    fi
+    if ! docker info &>/dev/null; then
+        echo -e "${YELLOW} Docker 未运行，尝试启动...${RESET}"
+        if systemctl list-unit-files | grep -q "^docker.service"; then
+            systemctl start docker
+        else
+            nohup dockerd >/dev/null 2>&1 &
+            sleep 5
+        fi
+    fi
+    if ! docker info &>/dev/null; then
+        echo -e "${RED}❌ Docker 启动失败，请检查日志${RESET}"
+        return 1
+    fi
+    return 0
+}
+
+# -----------------------------
+# 自动检测国内/国外
+# -----------------------------
+detect_country() {
+    local country=$(curl -s --max-time 5 ipinfo.io/country)
+    if [[ "$country" == "CN" ]]; then
+        echo "CN"
+    else
+        echo "OTHER"
+    fi
+}
+
+# -----------------------------
+# 安装/更新 Docker
+# -----------------------------
+docker_install() {
+    root_use
+    local country=$(detect_country)
+    echo -e "${CYAN}检测到国家: $country${RESET}"
+    if [ "$country" = "CN" ]; then
+        echo -e "${YELLOW}使用国内源安装 Docker...${RESET}"
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sh get-docker.sh
+        mkdir -p /etc/docker
+        cat > /etc/docker/daemon.json << EOF
+{
+  "registry-mirrors": [
+    "https://docker.0.unsee.tech",
+    "https://docker.1panel.live",
+    "https://registry.dockermirror.com",
+    "https://docker.m.daocloud.io"
+  ]
+}
+EOF
+    else
+        echo -e "${YELLOW}使用官方源安装 Docker...${RESET}"
+        curl -fsSL https://get.docker.com | sh
+    fi
+    systemctl enable docker
+    systemctl start docker
+    echo -e "${GREEN}Docker 安装完成并已启动（已设置开机自启）${RESET}"
+}
+
+docker_update() {
+    root_use
+    echo -e "${YELLOW}正在更新 Docker...${RESET}"
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sh get-docker.sh
+    systemctl enable docker
+    systemctl restart docker
+    echo -e "${GREEN}Docker 更新完成并已启动（已设置开机自启）${RESET}"
+}
+
+docker_install_update() {
+    root_use
+    if command -v docker &>/dev/null; then
+        docker_update
+    else
+        docker_install
+    fi
+}
+
+# -----------------------------
+# 卸载 Docker
+# -----------------------------
+docker_uninstall() {
+    root_use
+    echo -e "${RED}正在卸载 Docker 和 Docker Compose...${RESET}"
+    systemctl stop docker 2>/dev/null
+    systemctl disable docker 2>/dev/null
+    pkill dockerd 2>/dev/null
+
+    if command -v apt &>/dev/null; then
+        apt remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
+        apt purge -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
+        apt autoremove -y
+    elif command -v yum &>/dev/null; then
+        yum remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
+    fi
+
+    rm -rf /var/lib/docker /etc/docker /var/lib/containerd /var/run/docker.sock /usr/local/bin/docker-compose
+    echo -e "${GREEN}Docker 和 Docker Compose 已卸载干净${RESET}"
+}
+
+# -----------------------------
+# Docker Compose 安装/更新
+# -----------------------------
+docker_compose_install_update() {
+    root_use
+    echo -e "${CYAN}正在安装/更新 Docker Compose...${RESET}"
+    if ! command -v jq &>/dev/null; then
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y jq
+        elif command -v yum &>/dev/null; then
+            yum install -y jq
+        fi
+    fi
+    local latest=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
+    latest=${latest:-"v2.30.0"}
+    curl -L "https://github.com/docker/compose/releases/download/$latest/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+    echo -e "${GREEN}Docker Compose 已安装/更新到版本 $latest${RESET}"
+}
+
+
+# -----------------------------
+# Docker IPv6
+# -----------------------------
+docker_ipv6_on() {
+    root_use
+    mkdir -p /etc/docker
+    if [ -f /etc/docker/daemon.json ]; then
+        jq '. + {ipv6:true,"fixed-cidr-v6":"fd00::/64"}' /etc/docker/daemon.json 2>/dev/null \
+            >/etc/docker/daemon.json.tmp || \
+            echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
+    else
+        echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
+    fi
+    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+    restart_docker
+    docker ps -a -q | xargs -r docker start
+    echo -e "${GREEN}✅ Docker IPv6 已开启，所有容器已恢复${RESET}"
+}
+
+docker_ipv6_off() {
+    root_use
+    if [ -f /etc/docker/daemon.json ]; then
+        jq 'del(.ipv6) | del(.["fixed-cidr-v6"])' /etc/docker/daemon.json \
+            >/etc/docker/daemon.json.tmp 2>/dev/null || \
+            cp /etc/docker/daemon.json /etc/docker/daemon.json.tmp
+        mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+        restart_docker
+        docker ps -a -q | xargs -r docker start
+        echo -e "${GREEN}✅ Docker IPv6 已关闭，所有容器已恢复${RESET}"
+    else
+        echo -e "${YELLOW} Docker 配置文件不存在，无法关闭 IPv6${RESET}"
+    fi
+}
+
+# -----------------------------
+# 开放所有端口（IPv4 + IPv6 + nftables）
+# -----------------------------
+open_all_ports() {
+    root_use
+    read -p "确认要开放所有端口吗？(Y/N): " confirm
+    [[ $confirm =~ [Yy] ]] || { echo -e "${YELLOW}操作已取消${RESET}"; return; }
+    echo -e "${YELLOW}正在检测可用防火墙工具...${RESET}"
+
+    if command -v iptables &>/dev/null; then
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+        iptables -F
+    fi
+    if command -v ip6tables &>/dev/null; then
+        ip6tables -P INPUT ACCEPT
+        ip6tables -P FORWARD ACCEPT
+        ip6tables -P OUTPUT ACCEPT
+        ip6tables -F
+    fi
+    if command -v nft &>/dev/null; then
+        nft flush ruleset 2>/dev/null || true
+    fi
+    echo -e "${GREEN}✅ 已开放所有端口${RESET}"
+    restart_docker
+}
+
+# -----------------------------
+# iptables 切换
+# -----------------------------
+switch_iptables_legacy() {
+    root_use
+    if [ -x /usr/sbin/iptables-legacy ] && [ -x /usr/sbin/ip6tables-legacy ]; then
+        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
+        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
+        update-alternatives --set iptables /usr/sbin/iptables-legacy
+        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+        restart_docker
+        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
+        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
+        echo -e "${GREEN}✅ 已切换到 iptables-legacy 并恢复规则${RESET}"
+    else
+        echo -e "${RED}系统未安装 iptables-legacy，无法切换${RESET}"
+    fi
+}
+
+switch_iptables_nft() {
+    root_use
+    if [ -x /usr/sbin/iptables-nft ] && [ -x /usr/sbin/ip6tables-nft ]; then
+        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
+        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
+        update-alternatives --set iptables /usr/sbin/iptables-nft
+        update-alternatives --set ip6tables /usr/sbin/ip6tables-nft
+        restart_docker
+        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
+        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
+        echo -e "${GREEN}✅ 已切换到 iptables-nft 并恢复规则${RESET}"
+    else
+        echo -e "${RED}系统未安装 iptables-nft，无法切换${RESET}"
+    fi
+}
+
+# -----------------------------
+# Docker 状态
+# -----------------------------
+docker_status() {
+    if docker info &>/dev/null; then
+        echo "运行中"
+    else
+        echo "未运行"
+    fi
+}
+
+current_iptables() {
+    ipt=$(update-alternatives --query iptables 2>/dev/null | grep 'Value:' | awk '{print $2}')
+    if [[ $ipt == *legacy ]]; then
+        echo "legacy"
+    else
+        echo "nft"
+    fi
+}
+
+docker_container_info() {
+    total=$(docker ps -a -q | wc -l)
+    running=$(docker ps -q | wc -l)
+    echo "总容器: $total | 运行中: $running"
+}
+
+
+# -----------------------------
+# Docker 容器管理
+# -----------------------------
+docker_ps() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 容器管理 =====${RESET}"
+        docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
+        echo -e "${GREEN}01. 创建新容器${RESET}"
+        echo -e "${GREEN}02. 启动容器${RESET}"
+        echo -e "${GREEN}03. 停止容器${RESET}"
+        echo -e "${GREEN}04. 删除容器${RESET}"
+        echo -e "${GREEN}05. 重启容器${RESET}"
+        echo -e "${GREEN}06. 启动所有容器${RESET}"
+        echo -e "${GREEN}07. 停止所有容器${RESET}"
+        echo -e "${GREEN}08. 删除所有容器${RESET}"
+        echo -e "${GREEN}09. 重启所有容器${RESET}"
+        echo -e "${GREEN}10. 进入容器${RESET}"
+        echo -e "${GREEN}11. 查看日志${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) read -p "请输入创建命令: " cmd; $cmd ;;
+            02|2) read -p "请输入容器名: " name; docker start $name ;;
+            03|3) read -p "请输入容器名: " name; docker stop $name ;;
+            04|4) read -p "请输入容器名: " name; docker rm -f $name ;;
+            05|5) read -p "请输入容器名: " name; docker restart $name ;;
+            06|6) containers=$(docker ps -a -q); [ -n "$containers" ] && docker start $containers || echo "无容器可启动" ;;
+            07|7) containers=$(docker ps -q); [ -n "$containers" ] && docker stop $containers || echo "无容器正在运行" ;;
+            08|8) read -p "确定删除所有容器? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rm -f $(docker ps -a -q) ;;
+            09|9) containers=$(docker ps -q); [ -n "$containers" ] && docker restart $containers || echo "无容器正在运行" ;;
+            10) read -p "请输入容器名: " name; docker exec -it $name /bin/bash ;;
+            11) read -p "请输入容器名: " name; docker logs -f $name ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
     done
 }
 
-# ---------------------------
-# 确认操作
-# ---------------------------
-function confirm_action() {
-    read -p "$(echo -e "${GREEN}确认执行此操作吗？(y/N): ${RESET}")" confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        return 0
-    else
-        echo -e "${RED}操作已取消${RESET}"
-        sleep 1
-        return 1
+
+# -----------------------------
+# Docker 镜像管理
+# -----------------------------
+docker_image() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 镜像管理 =====${RESET}"
+        docker image ls
+        echo -e "${GREEN}01. 拉取镜像${RESET}"
+        echo -e "${GREEN}02. 更新镜像${RESET}"
+        echo -e "${GREEN}03. 删除镜像${RESET}"
+        echo -e "${GREEN}04. 删除所有镜像${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
+            02|2) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
+            03|3) read -p "请输入镜像名: " imgs; for img in $imgs; do docker rmi -f $img; done ;;
+            04|4) read -p "确定删除所有镜像? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rmi -f $(docker images -q) ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 卷管理
+# -----------------------------
+docker_volume() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 卷管理 =====${RESET}"
+        docker volume ls
+        echo -e "${GREEN}1. 创建卷${RESET}"
+        echo -e "${GREEN}2. 删除卷${RESET}"
+        echo -e "${GREEN}3. 删除所有无用卷${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            1) read -p "请输入卷名: " v; docker volume create $v ;;
+            2) read -p "请输入卷名: " v; docker volume rm $v ;;
+            3) docker volume prune -f ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# 清理所有未使用资源
+# -----------------------------
+docker_cleanup() {
+    root_use
+    echo -e "${YELLOW}清理所有未使用容器、镜像、卷...${RESET}"
+    docker system prune -af --volumes
+    echo -e "${GREEN}清理完成${RESET}"
+}
+
+# -----------------------------
+# Docker 网络管理
+# -----------------------------
+docker_network() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 网络管理 =====${RESET}"
+        docker network ls
+        echo -e "${GREEN}1. 创建网络${RESET}"
+        echo -e "${GREEN}2. 加入网络${RESET}"
+        echo -e "${GREEN}3. 退出网络${RESET}"
+        echo -e "${GREEN}4. 删除网络${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " sub_choice
+        case $sub_choice in
+            1) read -p "设置新网络名: " dockernetwork; docker network create $dockernetwork ;;
+            2) read -p "加入网络名: " dockernetwork; read -p "容器名: " dockername; docker network connect $dockernetwork $dockername ;;
+            3) read -p "退出网络名: " dockernetwork; read -p "容器名: " dockername; docker network disconnect $dockernetwork $dockername ;;
+            4) read -p "请输入要删除的网络名: " dockernetwork; docker network rm $dockernetwork || echo -e "${RED}删除失败，网络可能被容器占用${RESET}" ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 备份/恢复菜单
+# -----------------------------
+# -----------------------------
+# Docker 备份/恢复菜单
+# -----------------------------
+docker_backup_menu() {
+    root_use
+
+    BACKUP_DIR="/opt/docker_backups"
+    LOG_FILE="$BACKUP_DIR/backup.log"
+    mkdir -p "$BACKUP_DIR"
+
+    # -----------------------------
+    # 检查 jq
+    # -----------------------------
+    if ! command -v jq &>/dev/null; then
+        echo -e "${YELLOW}未检测到 jq，正在安装...${RESET}"
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y jq
+        elif command -v yum &>/dev/null; then
+            yum install -y epel-release && yum install -y jq
+        elif command -v dnf &>/dev/null; then
+            dnf install -y jq
+        else
+            echo -e "${RED}无法检测到包管理器，请手动安装 jq${RESET}"
+            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+            return
+        fi
     fi
-}
 
-# ---------------------------
-# 操作完成提示
-# ---------------------------
-function action_done() {
-    read -p "$(echo -e ${GREEN}操作完成！按回车返回菜单...${RESET})" temp
-}
+    # -----------------------------
+    # 检查 Docker
+    # -----------------------------
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y docker.io
+        elif command -v yum &>/dev/null; then
+            yum install -y docker
+        elif command -v dnf &>/dev/null; then
+            dnf install -y docker
+        else
+            echo -e "${RED}无法检测到包管理器，请手动安装 Docker${RESET}"
+            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+            return
+        fi
+    fi
 
-# ---------------------------
-# 状态汉化核心引擎
-# ---------------------------
-function translate_status() {
-    local raw_status="$1"
-    echo "$raw_status" | \
-        sed 's/Up /运行 /' | \
-        sed 's/Exited/已停止/' | \
-        sed 's/(healthy)/(健康)/' | \
-        sed 's/(unhealthy)/(非健康)/' | \
-        sed 's/(starting)/(启动中)/' | \
-        sed 's/seconds/秒/' | \
-        sed 's/second/秒/' | \
-        sed 's/minutes/分钟/' | \
-        sed 's/minute/分钟/' | \
-        sed 's/hours/小时/' | \
-        sed 's/hour/小时/' | \
-        sed 's/days/天/' | \
-        sed 's/day/天/' | \
-        sed 's/weeks/周/' | \
-        sed 's/week/周/' | \
-        sed 's/months/月/' | \
-        sed 's/month/月/' | \
-        sed 's/about //' | \
-        sed 's/ago/前/'
-}
+    # -----------------------------
+    # 检查 Docker 服务
+    # -----------------------------
+    if ! pgrep -x dockerd &>/dev/null; then
+        echo -e "${YELLOW}Docker 服务未运行，正在启动...${RESET}"
+        if command -v systemctl &>/dev/null; then
+            systemctl start docker
+            systemctl enable docker
+        else
+            service docker start
+        fi
+        sleep 2
+        if ! pgrep -x dockerd &>/dev/null; then
+            echo -e "${RED}Docker 启动失败，请手动检查服务${RESET}"
+            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+            return
+        fi
+    fi
 
-# ---------------------------
-# 核心功能：绑定/解绑 127.0.0.1
-# ---------------------------
-function toggle_ip_binding() {
-    local action="$1"
-    local backup_file="${COMPOSE_FILE}.bak_ip"
-
-    if [ ! -f "$COMPOSE_FILE" ]; then
-        echo -e "${RED}错误: 找不到配置文件！${RESET}"
-        sleep 1
+    # -----------------------------
+    # 检查磁盘空间
+    # -----------------------------
+    avail_space=$(df --output=avail "$BACKUP_DIR" | tail -1)
+    if (( avail_space < 1048576 )); then
+        echo -e "${RED}磁盘剩余空间不足 1GB，无法执行备份！${RESET}"
+        read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
         return
     fi
 
-    cp "$COMPOSE_FILE" "$backup_file"
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker Run备份与恢复 =====${RESET}"
+        echo -e "${GREEN}1. 备份 Docker${RESET}"
+        echo -e "${GREEN}2. 恢复 Docker${RESET}"
+        echo -e "${GREEN}3. 删除备份文件${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            1)
+                # -----------------------------
+                # 备份逻辑
+                # -----------------------------
+                while true; do
+                    echo -e "${YELLOW}选择备份类型:${RESET}"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
+                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " btype
+                    [[ "$btype" == "0" ]] && break
 
-    if [ "$action" == "bind" ]; then
-        echo -e "${YELLOW}正在尝试将外部端口绑定到 127.0.0.1...${RESET}"
-        sed -i -E 's/- ("|'\''?)([0-9]+):([0-9]+)("|'\''?)/- \1127.0.0.1:\2:\3\4/g' "$COMPOSE_FILE"
-        sed -i -E 's/- ("|'\''?)0.0.0.0:([0-9]+):([0-9]+)("|'\''?)/- \1127.0.0.1:\2:\3\4/g' "$COMPOSE_FILE"
-        sed -i 's/0.0.0.0:/127.0.0.1:/g' "$COMPOSE_FILE"
-    else
-        echo -e "${YELLOW}正在尝试解绑 127.0.0.1 (恢复为全网公开)...${RESET}"
-        sed -i -E 's/- ("|'\''?)127.0.0.1:([0-9]+):([0-9]+)("|'\''?)/- \1\2:\3\4/g' "$COMPOSE_FILE"
-        sed -i 's/127.0.0.1:/0.0.0.0:/g' "$COMPOSE_FILE"
-    fi
+                    read -p "请输入备份文件名（默认 docker_backup_$(date +%F).tar.gz）: " backup_name
+                    backup_name=${backup_name:-docker_backup_$(date +%F).tar.gz}
+                    backup_path="$BACKUP_DIR/$backup_name"
 
-    if diff "$COMPOSE_FILE" "$backup_file" >/dev/null 2>&1; then
-        echo -e "${ORANGE}提示: 端口规则没有发生变化。${RESET}"
-        rm -f "$backup_file"
-    else
-        echo -e "${GREEN}配置已调整，正在重启容器生效...${RESET}"
-        docker compose -f "$COMPOSE_FILE" down && docker compose -f "$COMPOSE_FILE" up -d
-        rm -f "$backup_file"
-        echo -e "${GREEN}网络边界调整成功！${RESET}"
-    fi
-    action_done
+                    TMP_BACKUP_DIR=$(mktemp -d /tmp/docker_backup_XXXX)
+
+                    # --- 容器备份 ---
+                    if [[ "$btype" == "1" || "$btype" == "4" ]]; then
+                        echo "可用容器列表："
+                        docker ps -a --format "{{.Names}}"
+                        read -p "请输入要备份的容器名（多个用空格，留空则全部）: " selected_containers
+                        [[ -z "$selected_containers" ]] && selected_containers=$(docker ps -a --format "{{.Names}}")
+                        for cname in $selected_containers; do
+                            cid=$(docker ps -a -q -f name="^${cname}$")
+                            [[ -z "$cid" ]] && echo "容器 $cname 不存在，跳过" && continue
+                            docker inspect $cid > "$TMP_BACKUP_DIR/container_${cname}.json"
+                            docker export "$cid" -o "$TMP_BACKUP_DIR/container_${cname}.tar"
+                            echo "$(date '+%F %T') 备份容器 $cname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 镜像备份 ---
+                    if [[ "$btype" == "2" || "$btype" == "4" ]]; then
+                        echo "可用镜像列表："
+                        docker images --format "{{.Repository}}:{{.Tag}}"
+                        read -p "请输入要备份的镜像（多个用空格，留空则全部）: " selected_images
+                        [[ -z "$selected_images" ]] && selected_images=$(docker images --format "{{.Repository}}:{{.Tag}}")
+                        for iname in $selected_images; do
+                            [[ "$iname" == "<none>:<none>" ]] && continue
+                            safe_name=$(echo "$iname" | tr '/:' '_')
+                            docker save "$iname" -o "$TMP_BACKUP_DIR/image_${safe_name}.tar"
+                            echo "$(date '+%F %T') 备份镜像 $iname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 卷备份 ---
+                    if [[ "$btype" == "3" || "$btype" == "4" ]]; then
+                        echo "可用卷列表："
+                        docker volume ls -q
+                        read -p "请输入要备份的卷名（多个用空格，留空则全部）: " selected_volumes
+                        [[ -z "$selected_volumes" ]] && selected_volumes=$(docker volume ls -q)
+                        for vol in $selected_volumes; do
+                            [[ ! -d /var/lib/docker/volumes/"$vol"/_data ]] && echo "卷 $vol 不存在，跳过" && continue
+                            read -p "请确保卷 $vol 未被容器使用，按回车继续..."
+                            tar -czf "$TMP_BACKUP_DIR/volume_${vol}.tar.gz" -C /var/lib/docker/volumes/"$vol"/_data .
+                            echo "$(date '+%F %T') 备份卷 $vol 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    tar -czf "$backup_path" -C "$TMP_BACKUP_DIR" .
+                    rm -rf "$TMP_BACKUP_DIR"
+                    echo -e "${GREEN}备份完成: $backup_path${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
+                ;;
+            2)
+                # -----------------------------
+                # 恢复逻辑（保持原有选择逻辑）并增强安全
+                # -----------------------------
+                while true; do
+                    echo -e "${YELLOW}选择恢复类型:${RESET}"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
+                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " rtype
+                    [[ "$rtype" == "0" ]] && break
+
+                    read -p "请输入备份文件路径: " backup_file
+                    [[ ! -f "$backup_file" ]] && echo -e "${RED}备份文件不存在${RESET}" && read -p "按回车继续..." && continue
+
+                    TMP_RESTORE_DIR=$(mktemp -d /tmp/docker_restore_XXXX)
+                    tar -xzf "$backup_file" -C "$TMP_RESTORE_DIR"
+
+                    # --- 容器恢复 ---
+                    if [[ "$rtype" == "1" || "$rtype" == "4" ]]; then
+                        for cjson in "$TMP_RESTORE_DIR"/container_*.json; do
+                            [[ ! -f "$cjson" ]] && continue
+                            cname=$(basename "$cjson" | sed 's/container_\(.*\).json/\1/')
+                            image=$(jq -r '.[0].Config.Image' "$cjson")
+                            envs=$(jq -r '.[0].Config.Env | join(" -e ")' "$cjson")
+                            [[ -n "$envs" ]] && envs="-e $envs"
+                            ports=$(jq -r '.[0].HostConfig.PortBindings | to_entries | map("\(.value[0].HostPort):\(.key)") | join(" -p ")' "$cjson")
+                            [[ -n "$ports" ]] && ports="-p $ports"
+                            mounts=$(jq -r '.[0].Mounts | map("-v \(.Source):\(.Destination)") | join(" ")' "$cjson")
+                            network=$(jq -r '.[0].HostConfig.NetworkMode' "$cjson")
+                            echo "注意：如果端口已被占用，容器 $cname 启动可能失败"
+
+                            # 如果镜像不存在，尝试从备份加载
+                            safe_image_name=$(echo "$image" | tr '/:' '_')
+                            img_tar="$TMP_RESTORE_DIR/image_${safe_image_name}.tar"
+                            [[ -f "$img_tar" ]] && docker load -i "$img_tar"
+
+                            docker run -d --name "$cname" $envs $ports $mounts --network "$network" "$image"
+                            echo "$(date '+%F %T') 恢复容器 $cname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 镜像恢复 ---
+                    if [[ "$rtype" == "2" || "$rtype" == "4" ]]; then
+                        for img_file in "$TMP_RESTORE_DIR"/image_*.tar; do
+                            [[ -f "$img_file" ]] && docker load -i "$img_file"
+                        done
+                    fi
+
+                    # --- 卷恢复 ---
+                    if [[ "$rtype" == "3" || "$rtype" == "4" ]]; then
+                        for vol_file in "$TMP_RESTORE_DIR"/volume_*.tar.gz; do
+                            vol_name=$(basename "$vol_file" | sed 's/volume_\(.*\).tar.gz/\1/')
+                            if docker volume inspect "$vol_name" &>/dev/null; then
+                                read -p "卷 $vol_name 已存在，是否覆盖? (y/N): " confirm
+                                [[ "$confirm" != "y" ]] && continue
+                            fi
+                            docker volume create "$vol_name" >/dev/null 2>&1
+                            tar -xzf "$vol_file" -C /var/lib/docker/volumes/"$vol_name"/_data
+                            echo "$(date '+%F %T') 恢复卷 $vol_name 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    rm -rf "$TMP_RESTORE_DIR"
+                    echo -e "${GREEN}恢复完成${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
+                ;;
+            3)
+                # -----------------------------
+                # 删除备份文件（支持多选或通配符）
+                # -----------------------------
+                while true; do
+                    echo "当前备份目录：$BACKUP_DIR"
+                    ls "$BACKUP_DIR"
+                    read -p "请输入要删除的备份文件名（支持空格或*通配符，输入0返回）: " del_files
+                    [[ "$del_files" == "0" ]] && break
+                    rm -f $BACKUP_DIR/$del_files
+                    echo -e "${GREEN}删除完成${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
+                ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}"; read -p "$(echo -e ${GREEN}按回车继续...${RESET})" ;;
+        esac
+    done
 }
 
-
-
-# ---------------------------
-# 核心功能：Watchtower 自动更新控制
-# ---------------------------
-function toggle_watchtower_label() {
-    local action="$1"
-    local backup_file="${COMPOSE_FILE}.bak_wt"
-    local target_label="com.centurylinklabs.watchtower.enable=true"
-
-    if [ ! -f "$COMPOSE_FILE" ]; then
-        echo -e "${RED}错误: 找不到配置文件！${RESET}"
-        sleep 1
-        return
-    fi
-
-    cp "$COMPOSE_FILE" "$backup_file"
-
-    if [ "$action" == "enable" ]; then
-        echo -e "${YELLOW}正在为项目服务注入 Watchtower 自动更新标签...${RESET}"
-        
-        # 1. 先彻底清除可能残留的相关老标签
-        sed -i '/com.centurylinklabs.watchtower.enable/d' "$COMPOSE_FILE"
-        
-        # 2. 找到所有服务容器的 image: 行，并在其下一行精准插入 labels
-        # 这种做法对绝大多数 docker-compose 格式最安全，缩减和层级完全匹配
-        sed -i '/^[[:space:]]\{2,4\}image:/a \    labels:\n      - "com.centurylinklabs.watchtower.enable=true"' "$COMPOSE_FILE"
-        
-    else
-        echo -e "${YELLOW}正在关闭并清除 Watchtower 自动更新标签...${RESET}"
-        # 清除标签行
-        sed -i '/com.centurylinklabs.watchtower.enable/d' "$COMPOSE_FILE"
-        # 顺便清理可能变成空内容的 labels: 行（如果其下方紧接着不是以空格加横杠开头的子项）
-        # 这里做精细化处理，直接删掉孤立的 labels:
-        sed -i '/^[[:space:]]\{2,4\}labels:[[:space:]]*$/{N;/labels:[[:space:]]*\n[[:space:]]*[^[:space:]-]/d}' "$COMPOSE_FILE"
-    fi
-
-    if diff "$COMPOSE_FILE" "$backup_file" >/dev/null 2>&1; then
-        echo -e "${ORANGE}提示: 标签配置没有发生变化（可能已是目标状态）。${RESET}"
-        rm -f "$backup_file"
-    else
-        echo -e "${GREEN}配置已调整，正在更新服务使标签对 Watchtower 生效...${RESET}"
-        # 重新 up -d 即可让 Docker 引擎刷新容器的 Labels 元素，无需 down
-        docker compose -f "$COMPOSE_FILE" up -d --force-recreate
-        rm -f "$backup_file"
-        echo -e "${GREEN}Watchtower 配置调整成功！${RESET}"
-    fi
-    action_done
-}
-
-# ---------------------------
-# 查看所有项目容器运行状态
-# ---------------------------
 monitor_docker_containers() {
     clear
     echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}      🐳 Docker 项目容器状态监控        ${RESET}"
+    echo -e "${GREEN}          🐳 Docker 容器监控${RESET}"
     echo -e "${GREEN}========================================${RESET}"
 
-    scan_projects
-    
-    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
-        echo -e "${RED}未在指定目录下找到任何 Docker Compose 项目！${RESET}"
-    else
-        local all_stats
-        all_stats=$(docker stats --no-stream --format "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" 2>/dev/null)
-
-        for i in "${!PROJECT_PATHS[@]}"; do
-            local proj="${PROJECT_PATHS[$i]}"
-            local project_name="${PROJECT_NAMES[$i]}"
-            
-            echo -e "${YELLOW}📁 项目名称: $project_name${RESET}"
-            echo -e "${YELLOW}----------------------------------------${RESET}"
-            
-            local l_compose=""
-            [ -f "$proj/docker-compose.yml" ] && l_compose="$proj/docker-compose.yml"
-            [ -f "$proj/docker-compose.yaml" ] && l_compose="$proj/docker-compose.yaml"
-            
-            local services=$(docker compose -f "$l_compose" ps --services 2>/dev/null)
-            
-            if [ -z "$services" ]; then
-                echo -e "  ${YELLOW}暂无服务配置${RESET}"
-                echo -e "${YELLOW}----------------------------------------${RESET}"
-                continue
-            fi
-
-            local stats_list=()
-            for service in $services; do
-                local container_id=$(docker compose -f "$l_compose" ps -q "$service" 2>/dev/null)
-                local cpu="0.00%" mem="0B / 0B" net="0B / 0B" ports="无端口映射"
-                local raw_status="Exited (0) 0 seconds ago"
-
-                if [ -n "$container_id" ]; then
-                    local match_stats=$(echo "$all_stats" | grep "^${container_id:0:12}")
-                    if [ -n "$match_stats" ]; then
-                        cpu=$(echo "$match_stats" | cut -f2)
-                        mem=$(echo "$match_stats" | cut -f3)
-                        net=$(echo "$match_stats" | cut -f4)
-                    fi
-                    raw_status=$(docker ps -a --filter "id=$container_id" --format "{{.Status}}")
-                    local port_info=$(docker ps -a --filter "id=$container_id" --format "{{.Ports}}")
-                    [ -n "$port_info" ] && ports=$port_info
-                fi
-                stats_list+=("$service	$cpu	$mem	$net	$ports	$raw_status")
-            done
-            
-            printf "%s\n" "${stats_list[@]}" | sort -k3 -hr | while IFS=$'\t' read -r service cpu mem net ports raw_status; do
-                local uptime=$(translate_status "$raw_status")
-                local status_icon="${RED}❌${RESET}"
-                [[ "$raw_status" == *"Up"* ]] && status_icon="${GREEN}✔${RESET}"
-
-                echo -e "${YELLOW}◈ 服务: ${RESET}${YELLOW}${service}${RESET} ${status_icon}"
-                echo -e "  ├─ ${YELLOW}运行状态: ${RESET}${uptime}"
-                echo -e "  ├─ ${YELLOW}端口映射: ${RESET}${GREEN}${ports}${RESET}"
-                echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${cpu}"
-                echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
-                echo -e "  └─ ${YELLOW}网络 I/O: ${RESET}${net}"
-                echo -e "${YELLOW}----------------------------------------${RESET}"
-            done
-            echo
-        done
-    fi
-    read -p "$(echo -e "${GREEN}按回车返回主菜单...${RESET}")" temp
-}
-
-# ---------------------------
-# 选择项目
-# ---------------------------
-function select_project() {
-    clear
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}      ◈    请选择要管理的项目    ◈      ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    
-    scan_projects
-
-    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
-        echo -e "${RED}未找到任何 Docker Compose 项目！${RESET}"
-        read -p "$(echo -e "${GREEN}按回车返回主菜单...${RESET}")" temp
-        return
-    fi
-    
-    for i in "${!PROJECT_NAMES[@]}"; do
-        local p_name="${PROJECT_NAMES[$i]}"
-        local p_path="${PROJECT_PATHS[$i]}"
-        echo -e "${YELLOW}$((i+1))) $p_name${RESET}"
-    done
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}0) 返回主菜单${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    read -p "$(echo -e ${GREEN}请输入编号: ${RESET})" choice
-    if [[ "$choice" == "0" ]]; then
-        return
-    elif [[ "$choice" =~ ^[0-9]+$ && $choice -ge 1 && $choice -le ${#PROJECT_NAMES[@]} ]]; then
-        PROJECT_DIR=${PROJECT_PATHS[$((choice-1))]}
-        if [ -f "$PROJECT_DIR/docker-compose.yml" ]; then
-            COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
-        else
-            COMPOSE_FILE="$PROJECT_DIR/docker-compose.yaml"
-        fi
-        project_menu
-    else
-        echo -e "${RED}无效选择${RESET}"
-        sleep 1
-        select_project
-    fi
-}
-
-# ---------------------------
-# 进入容器
-# ---------------------------
-function select_container() {
-    local containers=$(docker compose -f "$COMPOSE_FILE" ps --services)
-    if [ -z "$containers" ]; then
-        echo -e "${RED}没有正在运行的容器${RESET}"
-        sleep 1
-        return
-    fi
-    echo -e "${GREEN}可进入的容器：${RESET}"
-    echo -e "${GREEN}$containers${RESET}"
-    read -p "请输入容器名: " cname
-    if [[ "$containers" == *"$cname"* ]]; then
-        docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/sh || docker compose -f "$COMPOSE_FILE" exec "$cname" /bin/bash
-        action_done
-    else
-        echo -e "${RED}容器不存在${RESET}"
-        sleep 1
-    fi
-}
-
-# ---------------------------
-# 删除整个项目
-# ---------------------------
-function delete_project() {
-    echo -e "${RED}注意！这将删除整个项目，包括容器、镜像、数据卷和项目文件夹${RESET}"
-    if confirm_action; then
-        docker compose -f "$COMPOSE_FILE" down --rmi all -v
-        rm -rf "$PROJECT_DIR"
-        echo -e "${GREEN}项目已删除${RESET}"
-        sleep 1
-        return
-    fi
-}
-
-# ---------------------------
-# 多选删除项目
-# ---------------------------
-function delete_multiple_projects() {
-    clear
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}        ◈      多选删除项目     ◈          ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    
-    scan_projects
-
-    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
-        echo -e "${RED}未找到任何项目${RESET}"
-        sleep 1
-        return
-    fi
-
-    for i in "${!PROJECT_NAMES[@]}"; do
-        echo -e "${GREEN}$((i+1))) ${PROJECT_NAMES[$i]}${RESET}"
-    done
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}输入要删除的项目编号，用空格分隔（例如: 1 3 5）${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET}) " choices
-
-    if [[ "$choices" == "0" ]]; then
-        return
-    fi
-
-    for c in $choices; do
-        if [[ "$c" =~ ^[0-9]+$ && $c -ge 1 && $c -le ${#PROJECT_NAMES[@]} ]]; then
-            local proj="${PROJECT_PATHS[$((c-1))]}"
-            local l_compose=""
-            [ -f "$proj/docker-compose.yml" ] && l_compose="$proj/docker-compose.yml"
-            [ -f "$proj/docker-compose.yaml" ] && l_compose="$proj/docker-compose.yaml"
-            
-            local p_name="${PROJECT_NAMES[$((c-1))]}"
-            echo -e "${RED}准备删除项目: $p_name ($proj)${RESET}"
-            if confirm_action; then
-                docker compose -f "$l_compose" down --rmi all -v
-                rm -rf "$proj"
-                echo -e "${GREEN}已删除 $p_name${RESET}"
-            fi
-        else
-            echo -e "${RED}无效编号: $c${RESET}"
-        fi
-    done
-    action_done
-}
-
-# ---------------------------
-# 一键删除所有未运行的项目
-# ---------------------------
-function delete_all_stopped_projects() {
-    clear
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}   ◈    一键删除所有未运行项目    ◈     ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    
-    scan_projects
-
-    if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
-        echo -e "${RED}未找到任何项目${RESET}"
-        sleep 1
-        return
-    fi
-
-    local deleted_any=false
-    for i in "${!PROJECT_PATHS[@]}"; do
-        local proj="${PROJECT_PATHS[$i]}"
-        local p_name="${PROJECT_NAMES[$i]}"
-        local l_compose=""
-        [ -f "$proj/docker-compose.yml" ] && l_compose="$proj/docker-compose.yml"
-        [ -f "$proj/docker-compose.yaml" ] && l_compose="$proj/docker-compose.yaml"
+    # 获取并处理数据 (按内存排序)
+    docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | sort -k3 -hr | while IFS=$'\t' read -r name cpu mem net; do
         
-        local services=$(docker compose -f "$l_compose" ps --services 2>/dev/null)
-        local all_stopped=true
+        # 1. 获取运行时间并深度汉化
+        local raw_status
+        raw_status=$(docker ps -a --filter "name=^/${name}$" --format "{{.Status}}")
         
-        for service in $services; do
-            local cid=$(docker compose -f "$l_compose" ps -q "$service" 2>/dev/null)
-            if [ -n "$cid" ]; then
-                local status=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)
-                if [[ "$status" == "true" ]]; then
-                    all_stopped=false
-                    break
-                fi
-            fi
-        done
-
-        if [ -n "$services" ] && $all_stopped; then
-            echo -e "${RED}准备删除未运行的项目: $p_name ($proj)${RESET}"
-            if confirm_action; then
-                docker compose -f "$l_compose" down --rmi all -v
-                rm -rf "$proj"
-                echo -e "${GREEN}已删除 $p_name${RESET}"
-                deleted_any=true
-            fi
-        fi
-    done
-
-    if ! $deleted_any; then
-        echo -e "${GREEN}没有未运行的项目需要删除${RESET}"
-    fi
-    action_done
-}
-
-# ---------------------------
-# 项目管理菜单
-# ---------------------------
-function project_menu() {
-    while true; do
-        clear
-        local project_name=$(basename "$PROJECT_DIR")
-        echo -e "${GREEN}=============================================${RESET}"
-        echo -e "${GREEN}        ◈  管理项目:${RESET} ${YELLOW}$project_name${RESET} ${GREEN} ◈      ${RESET}"
-        echo -e "${GREEN}=============================================${RESET}"
-
-        echo -e "${YELLOW}[ 当前容器实时状态 ]${RESET}"
-        local services=$(docker compose -f "$COMPOSE_FILE" ps --services 2>/dev/null)
-        if [ -z "$services" ]; then
-            echo -e "  ${YELLOW}暂无服务配置${RESET}"
+        # 汉化引擎：包含时间、单位、状态
+        local uptime
+        uptime=$(echo "$raw_status" | \
+            sed 's/Up /运行 /' | \
+            sed 's/Exited/已停止/' | \
+            sed 's/(healthy)/(健康)/' | \
+            sed 's/(unhealthy)/(非健康)/' | \
+            sed 's/(starting)/(启动中)/' | \
+            sed 's/seconds/秒/' | \
+            sed 's/second/秒/' | \
+            sed 's/minutes/分钟/' | \
+            sed 's/minute/分钟/' | \
+            sed 's/hours/小时/' | \
+            sed 's/hour/小时/' | \
+            sed 's/days/天/' | \
+            sed 's/day/天/' | \
+            sed 's/weeks/周/' | \
+            sed 's/week/周/' | \
+            sed 's/months/月/' | \
+            sed 's/month/月/' | \
+            sed 's/about //' | \
+            sed 's/ago/前/')
+        
+        # 2. 新增：获取并格式化端口信息
+        local ports
+        ports=$(docker ps -a --filter "name=^/${name}$" --format "{{.Ports}}")
+        
+        # 如果端口为空，显示“无端口映射”；否则去掉 0.0.0.0: 或 ::: 以便手机端美观显示
+        if [ -z "$ports" ]; then
+            ports="无端口映射"
         else
-            for service in $services; do
-                local container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service" 2>/dev/null)
-                local ports="无端口映射"
-                local raw_status="Exited (0) 0 seconds ago"
-                
-                if [ -n "$container_id" ]; then
-                    raw_status=$(docker ps -a --filter "id=$container_id" --format "{{.Status}}")
-                    local port_info=$(docker ps -a --filter "id=$container_id" --format "{{.Ports}}")
-                    [ -n "$port_info" ] && ports=$port_info
-                fi
-                
-                local uptime=$(translate_status "$raw_status")
-                local status_icon="${RED}❌${RESET}"
-                [[ "$raw_status" == *"Up"* ]] && status_icon="${GREEN}✔${RESET}"
-                
-                echo -e "  ${YELLOW}◈ $service${RESET} $status_icon ${YELLOW}-> $uptime${RESET}"
-                echo -e "    ${YELLOW}└─ 端口:${RESET} ${GREEN}$ports${RESET}"
-            done
+            # 将 "0.0.0.0:8080->80/tcp, :::8080->80/tcp" 简化为 "8080->80/tcp" 这样的干净格式
+            ports=$(echo "$ports" | sed 's/0.0.0.0://g' | sed 's/::://g' | sed 's/, /\n        │     /g')
         fi
-        echo -e "${GREEN}---------------------------------------------${RESET}"
 
-        echo -e "${GREEN} 1) 启动服务     |     2) 停止服务${RESET}"
-        echo -e "${GREEN} 3) 重启服务     |     4) 查看日志${RESET}"
-        echo -e "${GREEN} 5) 容器状态     |     6) 更新容器(pull&up)${RESET}"
-        echo -e "${GREEN} 7) 进入容器     |     8) 删除容器+镜像+卷${RESET}"
-        echo -e "${GREEN} 9) 删除容器     |    10) 删除整个项目${RESET}"
-        echo -e "${GREEN}11) 禁止公网     |    12) 允许公网${RESET}"
-        echo -e "${GREEN}14) 开启更新     |    15) 关闭自动更新${RESET}"
-        echo -e "${GREEN}=============================================${RESET}"
-        echo -e "${YELLOW}13) 切换项目     |     0) 返回主菜单${RESET}"
-        echo -e "${GREEN}=============================================${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case "$choice" in
-            1) docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
-            2) docker compose -f "$COMPOSE_FILE" stop && action_done ;;
-            3) docker compose -f "$COMPOSE_FILE" down && docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
-            4) docker compose -f "$COMPOSE_FILE" logs -f ; action_done ;;
-            5) docker compose -f "$COMPOSE_FILE" ps ; action_done ;;
-            6) docker compose -f "$COMPOSE_FILE" pull && docker compose -f "$COMPOSE_FILE" up -d && action_done ;;
-            7) select_container ;;
-            8) if confirm_action; then docker compose -f "$COMPOSE_FILE" down --rmi all -v && action_done; fi ;;
-            9) if confirm_action; then docker compose -f "$COMPOSE_FILE" down && action_done; fi ;;
-            10) delete_project; return ;;
-            11) toggle_ip_binding "bind" ;;
-            12) toggle_ip_binding "unbind" ;;
-            13) select_project; return ;;
-            14) toggle_watchtower_label "enable" ;;
-            15) toggle_watchtower_label "disable" ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
-        esac
+        # 3. 手机端纵向块状输出
+        echo -e "${YELLOW}◈ 容器: ${RESET}${YELLOW}${name}${RESET}"
+        echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${CPU_COLOR}${cpu}${RESET}"
+        echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
+        echo -e "  ├─ ${YELLOW}网络 I/O: ${RESET}${net}"
+        echo -e "  ├─ ${YELLOW}端口映射: ${RESET}${CYAN}${ports}${RESET}"
+        echo -e "  └─ ${YELLOW}运行状态: ${RESET}${YELLOW}${uptime}${RESET}"
+        echo -e "${YELLOW}----------------------------------------${RESET}"
     done
 }
 
-# ---------------------------
-# Docker 网络管理
-# ---------------------------
-function network_menu() {
-    while true; do
-        clear
-        # 实时抓取系统中的所有网络状态数据
-        local total_nets=$(docker network ls -q | wc -l)
-        local net_list=$(docker network ls --format "{{.Name}} ({{.Driver}})" | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
 
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}   ◈    Docker  网络管理    ◈   ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${YELLOW}当前总计: $total_nets 个独立网络${RESET}"
-        echo -e "${YELLOW}网络列表: $net_list${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}1) 查看所有网络${RESET}"
-        echo -e "${GREEN}2) 创建网络${RESET}"
-        echo -e "${GREEN}3) 删除网络${RESET}"
-        echo -e "${GREEN}4) 将容器加入网络（支持多选）${RESET}"
-        echo -e "${GREEN}5) 将容器退出网络（支持多选）${RESET}"
-        echo -e "${GREEN}0) 返回主菜单${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case "$choice" in
-            1) docker network ls; read -p "$(echo -e "${GREEN}按回车返回...${RESET}")" temp ;;
+# -----------------------------
+# Docker 配置修改通用函数
+# -----------------------------
+set_docker_mirror() {
+    root_use
+    mkdir -p /etc/docker
+    
+    echo -e "${CYAN}请选择或输入镜像加速源选项:${RESET}"
+    echo -e "${GREEN}1. 使用默认高速代理${RESET}"
+    echo -e "${GREEN}2. 输入自定义加速源${RESET}"
+    echo -e "${GREEN}3. 恢复默认设置(清空加速源)${RESET}"
+    echo -ne "${GREEN}请选择或输入镜像加速源选项 (默认 1): ${RESET}"
+    read mirror_choice
+    mirror_choice=${mirror_choice:-1}
+
+    local mirrors=""
+    
+    if [ "$mirror_choice" == "1" ]; then
+        mirrors='["https://gh-proxy.org/docker/","https://registry.lfree.org","https://hub.glowp.xyz","https://docker.1panel.live"]'
+    elif [ "$mirror_choice" == "2" ]; then
+        read -p "请输入完整的加速地址 (例如 https://hub.glowp.xyz , 多个用英文逗号隔开): " custom_mirror
+        # 简单转换补全为 JSON 数组格式
+        mirrors="[\"$(echo $custom_mirror | sed 's/,/","/g' | sed 's/ //g')\"]"
+    elif [ "$mirror_choice" == "3" ]; then
+        echo -e "${YELLOW}正在恢复默认设置，移除所有自定义镜像源...${RESET}"
+        # 移除配置：如果 jq 存在就删掉该 Key，否则直接覆盖为一个空配置或移出该字段
+        if command -v jq &>/dev/null && [ -f /etc/docker/daemon.json ]; then
+            jq 'del(."registry-mirrors")' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
+            if [ $? -eq 0 ]; then
+                mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+            else
+                echo "{}" > /etc/docker/daemon.json
+            fi
+        else
+            echo "{}" > /etc/docker/daemon.json
+        fi
+        echo -e "${GREEN}✅ 已成功恢复默认设置！${RESET}"
+        restart_docker
+        return
+    else
+        echo -e "${RED}无效选项，操作已取消${RESET}"
+        return
+    fi
+
+    # 写入配置逻辑 (针对 1 和 2 选项)
+    if command -v jq &>/dev/null && [ -f /etc/docker/daemon.json ]; then
+        jq --argjson m "$mirrors" '. + {"registry-mirrors": $m}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
+        if [ $? -eq 0 ]; then
+            mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+        else
+            echo "{\"registry-mirrors\": $mirrors}" > /etc/docker/daemon.json
+        fi
+    else
+        echo "{\"registry-mirrors\": $mirrors}" > /etc/docker/daemon.json
+    fi
+
+    echo -e "${GREEN}✅ 镜像加速源配置成功！当前配置为:${RESET}"
+    cat /etc/docker/daemon.json
+    restart_docker
+}
+
+# -----------------------------
+# Docker 日志管理子菜单
+# -----------------------------
+docker_log_menu() {
+    root_use
+    mkdir -p /etc/docker
+
+    while true; do
+        echo -e "${CYAN}===== Docker 日志大小限制管理 =====${RESET}"
+        echo -e "${GREEN}1. 开启日志大小限制${RESET}"
+        echo -e "${GREEN}2. 关闭日志大小限制 (恢复默认无限制)${RESET}"
+        echo -e "${GREEN}0. 返回主菜单${RESET}"
+        echo -ne "${GREEN}请选择操作: ${RESET}"
+        read log_choice
+
+        case $log_choice in
+            1)
+                echo -e "${CYAN}正在配置日志限制...${RESET}"
+                if [ ! -f /etc/docker/daemon.json ]; then echo '{}' > /etc/docker/daemon.json; fi
+                jq '. + {"log-driver": "json-file", "log-opts": {"max-size": "20m", "max-file": "3"}}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
+                mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+                echo -e "${GREEN}✅ 日志大小限制开启成功！${RESET}"
+                echo -e "${YELLOW}注意: 此限制仅对【新创建】的容器生效，老容器需重建方能生效。${RESET}"
+                restart_docker
+                read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                ;;
             2)
-                read -p "请输入网络名称: " netname
-                read -p "请输入驱动 (bridge/overlay/macvlan，默认 bridge): " netdriver
-                netdriver=${netdriver:-bridge}
-                docker network create -d "$netdriver" "$netname" && echo -e "${GREEN}网络 $netname 创建成功${RESET}"
-                read -p "$(echo -e "${GREEN}按回车返回...${RESET}")" temp
-                ;;
-            3)
-                docker network ls --format "{{.Name}}" | nl
-                read -p "请输入要删除的网络编号: " num
-                netname=$(docker network ls --format "{{.Name}}" | sed -n "${num}p")
-                if [ -n "$netname" ]; then
-                    docker network rm "$netname" && echo -e "${GREEN}网络 $netname 删除成功${RESET}"
+                echo -e "${YELLOW}正在解除日志限制...${RESET}"
+                if [ -f /etc/docker/daemon.json ]; then
+                    jq 'del(."log-driver") | del(."log-opts")' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
+                    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+                    echo -e "${GREEN}✅ 已关闭日志大小限制（恢复系统默认）。${RESET}"
                 else
-                    echo -e "${RED}无效编号${RESET}"
+                    echo -e "${YELLOW}配置文件不存在，无需关闭。${RESET}"
                 fi
-                read -p "$(echo -e "${GREEN}按回车返回...${RESET}")" temp
+                restart_docker
+                read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
                 ;;
-            4)
-                echo -e "${GREEN}可用网络：${RESET}"
-                docker network ls --format "{{.Name}}" | nl
-                read -p "请输入要加入的网络编号: " netnum
-                netname=$(docker network ls --format "{{.Name}}" | sed -n "${netnum}p")
-                if [ -z "$netname" ]; then read -p "无效编号，按回车返回..." temp; continue; fi
-
-                echo -e "${GREEN}正在运行的容器：${RESET}"
-                docker ps --format "{{.Names}}" | nl
-                read -p "请输入容器编号（空格分隔支持多选）: " cnumbers
-                for cnum in $cnumbers; do
-                    cname=$(docker ps --format "{{.Names}}" | sed -n "${cnum}p")
-                    [ -n "$cname" ] && docker network connect "$netname" "$cname" && echo -e "${GREEN}容器 $cname 已加入${RESET}"
-                done
-                read -p "$(echo -e "${GREEN}按回车返回...${RESET}")" temp
+            0)
+                break
                 ;;
-            5)
-                echo -e "${GREEN}可用网络：${RESET}"
-                docker network ls --format "{{.Name}}" | nl
-                read -p "请输入网络编号: " netnum
-                netname=$(docker network ls --format "{{.Name}}" | sed -n "${netnum}p")
-                if [ -z "$netname" ]; then read -p "无效编号，按回车返回..." temp; continue; fi
-
-                echo -e "${GREEN}已连接容器：${RESET}"
-                docker network inspect "$netname" --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | nl
-                read -p "请输入容器编号（空格分隔支持多选）: " cnumbers
-                containers=($(docker network inspect "$netname" --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n'))
-                for cnum in $cnumbers; do
-                    cname=${containers[$((cnum-1))]}
-                    [ -n "$cname" ] && docker network disconnect "$netname" "$cname" && echo -e "${GREEN}容器 $cname 已退出${RESET}"
-                done
-                read -p "$(echo -e "${GREEN}按回车返回...${RESET}")" temp
+            *)
+                echo -e "${RED}无效选择${RESET}" && sleep 1
                 ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
         esac
     done
 }
 
-# ---------------------------
-# 主菜单
-# ---------------------------
-function main_menu() {
+# -----------------------------
+# 主菜单显示状态
+# -----------------------------
+main_menu() {
+    root_use
     while true; do
         clear
-        # 1. 统计容器数量
-        local running_containers=$(docker ps -q 2>/dev/null | wc -l)
-        # 使用 -f status=exited 筛选已停止的容器
-        local stopped_containers=$(docker ps -aq -f status=exited 2>/dev/null | wc -l)
-        # 2. 统计镜像、卷、网络数量
-        local total_images=$(docker images -q 2>/dev/null | sort -u | wc -l)
-        local total_volumes=$(docker volume ls -q 2>/dev/null | wc -l)
-        # 统计自定义网络（排除自带的 bridge, host, none）
-        local total_networks=$(docker network ls --filter "type=custom" -q 2>/dev/null | wc -l)
-
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} ◈  Docker Compose 项目管理  ◈ ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}🟢 运行容器:${RESET} ${YELLOW}$running_containers 个${RESET}"  
-        echo -e "${GREEN}🔴 停止容器:${RESET} ${RED}$stopped_containers 个${RESET}"
-        echo -e "${GREEN}💾 数据卷数:${RESET} ${YELLOW}$total_volumes 个${RESET}"    
-        echo -e "${GREEN}🌐 网络数量:${RESET} ${YELLOW}$total_networks 个${RESET}"
-        echo -e "${GREEN}📦 系统镜像:${RESET} ${YELLOW}$total_images 个${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}1) 管理项目${RESET}"
-        echo -e "${GREEN}2) 网络管理${RESET}"
-        echo -e "${GREEN}3) 查看容器运行状态${RESET}"
-        echo -e "${GREEN}4) 多选删除项目${RESET}"
-        echo -e "${GREEN}5) 删除未运行的项目${RESET}"
-        echo -e "${GREEN}0) 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
+        echo -e "${CYAN}"
+        echo "  ____             _               "
+        echo " |  _ \  ___   ___| | _____ _ __   "
+        echo " | | | |/ _ \ / __| |/ / _ \ '__|  "
+        echo " | |_| | (_) | (__|   <  __/ |     "
+        echo " |____/ \___/ \___|_|\_\___|_|     "
+        echo -e "${RESET}"
+        echo -e "${GREEN}===========================================${RESET}"
+       # 检测 Docker 状态
+        if command -v docker &>/dev/null; then
+            # 1. 获取基础状态与版本
+            local docker_status=$(docker info &>/dev/null && echo "运行中" || echo "未运行")
+            local docker_ver=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "未知")
+            local compose_ver=$(docker compose version --short 2>/dev/null || echo "未知")
+            
+            # 2. 统计各项数量
+            local total=$(docker ps -a -q 2>/dev/null | wc -l)
+            local running=$(docker ps -q 2>/dev/null | wc -l)
+            local stopped=$(docker ps -aq -f status=exited 2>/dev/null | wc -l)
+            local total_volumes=$(docker volume ls -q 2>/dev/null | wc -l)
+            local total_networks=$(docker network ls --filter "type=custom" -q 2>/dev/null | wc -l)
+            
+            # 3. 打印美化后的状态栏 (分两行显示，避免过长换行破环UI)
+            echo -e "${YELLOW}🐳 Docker     : $docker_status |🌐 iptables: $(current_iptables) "
+            echo -e "${YELLOW}🆔 版本       : v$docker_ver | 🐙 Compose: v$compose_ver${RESET}"
+            echo -e "${YELLOW}📊 容器状态   : 🟢 运行中: $running 个 | 🔴 已停止: $stopped 个${RESET}"
+            echo -e "${YELLOW}💾 独立数据卷 : $total_volumes 个   | 🌐 自定义网络: $total_networks 个${RESET}"
+        else
+            # Docker 未安装时只显示 iptables 状态
+            echo -e "${YELLOW}🐳 Docker: 未安装 | iptables: $(current_iptables)${RESET}"
+        fi
+        echo -e "${GREEN}===========================================${RESET}"
+        echo -e "${GREEN}01. 安装/更新 Docker${RESET}"
+        echo -e "${GREEN}02. 安装/更新 Docker Compose${RESET}"
+        echo -e "${GREEN}03. 卸载 Docker & Compose${RESET}"
+        echo -e "${GREEN}04. 容器管理${RESET}"
+        echo -e "${GREEN}05. 镜像管理${RESET}"
+        echo -e "${GREEN}06. 开启 IPv6${RESET}"
+        echo -e "${GREEN}07. 关闭 IPv6${RESET}"
+        echo -e "${GREEN}08. 开放所有端口${RESET}"
+        echo -e "${GREEN}09. 网络管理${RESET}"
+        echo -e "${GREEN}10. 切换 iptables-legacy${RESET}"
+        echo -e "${GREEN}11. 切换 iptables-nft${RESET}"
+        echo -e "${GREEN}12. Docker 备份/恢复${RESET}"
+        echo -e "${GREEN}13. 重启 Docker${RESET}"
+        echo -e "${GREEN}14. 卷管理 ${RESET}"
+        echo -e "${GREEN}15. 设置Docker镜像加速源${RESET}"
+        echo -e "${GREEN}16. 设置Docker日志限制${RESET}"
+        echo -e "${GREEN}17.${RESET} ${YELLOW}一键清理所有未使用容器/镜像/卷${RESET}"
+        echo -e "${GREEN}18. Docker监控${RESET}"
+        echo -e "${GREEN}00. 退出${RESET}"
+        echo -e "${GREEN}===========================================${RESET}"
         read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case "$choice" in
-            1) select_project ;;
-            2) network_menu ;;
-            3) monitor_docker_containers ;;
-            4) delete_multiple_projects ;;
-            5) delete_all_stopped_projects ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" && sleep 1 ;;
+        case $choice in
+            01|1) docker_install_update ;;
+            02|2) docker_compose_install_update ;;
+            03|3) docker_uninstall ;;
+            04|4) check_docker_running && docker_ps ;;
+            05|5) check_docker_running && docker_image ;;
+            06|6) check_docker_running && docker_ipv6_on ;;
+            07|7) check_docker_running && docker_ipv6_off ;;
+            08|8) open_all_ports ;;
+            09|9) check_docker_running && docker_network ;;
+            10) switch_iptables_legacy ;;
+            11) switch_iptables_nft ;;
+            12) check_docker_running && docker_backup_menu ;;
+            13|13) check_docker_running && restart_docker ;;
+            14|14) check_docker_running && docker_volume ;;
+            15|15) check_docker_running && set_docker_mirror ;;
+            16|16) docker_log_menu ;;
+            17|17) check_docker_running && docker_cleanup ;;
+            18|18) monitor_docker_containers ;;
+             00|0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
         esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
     done
 }
 
-# 启动
+
+
+
+# 启动脚本
 main_menu

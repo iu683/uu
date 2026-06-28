@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
 
 # =============================================================================
-#  Shadowsocks-Rust 智能多实例矩阵管理面板 (Systemd 专属版)
-#  协议标准: SS-2022 (2022-blake3-aes-256-gcm)
+#  Snell v6 Server 智能多实例矩阵管理面板 (Linux Systemd 专属强力版)
+#  完美兼容: Surge Mac / iOS 客户端 (全面支持多实例隔离、IPv6 自动包裹)
 # =============================================================================
 
 set -Eu
+set -o pipefail
 
 # ── 核心路径与全局隔离变量 ──────────────────────────────────────────────────
-export TEMPLATE_NAME="ss-rust"
+export TEMPLATE_NAME="snellv6"
 export BASE_DIR="/etc/${TEMPLATE_NAME}"
-export BINARY_PATH="/usr/local/bin/ssserver"
-export RUN_USER="ss-rust"
-export METHOD="2022-blake3-aes-256-gcm"
-export KEY_BYTES=32
+export LOG_FILE="/var/log/${TEMPLATE_NAME}_manager.log"
+export SNELL_USER="snellv6"
 
-# 注册表文件：持久化记录活跃实例名字
+# 注册表文件：持久化记录矩阵内所有活跃的实例名
 export REGISTRY_FILE="${BASE_DIR}/.instances.env"
 
 # 默认控制的目标实例名称自动改成当前主机名
-CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "SS")"
+CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "snell")"
 
 # ── 终端颜色定义 ────────────────────────────────────────────────────────────
 export RESET='\033[0m'
@@ -29,67 +28,20 @@ export RED='\033[0;31m'
 export BLUE='\033[0;34m'
 export CYAN='\033[0;36m'
 
-# 动态临时沙盒
-TMP_DIR=$(mktemp -d -t ss-rust.XXXXXX)
-
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
-
-# ── 运行沙盒清理与安全退出 ──────────────────────────────────────────────────
-cleanup() {
-    local exit_code=$?
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-    exit $exit_code
-}
-trap cleanup EXIT INT TERM
-
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[ERROR]请使用 root 权限运行此脚本！${RESET}" >&2
+    echo -e "${RED}[错误] 请使用 root 权限运行此脚本！${RESET}" >&2
     exit 1
 fi
 
-# ── 底层依赖精准检测与静默补全 ────────────────────────────────────────────────
-check_deps() {
-    echo -e "${BLUE}[INFO]正在检测系统底层依赖组件...${RESET}"
-    install_pkg() {
-        if command -v apt >/dev/null 2>&1; then
-            apt update -y -q && apt install -y -q "$@"
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y -q "$@"
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y -q "$@"
-        fi
-    }
+# ── 工具函数 ────────────────────────────────────────────────────────────────
+info() { echo -e "${BLUE}[信息] $*${RESET}"; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+ok()   { echo -e "${GREEN}[成功] $*${RESET}"; }
+pause() { echo; echo -ne "${GREEN}按任意键重新返回控制面板...${RESET}"; read -n 1 -s; echo; }
 
-    command -v curl >/dev/null 2>&1 || install_pkg curl
-    command -v wget >/dev/null 2>&1 || install_pkg wget
-    command -v tar  >/dev/null 2>&1 || install_pkg tar
-    command -v awk  >/dev/null 2>&1 || install_pkg gawk
-
-    if ! command -v xz >/dev/null 2>&1; then
-        if command -v apt >/dev/null 2>&1; then install_pkg xz-utils; else install_pkg xz; fi
-    fi
-
-    if ! command -v ss >/dev/null 2>&1; then
-        if command -v apt >/dev/null 2>&1; then install_pkg iproute2; else install_pkg iproute; fi
-    fi
-    
-    command -v openssl >/dev/null 2>&1 || install_pkg openssl
-    command -v jq >/dev/null 2>&1 || install_pkg jq
-    command -v uuidgen >/dev/null 2>&1 || { if command -v apt >/dev/null 2>&1; then install_pkg uuid-runtime; fi; }
-    
-    echo -e "${GREEN}[OK]基础依赖检测就绪${RESET}"
-}
-
-# ── 核心安全组件 ────────────────────────────────────────────────────────────
 create_user() {
-    id -u "$RUN_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$RUN_USER"
+    id -u "$SNELL_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$SNELL_USER"
 }
 
 check_port_occupied() {
@@ -102,24 +54,9 @@ check_port_occupied() {
 
 is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
 is_valid_alias() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
-random_key() { openssl rand -base64 "$KEY_BYTES" | tr -d '\n'; }
+random_key() { openssl rand -base64 24 | tr -d '\n\r/=+' | head -c 20; }
 random_port() { shuf -i 2000-65000 -n 1; }
 get_system_dns() { grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd "," -; }
-
-validate_password() {
-    local password="$1"
-    if ! echo "$password" | base64 -d >/dev/null 2>&1; then
-        echo -e "${RED}[ERROR]密码并非合法的 Base64 编码格式${RESET}" >&2
-        return 1
-    fi
-    local decoded_len
-    decoded_len=$(echo "$password" | base64 -d 2>/dev/null | wc -c)
-    if [[ "$decoded_len" -ne "$KEY_BYTES" ]]; then
-        echo -e "${RED}[ERROR]SS-2022 对齐要求密码解密后必须恰好为 ${KEY_BYTES} 字节 (当前: ${decoded_len} 字节)${RESET}" >&2
-        return 1
-    fi
-    return 0
-}
 
 get_public_ip() {
     local mode=${1:-"auto"}
@@ -143,19 +80,7 @@ get_public_ip() {
     echo "127.0.0.1"
 }
 
-detect_arch() {
-    case "$(uname -m)" in
-        x86_64)   echo "x86_64-unknown-linux-gnu" ;;
-        aarch64)  echo "aarch64-unknown-linux-gnu" ;;
-        armv7l)   echo "armv7-unknown-linux-gnueabihf" ;;
-        *)
-            echo -e "${RED}[ERROR]不支持的系统架构: $(uname -m)${RESET}" >&2
-            exit 1
-            ;;
-    esac
-}
-
-# ── 注册表核心控制模块 ────────────────────────────────────────────────────────
+# ── 注册表管理系统 ──────────────────────────────────────────────────────────
 register_instance() {
     local name="$1"
     mkdir -p "$BASE_DIR" && touch "$REGISTRY_FILE"
@@ -173,335 +98,354 @@ unregister_instance() {
 
 sync_registry() {
     mkdir -p "$BASE_DIR" && touch "$REGISTRY_FILE"
-    local temp_reg="${TMP_DIR}/sync.env"
-    touch "$temp_reg"
-    for f in "${BASE_DIR}"/config_*.json; do
+    local temp_reg=$(mktemp)
+    for f in "${BASE_DIR}"/config_*.conf; do
         [ -e "$f" ] || continue
         local name
-        name=$(basename "$f" | sed 's/^config_//;s/\.json$//')
+        name=$(basename "$f" | sed 's/^config_//;s/\.conf$//')
         if [ -n "$name" ]; then echo "$name" >> "$temp_reg"; fi
     done
     mv -f "$temp_reg" "$REGISTRY_FILE"
 }
 
-# ── 核心文件下载引擎 ──────────────────────────────────────────────────────────
-fetch_latest_version() {
-    echo -e "${BLUE}[INFO]正在轮询检索 GitHub 官方 Shadowsocks-Rust 最新发行版...${RESET}"
-    VERSION=""
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local api_url="${proxy}https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest"
-        local resp
-        resp=$(curl -fsSL --max-time 5 "$api_url" 2>/dev/null) || continue
-        local tmp_ver
-        tmp_ver=$(echo "$resp" | jq -r '.tag_name' 2>/dev/null | sed 's/v//')
-        if [[ -n "$tmp_ver" && "$tmp_ver" != "null" ]]; then
-            VERSION="$tmp_ver"
-            echo -e "${GREEN}[OK]成功获取到最新版本: v${VERSION}${RESET}"
-            break
-        fi
-    done
-    if [ -z "$VERSION" ]; then
-        VERSION="1.18.4" # 稳定兜底版
-        echo -e "${YELLOW}[WARN]网络请求受阻，将降级采用稳定默认版本: v${VERSION}${RESET}"
+# ── 智能动态感知 Snell v6 版本 ──────────────────────────────────────────────
+get_latest_snell_version() {
+    local latest_version=""
+    # 针对部分握手可能受阻的环境，增加超时和伪装 Agent 防御机制
+    latest_version=$(curl -sL --connect-timeout 4 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+        "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | \
+        grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
+        
+    if [[ -z "$latest_version" ]]; then
+        latest_version="v6.0.0b4" # 稳健的保底正式版
     fi
+    echo "$latest_version"
 }
 
-download_bin_package() {
-    local arch
-    arch=$(detect_arch)
-    fetch_latest_version
-    local download_success=false
+download_and_extract_snell() {
+    local RAW_VERSION=$1
+    local ARCH=$(uname -m)
+    
+    if ! command -v unzip &>/dev/null; then
+        info "未检测到 unzip，正在为您自动补全组件..."
+        if command -v apt &>/dev/null; then apt update && apt install -y unzip;
+        elif command -v yum &>/dev/null; then yum install -y unzip;
+        elif command -v apk &>/dev/null; then apk update && apk add unzip; fi
+    fi
 
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local url_path="${proxy}https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${VERSION}/shadowsocks-v${VERSION}.${arch}.tar.xz"
-        echo -e "${BLUE}[INFO]正在通过代理节点 [ ${CYAN}${proxy:-官方直连}${BLUE} ] 推进核心下载...${RESET}"
-        if wget -T 15 -t 2 -O "$TMP_DIR/ss.tar.xz" "$url_path"; then
-            if [ -s "$TMP_DIR/ss.tar.xz" ]; then
-                download_success=true
-                cd "$TMP_DIR" && tar -xf ss.tar.xz
-                echo -e "${GREEN}[OK]资产包下载并解压成功！${RESET}"
-                break
-            fi
+    local URL_ARCH
+    case "$ARCH" in
+        aarch64|arm64)              URL_ARCH="linux-aarch64" ;;
+        armv7l|armhf|armv8l)        URL_ARCH="linux-armv7l" ;;
+        x86_64|amd64)               URL_ARCH="linux-amd64" ;;
+        i386|i686|x86)              URL_ARCH="linux-i386" ;;
+        *) error "不支持的系统架构: ${ARCH}"; return 1 ;;
+    esac
+
+    local VERSION_WITHOUT_V="${RAW_VERSION#v}"
+    local VERSION_WITH_V="v${VERSION_WITHOUT_V}"
+
+    local URLS=(
+        "https://dl.nssurge.com/snell/snell-server-${VERSION_WITH_V}-${URL_ARCH}.zip"
+        "https://dl.nssurge.com/snell/snell-server-${VERSION_WITHOUT_V}-${URL_ARCH}.zip"
+    )
+
+    local success=false
+    for url in "${URLS[@]}"; do
+        info "正在尝试下载内核: ${url}"
+        if wget --timeout=8 --tries=1 --no-check-certificate -O snell.zip "$url" 2>/dev/null; then
+            success=true && break
         fi
-        echo -e "${YELLOW}[WARN]当前镜像源连接超时，准备自动重试下一备用源...${RESET}"
     done
 
-    if [ "$download_success" = "false" ]; then
-        echo -e "${RED}[ERROR]所有 GitHub 镜像代理均拉取资产失败，请检查机器网络状况。${RESET}" >&2
-        exit 1
+    if [ "$success" = false ]; then
+        warn "动态获取的测试版路径可能已失效，使用标准保底渠道下载..."
+        local FALLBACK_URL="https://dl.nssurge.com/snell/snell-server-v6.0.0b4-${URL_ARCH}.zip"
+        wget --no-check-certificate -O snell.zip "$FALLBACK_URL" || { error "下载 Snell 核心引擎失败！"; return 1; }
     fi
+
+    unzip -o snell.zip -d "$BASE_DIR"
+    rm -f snell.zip
+    chmod +x "$BASE_DIR/snell-server"
+    ok "Snell 二进制核心解压成功！"
 }
 
-# ── 配置与 Systemd 动态分流服务写入 ──────────────────────────────────────────
+# ── 核心写入与 Surge 配置优雅生成 ────────────────────────────────────────────
 write_config() {
-    local instance="$1" port="$2" password="$3" dns="$4"
-    local conf_file="${BASE_DIR}/config_${instance}.json"
+    local instance="$1" port="$2" psk="$3" mode="$4" listen="$5" dns_pref="$6" obfs="$7" tfo="$8" dns="$9"
+    local conf_file="${BASE_DIR}/config_${instance}.conf"
     
     mkdir -p "$BASE_DIR"
-    local dns_json
-    dns_json=$(echo "$dns" | awk -F',' '{
-        for(i=1;i<=NF;i++){
-            gsub(/^[ \t]+|[ \t]+$/, "", $i)
-            printf "%s\"%s\"", (i>1?",":""), $i
-        }
-    }')
 
     cat > "$conf_file" <<EOF
-{
-    "server": "::",
-    "server_port": ${port},
-    "password": "${password}",
-    "method": "${METHOD}",
-    "fast_open": true,
-    "mode": "tcp_and_udp",
-    "timeout": 300,
-    "no_delay": true,
-    "ipv6_first": false,
-    "nameserver": [
-        ${dns_json}
-    ],
-    "_meta": { "alias": "${instance}" }
-}
+[snell-server]
+listen = ${listen}
+psk = ${psk}
+mode = ${mode}
+obfs = ${obfs}
+tfo = ${tfo}
+dns = ${dns}
+dns-ip-preference = ${dns_pref}
 EOF
+
     chmod 600 "$conf_file"
-    chown -R "${RUN_USER}:${RUN_USER}" "$BASE_DIR"
+    chown -R "$SNELL_USER":"$SNELL_USER" "$BASE_DIR"
     register_instance "$instance"
-}
 
-write_systemd_template() {
-    local service_file="/etc/systemd/system/${TEMPLATE_NAME}@.service"
-    cat > "$service_file" <<EOF
-[Unit]
-Description=Shadowsocks Rust Multi-Instance Server (%i)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${RUN_USER}
-Group=${RUN_USER}
-ExecStart=${BINARY_PATH} -c ${BASE_DIR}/config_%i.json
-Restart=on-failure
-RestartSec=3
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-}
-
-generate_share_links() {
-    local instance="$1"
-    local file="${BASE_DIR}/config_${instance}.json"
-    [[ ! -f "$file" ]] && return 1
-    
-    local port password ip encoded display_ip hostname
-    port=$(jq -r '.server_port' "$file" 2>/dev/null)
-    password=$(jq -r '.password' "$file" 2>/dev/null)
-    ip=$(get_public_ip "auto")
-    hostname=$(hostname -s 2>/dev/null | sed 's/ /_/g' || echo "SS")
-    encoded=$(echo -n "${METHOD}:${password}" | base64 | tr -d '\n\r ')
-
-    display_ip="$ip"
+    # 生成 Surge 单行配置，在遇到 IPv6 地址时进行自动包裹防护 `[...]`
+    local ip=$(get_public_ip "auto")
+    local display_ip="$ip"
     if [[ "$ip" == *":"* ]]; then display_ip="[$ip]"; fi
+    local hostname=$(hostname -s 2>/dev/null | sed 's/ /_/g' || echo "SnellV6")
 
-    cat > "${BASE_DIR}/link_${instance}_ss.txt" <<EOF
-ss://${encoded}@${display_ip}:${port}#${hostname}-${instance}-SS2022
-EOF
-
-    cat > "${BASE_DIR}/link_${instance}_surge.txt" <<EOF
-${hostname}-${instance}-SS2022 = ss, ${ip}, ${port}, encrypt-method=${METHOD}, password=${password}, tfo=true, udp-relay=true, ecn=true
+    cat > "${BASE_DIR}/link_${instance}.txt" <<EOF
+${hostname}-${instance}-SnellV6 = snell, ${display_ip}, ${port}, psk=${psk}, version=6, mode=${mode}, tfo=${tfo}, reuse=true, ecn=true
 EOF
 }
 
 print_instance_summary() {
     local instance="$1"
-    local file="${BASE_DIR}/config_${instance}.json"
-    if [ ! -f "$file" ]; then return; fi
+    local conf_file="${BASE_DIR}/config_${instance}.conf"
+    [[ ! -f "$conf_file" ]] && return
 
-    generate_share_links "$instance"
-
-    echo -e "\n${GREEN}====== Shadowsocks 实例 [ ${instance} ] 配置详情 ======${RESET}"
-    echo -e "${GREEN} 绑定外网 IP  :${RESET} $(get_public_ip "auto")"
-    echo -e "${GREEN} 监听绑定端口 :${RESET} $(jq -r '.server_port' "$file" 2>/dev/null)"
-    echo -e "${GREEN} 预共享密钥   :${RESET} $(jq -r '.password' "$file" 2>/dev/null)"
-    echo -e "${GREEN} 加密防护算法 :${RESET} ${METHOD}"
-    echo -e "${GREEN} 内部上游 DNS :${RESET} $(jq -r '.nameserver | join(",")' "$file" 2>/dev/null)"
-    echo -e "${GREEN} 独立配置文件 :${RESET} ${file}"
+    echo -e "\n${GREEN}====== Snell v6 实例 [ ${instance} ] 配置详情 ======${RESET}"
+    echo -e "${GREEN} 绑定监听 (Listen) :${RESET} $(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')"
+    echo -e "${GREEN} 密钥 (PSK)        :${RESET} $(grep '^psk' "$conf_file" | awk -F'= ' '{print $2}')"
+    echo -e "${GREEN} 工作模式 (Mode)   :${RESET} $(grep '^mode' "$conf_file" | awk -F'= ' '{print $2}')"
+    echo -e "${GREEN} Fast Open (TFO)   :${RESET} $(grep '^tfo' "$conf_file" | awk -F'= ' '{print $2}')"
     echo "------------------------------------------------------------------------"
-    if [[ -f "${BASE_DIR}/link_${instance}_ss.txt" ]]; then
-        echo -e "${GREEN}[SS 2022 订阅链接] :${RESET}"
-        echo -e "${YELLOW}$(cat "${BASE_DIR}/link_${instance}_ss.txt")${RESET}\n"
+    if [[ -f "${BASE_DIR}/link_${instance}.txt" ]]; then
+        echo -e "${GREEN}[Surge 节点配置托管托管] :${RESET}"
+        echo -e "${YELLOW}$(cat "${BASE_DIR}/link_${instance}.txt")${RESET}\n"
     fi
-    if [[ -f "${BASE_DIR}/link_${instance}_surge.txt" ]]; then
-        echo -e "${GREEN}[Surge 托管配置]   :${RESET}"
-        echo -e "${YELLOW}$(cat "${BASE_DIR}/link_${instance}_surge.txt")${RESET}"
-    fi
-    echo ""
 }
 
-# ── 交互式菜单逻辑核心 ────────────────────────────────────────────────────────
+# ── 交互式多开逻辑 ────────────────────────────────────────────────────────────
 menu_install_instance() {
-    check_deps
     create_user
-    
+    mkdir -p "$BASE_DIR"
+
     local is_edit=false
     if [ "${1:-}" = "edit" ]; then is_edit=true; fi
 
-    local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
+    local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
     
-    if [ "$is_edit" = "true" ]; then
-        if [ ! -f "$conf_file" ]; then
-            echo -e "${RED}[ERROR]当前聚焦实例 [ ${CURRENT_INSTANCE} ] 并不存在旧配置文件，无法进行微调修改！${RESET}" >&2
-            return
-        fi
-        echo -e "\n${GREEN}==== [💡 正在微调修改实例: ${CURRENT_INSTANCE} (直接回车保持原样)] ====${RESET}"
-        OLD_PORT=$(jq -r '.server_port' "$conf_file" 2>/dev/null)
-        OLD_PASS=$(jq -r '.password' "$conf_file" 2>/dev/null)
-        OLD_DNS=$(jq -r '.nameserver | join(",")' "$conf_file" 2>/dev/null)
+    local old_port old_key old_mode old_listen old_dns_pref old_obfs old_tfo old_dns
+    if [ "$is_edit" = "true" ] && [ -f "$conf_file" ]; then
+        echo -e "\n${GREEN}==== [正在精细修改实例: ${CURRENT_INSTANCE}] ====${RESET}"
+        old_listen=$(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')
+        old_port=$(echo "$old_listen" | awk -F: '{print $NF}' | cut -d',' -f1)
+        old_key=$(grep '^psk' "$conf_file" | awk -F'= ' '{print $2}')
+        old_mode=$(grep '^mode' "$conf_file" | awk -F'= ' '{print $2}')
+        old_obfs=$(grep '^obfs' "$conf_file" | awk -F'= ' '{print $2}')
+        old_tfo=$(grep '^tfo' "$conf_file" | awk -F'= ' '{print $2}')
+        old_dns=$(grep '^dns' "$conf_file" | awk -F'= ' '{print $2}')
+        old_dns_pref=$(grep '^dns-ip-preference' "$conf_file" | awk -F'= ' '{print $2}')
     else
         if [ -f "$conf_file" ]; then
-            echo -e "${YELLOW}[WARN]检测到当前实例 [ ${CURRENT_INSTANCE} ] 已经存在。${RESET}"
+            warn "检测到该实例 [ ${CURRENT_INSTANCE} ] 已创建过配置。"
             local confirm=""
-            read -r -p "$(echo -e "${GREEN}是否强行完全覆盖并重置该实例？[y/N]: ${RESET}")" confirm || true
+            read -r -p "是否强行完全重置此节点配置？[y/N]: " confirm
             [[ "$confirm" =~ ^[Yy]$ ]] || return
         fi
-        echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
-        OLD_PORT=$(random_port)
-        while ! check_port_occupied "$OLD_PORT"; do OLD_PORT=$(random_port); done
-        OLD_PASS=$(random_key)
-        OLD_DNS=$(get_system_dns)
-        [[ -z "$OLD_DNS" ]] && OLD_DNS="1.1.1.1,8.8.8.8"
+        echo -e "\n${GREEN}==== [配置新 Snell 矩阵实例: ${CURRENT_INSTANCE}] ====${RESET}"
+        old_port=$(random_port)
+        while ! check_port_occupied "$old_port"; do old_port=$(random_port); done
+        old_key=$(random_key)
+        old_mode="default"
+        old_obfs="off"
+        old_tfo="true"
+        old_dns=$(get_system_dns)
+        [[ -z "$old_dns" ]] && old_dns="1.1.1.1,8.8.8.8"
+        old_dns_pref="default"
     fi
 
-    # 1. 端口绑定引导
+    # 1. 端口引导
     local input_port="" opt_port=""
     while true; do
-        read -r -p "$(echo -e "${GREEN}请输入服务端口 [当前: ${YELLOW}${OLD_PORT}${GREEN} | 回车不改]: ${RESET}")" input_port || true
-        opt_port="${input_port:-$OLD_PORT}"
+        read -r -p "$(echo -e "${GREEN}请输入服务端口 [当前: ${YELLOW}${old_port}${GREEN}]: ${RESET}")" input_port
+        opt_port="${input_port:-$old_port}"
         if is_valid_port "$opt_port"; then
-            if [ "$opt_port" != "${OLD_PORT}" ] || [ "$is_edit" = "false" ]; then
+            if [ "$opt_port" != "$old_port" ] || [ "$is_edit" = "false" ]; then
                 if ! check_port_occupied "$opt_port"; then
-                    echo -e "${RED}[ERROR]端口 ${opt_port} 目前正被其他进程占用，请换个端口！${RESET}" >&2
+                    error "端口 ${opt_port} 正被占用，请换个端口！"
                     continue
                 fi
             fi
             break
         else
-            echo -e "${RED}[ERROR]端口无效，请输入 1-65535 之间的整数数值。${RESET}" >&2
+            error "端口无效，请输入 1-65535 整数。"
         fi
     done
 
-    # 2. 密码配置引导
-    local input_pwd="" opt_pwd=""
-    while true; do
-        read -r -p "$(echo -e "${GREEN}请输入 Base64 密码 (32字节) [当前: ${YELLOW}${OLD_PASS}${GREEN} | 回车不改]: ${RESET}")" input_pwd || true
-        opt_pwd="${input_pwd:-$OLD_PASS}"
-        validate_password "$opt_pwd" && break
-    done
+    # 2. 密钥引导
+    local input_key="" opt_key=""
+    read -r -p "$(echo -e "${GREEN}请输入 PSK 密钥 [当前: ${YELLOW}${old_key}${GREEN}]: ${RESET}")" input_key
+    opt_key="${input_key:-$old_key}"
 
-    # 3. 内置上游 DNS 引导
+    # 3. 混淆加密模式
+    echo -e "${YELLOW}请选择 Snell 工作模式 (mode):${RESET}"
+    echo "1. default     (流量混淆 + AES 加密)"
+    echo "2. unshaped    (禁用混淆，仅加密。吞吐增高，等同于 v3)"
+    echo "3. unsafe-raw  (纯明文传输模式：禁用加密混淆)"
+    local choice_mode="" opt_mode="$old_mode"
+    read -r -p "请选择 (直接回车保持当前): " choice_mode
+    case "$choice_mode" in
+        1) opt_mode="default" ;;
+        2) opt_mode="unshaped" ;;
+        3) opt_mode="unsafe-raw" ;;
+    esac
+
+    # 4. 监听网络模式
+    echo -e "${YELLOW}请选择网络双栈绑定模式:${RESET}"
+    echo "1. 同时绑定监听 IPv4 & IPv6 (双栈共存推荐)"
+    echo "2. 仅绑定监听 IPv4 (0.0.0.0)"
+    echo "3. 仅绑定监听 IPv6 ([::])"
+    local choice_listen="" opt_listen=""
+    read -r -p "请选择 (直接回车保持默认/当前): " choice_listen
+    case "$choice_listen" in
+        2) opt_listen="0.0.0.0:${opt_port}" ;;
+        3) opt_listen="[::]:${opt_port}" ;;
+        1) opt_listen="0.0.0.0:${opt_port},[::]:${opt_port}" ;;
+        *) opt_listen=${old_listen:-"0.0.0.0:${opt_port},[::]:${opt_port}"} ;;
+    esac
+
+    # 5. 家族优先级
+    echo -e "${YELLOW}请选择 DNS 解析家族优先级 (dns-ip-preference):${RESET}"
+    echo "1. default     2. prefer-ipv4     3. prefer-ipv6     4. ipv4-only     5. ipv6-only"
+    local choice_pref="" opt_pref="$old_dns_pref"
+    read -r -p "请选择 (回车保持): " choice_pref
+    case "$choice_pref" in
+        1) opt_pref="default" ;;
+        2) opt_pref="prefer-ipv4" ;;
+        3) opt_pref="prefer-ipv6" ;;
+        4) opt_pref="ipv4-only" ;;
+        5) opt_pref="ipv6-only" ;;
+    esac
+
+    # 6. OBFS 混淆
+    echo -e "${YELLOW}配置高级 OBFS 混淆 [不推荐无故开启]:${RESET}"
+    echo "1. TLS    2. HTTP    3. 关闭"
+    local choice_obfs="" opt_obfs="$old_obfs"
+    read -r -p "请选择 (回车保持): " choice_obfs
+    case "$choice_obfs" in
+        1) opt_obfs="tls" ;;
+        2) opt_obfs="http" ;;
+        3) opt_obfs="off" ;;
+    esac
+
+    # 7. TFO
+    local choice_tfo="" opt_tfo="$old_tfo"
+    read -r -p "$(echo -e "${GREEN}是否开启 TCP Fast Open？(1.开启 2.关闭) [当前: ${old_tfo}]: ${RESET}")" choice_tfo
+    [[ "$choice_tfo" == "1" ]] && opt_tfo="true"
+    [[ "$choice_tfo" == "2" ]] && opt_tfo="false"
+
+    # 8. DNS
     local input_dns="" opt_dns=""
-    read -r -p "$(echo -e "${GREEN}请输入内部解析 DNS [当前: ${YELLOW}${OLD_DNS}${GREEN} | 回车不改]: ${RESET}")" input_dns || true
-    opt_dns="${input_dns:-$OLD_DNS}"
+    read -r -p "$(echo -e "${GREEN}请输入上游解析 DNS [当前: ${YELLOW}${old_dns}${GREEN}]: ${RESET}")" input_dns
+    opt_dns="${input_dns:-$old_dns}"
 
-    # 4. 执行文件落盘与启动逻辑
-    if [ ! -f "$BINARY_PATH" ]; then
-        download_bin_package
-        install -m 755 "$TMP_DIR/ssserver" "$BINARY_PATH"
-        echo "$VERSION" > "${BASE_DIR}/version.txt"
+    # 下发安装
+    if [ ! -f "$BASE_DIR/snell-server" ]; then
+        info "正在检测并部署 Snell 核心运行时..."
+        local VER=$(get_latest_snell_version)
+        download_and_extract_snell "$VER"
     fi
 
-    write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_pwd" "$opt_dns"
+    write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_key" "$opt_mode" "$opt_listen" "$opt_pref" "$opt_obfs" "$opt_tfo" "$opt_dns"
     write_systemd_template
 
-    echo -e "${BLUE}[INFO]正在通过 Systemd 安全拉起服务单元...${RESET}"
+    info "正在通知 Systemd 安全引擎接管并启动新服务实例..."
     systemctl daemon-reload
-    systemctl enable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}.service" >/dev/null 2>&1 || true
-    systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}.service"
+    systemctl enable "snellv6@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+    systemctl restart "snellv6@${CURRENT_INSTANCE}"
 
-    sleep 1.2
-    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}.service"; then
-        echo -e "${GREEN}[OK]实例 [ ${CURRENT_INSTANCE} ] 矩阵上云成功！${RESET}"
+    sleep 1
+    if systemctl is-active --quiet "snellv6@${CURRENT_INSTANCE}"; then
+        ok "实例 [ ${CURRENT_INSTANCE} ] 多开分流矩阵启动成功！"
         print_instance_summary "$CURRENT_INSTANCE"
     else
-        echo -e "${RED}[ERROR]实例部署完成，但拉起后遇到异常挂起，请选择 8 翻看单元滚动日志进行诊断。${RESET}" >&2
+        error "实例配置下发完成，但拉起失败。请按菜单选项 8 查看服务系统错误日志。"
     fi
 }
 
+write_systemd_template() {
+    cat > /etc/systemd/system/snellv6@.service <<EOF
+[Unit]
+Description=Snell v6 Dynamic Server Matrix Node (%i)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${BASE_DIR}/snell-server -c ${BASE_DIR}/config_%i.conf
+Restart=on-failure
+User=${SNELL_USER}
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 menu_uninstall_instance() {
-    echo -e "${YELLOW}[WARN]该操作将彻底销毁清理当前控制聚焦的 [ ${CURRENT_INSTANCE} ] 独立服务。${RESET}"
+    warn "该操作将直接熔断并销毁清洗当前控制聚焦的 [ ${CURRENT_INSTANCE} ] 独立子服务。"
     local confirm=""
-    read -r -p "$(echo -e "${RED}确认完全抹除实例 [ ${CURRENT_INSTANCE} ] 吗？[y/N]: ${RESET}")" confirm || true
+    read -r -p "确定完全移除此实例？[y/N]: " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return
 
-    systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}.service" >/dev/null 2>&1 || true
-    systemctl disable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}.service" >/dev/null 2>&1 || true
+    systemctl stop "snellv6@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+    systemctl disable "snellv6@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
     
-    rm -f "${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
-    rm -f "${BASE_DIR}/link_${CURRENT_INSTANCE}_ss.txt"
-    rm -f "${BASE_DIR}/link_${CURRENT_INSTANCE}_surge.txt"
+    rm -f "${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
+    rm -f "${BASE_DIR}/link_${CURRENT_INSTANCE}.txt"
     unregister_instance "$CURRENT_INSTANCE"
-    echo -e "${GREEN}[OK]实例 [ ${CURRENT_INSTANCE} ] 现场清理干净。${RESET}"
+    ok "实例 [ ${CURRENT_INSTANCE} ] 现场清洗干净。"
 
+    # 全栈自清洗常驻组件
     if [ -d "$BASE_DIR" ] && [ -z "$(ls -A "$BASE_DIR" | grep 'config_')" ]; then
-        echo -e "${BLUE}[INFO]检测到矩阵内所有实例已被排空，自动触发全局常驻组件垃圾回收机制...${RESET}"
-        rm -f "/etc/systemd/system/${TEMPLATE_NAME}@.service"
-        rm -f "$BINARY_PATH" "$REGISTRY_FILE"
-        rm -rf "$BASE_DIR"
+        info "检测到矩阵内已无任何子实例，自动启动全局常驻清理程序..."
+        rm -f /etc/systemd/system/snellv6@.service
         systemctl daemon-reload
-        echo -e "${GREEN}[OK]全系统干净卸载，基础常驻依赖与核心已全部解绑！${RESET}"
-        CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "SS")"
+        rm -rf "$BASE_DIR"
+        ok "全系统卸载干净，基础常驻组件已彻底清除。"
+        CURRENT_INSTANCE="snell"
     fi
 }
 
 menu_switch_matrix() {
-    echo -e "\n${GREEN}==== [多开实例矩阵管理中心] ====${RESET}"
+    echo -e "\n${GREEN}==== [多开实例 Systemd 节点矩阵管理中心] ====${RESET}"
     echo -e "当前聚焦的操作目标: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
     echo "目前持久化注册表内的独立实例列表:"
 
     sync_registry
-
-    local instance_list=()
-    local count=0
+    local instance_list=() count=0
 
     if [ -f "$REGISTRY_FILE" ]; then
         while IFS= read -r name || [ -n "$name" ]; do
             [ -z "$name" ] && continue
-            local conf_file="${BASE_DIR}/config_${name}.json"
-            [ -f "$conf_file" ] || continue
+            local c_file="${BASE_DIR}/config_${name}.conf"
+            [ -f "$c_file" ] || continue
 
             ((count++))
             instance_list+=("$name")
             
-            local port_num
-            port_num=$(jq -r '.server_port // "未知"' "$conf_file" 2>/dev/null || echo "未知")
+            local port_num=$(grep '^listen' "$c_file" | awk -F: '{print $NF}' | cut -d',' -f1)
             local status_str="${RED}已挂起${RESET}"
-            systemctl is-active --quiet "${TEMPLATE_NAME}@${name}.service" && status_str="${GREEN}分流中${RESET}"
+            systemctl is-active --quiet "snellv6@${name}" && status_str="${GREEN}分流中${RESET}"
             
-            echo -e " [ ${CYAN}${count}${RESET} ] -> ${YELLOW}${name}${RESET} [端口: ${port_num} | 状态: ${status_str}]"
+            echo -e " [ ${CYAN}${count}${RESET} ] -> ${YELLOW}${name}${RESET} [分配端口: ${port_num} | 核心状态: ${status_str}]"
         done < "$REGISTRY_FILE"
     fi
 
-    if [ "$count" -eq 0 ]; then
-        echo " (暂无任何多开实例，请直接输入新名称创建)"
-    fi
+    [[ "$count" -eq 0 ]] && echo " (矩阵内空空如也，请直接输入新名称新建多开节点)"
     
     echo ""
-    echo -e "👉 ${GREEN}输入现有实例前面的【数字编号】快速切换管理目标${RESET}"
+    echo -e "👉 ${GREEN}输入已有实例前面的【数字编号】快速切换管理目标${RESET}"
     echo -e "👉 ${GREEN}或者直接输入一个【全新的英文名字】来新建多开实例${RESET}"
     local input_val=""
-    read -r -p "请输入选择或名字: " input_val || true
+    read -r -p "请输入选择或新实例名字: " input_val
 
     if [ -z "$input_val" ]; then return; fi
 
@@ -509,40 +453,39 @@ menu_switch_matrix() {
         if [ "$input_val" -gt 0 ] && [ "$input_val" -le "$count" ]; then
             local index=$((input_val - 1))
             CURRENT_INSTANCE="${instance_list[$index]}"
-            echo -e "${GREEN}[OK]操作焦点已成功切为编号 [ ${input_val} ] 的实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+            ok "操作焦点已成功切为实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
         else
-            echo -e "${YELLOW}[WARN]编号输入超出范围！保持原有聚焦。${RESET}"
+            warn "编号超出可用范围！"
         fi
     else
         if is_valid_alias "$input_val"; then
             CURRENT_INSTANCE="$input_val"
-            echo -e "${GREEN}[OK]已锁定新实例焦点为: ${YELLOW}${CURRENT_INSTANCE}${RESET} (请在主菜单按 1 完成实际创建部署)"
+            ok "已成功锁定新焦点: ${YELLOW}${CURRENT_INSTANCE}${RESET} (请在主菜单按 1 完成实际下发部署)"
         else
-            echo -e "${RED}[ERROR]名字仅限英文字母/数字/下划线/中划线组合！${RESET}" >&2
+            error "命名仅限英文字母/数字/下划线组合！"
         fi
     fi
 }
 
 get_panel_status_info() {
-    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}.service" 2>/dev/null; then
+    if systemctl is-active --quiet "snellv6@${CURRENT_INSTANCE}"; then
         panel_status="${GREEN}运行中${RESET}"
     else
         panel_status="${RED}未运行${RESET}"
     fi
 
-    if [ -f "${BASE_DIR}/version.txt" ]; then
-        panel_version="v$(cat "${BASE_DIR}/version.txt") (Systemd 矩阵版)"
+    if [ -x "$BASE_DIR/snell-server" ]; then
+        panel_version=$("$BASE_DIR/snell-server" -v 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n1)
+        [[ -z "$panel_version" ]] && panel_version="v6.X 内核"
     else
         panel_version="${RED}未下载内核${RESET}"
     fi
 
-    local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
+    local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
     if [ -f "$conf_file" ]; then
-        local p_num
-        p_num=$(jq -r '.server_port // empty' "$conf_file" 2>/dev/null)
-        panel_port="${p_num} (SS-2022)"
+        panel_port=$(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')
     else
-        panel_port="未创建配置"
+        panel_port="未创建节点配置"
     fi
 }
 
@@ -551,22 +494,22 @@ while true; do
     get_panel_status_info
     clear
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} ◈ Shadowsocks-Rust Systemd 矩阵多实例面板 ◈ ${RESET}"
+    echo -e "${GREEN} ◈  Snell v6 Systemd 矩阵多实例管理面板   ◈ ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
+    echo -e "${GREEN}目标节点监听 :${RESET} ${YELLOW}${panel_port}${RESET}"
     echo -e "${GREEN}服务活跃状态 :${RESET} $panel_status"
     echo -e "${GREEN}核心沙箱引擎 :${RESET} ${YELLOW}${panel_version}${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} 1. 安装当前实例${RESET}"
+    echo -e "${GREEN} 1. 安装当前焦点实例${RESET}"
     echo -e "${GREEN} 2. 更新全局内核程序${RESET}"
-    echo -e "${GREEN} 3. 卸载当前实例${RESET}"
-    echo -e "${GREEN} 4. 修改当前实例配置${RESET}"
-    echo -e "${GREEN} 5. 启动当前实例${RESET}"
-    echo -e "${GREEN} 6. 停止当前实例${RESET}"
-    echo -e "${GREEN} 7. 重启当前实例${RESET}"
-    echo -e "${GREEN} 8. 查看当前实例滚动日志${RESET}"
-    echo -e "${GREEN} 9. 查看当前实例节点配置${RESET}"
+    echo -e "${GREEN} 3. 卸载当前焦点实例${RESET}"
+    echo -e "${GREEN} 4. 修改当前焦点实例配置${RESET}"
+    echo -e "${GREEN} 5. 启动当前焦点实例${RESET}"
+    echo -e "${GREEN} 6. 停止当前焦点实例${RESET}"
+    echo -e "${GREEN} 7. 重启当前焦点实例${RESET}"
+    echo -e "${GREEN} 8. 查看当前实例滚动日志 (Journald)${RESET}"
+    echo -e "${GREEN} 9. 查看当前实例 Surge 配置单行${RESET}"
     echo -e "${GREEN}10. 管理节点矩阵矩阵${RESET}  ${YELLOW}← 添加 / 切换独立实例${RESET}"
     echo -e "${GREEN} 0. 退出管理台面${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
@@ -574,22 +517,23 @@ while true; do
     choice=""
     read -r -p "$(echo -e "${GREEN}选择操作序号: ${RESET}")" choice || true
     case "$choice" in
-        1) menu_install_instance "new" ;;
+        1) menu_install_instance "new" ; pause ;;
         2) 
-            download_bin_package && install -m 755 "$TMP_DIR/ssserver" "$BINARY_PATH"
-            echo "$VERSION" > "${BASE_DIR}/version.txt"
-            echo -e "${GREEN}[OK]二进制核心覆盖升级完毕，请视情况手动重启各运行中的实例。${RESET}" 
+            VER=$(get_latest_snell_version)
+            download_and_extract_snell "$VER" && ok "内核升级完毕，请按 7 重启各实例生效。" ; pause
             ;;
-        3) menu_uninstall_instance ;;
-        4) menu_install_instance "edit" ;;
-        5) systemctl start "${TEMPLATE_NAME}@${CURRENT_INSTANCE}.service" && echo -e "${GREEN}[OK]拉起成功${RESET}" ;;
-        6) systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}.service" && echo -e "${GREEN}[OK]挂起成功${RESET}" ;;
-        7) systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}.service" && echo -e "${GREEN}[OK]重启完毕${RESET}" ;;
-        8) journalctl -u "${TEMPLATE_NAME}@${CURRENT_INSTANCE}.service" -n 50 -f --no-pager ;;
-        9) print_instance_summary "$CURRENT_INSTANCE" ;;
+        3) menu_uninstall_instance ; pause ;;
+        4) menu_install_instance "edit" ; systemctl restart "snellv6@${CURRENT_INSTANCE}" ; pause ;;
+        5) systemctl start "snellv6@${CURRENT_INSTANCE}" ; pause ;;
+        6) systemctl stop "snellv6@${CURRENT_INSTANCE}" ; pause ;;
+        7) systemctl restart "snellv6@${CURRENT_INSTANCE}" ; pause ;;
+        8) 
+            echo -e "${BLUE}[信息] 正在调用 Journald 捕获实时日志输出 (Ctrl+C 返回菜单):${RESET}"
+            journalctl -u "snellv6@${CURRENT_INSTANCE}" -f -n 50
+            ;;
+        9) print_instance_summary "$CURRENT_INSTANCE" ; pause ;;
         10) menu_switch_matrix ;;
         0) exit 0 ;;
-        *) echo -e "${YELLOW}[WARN]无效输入序号！${RESET}"; sleep 1 ;;
+        *) echo -e "${YELLOW}[警告] 输入未知操作序号！${RESET}" ; sleep 0.5 ;;
     esac
-    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制面板...${RESET}")" || true
 done

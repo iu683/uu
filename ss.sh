@@ -1,547 +1,740 @@
 #!/usr/bin/env bash
+#
+# Hysteria 2 矩阵多实例控制面板 (Linux Systemd 强力版)
+# SPDX-License-Identifier: MIT
+#
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
-# =============================================================================
-#  Snell v6 Server 智能多实例矩阵管理面板 (Linux Systemd 专属强力版)
-#  完美兼容: Surge Mac / iOS 客户端 (全面支持多实例隔离、IPv6 自动包裹)
-# =============================================================================
-
-set -Eu
-set -o pipefail
-
-# ── 核心路径与全局隔离变量 ──────────────────────────────────────────────────
-export TEMPLATE_NAME="snellv6"
-export BASE_DIR="/etc/${TEMPLATE_NAME}"
-export LOG_FILE="/var/log/${TEMPLATE_NAME}_manager.log"
-export SNELL_USER="snellv6"
+# 基础隔离目录与硬编码配置
+export TEMPLATE_NAME="hysteria"
+export BASE_DIR="/etc/mo-hy2"
+export INSTALL_BIN="/usr/local/bin/hysteria"
+export DATA_BASE_DIR="/var/lib/hysteria"
+export HY_DIR_BASE="/root/proxynode/hy2"
 
 # 注册表文件：持久化记录矩阵内所有活跃的实例名
 export REGISTRY_FILE="${BASE_DIR}/.instances.env"
 
 # 默认控制的目标实例名称自动改成当前主机名
-CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "snell")"
+CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "hy2")"
 
-# ── 终端颜色定义 ────────────────────────────────────────────────────────────
-export RESET='\033[0m'
-export GREEN='\033[0;32m'
-export YELLOW='\033[0;33m'
-export RED='\033[0;31m'
-export BLUE='\033[0;34m'
-export CYAN='\033[0;36m'
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+REPO_URL="https://github.com/apernet/hysteria"
+API_BASE_URL="https://api.github.com/repos/apernet/hysteria"
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[错误] 请使用 root 权限运行此脚本！${RESET}" >&2
-    exit 1
-fi
+# 自动检测环境变量占位
+PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
+OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+ARCHITECTURE="${ARCHITECTURE:-}"
 
-# ── 工具函数 ────────────────────────────────────────────────────────────────
-info() { echo -e "${BLUE}[信息] $*${RESET}"; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
+# 终端颜色代码
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
+RESET="\033[0m"
+
+# 全局实例控制变量占位
+firstport=""
+endport=""
+
+# GITHUB 代理列表
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+)
+
+# =========================================================
+# 2. 核心底层工具函数
+# =========================================================
+has_command() { type -P "$1" > /dev/null 2>&1; }
+curl() { command curl "${CURL_FLAGS[@]}" "$@"; }
+mktemp() { command mktemp "$@" "hyservinst.XXXXXXXXXX"; }
+
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
 error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-ok()   { echo -e "${GREEN}[成功] $*${RESET}"; }
-pause() { echo; echo -ne "${GREEN}按任意键重新返回控制面板...${RESET}"; read -n 1 -s; echo; }
+pause() { echo; read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制面板...${RESET}")"; }
 
-create_user() {
-    id -u "$SNELL_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$SNELL_USER"
+generate_random_password() {
+  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
 }
 
-check_port_occupied() {
-    local port="$1"
-    if ss -tulnH | awk '{print $5}' | grep -qE "[:.]${port}$"; then
-        return 1  # 占用
+is_user_exists() { id "$1" > /dev/null 2>&1; }
+
+detect_package_manager() {
+  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
+  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
+  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
+  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
+  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
+  return 1
+}
+
+install_software() {
+  local _package_name="$1"
+  if ! detect_package_manager; then
+    error "未检测到支持的包管理器，请手动安装 $_package_name"
+    exit 65
+  fi
+  $PACKAGE_MANAGEMENT_INSTALL $_package_name >/dev/null 2>&1 || true
+}
+
+check_environment() {
+  if [[ "x$(uname)" != "xLinux" ]]; then
+    error "本脚本仅支持 Linux 系统。"
+    exit 95
+  fi
+
+  case "$(uname -m)" in
+    'i386' | 'i686') ARCHITECTURE='386' ;;
+    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='arm' ;;
+    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+    's390x') ARCHITECTURE='s390x' ;;
+    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
+  esac
+  OPERATING_SYSTEM=linux
+
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+  has_command openssl || install_software openssl
+  has_command socat || install_software socat
+  has_command python3 || install_software python3
+  has_command iptables || install_software iptables
+}
+
+get_installed_version() {
+  if [[ -f "$INSTALL_BIN" ]]; then
+    local version_out
+    version_out=$("$INSTALL_BIN" version 2>/dev/null || "$INSTALL_BIN" -v 2>/dev/null || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
+    else echo "未知版本"; fi
+  else echo "未安装核心"; fi
+}
+
+get_latest_version() {
+  local _tmpfile=$(mktemp)
+  local _success=1
+  local _tag_name=""
+
+  for proxy in "${GITHUB_PROXY[@]}"; do
+    local _url="${proxy}${API_BASE_URL}/releases/latest"
+    if curl -sS -H 'Accept: application/vnd.github.v3+json' "$_url" -o "$_tmpfile"; then
+      _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
+      if [[ -n "$_tag_name" && "$_tag_name" != "null" ]]; then
+        _success=0
+        break
+      fi
     fi
-    return 0      # 空闲
+  done
+  rm -f "$_tmpfile"
+  if [[ $_success -eq 0 ]]; then echo "${_tag_name##*\/}"; else echo ""; fi
 }
 
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-is_valid_alias() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
-random_key() { openssl rand -base64 24 | tr -d '\n\r/=+' | head -c 20; }
-random_port() { shuf -i 2000-65000 -n 1; }
-get_system_dns() { grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd "," -; }
+download_hysteria() {
+  local _version="$1"
+  local _destination="$2"
+  [[ ! "$_version" =~ "v" ]] && _version="v$_version"
 
-get_public_ip() {
-    local mode=${1:-"auto"}
-    local ip=""
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1"
+  for proxy in "${GITHUB_PROXY[@]}"; do
+    local _download_url="${proxy}${REPO_URL}/releases/download/app/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
+    info "正在通过代理 [${proxy:-直连}] 下载 Hysteria 核心 (尝试1) ..."
+    if curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then return 0; fi
+
+    _download_url="${proxy}${REPO_URL}/releases/download/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
+    info "正在通过代理 [${proxy:-直连}] 下载 Hysteria 核心 (尝试2) ..."
+    if curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then return 0; fi
+  done
+  error "核心下载失败！所有代理及直连均无法访问。"
+  return 11
 }
 
-# ── 注册表管理系统 ──────────────────────────────────────────────────────────
+# =========================================================
+# 3. 多实例矩阵持久化与内核注册表
+# =========================================================
 register_instance() {
-    local name="$1"
-    mkdir -p "$BASE_DIR" && touch "$REGISTRY_FILE"
-    if ! grep -q "^${name}$" "$REGISTRY_FILE" 2>/dev/null; then
-        echo "$name" >> "$REGISTRY_FILE"
-    fi
+  local name="$1"
+  [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
+  touch "$REGISTRY_FILE"
+  if ! grep -q "^${name}$" "$REGISTRY_FILE" 2>/dev/null; then
+    echo "$name" >> "$REGISTRY_FILE"
+  fi
 }
 
 unregister_instance() {
-    local name="$1"
-    if [ -f "$REGISTRY_FILE" ]; then
-        sed -i "/^${name}$/d" "$REGISTRY_FILE"
-    fi
+  local name="$1"
+  if [ -f "$REGISTRY_FILE" ]; then
+    sed -i "/^${name}$/d" "$REGISTRY_FILE"
+  fi
 }
 
 sync_registry() {
-    mkdir -p "$BASE_DIR" && touch "$REGISTRY_FILE"
-    local temp_reg=$(mktemp)
-    for f in "${BASE_DIR}"/config_*.conf; do
-        [ -e "$f" ] || continue
-        local name
-        name=$(basename "$f" | sed 's/^config_//;s/\.conf$//')
-        if [ -n "$name" ]; then echo "$name" >> "$temp_reg"; fi
-    done
-    mv -f "$temp_reg" "$REGISTRY_FILE"
+  [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
+  touch "$REGISTRY_FILE"
+  local temp_reg=$(mktemp)
+  for f in "${BASE_DIR}"/config_*.yaml; do
+    [ -e "$f" ] || continue
+    local name=$(basename "$f" | sed 's/^config_//;s/\.yaml$//')
+    if [ -n "$name" ]; then echo "$name" >> "$temp_reg"; fi
+  done
+  mv -f "$temp_reg" "$REGISTRY_FILE"
 }
 
-# ── 智能动态感知 Snell v6 版本 ──────────────────────────────────────────────
-get_latest_snell_version() {
-    local latest_version=""
-    # 针对部分握手可能受阻的环境，增加超时和伪装 Agent 防御机制
-    latest_version=$(curl -sL --connect-timeout 4 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-        "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | \
-        grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
-        
-    if [[ -z "$latest_version" ]]; then
-        latest_version="v6.0.0b4" # 稳健的保底正式版
-    fi
-    echo "$latest_version"
-}
-
-download_and_extract_snell() {
-    local RAW_VERSION=$1
-    local ARCH=$(uname -m)
-    
-    if ! command -v unzip &>/dev/null; then
-        info "未检测到 unzip，正在为您自动补全组件..."
-        if command -v apt &>/dev/null; then apt update && apt install -y unzip;
-        elif command -v yum &>/dev/null; then yum install -y unzip;
-        elif command -v apk &>/dev/null; then apk update && apk add unzip; fi
-    fi
-
-    local URL_ARCH
-    case "$ARCH" in
-        aarch64|arm64)              URL_ARCH="linux-aarch64" ;;
-        armv7l|armhf|armv8l)        URL_ARCH="linux-armv7l" ;;
-        x86_64|amd64)               URL_ARCH="linux-amd64" ;;
-        i386|i686|x86)              URL_ARCH="linux-i386" ;;
-        *) error "不支持的系统架构: ${ARCH}"; return 1 ;;
-    esac
-
-    local VERSION_WITHOUT_V="${RAW_VERSION#v}"
-    local VERSION_WITH_V="v${VERSION_WITHOUT_V}"
-
-    local URLS=(
-        "https://dl.nssurge.com/snell/snell-server-${VERSION_WITH_V}-${URL_ARCH}.zip"
-        "https://dl.nssurge.com/snell/snell-server-${VERSION_WITHOUT_V}-${URL_ARCH}.zip"
-    )
-
-    local success=false
-    for url in "${URLS[@]}"; do
-        info "正在尝试下载内核: ${url}"
-        if wget --timeout=8 --tries=1 --no-check-certificate -O snell.zip "$url" 2>/dev/null; then
-            success=true && break
-        fi
-    done
-
-    if [ "$success" = false ]; then
-        warn "动态获取的测试版路径可能已失效，使用标准保底渠道下载..."
-        local FALLBACK_URL="https://dl.nssurge.com/snell/snell-server-v6.0.0b4-${URL_ARCH}.zip"
-        wget --no-check-certificate -O snell.zip "$FALLBACK_URL" || { error "下载 Snell 核心引擎失败！"; return 1; }
-    fi
-
-    unzip -o snell.zip -d "$BASE_DIR"
-    rm -f snell.zip
-    chmod +x "$BASE_DIR/snell-server"
-    ok "Snell 二进制核心解压成功！"
-}
-
-# ── 核心写入与 Surge 配置优雅生成 ────────────────────────────────────────────
-write_config() {
-    local instance="$1" port="$2" psk="$3" mode="$4" listen="$5" dns_pref="$6" obfs="$7" tfo="$8" dns="$9"
-    local conf_file="${BASE_DIR}/config_${instance}.conf"
-    
-    mkdir -p "$BASE_DIR"
-
-    cat > "$conf_file" <<EOF
-[snell-server]
-listen = ${listen}
-psk = ${psk}
-mode = ${mode}
-obfs = ${obfs}
-tfo = ${tfo}
-dns = ${dns}
-dns-ip-preference = ${dns_pref}
-EOF
-
-    chmod 600 "$conf_file"
-    chown -R "$SNELL_USER":"$SNELL_USER" "$BASE_DIR"
-    register_instance "$instance"
-
-    # 生成 Surge 单行配置，在遇到 IPv6 地址时进行自动包裹防护 `[...]`
-    local ip=$(get_public_ip "auto")
-    local display_ip="$ip"
-    if [[ "$ip" == *":"* ]]; then display_ip="[$ip]"; fi
-    local hostname=$(hostname -s 2>/dev/null | sed 's/ /_/g' || echo "SnellV6")
-
-    cat > "${BASE_DIR}/link_${instance}.txt" <<EOF
-${hostname}-${instance}-SnellV6 = snell, ${display_ip}, ${port}, psk=${psk}, version=6, mode=${mode}, tfo=${tfo}, reuse=true, ecn=true
-EOF
-}
-
-print_instance_summary() {
-    local instance="$1"
-    local conf_file="${BASE_DIR}/config_${instance}.conf"
-    [[ ! -f "$conf_file" ]] && return
-
-    echo -e "\n${GREEN}====== Snell v6 实例 [ ${instance} ] 配置详情 ======${RESET}"
-    echo -e "${GREEN} 绑定监听 (Listen) :${RESET} $(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')"
-    echo -e "${GREEN} 密钥 (PSK)        :${RESET} $(grep '^psk' "$conf_file" | awk -F'= ' '{print $2}')"
-    echo -e "${GREEN} 工作模式 (Mode)   :${RESET} $(grep '^mode' "$conf_file" | awk -F'= ' '{print $2}')"
-    echo -e "${GREEN} Fast Open (TFO)   :${RESET} $(grep '^tfo' "$conf_file" | awk -F'= ' '{print $2}')"
-    echo "------------------------------------------------------------------------"
-    if [[ -f "${BASE_DIR}/link_${instance}.txt" ]]; then
-        echo -e "${GREEN}[Surge 节点配置托管托管] :${RESET}"
-        echo -e "${YELLOW}$(cat "${BASE_DIR}/link_${instance}.txt")${RESET}\n"
-    fi
-}
-
-# ── 交互式多开逻辑 ────────────────────────────────────────────────────────────
-menu_install_instance() {
-    create_user
-    mkdir -p "$BASE_DIR"
-
-    local is_edit=false
-    if [ "${1:-}" = "edit" ]; then is_edit=true; fi
-
-    local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
-    
-    local old_port old_key old_mode old_listen old_dns_pref old_obfs old_tfo old_dns
-    if [ "$is_edit" = "true" ] && [ -f "$conf_file" ]; then
-        echo -e "\n${GREEN}==== [正在精细修改实例: ${CURRENT_INSTANCE}] ====${RESET}"
-        old_listen=$(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')
-        old_port=$(echo "$old_listen" | awk -F: '{print $NF}' | cut -d',' -f1)
-        old_key=$(grep '^psk' "$conf_file" | awk -F'= ' '{print $2}')
-        old_mode=$(grep '^mode' "$conf_file" | awk -F'= ' '{print $2}')
-        old_obfs=$(grep '^obfs' "$conf_file" | awk -F'= ' '{print $2}')
-        old_tfo=$(grep '^tfo' "$conf_file" | awk -F'= ' '{print $2}')
-        old_dns=$(grep '^dns' "$conf_file" | awk -F'= ' '{print $2}')
-        old_dns_pref=$(grep '^dns-ip-preference' "$conf_file" | awk -F'= ' '{print $2}')
-    else
-        if [ -f "$conf_file" ]; then
-            warn "检测到该实例 [ ${CURRENT_INSTANCE} ] 已创建过配置。"
-            local confirm=""
-            read -r -p "是否强行完全重置此节点配置？[y/N]: " confirm
-            [[ "$confirm" =~ ^[Yy]$ ]] || return
-        fi
-        echo -e "\n${GREEN}==== [配置新 Snell 矩阵实例: ${CURRENT_INSTANCE}] ====${RESET}"
-        old_port=$(random_port)
-        while ! check_port_occupied "$old_port"; do old_port=$(random_port); done
-        old_key=$(random_key)
-        old_mode="default"
-        old_obfs="off"
-        old_tfo="true"
-        old_dns=$(get_system_dns)
-        [[ -z "$old_dns" ]] && old_dns="1.1.1.1,8.8.8.8"
-        old_dns_pref="default"
-    fi
-
-    # 1. 端口引导
-    local input_port="" opt_port=""
-    while true; do
-        read -r -p "$(echo -e "${GREEN}请输入服务端口 [当前: ${YELLOW}${old_port}${GREEN}]: ${RESET}")" input_port
-        opt_port="${input_port:-$old_port}"
-        if is_valid_port "$opt_port"; then
-            if [ "$opt_port" != "$old_port" ] || [ "$is_edit" = "false" ]; then
-                if ! check_port_occupied "$opt_port"; then
-                    error "端口 ${opt_port} 正被占用，请换个端口！"
-                    continue
-                fi
-            fi
-            break
-        else
-            error "端口无效，请输入 1-65535 整数。"
-        fi
-    done
-
-    # 2. 密钥引导
-    local input_key="" opt_key=""
-    read -r -p "$(echo -e "${GREEN}请输入 PSK 密钥 [当前: ${YELLOW}${old_key}${GREEN}]: ${RESET}")" input_key
-    opt_key="${input_key:-$old_key}"
-
-    # 3. 混淆加密模式
-    echo -e "${YELLOW}请选择 Snell 工作模式 (mode):${RESET}"
-    echo "1. default     (流量混淆 + AES 加密)"
-    echo "2. unshaped    (禁用混淆，仅加密。吞吐增高，等同于 v3)"
-    echo "3. unsafe-raw  (纯明文传输模式：禁用加密混淆)"
-    local choice_mode="" opt_mode="$old_mode"
-    read -r -p "请选择 (直接回车保持当前): " choice_mode
-    case "$choice_mode" in
-        1) opt_mode="default" ;;
-        2) opt_mode="unshaped" ;;
-        3) opt_mode="unsafe-raw" ;;
-    esac
-
-    # 4. 监听网络模式
-    echo -e "${YELLOW}请选择网络双栈绑定模式:${RESET}"
-    echo "1. 同时绑定监听 IPv4 & IPv6 (双栈共存推荐)"
-    echo "2. 仅绑定监听 IPv4 (0.0.0.0)"
-    echo "3. 仅绑定监听 IPv6 ([::])"
-    local choice_listen="" opt_listen=""
-    read -r -p "请选择 (直接回车保持默认/智能同步新端口): " choice_listen
-    case "$choice_listen" in
-        2) opt_listen="0.0.0.0:${opt_port}" ;;
-        3) opt_listen="[::]:${opt_port}" ;;
-        1) opt_listen="0.0.0.0:${opt_port},[::]:${opt_port}" ;;
-        *) 
-            # 如果直接回车，且有旧的监听配置
-            if [ -n "${old_listen:-}" ]; then
-                # 智能把旧监听配置里所有的旧端口，替换为新输入/生成的目标端口
-                opt_listen=$(echo "$old_listen" | sed -E "s/([:])[0-9]+/\1${opt_port}/g")
-            else
-                opt_listen="0.0.0.0:${opt_port},[::]:${opt_port}"
-            fi
-            ;;
-    esac
-
-    # 5. 家族优先级
-    echo -e "${YELLOW}请选择 DNS 解析家族优先级 (dns-ip-preference):${RESET}"
-    echo "1. default     2. prefer-ipv4     3. prefer-ipv6     4. ipv4-only     5. ipv6-only"
-    local choice_pref="" opt_pref="$old_dns_pref"
-    read -r -p "请选择 (回车保持): " choice_pref
-    case "$choice_pref" in
-        1) opt_pref="default" ;;
-        2) opt_pref="prefer-ipv4" ;;
-        3) opt_pref="prefer-ipv6" ;;
-        4) opt_pref="ipv4-only" ;;
-        5) opt_pref="ipv6-only" ;;
-    esac
-
-    # 6. OBFS 混淆
-    echo -e "${YELLOW}配置高级 OBFS 混淆 [不推荐无故开启]:${RESET}"
-    echo "1. TLS    2. HTTP    3. 关闭"
-    local choice_obfs="" opt_obfs="$old_obfs"
-    read -r -p "请选择 (回车保持): " choice_obfs
-    case "$choice_obfs" in
-        1) opt_obfs="tls" ;;
-        2) opt_obfs="http" ;;
-        3) opt_obfs="off" ;;
-    esac
-
-    # 7. TFO
-    local choice_tfo="" opt_tfo="$old_tfo"
-    read -r -p "$(echo -e "${GREEN}是否开启 TCP Fast Open？(1.开启 2.关闭) [当前: ${old_tfo}]: ${RESET}")" choice_tfo
-    [[ "$choice_tfo" == "1" ]] && opt_tfo="true"
-    [[ "$choice_tfo" == "2" ]] && opt_tfo="false"
-
-    # 8. DNS
-    local input_dns="" opt_dns=""
-    read -r -p "$(echo -e "${GREEN}请输入上游解析 DNS [当前: ${YELLOW}${old_dns}${GREEN}]: ${RESET}")" input_dns
-    opt_dns="${input_dns:-$old_dns}"
-
-    # 下发安装
-    if [ ! -f "$BASE_DIR/snell-server" ]; then
-        info "正在检测并部署 Snell 核心运行时..."
-        local VER=$(get_latest_snell_version)
-        download_and_extract_snell "$VER"
-    fi
-
-    write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_key" "$opt_mode" "$opt_listen" "$opt_pref" "$opt_obfs" "$opt_tfo" "$opt_dns"
-    write_systemd_template
-
-    info "正在通知 Systemd 安全引擎接管并启动新服务实例..."
-    systemctl daemon-reload
-    systemctl enable "snellv6@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    systemctl restart "snellv6@${CURRENT_INSTANCE}"
-
-    sleep 1
-    if systemctl is-active --quiet "snellv6@${CURRENT_INSTANCE}"; then
-        ok "实例 [ ${CURRENT_INSTANCE} ] 多开分流矩阵启动成功！"
-        print_instance_summary "$CURRENT_INSTANCE"
-    else
-        error "实例配置下发完成，但拉起失败。请按菜单选项 8 查看服务系统错误日志。"
-    fi
-}
-
+# 动态实例化多开 Systemd 核心骨架
 write_systemd_template() {
-    cat > /etc/systemd/system/snellv6@.service <<EOF
+  local template_file="/etc/systemd/system/hysteria-server@.service"
+  cat << EOF > "$template_file"
 [Unit]
-Description=Snell v6 Dynamic Server Matrix Node (%i)
+Description=Hysteria 2 Server Service - Instance: %I
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=${BASE_DIR}/snell-server -c ${BASE_DIR}/config_%i.conf
-Restart=on-failure
-User=${SNELL_USER}
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+ExecStart=$INSTALL_BIN server --config ${BASE_DIR}/config_%I.yaml
+WorkingDirectory=${DATA_BASE_DIR}/%I
+User=hysteria
+Group=hysteria
+Environment=HYSTERIA_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=true
+Restart=on-failure
+RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  systemctl daemon-reload
 }
 
-menu_uninstall_instance() {
-    warn "该操作将直接熔断并销毁清洗当前控制聚焦的 [ ${CURRENT_INSTANCE} ] 独立子服务。"
-    local confirm=""
-    read -r -p "确定完全移除此实例？[y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
+# =========================================================
+# 4. 外部证书穿透赋权与网络辅助
+# =========================================================
+fix_external_cert_permission() {
+  local cert=$1 key=$2 target_user=${3:-hysteria}
+  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
+    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！非 root 运行用户无权穿透读取。"
+    info "权威推荐: 请重新导出证书到公共目录（如 /etc/ssl/ ）再试。"
+    return 1
+  fi
+  local cert_dir=$(dirname "$cert")
+  chmod +x "$cert_dir" 2>/dev/null || true
+  chmod 644 "$cert" "$key" 2>/dev/null || true
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:"$target_user":rx "$cert_dir" 2>/dev/null || true
+    setfacl -m u:"$target_user":r "$cert" "$key" 2>/dev/null || true
+  fi
+  return 0
+}
 
-    systemctl stop "snellv6@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    systemctl disable "snellv6@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    
-    rm -f "${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
-    rm -f "${BASE_DIR}/link_${CURRENT_INSTANCE}.txt"
-    unregister_instance "$CURRENT_INSTANCE"
-    ok "实例 [ ${CURRENT_INSTANCE} ] 现场清洗干净。"
+get_public_ip() {
+  local ip
+  for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+      ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+    done
+  done
+  echo "127.0.0.1"
+}
 
-    # 全栈自清洗常驻组件
-    if [ -d "$BASE_DIR" ] && [ -z "$(ls -A "$BASE_DIR" | grep 'config_')" ]; then
-        info "检测到矩阵内已无任何子实例，自动启动全局常驻清理程序..."
-        rm -f /etc/systemd/system/snellv6@.service
-        systemctl daemon-reload
-        rm -rf "$BASE_DIR"
-        ok "全系统卸载干净，基础常驻组件已彻底清除。"
-        CURRENT_INSTANCE="snell"
+check_port() {
+  local port="$1"
+  if ss -tunlp 2>/dev/null | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
+    return 1 # 被占用
+  fi
+  return 0 # 可用
+}
+
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
+
+get_random_port() {
+  local rand_port
+  while true; do
+    rand_port=$(shuf -i 2000-65535 -n 1)
+    check_port "$rand_port" && echo "$rand_port" && return 0
+  done
+}
+
+get_hy_status() {
+  if systemctl is-active --quiet "hysteria-server@${CURRENT_INSTANCE}" 2>/dev/null; then
+    echo -e "${GREEN}● 运行中${RESET}"
+  else
+    echo -e "${RED}● 未运行${RESET}"
+  fi
+}
+
+get_current_port_display() {
+  local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.yaml"
+  local hy_dir="${HY_DIR_BASE}/${CURRENT_INSTANCE}"
+  if [[ -f "$conf_file" ]]; then
+    local main_port=$(grep -E '^listen:' "$conf_file" | awk -F ':' '{print $3}' | tr -d ' ')
+    if [[ -f "$hy_dir/hy-client.yaml" ]]; then
+      local jump_range=$(grep -E '^server:' "$hy_dir/hy-client.yaml" | awk -F ',' '{print $2}' | tr -d ' ')
+      [[ -n "$jump_range" ]] && echo "${main_port} [跳跃: ${jump_range}]" && return
     fi
+    echo "${main_port:- -}"
+  else echo "子实例未初始化"; fi
+}
+
+# =========================================================
+# 5. 证书与端口隔离引导生成
+# =========================================================
+inst_cert() {
+  local instance="$1"
+  local cert_path="${BASE_DIR}/server_${instance}.crt"
+  local key_path="${BASE_DIR}/server_${instance}.key"
+
+  echo "---------------------------------------------"
+  echo -e "实例 [ ${instance} ] 证书配置选择："
+  echo -e " 1) 必应自签证书${YELLOW}（默认）${RESET}"
+  echo -e " 2) Acme自动申请 (需临时放行公网 80 端口)"
+  echo -e " 3) 自定义外部证书路径"
+  echo "---------------------------------------------"
+  local certInput
+  read -rp "请输入选项 [1-3] (回车默认自签): " certInput
+  certInput=${certInput:-1}
+
+  if [[ $certInput == 2 ]]; then
+    local vps_ip=$(get_public_ip)
+    read -rp "请输入要绑定的域名: " domain
+    [[ -z $domain ]] && error "未输入域名，操作取消！" && return 1
+
+    local acme_cmd="/root/.acme.sh/acme.sh"
+    if [[ ! -f "$acme_cmd" ]]; then
+      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+    fi
+    "$acme_cmd" --set-default-ca --server letsencrypt
+    
+    local reload_cmd="systemctl restart hysteria-server@${instance}"
+    
+    if [[ "$vps_ip" =~ ":" ]]; then
+      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+    else
+      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+    fi
+
+    if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "$reload_cmd"; then
+      hy_domain=$domain
+      info "Acme 独立实例证书部署成功，并已绑定无人值守重载机制！"
+    else
+      error "Acme 申请失败，降级回自签模式。"
+      certInput=1
+    fi
+  elif [[ $certInput == 3 ]]; then
+    while true; do
+      local user_cert user_key
+      read -rp "请输入公钥文件 (fullchain.pem/crt) 绝对路径: " user_cert
+      read -rp "请输入密钥文件 (privkey.pem/key) 绝对路径: " user_key
+      read -rp "请输入对应域名: " hy_domain
+      if [[ -f "$user_cert" && -f "$user_key" ]]; then
+        rm -f "$cert_path" "$key_path"
+        fix_external_cert_permission "$user_cert" "$user_key" "hysteria" || continue
+        ln -sf "$user_cert" "$cert_path"
+        ln -sf "$user_key" "$key_path"
+        break
+      else
+        error "路径未找到，请重新输入！"
+      fi
+    done
+  fi
+
+  if [[ $certInput == 1 ]]; then
+    rm -f "$cert_path" "$key_path"
+    openssl ecparam -genkey -name prime256v1 -out "$key_path"
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
+    hy_domain="www.bing.com"
+  fi
+
+  chown -h hysteria:hysteria "$cert_path" "$key_path" 2>/dev/null || true
+  export EVAL_CERT_PATH="$cert_path"
+  export EVAL_KEY_PATH="$key_path"
+  export EVAL_DOMAIN="$hy_domain"
+}
+
+inst_port() {
+  local instance="$1"
+  local conf_file="${BASE_DIR}/config_${instance}.yaml"
+  local hy_dir="${HY_DIR_BASE}/${instance}"
+  local default_port=""
+
+  [[ -f "$conf_file" ]] && default_port=$(grep -E '^listen:' "$conf_file" | awk -F ':' '{print $3}' | tr -d ' ')
+  local prompt_msg="设置该实例监听主端口 (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置该实例监听主端口 [当前: ${default_port}, 回车不修改]: "
+
+  while true; do
+    read -rp "$prompt_msg" port
+    port=${port:-$default_port}
+    [[ -z "$port" ]] && port=$(get_random_port) && info "为您分发未占用端口: $port" && break
+    if is_valid_port "$port"; then
+      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
+        error "端口 ${port} 已被占用，请更换。" && continue
+      fi
+      break
+    else error "请输入合法端口数字！"; fi
+  done
+
+  # 清理专属于此实例的老端口跳跃链，防多实例串味
+  iptables -t nat -F "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -j "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
+  iptables -t nat -X "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
+  ip6tables -t nat -F "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
+  ip6tables -t nat -D PREROUTING -j "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
+  ip6tables -t nat -X "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
+
+  echo "---------------------------------------------"
+  echo -e "实例端口跳跃流控模式："
+  echo -e " 1) 单端口独立模式"
+  echo -e " 2) 端口跳跃分流模式"
+  echo "---------------------------------------------"
+  local jumpInput
+  read -rp "请选择模式 [1-2] (直接回车保持单端口): " jumpInput
+  jumpInput=${jumpInput:-1}
+
+  if [[ $jumpInput == 2 ]]; then
+    while true; do
+      read -rp "设置起始端口: " firstport
+      read -rp "设置结束端口: " endport
+      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then break;
+      else error "输入无效，起始端口必须小于末尾端口！"; fi
+    done
+
+    # 建立隔离型专属自定义链名
+    iptables -t nat -N "HY2_JUMP_${instance}" 2>/dev/null || true
+    iptables -t nat -A "HY2_JUMP_${instance}" -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
+    iptables -t nat -I PREROUTING -j "HY2_JUMP_${instance}"
+    
+    ip6tables -t nat -N "HY2_JUMP_${instance}" 2>/dev/null || true
+    ip6tables -t nat -A "HY2_JUMP_${instance}" -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
+    ip6tables -t nat -I PREROUTING -j "HY2_JUMP_${instance}"
+
+    if has_command netfilter-persistent; then command netfilter-persistent save >/dev/null 2>&1 || true; fi
+    info "已成功下发隔离型端口跳跃规则: $firstport-$endport -> $port"
+  else
+    firstport="" && endport=""
+  fi
+}
+
+write_and_show_config() {
+  local instance="$1"
+  local conf_file="${BASE_DIR}/config_${instance}.yaml"
+  local hy_dir="${HY_DIR_BASE}/${instance}"
+  local HOSTNAME=$(hostname -s | sed 's/ /_/g')
+  local vps_ip=$(get_public_ip)
+
+  local is_insecure="0" skip_cert="false" yaml_insecure="false"
+  if [[ "$EVAL_DOMAIN" == "www.bing.com" ]]; then
+    is_insecure="1" skip_cert="true" yaml_insecure="true"
+  fi
+
+  cat << EOF > "$conf_file"
+listen: :$port
+tls:
+  cert: $EVAL_CERT_PATH
+  key: $EVAL_KEY_PATH
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+auth:
+  type: password
+  password: $auth_pwd
+masquerade:
+  type: proxy
+  proxy:
+    url: https://$proxysite
+    rewriteHost: true
+EOF
+
+  local last_port=$port
+  [[ -n "${firstport}" && -n "${endport}" ]] && last_port="$port,$firstport-$endport"
+  local last_ip="$vps_ip"
+  [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
+
+  mkdir -p "$hy_dir"
+  cat << EOF > "$hy_dir/hy-client.yaml"
+server: $last_ip:$last_port
+auth: $auth_pwd
+tls:
+  sni: $EVAL_DOMAIN
+  insecure: $yaml_insecure
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+fastOpen: true
+socks5:
+  listen: 127.0.0.1:5678
+transport:
+  udp:
+    hopInterval: 30s 
+EOF
+
+  cat << EOF > "$hy_dir/url.txt"
+矩阵独立子实例分享: [ ${instance} ]
+外网出口地址: $vps_ip
+V2rayN 分享链接:
+hysteria2://$auth_pwd@$last_ip:$port?insecure=${is_insecure}&sni=$EVAL_DOMAIN#$HOSTNAME-hy-${instance}
+
+Surge 配置格式:
+$HOSTNAME-hy-${instance} = hysteria2, $vps_ip, $port, password=$auth_pwd, skip-cert-verify=${skip_cert}, sni=$EVAL_DOMAIN
+EOF
+
+  local inst_data_dir="${DATA_BASE_DIR}/${instance}"
+  install -m 0750 -o hysteria -g hysteria -d "$inst_data_dir"
+  chown -R hysteria:hysteria "$conf_file" 2>/dev/null || true
+  register_instance "$instance"
+
+  systemctl daemon-reload
+  systemctl enable "hysteria-server@${instance}" >/dev/null 2>&1 || true
+  systemctl restart "hysteria-server@${instance}" >/dev/null 2>&1 || true
+
+  if systemctl is-active --quiet "hysteria-server@${instance}" 2>/dev/null; then
+    info "Hysteria 2 子实例 [ ${instance} ] 配置下发并运行成功！"
+  else
+    error "实例服务下发完成，但拉起响应失败。请通过菜单 [8] 排查系统滚动日志。"
+  fi
+}
+
+# =========================================================
+# 6. 面板主功能：安装、精细修改、卸载与矩阵切换
+# =========================================================
+insthysteria() {
+  local mode="${1:-new}"
+  check_environment
+  
+  if ! has_command apt; then
+    if has_command yum || has_command dnf; then install_software "iptables-services"; fi
+  else
+    install_software "iptables-persistent netfilter-persistent"
+  fi
+
+  if [[ ! -f "$INSTALL_BIN" ]]; then
+    info "全局引擎内核缺失，准备同步拉取核心组件..."
+    local latest_version=$(get_latest_version)
+    [[ -z "$latest_version" ]] && error "无法获取云端最新版本！" && return 1
+    local _tmpfile=$(mktemp)
+    download_hysteria "$latest_version" "$_tmpfile" || return 1
+    install -Dm755 "$_tmpfile" "$INSTALL_BIN"
+    rm -f "$_tmpfile"
+  fi
+
+  if ! is_user_exists "hysteria"; then
+    useradd -r -d "$DATA_BASE_DIR" -m -s /usr/sbin/nologin hysteria >/dev/null 2>&1 || true
+  fi
+  write_systemd_template
+
+  local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.yaml"
+  if [[ "$mode" == "new" && -f "$conf_file" ]]; then
+    warn "检测到当前聚焦的实例名 [ ${CURRENT_INSTANCE} ] 已经存在配置。"
+    read -rp "是否彻底抹除、重新下发覆盖此实例配置？[y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return
+  fi
+
+  if [[ "$mode" == "edit" ]]; then
+    echo -e "\n${GREEN}==== [正在精细修改实例参数: ${CURRENT_INSTANCE}] ====${RESET}"
+    local old_pwd=$(grep -E '^\s*password:' "$conf_file" | awk '{print $2}' | tr -d '"'\' || true)
+    local old_cert=$(grep -E '^\s*cert:' "$conf_file" | awk '{print $2}' | tr -d '"'\' || true)
+    local old_key=$(grep -E '^\s*key:' "$conf_file" | awk '{print $2}' | tr -d '"'\' || true)
+    local old_site=$(grep -E '^\s*url:' "$conf_file" | awk '{print $2}' | sed 's#https://##' | tr -d '"'\' || true)
+    local old_sni="www.bing.com"
+    [[ -f "${HY_DIR_BASE}/${CURRENT_INSTANCE}/hy-client.yaml" ]] && old_sni=$(grep -E '^\s*sni:' "${HY_DIR_BASE}/${CURRENT_INSTANCE}/hy-client.yaml" | awk '{print $2}' | tr -d '"'\' || true)
+  fi
+
+  inst_cert "$CURRENT_INSTANCE" || return 1
+  inst_port "$CURRENT_INSTANCE"
+
+  if [[ "$mode" == "edit" ]]; then
+    read -rp "配置鉴权验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+    auth_pwd=${auth_pwd:-$old_pwd}
+    read -rp "配置伪装网站地址 [当前: ${old_site}, 回车不修改]: " proxysite
+    proxysite=${proxysite:-$old_site}
+  else
+    read -rp "设置验证密码 (回车分配高强度随机密钥): " auth_pwd
+    auth_pwd=${auth_pwd:-$(generate_random_password)}
+    read -rp "设置伪装网站域名 (默认: en.snu.ac.kr): " proxysite
+    proxysite=${proxysite:-"en.snu.ac.kr"}
+  fi
+
+  write_and_show_config "$CURRENT_INSTANCE"
+}
+
+unsthysteria() {
+  warn "⚠️ 警告：该操作将直接抹除当前管理的实例 [ ${CURRENT_INSTANCE} ] 所有资源。"
+  read -rp "确定完全销毁并卸载此实例吗？[y/N]: " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || return
+
+  systemctl stop "hysteria-server@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  systemctl disable "hysteria-server@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  
+  # 清洗对应的专属端口跳跃链条
+  iptables -t nat -F "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -j "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  iptables -t nat -X "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  ip6tables -t nat -F "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  ip6tables -t nat -D PREROUTING -j "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  ip6tables -t nat -X "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  if has_command netfilter-persistent; then command netfilter-persistent save >/dev/null 2>&1 || true; fi
+
+  rm -f "${BASE_DIR}/config_${CURRENT_INSTANCE}.yaml"
+  rm -f "${BASE_DIR}/server_${CURRENT_INSTANCE}.crt" "${BASE_DIR}/server_${CURRENT_INSTANCE}.key"
+  rm -rf "${DATA_BASE_DIR}/${CURRENT_INSTANCE}" "${HY_DIR_BASE}/${CURRENT_INSTANCE}"
+
+  unregister_instance "$CURRENT_INSTANCE"
+  ok "矩阵实例 [ ${CURRENT_INSTANCE} ] 彻底安全移除。"
+
+  # 矩阵自净逻辑：如果没有活跃实例，深度清理全局环境
+  sync_registry
+  if [ ! -s "$REGISTRY_FILE" ]; then
+    info "检测到矩阵内已无任何活跃节点，深度自动卸载全系统共享组件..."
+    rm -f /etc/systemd/system/hysteria-server@.service
+    rm -f "$INSTALL_BIN"
+    rm -rf "$BASE_DIR" "$DATA_BASE_DIR" "$HY_DIR_BASE"
+    userdel hysteria >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    ok "全系统宿主机残留已深度彻底清洗清除。"
+    CURRENT_INSTANCE="hy2"
+  fi
 }
 
 menu_switch_matrix() {
-    echo -e "\n${GREEN}==== [多开实例 Systemd 节点矩阵管理中心] ====${RESET}"
-    echo -e "当前聚焦的操作目标: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo "目前持久化注册表内的独立实例列表:"
+  echo -e "\n${GREEN}==== [Hysteria 2 多开实例矩阵分流中心] ====${RESET}"
+  echo -e "当前聚焦的操作目标实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+  echo "当前已激活的矩阵实例列表:"
 
-    sync_registry
-    local instance_list=() count=0
+  sync_registry
+  local count=0
+  local -a instance_list=()
 
-    if [ -f "$REGISTRY_FILE" ]; then
-        while IFS= read -r name || [ -n "$name" ]; do
-            [ -z "$name" ] && continue
-            local c_file="${BASE_DIR}/config_${name}.conf"
-            [ -f "$c_file" ] || continue
+  if [ -f "$REGISTRY_FILE" ]; then
+    while IFS= read -r name || [ -n "$name" ]; do
+      [ -z "$name" ] && continue
+      local c_file="${BASE_DIR}/config_${name}.yaml"
+      [ -f "$c_file" ] || continue
 
-            ((count++))
-            instance_list+=("$name")
-            
-            local port_num=$(grep '^listen' "$c_file" | awk -F: '{print $NF}' | cut -d',' -f1)
-            local status_str="${RED}已挂起${RESET}"
-            systemctl is-active --quiet "snellv6@${name}" && status_str="${GREEN}分流中${RESET}"
-            
-            echo -e " [ ${CYAN}${count}${RESET} ] -> ${YELLOW}${name}${RESET} [分配端口: ${port_num} | 核心状态: ${status_str}]"
-        done < "$REGISTRY_FILE"
-    fi
+      count=$((count + 1))
+      instance_list[$count]="$name"
+      
+      local port_num=$(grep -E '^listen:' "$c_file" | awk -F ':' '{print $3}' | tr -d ' ')
+      local status_str="${RED}已休眠挂起${RESET}"
+      if systemctl is-active --quiet "hysteria-server@${name}"; then status_str="${GREEN}分流中${RESET}"; fi
+      echo -e " [ ${CYAN}${count}${RESET} ] -> 实例空间: ${YELLOW}${name}${RESET} [核心端口: ${port_num} | 运行状态: ${status_str}]"
+    done < "$REGISTRY_FILE"
+  fi
 
-    [[ "$count" -eq 0 ]] && echo " (矩阵内空空如也，请直接输入新名称新建多开节点)"
-    
-    echo ""
-    echo -e "👉 ${GREEN}输入已有实例前面的【数字编号】快速切换管理目标${RESET}"
-    echo -e "👉 ${GREEN}或者直接输入一个【全新的英文名字】来新建多开实例${RESET}"
-    local input_val=""
-    read -r -p "请输入选择或新实例名字: " input_val
+  if [ "$count" -eq 0 ]; then echo " (当前矩阵内空空如也，请直接在下方输入新名字创建第一个多开实例)"; fi
+  
+  echo ""
+  echo -e "👉 ${GREEN}输入已有实例前面的【数字编号】快速切换管理焦点${RESET}"
+  echo -e "👉 ${GREEN}或者直接输入一个【全新的英文别名】来新建独立多开实例${RESET}"
+  read -rp "请输入您的选择: " input_val
+  [[ -z "$input_val" ]] && return
 
-    if [ -z "$input_val" ]; then return; fi
-
-    if [[ "$input_val" =~ ^[0-9]+$ ]]; then
-        if [ "$input_val" -gt 0 ] && [ "$input_val" -le "$count" ]; then
-            local index=$((input_val - 1))
-            CURRENT_INSTANCE="${instance_list[$index]}"
-            ok "操作焦点已成功切为实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-        else
-            warn "编号超出可用范围！"
-        fi
-    else
-        if is_valid_alias "$input_val"; then
-            CURRENT_INSTANCE="$input_val"
-            ok "已成功锁定新焦点: ${YELLOW}${CURRENT_INSTANCE}${RESET} (请在主菜单按 1 完成实际下发部署)"
-        else
-            error "命名仅限英文字母/数字/下划线组合！"
-        fi
-    fi
+  if [[ "$input_val" =~ ^[0-9]+$ ]]; then
+    if [ "$input_val" -gt 0 ] && [ "$input_val" -le "$count" ]; then
+      CURRENT_INSTANCE="${instance_list[$input_val]}"
+      ok "操作焦点成功切为已有实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+    else warn "编号超出可用范围！"; fi
+  else
+    if [[ "$input_val" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+      CURRENT_INSTANCE="$input_val"
+      ok "已锁定全新焦点: ${YELLOW}${CURRENT_INSTANCE}${RESET} (请选择菜单 [1] 下发独立节点配置)"
+    else warn "命名不规范，仅支持英文字母、数字、中/下划线！"; fi
+  fi
 }
 
-get_panel_status_info() {
-    if systemctl is-active --quiet "snellv6@${CURRENT_INSTANCE}"; then
-        panel_status="${GREEN}运行中${RESET}"
-    else
-        panel_status="${RED}未运行${RESET}"
-    fi
-
-    if [ -x "$BASE_DIR/snell-server" ]; then
-        panel_version=$("$BASE_DIR/snell-server" -v 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n1)
-        [[ -z "$panel_version" ]] && panel_version="v6.X 内核"
-    else
-        panel_version="${RED}未下载内核${RESET}"
-    fi
-
-    local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
-    if [ -f "$conf_file" ]; then
-        panel_port=$(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')
-    else
-        panel_port="未创建节点配置"
-    fi
+showconf() {
+  local hy_dir="${HY_DIR_BASE}/${CURRENT_INSTANCE}"
+  if [[ ! -d "$hy_dir" ]]; then
+    error "未找到 [ ${CURRENT_INSTANCE} ] 客户端配置文件，请先下发部署该实例。"
+    return
+  fi
+  echo -e "${GREEN}====== 客户端 YAML 配置 (实例: ${CURRENT_INSTANCE}) ======${RESET}"
+  cat "$hy_dir/hy-client.yaml"
+  echo
+  echo -e "${GREEN}====== 节点分享链接 (实例: ${CURRENT_INSTANCE}) ======${RESET}"
+  cat "$hy_dir/url.txt"
+  echo
 }
 
-# ── 主轮询路由中心 ────────────────────────────────────────────────────────────
-while true; do
-    get_panel_status_info
+# =========================================================
+# 7. 面板主菜单
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  check_environment
+
+  while true; do
     clear
+    local status=$(get_hy_status)
+    local version=$(get_installed_version)
+    local port_show=$(get_current_port_display)
+
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} ◈  Snell v6 Systemd 矩阵多实例管理面板   ◈ ${RESET}"
+    echo -e "${GREEN}   ◈  Hysteria 2 矩阵多实例控制面板  ◈    ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}目标节点监听 :${RESET} ${YELLOW}${panel_port}${RESET}"
-    echo -e "${GREEN}服务活跃状态 :${RESET} $panel_status"
-    echo -e "${GREEN}核心沙箱引擎 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}目标实例端口 :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}服务活跃状态 :${RESET} $status"
+    echo -e "${GREEN}核心共享引擎 :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} 1. 安装当前焦点实例${RESET}"
-    echo -e "${GREEN} 2. 更新全局内核程序${RESET}"
-    echo -e "${GREEN} 3. 卸载当前焦点实例${RESET}"
-    echo -e "${GREEN} 4. 修改当前焦点实例配置${RESET}"
+    echo -e "${GREEN} 1. 安装/下发当前焦点实例配置${RESET}"
+    echo -e "${GREEN} 2. 更新全局共享内核二进制程序${RESET}"
+    echo -e "${GREEN} 3. 销毁并卸载当前焦点实例${RESET}"
+    echo -e "${GREEN} 4. 精细修改当前焦点实例配置${RESET}"
     echo -e "${GREEN} 5. 启动当前焦点实例${RESET}"
     echo -e "${GREEN} 6. 停止当前焦点实例${RESET}"
     echo -e "${GREEN} 7. 重启当前焦点实例${RESET}"
-    echo -e "${GREEN} 8. 查看当前实例滚动日志 (Journald)${RESET}"
-    echo -e "${GREEN} 9. 查看当前实例 Surge 配置单行${RESET}"
-    echo -e "${GREEN}10. 管理节点矩阵矩阵${RESET}  ${YELLOW}← 添加 / 切换独立实例${RESET}"
-    echo -e "${GREEN} 0. 退出管理台面${RESET}"
+    echo -e "${GREEN} 8. 查看当前实例系统日志 (journalctl)${RESET}"
+    echo -e "${GREEN} 9. 打印查看当前实例客户端链接信息${RESET}"
+    echo -e "${GREEN}10. 管理/切换节点矩阵矩阵列表${RESET}  ${YELLOW}← 添加 / 隔离切换新旧实例${RESET}"
+    echo -e "${GREEN} 0. 安全退出当前管理台面${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
-    
-    choice=""
-    read -r -p "$(echo -e "${GREEN}选择操作序号: ${RESET}")" choice || true
+
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
     case "$choice" in
-        1) menu_install_instance "new" ; pause ;;
-        2) 
-            VER=$(get_latest_snell_version)
-            download_and_extract_snell "$VER" && ok "内核升级完毕，请按 7 重启各实例生效。" ; pause
-            ;;
-        3) menu_uninstall_instance ; pause ;;
-        4) menu_install_instance "edit" ; systemctl restart "snellv6@${CURRENT_INSTANCE}" ; pause ;;
-        5) systemctl start "snellv6@${CURRENT_INSTANCE}" ; pause ;;
-        6) systemctl stop "snellv6@${CURRENT_INSTANCE}" ; pause ;;
-        7) systemctl restart "snellv6@${CURRENT_INSTANCE}" ; pause ;;
-        8) 
-            echo -e "${BLUE}[信息] 正在调用 Journald 捕获实时日志输出 (Ctrl+C 返回菜单):${RESET}"
-            journalctl -u "snellv6@${CURRENT_INSTANCE}" -f -n 50
-            ;;
-        9) print_instance_summary "$CURRENT_INSTANCE" ; pause ;;
-        10) menu_switch_matrix ;;
-        0) exit 0 ;;
-        *) echo -e "${YELLOW}[警告] 输入未知操作序号！${RESET}" ; sleep 0.5 ;;
+      1) insthysteria "new"; pause ;;
+      2) 
+        local latest_version=$(get_latest_version)
+        if [[ -n "$latest_version" ]]; then
+          local _tmpfile=$(mktemp)
+          if download_hysteria "$latest_version" "$_tmpfile"; then
+            install -Dm755 "$_tmpfile" "$INSTALL_BIN" && rm -f "$_tmpfile"
+            ok "共享主内核引擎升级完毕，所有子实例重启后随之生效。"
+          fi
+        else error "获取云端版本号失败。"; fi
+        pause ;;
+      3) unsthysteria; pause ;;
+      4) insthysteria "edit"; pause ;;
+      5) systemctl start "hysteria-server@${CURRENT_INSTANCE}" && info "子实例已成功启动！" ; pause ;;
+      6) systemctl stop "hysteria-server@${CURRENT_INSTANCE}" && info "子实例已成功进入休眠停止状态！" ; pause ;;
+      7) systemctl restart "hysteria-server@${CURRENT_INSTANCE}" && info "子实例已成功平滑重启！" ; pause ;;
+      8) 
+        echo -e "${YELLOW}正在调取该实例实时滚动日志 (输入 q 或 Ctrl+C 退出返回):${RESET}\n"
+        journalctl -u "hysteria-server@${CURRENT_INSTANCE}" -n 50 -f || true
+        ;;
+      9) showconf; pause ;;
+      10) menu_switch_matrix ;;
+      0) clear; exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 0.5 ;;
     esac
-done
+  done
+}
+
+menu "$@"

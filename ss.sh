@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =============================================================================
-#  Snell v6 Server 智能多实例矩阵管理面板 (Linux Systemd 专属强力修复版)
+#  Snell v6 Server 智能多实例矩阵管理面板 (Linux Systemd 专属强力版)
 #  完美兼容: Surge Mac / iOS 客户端 (全面支持多实例隔离、IPv6 自动包裹)
 # =============================================================================
 
@@ -111,12 +111,13 @@ sync_registry() {
 # ── 智能动态感知 Snell v6 版本 ──────────────────────────────────────────────
 get_latest_snell_version() {
     local latest_version=""
+    # 针对部分握手可能受阻的环境，增加超时和伪装 Agent 防御机制
     latest_version=$(curl -sL --connect-timeout 4 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
         "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | \
         grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
         
     if [[ -z "$latest_version" ]]; then
-        latest_version="v6.0.0b4" 
+        latest_version="v6.0.0b4" # 稳健的保底正式版
     fi
     echo "$latest_version"
 }
@@ -169,24 +170,16 @@ download_and_extract_snell() {
     ok "Snell 二进制核心解压成功！"
 }
 
-# ── 核心写入与 Surge 配置优雅生成 (修复版) ──────────────────────────────────
+# ── 核心写入与 Surge 配置优雅生成 ────────────────────────────────────────────
 write_config() {
-    local instance="$1" port="$2" psk="$3" mode="$4" listen_mode="$5" dns_pref="$6" obfs="$7" tfo="$8" dns="$9"
+    local instance="$1" port="$2" psk="$3" mode="$4" listen="$5" dns_pref="$6" obfs="$7" tfo="$8" dns="$9"
     local conf_file="${BASE_DIR}/config_${instance}.conf"
     
     mkdir -p "$BASE_DIR"
 
-    # 【核心重构修复点】：动态根据新输入的 port 重新渲染 listen 字段，防范旧配置文件脏换行符污染
-    local real_listen=""
-    case "$listen_mode" in
-        *"0.0.0.0"*) real_listen="0.0.0.0:${port}" ;;
-        *"[::]"*)    real_listen="[::]:${port}" ;;
-        *)           real_listen="0.0.0.0:${port},[::]:${port}" ;;
-    esac
-
     cat > "$conf_file" <<EOF
 [snell-server]
-listen = ${real_listen}
+listen = ${listen}
 psk = ${psk}
 mode = ${mode}
 obfs = ${obfs}
@@ -196,9 +189,10 @@ dns-ip-preference = ${dns_pref}
 EOF
 
     chmod 600 "$conf_file"
-    chown -R "$SNELL_USER":"$SNELL_USER" "$BASE_DIR" 2>/dev/null || true
+    chown -R "$SNELL_USER":"$SNELL_USER" "$BASE_DIR"
     register_instance "$instance"
 
+    # 生成 Surge 单行配置，在遇到 IPv6 地址时进行自动包裹防护 `[...]`
     local ip=$(get_public_ip "auto")
     local display_ip="$ip"
     if [[ "$ip" == *":"* ]]; then display_ip="[$ip]"; fi
@@ -215,18 +209,18 @@ print_instance_summary() {
     [[ ! -f "$conf_file" ]] && return
 
     echo -e "\n${GREEN}====== Snell v6 实例 [ ${instance} ] 配置详情 ======${RESET}"
-    echo -e "${GREEN} 绑定监听 (Listen) :${RESET} $(grep '^listen' "$conf_file" | awk -F'=[ ]*' '{print $2}')"
-    echo -e "${GREEN} 密钥 (PSK)        :${RESET} $(grep '^psk' "$conf_file" | awk -F'=[ ]*' '{print $2}')"
-    echo -e "${GREEN} 工作模式 (Mode)   :${RESET} $(grep '^mode' "$conf_file" | awk -F'=[ ]*' '{print $2}')"
-    echo -e "${GREEN} Fast Open (TFO)   :${RESET} $(grep '^tfo' "$conf_file" | awk -F'=[ ]*' '{print $2}')"
+    echo -e "${GREEN} 绑定监听 (Listen) :${RESET} $(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')"
+    echo -e "${GREEN} 密钥 (PSK)        :${RESET} $(grep '^psk' "$conf_file" | awk -F'= ' '{print $2}')"
+    echo -e "${GREEN} 工作模式 (Mode)   :${RESET} $(grep '^mode' "$conf_file" | awk -F'= ' '{print $2}')"
+    echo -e "${GREEN} Fast Open (TFO)   :${RESET} $(grep '^tfo' "$conf_file" | awk -F'= ' '{print $2}')"
     echo "------------------------------------------------------------------------"
     if [[ -f "${BASE_DIR}/link_${instance}.txt" ]]; then
-        echo -e "${GREEN}[Surge 节点配置托管文本] :${RESET}"
+        echo -e "${GREEN}[Surge 节点配置托管托管] :${RESET}"
         echo -e "${YELLOW}$(cat "${BASE_DIR}/link_${instance}.txt")${RESET}\n"
     fi
 }
 
-# ── 交互式多开逻辑 (修复版) ──────────────────────────────────────────────────
+# ── 交互式多开逻辑 ────────────────────────────────────────────────────────────
 menu_install_instance() {
     create_user
     mkdir -p "$BASE_DIR"
@@ -239,25 +233,14 @@ menu_install_instance() {
     local old_port old_key old_mode old_listen old_dns_pref old_obfs old_tfo old_dns
     if [ "$is_edit" = "true" ] && [ -f "$conf_file" ]; then
         echo -e "\n${GREEN}==== [正在精细修改实例: ${CURRENT_INSTANCE}] ====${RESET}"
-        
-        # 【核心修复点】：添加 || true 阻断 set -eu 的进程强制终止，全面追加清洗规则
-        old_listen=$(grep '^listen[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
-        old_port=$(echo "$old_listen" | awk -F: '{print $NF}' | cut -d',' -f1 || echo "")
-        old_key=$(grep '^psk[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
-        old_mode=$(grep '^mode[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
-        old_obfs=$(grep '^obfs[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
-        old_tfo=$(grep '^tfo[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
-        old_dns=$(grep -E '^dns[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
-        old_dns_pref=$(grep '^dns-ip-preference[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
-        
-        # 空变量精准保底兜底
-        [[ -z "$old_port" ]] && old_port="61234"
-        [[ -z "$old_key" ]] && old_key=$(random_key)
-        [[ -z "$old_mode" ]] && old_mode="default"
-        [[ -z "$old_obfs" ]] && old_obfs="off"
-        [[ -z "$old_tfo" ]] && old_tfo="true"
-        [[ -z "$old_dns" ]] && old_dns="8.8.8.8,8.8.4.4"
-        [[ -z "$old_dns_pref" ]] && old_dns_pref="default"
+        old_listen=$(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')
+        old_port=$(echo "$old_listen" | awk -F: '{print $NF}' | cut -d',' -f1)
+        old_key=$(grep '^psk' "$conf_file" | awk -F'= ' '{print $2}')
+        old_mode=$(grep '^mode' "$conf_file" | awk -F'= ' '{print $2}')
+        old_obfs=$(grep '^obfs' "$conf_file" | awk -F'= ' '{print $2}')
+        old_tfo=$(grep '^tfo' "$conf_file" | awk -F'= ' '{print $2}')
+        old_dns=$(grep '^dns' "$conf_file" | awk -F'= ' '{print $2}')
+        old_dns_pref=$(grep '^dns-ip-preference' "$conf_file" | awk -F'= ' '{print $2}')
     else
         if [ -f "$conf_file" ]; then
             warn "检测到该实例 [ ${CURRENT_INSTANCE} ] 已创建过配置。"
@@ -319,12 +302,20 @@ menu_install_instance() {
     echo "2. 仅绑定监听 IPv4 (0.0.0.0)"
     echo "3. 仅绑定监听 IPv6 ([::])"
     local choice_listen="" opt_listen=""
-    read -r -p "请选择 (直接回车保持默认/当前): " choice_listen
+    read -r -p "请选择 (直接回车保持默认/智能同步新端口): " choice_listen
     case "$choice_listen" in
-        2) opt_listen="0.0.0.0" ;;
-        3) opt_listen="[::]" ;;
-        1) opt_listen="dual" ;;
-        *) opt_listen=${old_listen} ;;
+        2) opt_listen="0.0.0.0:${opt_port}" ;;
+        3) opt_listen="[::]:${opt_port}" ;;
+        1) opt_listen="0.0.0.0:${opt_port},[::]:${opt_port}" ;;
+        *) 
+            # 如果直接回车，且有旧的监听配置
+            if [ -n "${old_listen:-}" ]; then
+                # 智能把旧监听配置里所有的旧端口，替换为新输入/生成的目标端口
+                opt_listen=$(echo "$old_listen" | sed -E "s/([:])[0-9]+/\1${opt_port}/g")
+            else
+                opt_listen="0.0.0.0:${opt_port},[::]:${opt_port}"
+            fi
+            ;;
     esac
 
     # 5. 家族优先级
@@ -379,7 +370,7 @@ menu_install_instance() {
 
     sleep 1
     if systemctl is-active --quiet "snellv6@${CURRENT_INSTANCE}"; then
-        ok "实例 [ ${CURRENT_INSTANCE} ] 多开分流矩阵启动成功并已成功应用！"
+        ok "实例 [ ${CURRENT_INSTANCE} ] 多开分流矩阵启动成功！"
         print_instance_summary "$CURRENT_INSTANCE"
     else
         error "实例配置下发完成，但拉起失败。请按菜单选项 8 查看服务系统错误日志。"
@@ -420,6 +411,7 @@ menu_uninstall_instance() {
     unregister_instance "$CURRENT_INSTANCE"
     ok "实例 [ ${CURRENT_INSTANCE} ] 现场清洗干净。"
 
+    # 全栈自清洗常驻组件
     if [ -d "$BASE_DIR" ] && [ -z "$(ls -A "$BASE_DIR" | grep 'config_')" ]; then
         info "检测到矩阵内已无任何子实例，自动启动全局常驻清理程序..."
         rm -f /etc/systemd/system/snellv6@.service
@@ -499,7 +491,7 @@ get_panel_status_info() {
 
     local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
     if [ -f "$conf_file" ]; then
-        panel_port=$(grep '^listen' "$conf_file" | awk -F'=[ ]*' '{print $2}')
+        panel_port=$(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')
     else
         panel_port="未创建节点配置"
     fi
@@ -539,7 +531,7 @@ while true; do
             download_and_extract_snell "$VER" && ok "内核升级完毕，请按 7 重启各实例生效。" ; pause
             ;;
         3) menu_uninstall_instance ; pause ;;
-        4) menu_install_instance "edit" ; pause ;;
+        4) menu_install_instance "edit" ; systemctl restart "snellv6@${CURRENT_INSTANCE}" ; pause ;;
         5) systemctl start "snellv6@${CURRENT_INSTANCE}" ; pause ;;
         6) systemctl stop "snellv6@${CURRENT_INSTANCE}" ; pause ;;
         7) systemctl restart "snellv6@${CURRENT_INSTANCE}" ; pause ;;

@@ -1,515 +1,744 @@
-#!/usr/bin/sh
+#!/usr/bin/env bash
+#
+# Hysteria 2 矩阵多实例控制面板 (Linux Systemd 强力版)
+# SPDX-License-Identifier: MIT
+#
+# =========================================================
+# 1. 核心控制与全局环境初始化
+# =========================================================
+set -Eop pipefail
+export LANG=en_US.UTF-8
 
-# =============================================================================
-#  MicaProxy Alpine 专属多实例管理面板
-# =============================================================================
+# 基础隔离目录与硬编码配置
+export TEMPLATE_NAME="hysteria"
+export BASE_DIR="/etc/mo-hy2"
+export INSTALL_BIN="/usr/local/bin/hysteria"
+export DATA_BASE_DIR="/var/lib/hysteria"
+export HY_DIR_BASE="/root/proxynode/hy2"
 
-export REPO="judy-gotv/Rust-SOCKS5-HTTP"
-export BIN_PATH="/opt/MicaProxy/MicaProxy"
-export INSTANCE_DIR="/etc/MicaProxy"
-export DATA_DIR="/var/lib/micaproxy"
-export LOG_DIR="/opt/MicaProxy/log"
+# 注册表文件：持久化记录矩阵内所有活跃的实例名
+export REGISTRY_FILE="${BASE_DIR}/.instances.env"
 
 # 默认控制的目标实例名称自动改成当前主机名
-CURRENT_INSTANCE="$(hostname)"
+CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "hy2")"
 
-export RESET='\033[0m'
-export GREEN='\033[0;32m'
-export YELLOW='\033[0;33m'
-export RED='\033[0;31m'
-export BLUE='\033[0;34m'
-export CYAN='\033[0;36m'
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+REPO_URL="https://github.com/apernet/hysteria"
+API_BASE_URL="https://api.github.com/repos/apernet/hysteria"
 
-GITHUB_PROXIES=(
-    ""
-    "https://gh-proxy.com/"
-    "https://proxy.vvvv.ee/"
-    "https://v6.gh-proxy.org/"
-    "https://ghproxy.lvedong.eu.org/"
-    "https://hub.glowp.xyz/"
+# 自动检测环境变量占位
+PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
+OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+ARCHITECTURE="${ARCHITECTURE:-}"
+
+# 终端颜色代码
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
+RESET="\033[0m"
+
+# 全局实例控制变量占位
+firstport=""
+endport=""
+
+# GITHUB 代理列表
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
 )
 
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
-    exit 1
-fi
+# =========================================================
+# 2. 核心底层工具函数
+# =========================================================
+has_command() { type -P "$1" > /dev/null 2>&1; }
+curl() { command curl "${CURL_FLAGS[@]}" "$@"; }
+mktemp() { command mktemp "$@" "hyservinst.XXXXXXXXXX"; }
 
-info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
-ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
-die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
+info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+ok() { echo -e "${GREEN}[成功] $*${RESET}" >&2; }
+pause() { echo; read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制面板...${RESET}")"; }
 
-# ── ⚡ 优化：按需依赖检查 ─────────────────────────────────────────────────────
-REQUIRED_CMDS="sed grep awk openssl wget"
-MISSING_CMDS=""
-for cmd in $REQUIRED_CMDS; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then 
-        MISSING_CMDS="$MISSING_CMDS $cmd"
+generate_random_password() {
+  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
+}
+
+is_user_exists() { id "$1" > /dev/null 2>&1; }
+
+detect_package_manager() {
+  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
+  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
+  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
+  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
+  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
+  return 1
+}
+
+install_software() {
+  local _package_name="$1"
+  if ! detect_package_manager; then
+    error "未检测到支持的包管理器，请手动安装 $_package_name"
+    exit 65
+  fi
+  $PACKAGE_MANAGEMENT_INSTALL $_package_name >/dev/null 2>&1 || true
+}
+
+check_environment() {
+  if [[ "x$(uname)" != "xLinux" ]]; then
+    error "本脚本仅支持 Linux 系统。"
+    exit 95
+  fi
+
+  case "$(uname -m)" in
+    'i386' | 'i686') ARCHITECTURE='386' ;;
+    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='arm' ;;
+    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+    's390x') ARCHITECTURE='s390x' ;;
+    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
+  esac
+  OPERATING_SYSTEM=linux
+
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq || install_software jq
+  has_command openssl || install_software openssl
+  has_command socat || install_software socat
+  has_command python3 || install_software python3
+  has_command iptables || install_software iptables
+}
+
+get_installed_version() {
+  if [[ -f "$INSTALL_BIN" ]]; then
+    local version_out
+    version_out=$("$INSTALL_BIN" version 2>/dev/null || "$INSTALL_BIN" -v 2>/dev/null || echo "")
+    if [[ -n "$version_out" ]]; then
+      echo "$version_out" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
+    else echo "未知版本"; fi
+  else echo "未安装核心"; fi
+}
+
+get_latest_version() {
+  local _tmpfile=$(mktemp)
+  local _success=1
+  local _tag_name=""
+
+  for proxy in "${GITHUB_PROXY[@]}"; do
+    local _url="${proxy}${API_BASE_URL}/releases/latest"
+    if curl -sS -H 'Accept: application/vnd.github.v3+json' "$_url" -o "$_tmpfile"; then
+      _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
+      if [[ -n "$_tag_name" && "$_tag_name" != "null" ]]; then
+        _success=0
+        break
+      fi
     fi
-done
+  done
+  rm -f "$_tmpfile"
+  if [[ $_success -eq 0 ]]; then echo "${_tag_name##*\/}"; else echo ""; fi
+}
 
-if [ -n "$MISSING_CMDS" ] || [ ! -f /usr/glibc-compat/lib/ld-linux-x86-64.so.2 ]; then
-    info "检测到系统缺失必备组件或底层 glibc 运行环境，正在深度初始化 Alpine 兼容层..."
-    apk update -q
-    apk add -q openssl wget sed grep gawk ca-certificates
-    
-    # 下载并安装第三方社区维护的真正的 glibc 环境（解决 __res_init 等底层缺失问题）
-    wget -q -O /etc/apk/keys/sgerrand.rsa.pub https://alpine-pkgs.sgerrand.com/sgerrand.rsa.pub
-    wget https://github.com/sgerrand/alpine-pkg-glibc/releases/download/2.35-r1/glibc-2.35-r1.apk
-    apk add -q glibc-2.35-r1.apk
-    rm -f glibc-2.35-r1.apk
-    
-    ok "深度 glibc 环境虚拟化部署成功！"
-fi
+download_hysteria() {
+  local _version="$1"
+  local _destination="$2"
+  [[ ! "$_version" =~ "v" ]] && _version="v$_version"
+
+  for proxy in "${GITHUB_PROXY[@]}"; do
+    local _download_url="${proxy}${REPO_URL}/releases/download/app/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
+    info "正在通过代理 [${proxy:-直连}] 下载 Hysteria 核心 (尝试1) ..."
+    if curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then return 0; fi
+
+    _download_url="${proxy}${REPO_URL}/releases/download/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
+    info "正在通过代理 [${proxy:-直连}] 下载 Hysteria 核心 (尝试2) ..."
+    if curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then return 0; fi
+  done
+  error "核心下载失败！所有代理及直连均无法访问。"
+  return 11
+}
+
+# =========================================================
+# 3. 多实例矩阵持久化与内核注册表
+# =========================================================
+register_instance() {
+  local name="$1"
+  [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
+  touch "$REGISTRY_FILE"
+  if ! grep -q "^${name}$" "$REGISTRY_FILE" 2>/dev/null; then
+    echo "$name" >> "$REGISTRY_FILE"
+  fi
+}
+
+unregister_instance() {
+  local name="$1"
+  if [ -f "$REGISTRY_FILE" ]; then
+    sed -i "/^${name}$/d" "$REGISTRY_FILE"
+  fi
+}
+
+sync_registry() {
+  [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
+  touch "$REGISTRY_FILE"
+  local temp_reg=$(mktemp)
+  for f in "${BASE_DIR}"/config_*.yaml; do
+    [ -e "$f" ] || continue
+    local name=$(basename "$f" | sed 's/^config_//;s/\.yaml$//')
+    if [ -n "$name" ]; then echo "$name" >> "$temp_reg"; fi
+  done
+  mv -f "$temp_reg" "$REGISTRY_FILE"
+}
+
+# 动态实例化多开 Systemd 核心骨架
+write_systemd_template() {
+  local template_file="/etc/systemd/system/hysteria-server@.service"
+  cat << EOF > "$template_file"
+[Unit]
+Description=Hysteria 2 Server Service - Instance: %I
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$INSTALL_BIN server --config ${BASE_DIR}/config_%I.yaml
+WorkingDirectory=${DATA_BASE_DIR}/%I
+User=hysteria
+Group=hysteria
+Environment=HYSTERIA_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+# =========================================================
+# 4. 外部证书穿透赋权与网络辅助
+# =========================================================
+fix_external_cert_permission() {
+  local cert=$1 key=$2 target_user=${3:-hysteria}
+  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
+    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！非 root 运行用户无权穿透读取。"
+    info "权威推荐: 请重新导出证书到公共目录（如 /etc/ssl/ ）再试。"
+    return 1
+  fi
+  local cert_dir=$(dirname "$cert")
+  chmod +x "$cert_dir" 2>/dev/null || true
+  chmod 644 "$cert" "$key" 2>/dev/null || true
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:"$target_user":rx "$cert_dir" 2>/dev/null || true
+    setfacl -m u:"$target_user":r "$cert" "$key" 2>/dev/null || true
+  fi
+  return 0
+}
 
 get_public_ip() {
-    local ip=""
-    for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-        ip=$(wget -qO- --timeout=3 --tries=1 -T 3 --no-check-certificate "$url" 2>/dev/null) && [ -n "$ip" ] && [ -z "$(echo "$ip" | grep ':')" ] && echo "$ip" && return 0
+  local ip
+  for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+      ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
     done
-    echo "127.0.0.1"
+  done
+  echo "127.0.0.1"
 }
 
-detect_target() {
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64)  TARGET="micaproxy-linux-amd64" ;;
-        aarch64) TARGET="micaproxy-linux-arm64" ;;
-        armv7l)  TARGET="micaproxy-linux-armv7" ;;
-        *) die "暂不支持的系统架构: $ARCH" ;;
-    esac
+check_port() {
+  local port="$1"
+  if ss -tunlp 2>/dev/null | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
+    return 1 # 被占用
+  fi
+  return 0 # 可用
 }
 
-fetch_latest_version() {
-    info "正在轮询获取 MicaProxy 最新 Release 版本号..."
-    VERSION=""
-    for proxy in "${GITHUB_PROXIES[@]}"; do
-        local api_url="${proxy}https://api.github.com/repos/${REPO}/releases/latest"
-        local resp
-        resp=$(wget -qO- --timeout=5 --tries=1 --no-check-certificate "$api_url" 2>/dev/null)
-        local tmp_ver
-        tmp_ver=$(echo "$resp" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
-        if [ -n "$tmp_ver" ] && [ "$tmp_ver" != "null" ]; then
-            VERSION="$tmp_ver"
-            ok "成功获取到最新版本: ${GREEN}${VERSION}${RESET}"
-            break
-        fi
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
+
+get_random_port() {
+  local rand_port
+  while true; do
+    rand_port=$(shuf -i 2000-65535 -n 1)
+    check_port "$rand_port" && echo "$rand_port" && return 0
+  done
+}
+
+get_hy_status() {
+  if systemctl is-active --quiet "hysteria-server@${CURRENT_INSTANCE}" 2>/dev/null; then
+    echo -e "${GREEN}● 运行中${RESET}"
+  else
+    echo -e "${RED}● 未运行${RESET}"
+  fi
+}
+
+get_current_port_display() {
+  local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.yaml"
+  local hy_dir="${HY_DIR_BASE}/${CURRENT_INSTANCE}"
+  if [[ -f "$conf_file" ]]; then
+    local main_port=$(grep -E '^listen:' "$conf_file" | awk -F ':' '{print $3}' | tr -d ' ')
+    if [[ -f "$hy_dir/hy-client.yaml" ]]; then
+      local jump_range=$(grep -E '^server:' "$hy_dir/hy-client.yaml" | awk -F ',' '{print $2}' | tr -d ' ')
+      [[ -n "$jump_range" ]] && echo "${main_port} [跳跃: ${jump_range}]" && return
+    fi
+    echo "${main_port:- -}"
+  else echo "子实例未初始化"; fi
+}
+
+# =========================================================
+# 5. 证书与端口隔离引导生成
+# =========================================================
+inst_cert() {
+  local instance="$1"
+  local cert_path="${BASE_DIR}/server_${instance}.crt"
+  local key_path="${BASE_DIR}/server_${instance}.key"
+
+  echo "---------------------------------------------"
+  echo -e "实例 [ ${instance} ] 证书配置选择："
+  echo -e " 1) 必应自签证书${YELLOW}（默认）${RESET}"
+  echo -e " 2) Acme自动申请 (需临时放行公网 80 端口)"
+  echo -e " 3) 自定义外部证书路径"
+  echo "---------------------------------------------"
+  local certInput
+  read -rp "请输入选项 [1-3] (回车默认自签): " certInput
+  certInput=${certInput:-1}
+
+  if [[ $certInput == 2 ]]; then
+    local vps_ip=$(get_public_ip)
+    read -rp "请输入要绑定的域名: " domain
+    [[ -z $domain ]] && error "未输入域名，操作取消！" && return 1
+
+    local acme_cmd="/root/.acme.sh/acme.sh"
+    if [[ ! -f "$acme_cmd" ]]; then
+      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+    fi
+    "$acme_cmd" --set-default-ca --server letsencrypt
+    
+    local reload_cmd="systemctl restart hysteria-server@${instance}"
+    
+    if [[ "$vps_ip" =~ ":" ]]; then
+      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+    else
+      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+    fi
+
+    if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "$reload_cmd"; then
+      hy_domain=$domain
+      info "Acme 独立实例证书部署成功，并已绑定无人值守重载机制！"
+    else
+      error "Acme 申请失败，降级回自签模式。"
+      certInput=1
+    fi
+  elif [[ $certInput == 3 ]]; then
+    while true; do
+      local user_cert user_key
+      read -rp "请输入公钥文件 (fullchain.pem/crt) 绝对路径: " user_cert
+      read -rp "请输入密钥文件 (privkey.pem/key) 绝对路径: " user_key
+      read -rp "请输入对应域名: " hy_domain
+      if [[ -f "$user_cert" && -f "$user_key" ]]; then
+        rm -f "$cert_path" "$key_path"
+        fix_external_cert_permission "$user_cert" "$user_key" "hysteria" || continue
+        ln -sf "$user_cert" "$cert_path"
+        ln -sf "$user_key" "$key_path"
+        break
+      else
+        error "路径未找到，请重新输入！"
+      fi
     done
-    if [ -z "$VERSION" ]; then
-        VERSION="v3.0.6"
-        warn "降级采用稳定默认版本: ${VERSION}"
-    fi
+  fi
+
+  if [[ $certInput == 1 ]]; then
+    rm -f "$cert_path" "$key_path"
+    openssl ecparam -genkey -name prime256v1 -out "$key_path"
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
+    hy_domain="www.bing.com"
+  fi
+
+  chown -h hysteria:hysteria "$cert_path" "$key_path" 2>/dev/null || true
+  export EVAL_CERT_PATH="$cert_path"
+  export EVAL_KEY_PATH="$key_path"
+  export EVAL_DOMAIN="$hy_domain"
 }
 
-download_bin() {
-    detect_target
-    fetch_latest_version
-    TMP_DIR="$(mktemp -d)"
-    local download_success=false
-    
-    for proxy in "${GITHUB_PROXIES[@]}"; do
-        local url_bin="${proxy}https://github.com/${REPO}/releases/download/${VERSION}/${TARGET}"
-        info "正在尝试通过镜像源 [ ${CYAN}${proxy:-官方直连}${RESET} ] 下载资产包..."
-        if wget -q --timeout=8 --tries=1 --no-check-certificate -O "$TMP_DIR/MicaProxy" "$url_bin"; then
-            if [ -s "$TMP_DIR/MicaProxy" ]; then
-                download_success=true
-                ok "核心包通过 wget 同步下载完成！"
-                break
-            fi
-        fi
-        warn "当前源下载失败，正在为您自动切换下一个备用源..."
-    done
+inst_port() {
+  local instance="$1"
+  local conf_file="${BASE_DIR}/config_${instance}.yaml"
+  local hy_dir="${HY_DIR_BASE}/${instance}"
+  local default_port=""
 
-    if [ "$download_success" = "false" ]; then
-        rm -rf "$TMP_DIR"
-        die "所有 GitHub 镜像代理源及官方通道均尝试失败，请检查网络后重试！"
-    fi
-    export TARGET_BIN_PATH="$TMP_DIR/MicaProxy"
-}
+  [[ -f "$conf_file" ]] && default_port=$(grep -E '^listen:' "$conf_file" | awk -F ':' '{print $3}' | tr -d ' ')
+  local prompt_msg="设置该实例监听主端口 (回车随机分配): "
+  [[ -n "$default_port" ]] && prompt_msg="设置该实例监听主端口 [当前: ${default_port}, 回车不修改]: "
 
-write_openrc_service() {
-    local rc_file="/etc/init.d/micaproxy"
-    cat > "$rc_file" << 'EOF'
-#!/sbin/openrc-run
+  while true; do
+    read -rp "$prompt_msg" port
+    port=${port:-$default_port}
+    [[ -z "$port" ]] && port=$(get_random_port) && info "为您分发未占用端口: $port" && break
+    if is_valid_port "$port"; then
+      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
+        error "端口 ${port} 已被占用，请更换。" && continue
+      fi
+      break
+    else error "请输入合法端口数字！"; fi
+  done
 
-description="MicaProxy Multi-instance Service"
-INSTANCE="${RC_SVCNAME#micaproxy.}"
+  # 清理专属于此实例的老端口跳跃链，防多实例串味
+  iptables -t nat -F "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -j "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
+  iptables -t nat -X "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
+  ip6tables -t nat -F "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
+  ip6tables -t nat -D PREROUTING -j "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
+  ip6tables -t nat -X "HY2_JUMP_${instance}" >/dev/null 2>&1 || true
 
-if [ "$RC_SVCNAME" = "micaproxy" ]; then
-    INSTANCE="$(hostname)"
-fi
+  echo "---------------------------------------------"
+  echo -e "实例端口跳跃流控模式："
+  echo -e " 1) 单端口独立模式"
+  echo -e " 2) 端口跳跃分流模式"
+  echo "---------------------------------------------"
+  local jumpInput
+  read -rp "请选择模式 [1-2] (直接回车保持单端口): " jumpInput
+  jumpInput=${jumpInput:-1}
 
-CONF_FILE="/etc/MicaProxy/${INSTANCE}.toml"
-LOG_FILE="/opt/MicaProxy/log/${INSTANCE}.log"
-
-command="/opt/MicaProxy/MicaProxy"
-command_args="-c ${CONF_FILE}"
-command_background="yes"
-pidfile="/run/micaproxy.${INSTANCE}.pid"
-output_log="${LOG_FILE}"
-error_log="${LOG_FILE}"
-
-# 解除 Alpine 默认限制
-rc_ulimit="-n 65535"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    if [ ! -f "${CONF_FILE}" ]; then
-        eerror "Configuration file ${CONF_FILE} missing!"
-        return 1
-    fi
-    checkpath -d -m 0755 -o root:root /opt/MicaProxy/log
-}
-EOF
-    chmod 0755 "$rc_file"
-}
-
-init_environment() {
-    mkdir -p /opt/MicaProxy
-    mkdir -p "$LOG_DIR"
-    mkdir -p "$INSTANCE_DIR"
-    mkdir -p "$DATA_DIR"
-}
-
-write_config() {
-    local instance="$1" local proto="$2" local bind_ip="$3" local bind_port="$4" local username="$5" local password="$6" local outbound_type="$7"
-    local conf_file="${INSTANCE_DIR}/${instance}.toml"
-    
-    if [ -z "$(echo "$bind_ip" | grep '\[')" ] && [ -n "$(echo "$bind_ip" | grep ':')" ]; then
-        bind_ip="[${bind_ip}]"
-    fi
-
-    [ -z "$outbound_type" ] && outbound_type="default"
-
-    cat <<EOF > "$conf_file"
-[[outbounds]]
-name = "${outbound_type}-outbound"
-type = "${outbound_type}"
-
-[[listeners]]
-name = "${instance}-listener"
-listen = "${bind_ip}:${bind_port}"
-protocol = "${proto}"
-outbound = "${outbound_type}-outbound"
-EOF
-
-    if [ -n "$username" ] && [ -n "$password" ]; then
-        cat <<EOF >> "$conf_file"
-username = "${username}"
-password = "${password}"
-EOF
-    fi
-
-    if [ "$proto" = "socks5" ]; then
-        cat <<EOF >> "$conf_file"
-
-[socks5]
-enabled = true
-udp_enabled = true
-udp_idle_timeout_secs = 120
-udp_buffer_bytes = 8192
-EOF
-    fi
-
-    cat <<EOF >> "$conf_file"
-
-[runtime]
-driver = "epoll"
-EOF
-    chmod 0644 "$conf_file"
-}
-
-print_node_summary() {
-    local instance="$1"
-    local conf_file="${INSTANCE_DIR}/${instance}.toml"
-    if [ ! -f "$conf_file" ]; then return; fi
-
-    local proto
-    proto=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-    [ -z "$proto" ] && proto="socks5"
-
-    local bind_port
-    bind_port=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); split($2, a, ":"); print a[length(a)]}' "$conf_file")
-    
-    local auth_user
-    auth_user=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-    local auth_pass
-    auth_pass=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-
-    local public_ip
-    public_ip=$(get_public_ip)
-
-    echo -e "\n${GREEN}====== MicaProxy 实例 [ ${instance} ] 配置详情 ======${RESET}"
-    echo -e "${GREEN}实例协议     :${RESET} ${YELLOW}${proto^^}${RESET}"
-    echo -e "${GREEN}外网绑定 IP  :${RESET} ${public_ip}"
-    echo -e "${GREEN}监听端口     :${RESET} ${bind_port}"
-    if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
-        echo -e "${GREEN}用户名       :${RESET} ${auth_user}"
-        echo -e "${GREEN}密码         :${RESET} ${auth_pass}"
-    else
-        echo -e "${GREEN}鉴权模式     :${RESET} ${YELLOW}免密模式${RESET}"
-    fi
-    echo -e "${GREEN}配置文件路径 :${RESET} ${conf_file}"
-    
-    echo -e "${GREEN}====== 👉 客户端通用格式连接 ======${RESET}"
-    if [ "$proto" = "socks5" ]; then
-        if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
-            echo -e "${YELLOW}socks5://${auth_user}:${auth_pass}@${public_ip}:${bind_port}#${instance}${RESET}"
-            echo -e "\n${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
-            echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}&user=${auth_user}&pass=${auth_pass}${RESET}"
-        else
-            echo -e "${YELLOW}socks5://${public_ip}:${bind_port}#${instance}${RESET}"
-            echo -e "\n${GREEN}====== 🚀 Telegram 内置一键代理链接 ======${RESET}"
-            echo -e "${YELLOW}https://t.me/socks?server=${public_ip}&port=${bind_port}${RESET}"
-        fi
-    elif [ "$proto" = "http" ]; then
-        if [ -n "$auth_user" ] && [ "$auth_user" != "none" ]; then
-            echo -e "${YELLOW}http://${auth_user}:${auth_pass}@${public_ip}:${bind_port}${RESET}"
-        else
-            echo -e "${YELLOW}http://${public_ip}:${bind_port}${RESET}"
-        fi
-    fi
-    echo ""
-}
-
-get_status_info() {
-    if [ -L "/etc/init.d/micaproxy.${CURRENT_INSTANCE}" ] || [ -f "/etc/init.d/micaproxy.${CURRENT_INSTANCE}" ]; then
-        if rc-service "micaproxy.${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
-            panel_status="${GREEN}运行中${RESET}"
-        else
-            panel_status="${RED}未运行${RESET}"
-        fi
-    else
-        panel_status="${RED}未托管服务${RESET}"
-    fi
-
-    if [ -f "$BIN_PATH" ]; then
-        local real_ver=$($BIN_PATH --version 2>/dev/null | head -n 1 | awk '{print $2}')
-        [ -z "$real_ver" ] && real_ver=$($BIN_PATH -v 2>/dev/null | head -n 1)
-        panel_version="${real_ver:-v3.x}"
-    else
-        panel_version="${RED}未下载核心${RESET}"
-    fi
-
-    local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-    if [ -f "$conf_file" ]; then
-        local proto
-        proto=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-        local p_num=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-        panel_port="${p_num} (${proto^^})"
-    else
-        panel_port="未创建配置"
-    fi
-}
-
-parse_existing_config() {
-    local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-    if [ ! -f "$conf_file" ]; then return 1; fi
-
-    OLD_PROTO=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-    [ -z "$OLD_PROTO" ] && OLD_PROTO="socks5"
-
-    local raw_listen
-    raw_listen=$(awk -F '=' '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file")
-    OLD_PORT=$(echo "$raw_listen" | awk -F ':' '{print $NF}')
-    OLD_IP=$(echo "$raw_listen" | sed "s/:${OLD_PORT}$//g" | tr -d '[]')
-
-    OLD_USER=$(awk -F '=' '/^[[:space:]]*username[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-    OLD_PASS=$(awk -F '=' '/^[[:space:]]*password[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | tr -d '"')
-    [ -z "$OLD_USER" ] && OLD_USER="none"
-
-    OLD_OUTBOUND=$(awk -F '=' '/^[[:space:]]*type[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$conf_file" | head -n 1)
-    [ -z "$OLD_OUTBOUND" ] && OLD_OUTBOUND="default"
-    return 0
-}
-
-menu_switch_instance() {
-    echo -e "\n${GREEN}==== [多开实例矩阵管理中心] ====${RESET}"
-    echo -e "当前聚焦的操作目标: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo "目前存储于 ${INSTANCE_DIR} 内的独立实例列表:"
-
-    local files="${INSTANCE_DIR}/*.toml"
-    local count=0
-    
-    for f in $files; do
-        [ -e "$f" ] || continue
-        count=$((count + 1))
-        local name=$(basename "$f" .toml)
-        local proto_type=$(awk -F '=' '/^[[:space:]]*protocol[[:space:]]*=/ {gsub(/[ "[:space:]]/, "", $2); print $2}' "$f")
-        local status_str="${RED}已挂起${RESET}"
-        rc-service "micaproxy.${name}" status 2>/dev/null | grep -q "started" && status_str="${GREEN}分流中${RESET}"
-        echo -e " [ ${CYAN}${count}${RESET} ] -> ${YELLOW}${name}${RESET} [协议: ${proto_type^^} | 状态: ${status_str}]"
+  if [[ $jumpInput == 2 ]]; then
+    while true; do
+      read -rp "设置起始端口: " firstport
+      read -rp "设置结束端口: " endport
+      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then break;
+      else error "输入无效，起始端口必须小于末尾端口！"; fi
     done
 
-    if [ "$count" -eq 0 ]; then
-        echo " (暂无任何多开实例，请直接输入新名称创建)"
-    fi
-    echo ""
-    read -r -p "请输入要切换的[现有数字编号]或[直接输入全新英文名]: " input_val
-    if [ -z "$input_val" ]; then return; fi
-
-    if [ "$input_val" -eq "$input_val" ] 2>/dev/null; then
-        local idx=0
-        for f in $files; do
-            [ -e "$f" ] || continue
-            idx=$((idx + 1))
-            if [ "$idx" -eq "$input_val" ]; then
-                CURRENT_INSTANCE=$(basename "$f" .toml)
-                ok "操作焦点已成功切为: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-                return
-            fi
-        done
-        warn "编号不存在，未做任何变更。"
-    else
-        CURRENT_INSTANCE="$input_val"
-        ok "操作焦点锁定新实例名: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    fi
-}
-
-menu_install() {
-    init_environment
-    local is_edit=false
-    if [ "$1" = "edit" ]; then is_edit=true; fi
-
-    if [ "$is_edit" = "true" ]; then
-        if ! parse_existing_config; then
-            die "未检测到实例 [ ${CURRENT_INSTANCE} ] 的旧配置，无法执行微调！"
-        fi
-        echo -e "\n${GREEN}==== [💡 正在微调修改实例: ${CURRENT_INSTANCE} (直接回车保持原样)] ====${RESET}"
-    else
-        local conf_file="${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-        if [ -f "$conf_file" ]; then
-            warn "实例 [ ${CURRENT_INSTANCE} ] 已经存在对应配置文件。"
-            read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重写该实例？[y/N]: ${RESET}")" res
-            case "$res" in [Yy]*) ;; *) return ;; esac
-        fi
-        echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
-        
-        # ⚡ 纯正 Alpine 原生随机数发生器生成账号密码和可用随机端口
-        local rand_user="user_$(openssl rand -hex 3)"
-        local rand_pass="$(openssl rand -hex 6)"
-        local rand_port="$(( (rand_seed = rand_seed + 1) * 37 % 45000 + 15000 ))"
-
-        OLD_PROTO="socks5" OLD_IP="0.0.0.0" OLD_PORT="$rand_port" OLD_USER="$rand_user" OLD_PASS="$rand_pass" OLD_OUTBOUND="default"
-    fi
-
-    if [ "$is_edit" = "true" ]; then
-        echo -e "当前协议类型: ${CYAN}${OLD_PROTO^^}${RESET} (1. SOCKS5 | 2. HTTP)"
-        read -r -p "请输入新序号 [直接回车不修改]: " proto_choice
-    else
-        echo "1. SOCKS5 代理模式 (默认，附带完整 UDP 转发能力)"
-        echo "2. HTTP 传输代理模式"
-        read -r -p "选择形态序号 [1-2]: " proto_choice
-    fi
-    local opt_proto="$OLD_PROTO"
-    if [ "$proto_choice" = "1" ]; then opt_proto="socks5"; elif [ "$proto_choice" = "2" ]; then opt_proto="http"; fi
-
-    read -r -p "$(echo -e "${GREEN}请输入监听网卡 IP [当前: ${YELLOW}${OLD_IP}${GREEN} | 回车不改]: ${RESET}")" input_ip
-    local opt_ip="${input_ip:-$OLD_IP}"
-
-    read -r -p "$(echo -e "${GREEN}请输入服务端口 [当前: ${YELLOW}${OLD_PORT}${GREEN} | 回车不改]: ${RESET}")" input_port
-    local opt_port="${input_port:-$OLD_PORT}"
+    # 建立隔离型专属自定义链名
+    iptables -t nat -N "HY2_JUMP_${instance}" 2>/dev/null || true
+    iptables -t nat -A "HY2_JUMP_${instance}" -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
+    iptables -t nat -I PREROUTING -j "HY2_JUMP_${instance}"
     
-    local opt_user="" local opt_pass=""
-    # ⚡ 交互升级：中括号显示当前旧值或默认随机生成的账号
-    read -r -p "$(echo -e "${GREEN}配置连接账户 [当前/默认: ${YELLOW}${OLD_USER}${GREEN} | 输入 ${RED}none${GREEN} 开放免密 | 或自主输入]: ${RESET}")" input_user
-    if [ -z "$input_user" ]; then
-        if [ "$OLD_USER" = "none" ]; then opt_user=""; opt_pass=""; else opt_user="$OLD_USER"; opt_pass="$OLD_PASS"; fi
-    elif [ "$input_user" = "none" ]; then
-        opt_user=""; opt_pass=""
-    else
-        opt_user="$input_user"
-        # 如果是新设账户或修改账户，提示输入密码，并提供默认随机/旧密码回车继承
-        read -r -p "$(echo -e "${GREEN}请输入连接密码 [当前/默认: ${YELLOW}${OLD_PASS}${GREEN} | 回车不改]: ${RESET}")" input_pass
-        opt_pass="${input_pass:-$OLD_PASS}"
-    fi
+    ip6tables -t nat -N "HY2_JUMP_${instance}" 2>/dev/null || true
+    ip6tables -t nat -A "HY2_JUMP_${instance}" -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
+    ip6tables -t nat -I PREROUTING -j "HY2_JUMP_${instance}"
 
-    echo -e "\n${GREEN}==== [选择出站 Profile 路由路径] ====${RESET}"
-    echo "1. default (系统默认路由，普通混合网络)"
-    echo "2. ipv4    (IPv4-only，强制仅解析A记录/仅走v4)"
-    echo "3. ipv6    (IPv6-only，强制仅解析AAAA记录/仅走v6)"
-    read -r -p "选择出站路径序号 [1-3, 回车不修改]: " outbound_choice
-    local opt_outbound="$OLD_OUTBOUND"
-    if [ "$outbound_choice" = "1" ]; then opt_outbound="default"; elif [ "$outbound_choice" = "2" ]; then opt_outbound="ipv4"; elif [ "$outbound_choice" = "3" ]; then opt_outbound="ipv6"; fi
-
-    if [ ! -f "$BIN_PATH" ]; then
-        download_bin
-        install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$BIN_PATH"
-        rm -rf "$(dirname "$TARGET_BIN_PATH")"
-    fi
-
-    write_config "$CURRENT_INSTANCE" "$opt_proto" "$opt_ip" "$opt_port" "$opt_user" "$opt_pass" "$opt_outbound"
-    write_openrc_service
-
-    if [ ! -L "/etc/init.d/micaproxy.${CURRENT_INSTANCE}" ]; then
-        ln -sf /etc/init.d/micaproxy "/etc/init.d/micaproxy.${CURRENT_INSTANCE}"
-    fi
-
-    info "正在通过 OpenRC 拉起并解锁内核限制实例: ${CURRENT_INSTANCE} ..."
-    rc-update add "micaproxy.${CURRENT_INSTANCE}" default >/dev/null 2>&1
-    rc-service "micaproxy.${CURRENT_INSTANCE}" restart
-    
-    sleep 1.2
-    ok "MicaProxy OpenRC 实例 [ ${CURRENT_INSTANCE} ] 部署成功！"
-    print_node_summary "$CURRENT_INSTANCE"
+    if has_command netfilter-persistent; then command netfilter-persistent save >/dev/null 2>&1 || true; fi
+    info "已成功下发隔离型端口跳跃规则: $firstport-$endport -> $port"
+  else
+    firstport="" && endport=""
+  fi
 }
 
-menu_uninstall() {
-    warn "该操作将彻底销毁当前选定的 OpenRC 实例。"
-    read -r -p "$(echo -e "${RED}确认抹除实例 [ ${CURRENT_INSTANCE} ] 吗？[y/N]: ${RESET}")" res
-    case "$res" in [Yy]*) ;; *) return ;; esac
+write_and_show_config() {
+  local instance="$1"
+  local conf_file="${BASE_DIR}/config_${instance}.yaml"
+  local hy_dir="${HY_DIR_BASE}/${instance}"
+  local HOSTNAME=$(hostname -s | sed 's/ /_/g')
+  local vps_ip=$(get_public_ip)
 
-    rc-service "micaproxy.${CURRENT_INSTANCE}" stop >/dev/null 2>&1
-    rc-update del "micaproxy.${CURRENT_INSTANCE}" >/dev/null 2>&1
-    rm -f "/etc/init.d/micaproxy.${CURRENT_INSTANCE}"
-    rm -f "${INSTANCE_DIR}/${CURRENT_INSTANCE}.toml"
-    ok "实例 [ ${CURRENT_INSTANCE} ] 已干净销毁。"
+  local is_insecure="0" skip_cert="false" yaml_insecure="false"
+  if [[ "$EVAL_DOMAIN" == "www.bing.com" ]]; then
+    is_insecure="1" skip_cert="true" yaml_insecure="true"
+  fi
+
+  cat << EOF > "$conf_file"
+listen: :$port
+tls:
+  cert: $EVAL_CERT_PATH
+  key: $EVAL_KEY_PATH
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+auth:
+  type: password
+  password: $auth_pwd
+masquerade:
+  type: proxy
+  proxy:
+    url: https://$proxysite
+    rewriteHost: true
+EOF
+
+  local last_port=$port
+  [[ -n "${firstport}" && -n "${endport}" ]] && last_port="$port,$firstport-$endport"
+  local last_ip="$vps_ip"
+  [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
+
+  mkdir -p "$hy_dir"
+  cat << EOF > "$hy_dir/hy-client.yaml"
+server: $last_ip:$last_port
+auth: $auth_pwd
+tls:
+  sni: $EVAL_DOMAIN
+  insecure: $yaml_insecure
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+fastOpen: true
+socks5:
+  listen: 127.0.0.1:5678
+transport:
+  udp:
+    hopInterval: 30s 
+EOF
+
+  cat << EOF > "$hy_dir/url.txt"
+矩阵独立子实例分享: [ ${instance} ]
+外网出口地址: $vps_ip
+V2rayN 分享链接:
+hysteria2://$auth_pwd@$last_ip:$port?insecure=${is_insecure}&sni=$EVAL_DOMAIN#$HOSTNAME-hy-${instance}
+
+Surge 配置格式:
+$HOSTNAME-hy-${instance} = hysteria2, $vps_ip, $port, password=$auth_pwd, skip-cert-verify=${skip_cert}, sni=$EVAL_DOMAIN
+EOF
+
+  local inst_data_dir="${DATA_BASE_DIR}/${instance}"
+  install -m 0750 -o hysteria -g hysteria -d "$inst_data_dir"
+  chown -R hysteria:hysteria "$conf_file" 2>/dev/null || true
+  register_instance "$instance"
+
+  systemctl daemon-reload
+  systemctl enable "hysteria-server@${instance}" >/dev/null 2>&1 || true
+  systemctl restart "hysteria-server@${instance}" >/dev/null 2>&1 || true
+
+  if systemctl is-active --quiet "hysteria-server@${instance}" 2>/dev/null; then
+    info "Hysteria 2 子实例 [ ${instance} ] 配置下发并运行成功！"
+  else
+    error "实例服务下发完成，但拉起响应失败。请通过菜单 [8] 排查系统滚动日志。"
+  fi
 }
 
-rand_seed=17
+# =========================================================
+# 6. 面板主功能：安装、精细修改、卸载与矩阵切换
+# =========================================================
+insthysteria() {
+  local mode="${1:-new}"
+  check_environment
+  
+  # 【核心修复点】确保在任何配置写入和证书生成之前，基础目录必须存在
+  [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
+  
+  if ! has_command apt; then
+    if has_command yum || has_command dnf; then install_software "iptables-services"; fi
+  else
+    install_software "iptables-persistent netfilter-persistent"
+  fi
 
-while true; do
-    get_status_info
+  if [[ ! -f "$INSTALL_BIN" ]]; then
+    info "全局引擎内核缺失，准备同步拉取核心组件..."
+    local latest_version=$(get_latest_version)
+    [[ -z "$latest_version" ]] && error "无法获取云端最新版本！" && return 1
+    local _tmpfile=$(mktemp)
+    download_hysteria "$latest_version" "$_tmpfile" || return 1
+    install -Dm755 "$_tmpfile" "$INSTALL_BIN"
+    rm -f "$_tmpfile"
+  fi
+
+  if ! is_user_exists "hysteria"; then
+    useradd -r -d "$DATA_BASE_DIR" -m -s /usr/sbin/nologin hysteria >/dev/null 2>&1 || true
+  fi
+  write_systemd_template
+
+  local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.yaml"
+  if [[ "$mode" == "new" && -f "$conf_file" ]]; then
+    warn "检测到当前聚焦的实例名 [ ${CURRENT_INSTANCE} ] 已经存在配置。"
+    read -rp "是否彻底抹除、重新下发覆盖此实例配置？[y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return
+  fi
+
+  if [[ "$mode" == "edit" ]]; then
+    echo -e "\n${GREEN}==== [正在精细修改实例参数: ${CURRENT_INSTANCE}] ====${RESET}"
+    local old_pwd=$(grep -E '^\s*password:' "$conf_file" | awk '{print $2}' | tr -d '"'\' || true)
+    local old_cert=$(grep -E '^\s*cert:' "$conf_file" | awk '{print $2}' | tr -d '"'\' || true)
+    local old_key=$(grep -E '^\s*key:' "$conf_file" | awk '{print $2}' | tr -d '"'\' || true)
+    local old_site=$(grep -E '^\s*url:' "$conf_file" | awk '{print $2}' | sed 's#https://##' | tr -d '"'\' || true)
+    local old_sni="www.bing.com"
+    [[ -f "${HY_DIR_BASE}/${CURRENT_INSTANCE}/hy-client.yaml" ]] && old_sni=$(grep -E '^\s*sni:' "${HY_DIR_BASE}/${CURRENT_INSTANCE}/hy-client.yaml" | awk '{print $2}' | tr -d '"'\' || true)
+  fi
+
+  inst_cert "$CURRENT_INSTANCE" || return 1
+  inst_port "$CURRENT_INSTANCE"
+
+  if [[ "$mode" == "edit" ]]; then
+    read -rp "配置鉴权验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
+    auth_pwd=${auth_pwd:-$old_pwd}
+    read -rp "配置伪装网站地址 [当前: ${old_site}, 回车不修改]: " proxysite
+    proxysite=${proxysite:-$old_site}
+  else
+    read -rp "设置验证密码 (回车分配高强度随机密钥): " auth_pwd
+    auth_pwd=${auth_pwd:-$(generate_random_password)}
+    read -rp "设置伪装网站域名 (默认: en.snu.ac.kr): " proxysite
+    proxysite=${proxysite:-"en.snu.ac.kr"}
+  fi
+
+  write_and_show_config "$CURRENT_INSTANCE"
+}
+
+unsthysteria() {
+  warn "⚠️ 警告：该操作将直接抹除当前管理的实例 [ ${CURRENT_INSTANCE} ] 所有资源。"
+  read -rp "确定完全销毁并卸载此实例吗？[y/N]: " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || return
+
+  systemctl stop "hysteria-server@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  systemctl disable "hysteria-server@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  
+  # 清洗对应的专属端口跳跃链条
+  iptables -t nat -F "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -j "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  iptables -t nat -X "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  ip6tables -t nat -F "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  ip6tables -t nat -D PREROUTING -j "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  ip6tables -t nat -X "HY2_JUMP_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  if has_command netfilter-persistent; then command netfilter-persistent save >/dev/null 2>&1 || true; fi
+
+  rm -f "${BASE_DIR}/config_${CURRENT_INSTANCE}.yaml"
+  rm -f "${BASE_DIR}/server_${CURRENT_INSTANCE}.crt" "${BASE_DIR}/server_${CURRENT_INSTANCE}.key"
+  rm -rf "${DATA_BASE_DIR}/${CURRENT_INSTANCE}" "${HY_DIR_BASE}/${CURRENT_INSTANCE}"
+
+  unregister_instance "$CURRENT_INSTANCE"
+  ok "矩阵实例 [ ${CURRENT_INSTANCE} ] 彻底安全移除。"
+
+  # 矩阵自净逻辑
+  sync_registry
+  if [ ! -s "$REGISTRY_FILE" ]; then
+    info "检测到矩阵内已无任何活跃节点，深度自动卸载全系统共享组件..."
+    rm -f /etc/systemd/system/hysteria-server@.service
+    rm -f "$INSTALL_BIN"
+    rm -rf "$BASE_DIR" "$DATA_BASE_DIR" "$HY_DIR_BASE"
+    userdel hysteria >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    ok "全系统宿主机残留已深度彻底清洗清除。"
+    CURRENT_INSTANCE="hy2"
+  fi
+}
+
+menu_switch_matrix() {
+  echo -e "\n${GREEN}==== [Hysteria 2 多开实例矩阵分流中心] ====${RESET}"
+  echo -e "当前聚焦的操作目标实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+  echo "当前已激活的矩阵实例列表:"
+
+  sync_registry
+  local count=0
+  local -a instance_list=()
+
+  if [ -f "$REGISTRY_FILE" ]; then
+    while IFS= read -r name || [ -n "$name" ]; do
+      [ -z "$name" ] && continue
+      local c_file="${BASE_DIR}/config_${name}.yaml"
+      [ -f "$c_file" ] || continue
+
+      count=$((count + 1))
+      instance_list[$count]="$name"
+      
+      local port_num=$(grep -E '^listen:' "$c_file" | awk -F ':' '{print $3}' | tr -d ' ')
+      local status_str="${RED}已休眠挂起${RESET}"
+      if systemctl is-active --quiet "hysteria-server@${name}"; then status_str="${GREEN}分流中${RESET}"; fi
+      echo -e " [ ${CYAN}${count}${RESET} ] -> 实例空间: ${YELLOW}${name}${RESET} [核心端口: ${port_num} | 运行状态: ${status_str}]"
+    done < "$REGISTRY_FILE"
+  fi
+
+  if [ "$count" -eq 0 ]; then echo " (当前矩阵内空空如也，请直接在下方输入新名字创建第一个多开实例)"; fi
+  
+  echo ""
+  echo -e "👉 ${GREEN}输入已有实例前面的【数字编号】快速切换管理焦点${RESET}"
+  echo -e "👉 ${GREEN}或者直接输入一个【全新的英文别名】来新建独立多开实例${RESET}"
+  read -rp "请输入您的选择: " input_val
+  [[ -z "$input_val" ]] && return
+
+  if [[ "$input_val" =~ ^[0-9]+$ ]]; then
+    if [ "$input_val" -gt 0 ] && [ "$input_val" -le "$count" ]; then
+      CURRENT_INSTANCE="${instance_list[$input_val]}"
+      ok "操作焦点成功切为已有实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+    else warn "编号超出可用范围！"; fi
+  else
+    if [[ "$input_val" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+      CURRENT_INSTANCE="$input_val"
+      ok "已锁定全新焦点: ${YELLOW}${CURRENT_INSTANCE}${RESET} (请选择菜单 [1] 下发独立节点配置)"
+    else warn "命名不规范，仅支持英文字母、数字、中/下划线！"; fi
+  fi
+}
+
+showconf() {
+  local hy_dir="${HY_DIR_BASE}/${CURRENT_INSTANCE}"
+  if [[ ! -d "$hy_dir" ]]; then
+    error "未找到 [ ${CURRENT_INSTANCE} ] 客户端配置文件，请先下发部署该实例。"
+    return
+  fi
+  echo -e "${GREEN}====== 客户端 YAML 配置 (实例: ${CURRENT_INSTANCE}) ======${RESET}"
+  cat "$hy_dir/hy-client.yaml"
+  echo
+  echo -e "${GREEN}====== 节点分享链接 (实例: ${CURRENT_INSTANCE}) ======${RESET}"
+  cat "$hy_dir/url.txt"
+  echo
+}
+
+# =========================================================
+# 7. 面板主菜单
+# =========================================================
+menu() {
+  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
+  check_environment
+
+  while true; do
     clear
+    local status=$(get_hy_status)
+    local version=$(get_installed_version)
+    local port_show=$(get_current_port_display)
+
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} ◈ MicaProxy SOCKS5/HTTP 多实例管理面板 ◈  ${RESET}"
+    echo -e "${GREEN}   ◈  Hysteria 2 矩阵多实例控制面板  ◈    ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
-    echo -e "${GREEN}服务活跃状态 :${RESET} $panel_status"
-    echo -e "${GREEN}核心沙箱引擎 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}目标实例端口 :${RESET} ${YELLOW}${port_show}${RESET}"
+    echo -e "${GREEN}服务活跃状态 :${RESET} $status"
+    echo -e "${GREEN}核心共享引擎 :${RESET} ${YELLOW}${version}${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} 1. 安装 当前控制实例${RESET}"
-    echo -e "${GREEN} 2. 更新 当前控制实例${RESET}"
-    echo -e "${GREEN} 3. 卸载 当前控制实例${RESET}"
-    echo -e "${GREEN} 4. 修改 当前控制实例${RESET}"
-    echo -e "${GREEN} 5. 启动 当前控制实例${RESET}"
-    echo -e "${GREEN} 6. 停止 当前控制实例${RESET}"
-    echo -e "${GREEN} 7. 重启 当前控制实例${RESET}"
-    echo -e "${GREEN} 8. 查看当前实例日志${RESET}"
-    echo -e "${GREEN} 9. 查看当前实例配置${RESET}"
-    echo -e "${GREEN}10. 管理节点${RESET}  ${YELLOW}← 添加节点${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN} 1. 安装/下发当前焦点实例配置${RESET}"
+    echo -e "${GREEN} 2. 更新全局共享内核二进制程序${RESET}"
+    echo -e "${GREEN} 3. 销毁并卸载当前焦点实例${RESET}"
+    echo -e "${GREEN} 4. 精细修改当前焦点实例配置${RESET}"
+    echo -e "${GREEN} 5. 启动当前焦点实例${RESET}"
+    echo -e "${GREEN} 6. 停止当前焦点实例${RESET}"
+    echo -e "${GREEN} 7. 重启当前焦点实例${RESET}"
+    echo -e "${GREEN} 8. 查看当前实例系统日志 (journalctl)${RESET}"
+    echo -e "${GREEN} 9. 打印查看当前实例客户端链接信息${RESET}"
+    echo -e "${GREEN}10. 管理/切换节点矩阵矩阵列表${RESET}  ${YELLOW}← 添加 / 隔离切换新旧实例${RESET}"
+    echo -e "${GREEN} 0. 安全退出当前管理台面${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
-    
-    read -r -p "$(echo -e "${GREEN}选择操作序号: ${RESET}")" choice
+
+    local choice=""
+    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
+    [[ -z "$choice" ]] && continue
+
     case "$choice" in
-        1) menu_install "new" ;;
-        2) download_bin && install -m 0755 -o root -g root "$TARGET_BIN_PATH" "$BIN_PATH" && rm -rf "$(dirname "$TARGET_BIN_PATH")" && ok "核心覆盖成功" ;;
-        3) menu_uninstall ;;
-        4) menu_install "edit" ;;
-        5) rc-service "micaproxy.${CURRENT_INSTANCE}" start && ok "拉起成功" ;;
-        6) rc-service "micaproxy.${CURRENT_INSTANCE}" stop && ok "挂起成功" ;;
-        7) rc-service "micaproxy.${CURRENT_INSTANCE}" restart && ok "重启完毕" ;;
-        8) if [ -f "/opt/MicaProxy/log/${CURRENT_INSTANCE}.log" ]; then tail -n 50 -f "/opt/MicaProxy/log/${CURRENT_INSTANCE}.log"; else warn "暂无运行日志生成"; fi ;;
-        9) print_node_summary "$CURRENT_INSTANCE" ;;
-        10) menu_switch_instance ;;
-        0) exit 0 ;;
-        *) warn "无效输入！"; sleep 1 ;;
+      1) insthysteria "new"; pause ;;
+      2) 
+        local latest_version=$(get_latest_version)
+        if [[ -n "$latest_version" ]]; then
+          local _tmpfile=$(mktemp)
+          if download_hysteria "$latest_version" "$_tmpfile"; then
+            install -Dm755 "$_tmpfile" "$INSTALL_BIN" && rm -f "$_tmpfile"
+            ok "共享主内核引擎升级完毕，所有子实例重启后随之生效。"
+          fi
+        else error "获取云端版本号失败。"; fi
+        pause ;;
+      3) unsthysteria; pause ;;
+      4) insthysteria "edit"; pause ;;
+      5) systemctl start "hysteria-server@${CURRENT_INSTANCE}" && info "子实例已成功启动！" ; pause ;;
+      6) systemctl stop "hysteria-server@${CURRENT_INSTANCE}" && info "子实例已成功进入休眠停止状态！" ; pause ;;
+      7) systemctl restart "hysteria-server@${CURRENT_INSTANCE}" && info "子实例已成功平滑重启！" ; pause ;;
+      8) 
+        echo -e "${YELLOW}正在调取该实例实时滚动日志 (输入 q 或 Ctrl+C 退出返回):${RESET}\n"
+        journalctl -u "hysteria-server@${CURRENT_INSTANCE}" -n 50 -f || true
+        ;;
+      9) showconf; pause ;;
+      10) menu_switch_matrix ;;
+      0) clear; exit 0 ;;
+      *) error "无效输入，请重新选择。"; sleep 0.5 ;;
     esac
-    read -r -p "$(echo -e "${GREEN}按任意键重新返回控制台面...${RESET}")" dummy
-done
+  done
+}
+
+menu "$@"

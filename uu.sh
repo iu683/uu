@@ -6,6 +6,7 @@
 WEB_ROOT="/var/www/html"
 LOG_FILE="/var/log/nginx/tim_access.log"
 GREEN='\033[0;32m'
+YELLOW="\033[33m"
 RED='\033[0;31m'
 RESET='\033[0m'
 
@@ -39,12 +40,27 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
+# 动态检查服务部署状态
+check_status() {
+    # 检查 Nginx 启用的站点目录中是否存在任何短链配置
+    if [ -d "/etc/nginx/sites-enabled" ] && [ "$(ls -A /etc/nginx/sites-enabled 2>/dev/null)" ]; then
+        # 进一步确认这些启用的配置里是否包含咱们脚本特有的伪装短链标识
+        if grep -q "http_user_agent" /etc/nginx/sites-enabled/* 2>/dev/null; then
+            echo -e "${YELLOW}[已部署]${RESET}"
+            return
+        fi
+    fi
+    echo -e "${RED}[未部署]${RESET}"
+}
+
 
 show_menu() {
     clear
+    local STATUS_TEXT=$(check_status)
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}   ◈ vps短链脚本 管理菜单◈    ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}当前状态: ${STATUS_TEXT}${RESET}"
     echo -e "${GREEN}1) 部署脚本${RESET}"
     echo -e "${GREEN}2) 卸载脚本${RESET}"
     echo -e "${GREEN}3) 更新脚本${RESET}"
@@ -60,9 +76,9 @@ install_tim() {
         return
     fi
 
-    read -p "请输入脚本 URL（可选，留空默认不下载）： " TIM_URL
-    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
-    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
+    read -p "请输入脚本 URL（例如:https://raw.githubusercontent.com/gos/gost/refs/heads/main/gost.sh）： " TIM_URL
+    read -p "请输入 VPS 本地脚本存放目录（默认 /etc/tim）： " LOCAL_DIR
+    LOCAL_DIR=${LOCAL_DIR:-/etc/tim}
 
     # 根据域名自动预测 Let's Encrypt 默认路径
     PREDICT_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
@@ -177,14 +193,15 @@ EOF
     echo -e "${GREEN}==========================================${RESET}"
     echo -e "${GREEN}部署完成！${RESET}"
     echo -e "${GREEN}使用证书：$CERT_PATH${RESET}"
-    echo -e "${GREEN}网址：https://$DOMAIN${RESET}"
+    echo -e "${GREEN}访问网址：https://$DOMAIN${RESET}"
+    echo -e "${GREEN}使用命令：bash <(curl -fsSL $DOMAIN)${RESET}"
     echo -e "${GREEN}==========================================${RESET}"
 }
 
 uninstall_tim() {
     read -p "请输入你的域名 ： " DOMAIN
-    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
-    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
+    read -p "请输入 VPS 本地脚本存放目录（默认 /etc/tim）： " LOCAL_DIR
+    LOCAL_DIR=${LOCAL_DIR:-/etc/tim}
 
     rm -f /etc/nginx/sites-available/"$DOMAIN"
     rm -f /etc/nginx/sites-enabled/"$DOMAIN"
@@ -202,8 +219,8 @@ update_tim() {
         return
     fi
 
-    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
-    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
+    read -p "请输入 VPS 本地脚本存放目录（默认 /etc/tim）： " LOCAL_DIR
+    LOCAL_DIR=${LOCAL_DIR:-/etc/tim}
 
     read -p "请输入你的域名（用于确定文件名）： " DOMAIN
     if [[ -z "$DOMAIN" ]]; then

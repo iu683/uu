@@ -1,219 +1,275 @@
 #!/bin/bash
-# =========================================
-# 一键部署/管理脚本
-# =========================================
+# 随机图片多路径 API 管理脚本
 
-WEB_ROOT="/var/www/html"
-LOG_FILE="/var/log/nginx/tim_access.log"
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-RESET='\033[0m'
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
 
-show_menu() {
-    clear
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}    ◈ vps短链脚本 管理菜单◈    ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1) 部署脚本${RESET}"
-    echo -e "${GREEN}2) 卸载脚本${RESET}"
-    echo -e "${GREEN}3) 更新脚本${RESET}"
-    echo -e "${GREEN}4) 查看访问日志${RESET}"
-    echo -e "${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-}
+BASE_DIR="/var/www/random"
+PHP_VERSION=""
+PHP_FPM_SOCK=""
 
-install_tim() {
-    read -p "请输入你的域名： " DOMAIN
-    if [[ -z "$DOMAIN" ]]; then
-        echo -e "${RED}❌ 域名不能为空！${RESET}"
-        return
+# 检查 root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请用 root 用户运行${RESET}"
+    exit 1
+fi
+
+# 自动检测 PHP 版本
+detect_php() {
+    if command -v php >/dev/null 2>&1; then
+        PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+        if [ -S "/run/php/php${PHP_VERSION}-fpm.sock" ]; then
+            PHP_FPM_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
+            return
+        fi
     fi
-
-    read -p "请输入脚本 URL（可选，留空默认不下载）： " TIM_URL
-    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
-    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
-
-    # 根据域名自动预测 Let's Encrypt 默认路径
-    PREDICT_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-    PREDICT_KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-
-    echo -e "${GREEN}--- 证书路径配置（直接回车使用域名预测路径） ---${RESET}"
-    read -p "证书文件路径 [默认: $PREDICT_CERT]: " CERT_PATH
-    CERT_PATH=${CERT_PATH:-$PREDICT_CERT}
-
-    read -p "私钥文件路径 [默认: $PREDICT_KEY]: " KEY_PATH
-    KEY_PATH=${KEY_PATH:-$PREDICT_KEY}
-
-    if [[ ! -f "$CERT_PATH" || ! -f "$KEY_PATH" ]]; then
-        echo -e "${RED}❌ 错误：在指定路径未找到证书或私钥文件！${RESET}"
-        return
-    fi
-
-    echo -e "${GREEN}安装基础依赖: curl, dnsutils...${RESET}"
-    apt update && apt install -y curl dnsutils
-
-    # 检查域名解析
-    VPS_IPv4=$(curl -s4 https://ifconfig.co || true)
-    VPS_IPv6=$(curl -s6 https://ifconfig.co || true)
-    DOMAIN_A=$(dig +short A "$DOMAIN" | tail -n1)
-    DOMAIN_AAAA=$(dig +short AAAA "$DOMAIN" | tail -n1)
-
-    if [[ "$VPS_IPv4" == "$DOMAIN_A" || "$VPS_IPv6" == "$DOMAIN_AAAA" ]]; then
-        echo -e "${GREEN}✅ 域名解析正确${RESET}"
+    if apt-cache search php | grep -q "php8.3-fpm"; then
+        PHP_VERSION="8.3"
+    elif apt-cache search php | grep -q "php8.2-fpm"; then
+        PHP_VERSION="8.2"
     else
-        echo -e "${RED}❌ 域名 $DOMAIN 未解析到本 VPS 公网 IP${RESET}"
+        echo -e "${RED}未找到合适的 PHP 版本，请检查系统源${RESET}"
+        exit 1
+    fi
+    PHP_FPM_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
+}
+
+# 安装依赖 (仅安装 PHP 相关)
+install_dependencies() {
+    echo -e "${YELLOW}>>> 安装依赖 PHP + tree...${RESET}"
+    apt update
+    detect_php
+    echo -e "${GREEN}>>> 检测到 PHP ${PHP_VERSION}${RESET}"
+    apt install -y php${PHP_VERSION}-fpm php${PHP_VERSION}-cli php${PHP_VERSION}-common unzip curl tree
+    systemctl enable --now php${PHP_VERSION}-fpm
+}
+
+# 刷新权限函数
+refresh_permissions() {
+    echo -e "${YELLOW}>>> 正在刷新图片目录权限...${RESET}"
+    if [ -d "$BASE_DIR" ]; then
+        chown -R www-data:www-data $BASE_DIR
+        chmod -R 755 $BASE_DIR
+        echo -e "${GREEN}>>> 权限刷新成功！${RESET}"
+    else
+        echo -e "${RED}>>> 基础目录 $BASE_DIR 不存在，无法刷新权限。${RESET}"
+    fi
+}
+
+# 安装多路径随机图片服务并修改已有配置
+install_service() {
+    detect_php
+    
+    read -p "请输入已有网站的 Nginx 配置文件绝对路径 (如 /etc/nginx/sites-available/img.eu.org): " NGINX_CONF
+    if [ ! -f "$NGINX_CONF" ]; then
+        echo -e "${RED}文件不存在: $NGINX_CONF${RESET}"
         return
     fi
 
-    mkdir -p "$WEB_ROOT"
-    mkdir -p "$LOCAL_DIR"
-    chmod 700 "$LOCAL_DIR"
-
-    if [[ -n "$TIM_URL" ]]; then
-        curl -fsSL "$TIM_URL" -o "$WEB_ROOT/$DOMAIN"
-        chmod +x "$WEB_ROOT/$DOMAIN"
-        cp "$WEB_ROOT/$DOMAIN" "$LOCAL_DIR/$DOMAIN"
+    # 检查是否已经注入过
+    if grep -q "RANDOM IMAGE API START" "$NGINX_CONF"; then
+        echo -e "${YELLOW}该配置文件已包含随机图片 API 配置，请勿重复安装。${RESET}"
+        return
     fi
 
-    # 配置 Nginx 站点
-    NGINX_CONF="/etc/nginx/sites-available/$DOMAIN"
-    cat > "$NGINX_CONF" <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
+    # 创建基础目录和默认分类目录
+    mkdir -p $BASE_DIR/images/random
+    mkdir -p $BASE_DIR/images/random1
+    mkdir -p $BASE_DIR/images/random2
+
+    # 注入最新的无感降级、自带Debug天眼的 PHP 核心代码
+    cat > $BASE_DIR/index.php <<'EOF'
+<?php
+$base_dir = __DIR__ . '/images/';
+$request_uri = $_SERVER['REQUEST_URI'] ?? '/random';
+$path_only = parse_url($request_uri, PHP_URL_PATH);
+
+if (preg_match('/(random[0-9]*)/', $path_only, $matches)) {
+    $path = $matches[1];
+} else {
+    $path = 'random';
 }
 
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    server_name $DOMAIN;
+$is_json = str_ends_with(strtolower($path_only), '.json');
+$image_dir = $base_dir . $path . '/';
 
-    ssl_certificate $CERT_PATH;
-    ssl_certificate_key $KEY_PATH;
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    root $WEB_ROOT;
-
-    location = / {
-        try_files /$DOMAIN =200;
-
-        if (\$http_user_agent !~* "(curl|wget|fetch|httpie|Go-http-client|python-requests|bash)") {
-            add_header Content-Type text/html;
-            return 200 '<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<title>时钟</title>
-<style>
-html, body { margin:0; padding:0; height:100%; display:flex; justify-content:center; align-items:center; background:#f0f0f0; font-family:Arial,sans-serif; flex-direction:column;}
-h1 { font-size:3rem; margin:0;}
-#time { font-size:5rem; font-weight:bold; margin-top:20px;}
-</style>
-</head>
-<body>
-<h1>🌎世界时间</h1>
-<div id="time"></div>
-<script>
-function updateTime() {
-    const now = new Date();
-    document.getElementById("time").innerText = now.toLocaleString();
+if (!is_dir($image_dir)) { 
+    header("HTTP/1.1 200 OK");
+    echo "<h3>❌ 【图片分类错误】物理文件夹不存在！</h3>";
+    echo "系统尝试寻找的物理路径为: <code style='color:red'>" . htmlspecialchars($image_dir) . "</code><br><br>";
+    echo "<b>解决办法：</b>请在服务器端创建该目录：<br>";
+    echo "<pre style='background:#eee;padding:10px'>mkdir -p " . htmlspecialchars($image_dir) . "</pre>";
+    exit;
 }
-setInterval(updateTime, 1000);
-updateTime();
-</script>
-</body>
-</html>';
-        }
+
+$images = glob($image_dir . '*.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}', GLOB_BRACE);
+$protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? "https://" : "http://";
+$host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+
+if (!empty($images)) {
+    $random_image = $images[array_rand($images)];
+    $image_url = $protocol . $host . '/images/' . $path . '/' . basename($random_image);
+    if ($is_json) { 
+        header('Content-Type: application/json; charset=utf-8'); 
+        echo json_encode(["url" => $image_url], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE); 
+        exit; 
     }
-
-    access_log $LOG_FILE combined;
+    $ext = strtolower(pathinfo($random_image,PATHINFO_EXTENSION));
+    $mime_types=['jpg'=>'image/jpeg','jpeg'=>'image/jpeg','png'=>'image/png','gif'=>'image/gif','webp'=>'image/webp'];
+    $mime=$mime_types[$ext]??'application/octet-stream';
+    if (ob_get_level()) ob_end_clean();
+    header("Content-Type: $mime"); header("Content-Length: ".filesize($random_image)); readfile($random_image); exit;
+} else {
+    header("HTTP/1.1 200 OK");
+    echo "<h3>⚠️ 【图片分类错误】该分类文件夹下没有放入任何图片！</h3>";
+    echo "当前检测的物理路径为: <code style='color:orange'>" . htmlspecialchars($image_dir) . "</code><br><br>";
+    echo "<b>解决办法：</b>请将你的图片上传到上述路径中。";
+    exit;
 }
 EOF
 
-    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
+    # ==========================================
+    # 【核心修改】提取 Nginx 文件名，并安全备份到 /tmp
+    # ==========================================
+    CONF_NAME=$(basename "$NGINX_CONF")
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    TEMP_BAK="/tmp/${CONF_NAME}_bak_${TIMESTAMP}"
     
-    if nginx -t; then
-        systemctl reload nginx
-        echo -e "${GREEN}✅ Nginx 配置重载成功！${RESET}"
-    else
-        echo -e "${RED}❌ Nginx 配置有误，请检查！${RESET}"
-        return
-    fi
+    cp "$NGINX_CONF" "$TEMP_BAK"
+    echo -e "${YELLOW}>>> 已将原配置安全备份至: ${TEMP_BAK}${RESET}"
 
-    echo -e "${GREEN}==========================================${RESET}"
-    echo -e "${GREEN}部署完成！${RESET}"
-    echo -e "${GREEN}使用证书：$CERT_PATH${RESET}"
-    echo -e "${GREEN}网址：https://$DOMAIN${RESET}"
-    echo -e "${GREEN}==========================================${RESET}"
-}
+    echo -e "${YELLOW}>>> 正在无损注入专属全量接管路由配置...${RESET}"
 
-uninstall_tim() {
-    read -p "请输入你的域名 ： " DOMAIN
-    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
-    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
-
-    rm -f /etc/nginx/sites-available/"$DOMAIN"
-    rm -f /etc/nginx/sites-enabled/"$DOMAIN"
-    rm -rf "$LOCAL_DIR"
-    rm -f "$WEB_ROOT/$DOMAIN"
-
-    systemctl reload nginx
-    echo -e "${GREEN}卸载完成！${RESET}"
-}
-
-update_tim() {
-    read -p "请输入最新脚本 URL： " TIM_URL
-    if [[ -z "$TIM_URL" ]]; then
-        echo -e "${RED}❌ 脚本 URL 不能为空！${RESET}"
-        return
-    fi
-
-    read -p "请输入 VPS 本地脚本存放目录（默认 /root/tim）： " LOCAL_DIR
-    LOCAL_DIR=${LOCAL_DIR:-/root/tim}
-
-    read -p "请输入你的域名（用于确定文件名）： " DOMAIN
-    if [[ -z "$DOMAIN" ]]; then
-        echo -e "${RED}❌ 域名不能为空！${RESET}"
-        return
-    fi
-
-    mkdir -p "$LOCAL_DIR"
-    echo -e "${GREEN}正在下载最新脚本...${RESET}"
-    curl -fsSL "$TIM_URL" -o "$LOCAL_DIR/$DOMAIN" || {
-        echo -e "${RED}❌ 下载失败，请检查 URL！${RESET}"
-        return
+    # 注入全新的通用 try_files 规则，从根本上杜绝 404
+    awk -v sock="$PHP_FPM_SOCK" -v base="$BASE_DIR" '
+    /server_name/ && !done {
+        print $0
+        print ""
+        print "    # === RANDOM IMAGE API START ==="
+        print "    # 以下是由脚本自动注入的专属全量路由接管配置"
+        print "    location = /favicon.ico {"
+        print "        log_not_found off;"
+        print "        access_log off;"
+        print "        return 404;"
+        print "    }"
+        print "    location /images/ {"
+        print "        expires 30d;"
+        print "        add_header Cache-Control \"public, no-transform\";"
+        print "    }"
+        print "    location / {"
+        print "        try_files $uri $uri/ /index.php?$query_string;"
+        print "    }"
+        print "    location ~ \\.php$ {"
+        print "        include snippets/fastcgi-php.conf;"
+        print "        fastcgi_pass unix:" sock ";"
+        print "        fastcgi_param SCRIPT_FILENAME " base "$fastcgi_script_name;"
+        print "        fastcgi_param REQUEST_URI $request_uri;"
+        print "    }"
+        print "    # === RANDOM IMAGE API END ==="
+        done = 1
+        next
     }
-    chmod +x "$LOCAL_DIR/$DOMAIN"
-    
-    # 同步覆盖到网页根目录
-    cp -f "$LOCAL_DIR/$DOMAIN" "$WEB_ROOT/$DOMAIN"
-    echo -e "${GREEN}✅ 脚本已同步更新至最新版本！${RESET}"
-}
+    { print }
+    ' "$TEMP_BAK" > "$NGINX_CONF"
 
-view_logs() {
-    if [ -f "$LOG_FILE" ]; then
-        tail -n 20 "$LOG_FILE"
-        awk '{print $1}' "$LOG_FILE" | sort | uniq -c | sort -nr
+    # 统一刷新一下权限
+    refresh_permissions
+
+    # 测试并重启 Nginx
+    if nginx -t; then
+        systemctl restart nginx
+        echo -e "${GREEN}API 成功全量接入当前网站！${RESET}"
+        echo -e "原配置安全存放在: ${GREEN}${TEMP_BAK}${RESET}"
+        echo -e "分类访问示例: ${YELLOW}https://你的域名${RESET}"
+        echo -e "分类访问示例: ${YELLOW}https://你的域名/random1${RESET}"
+        echo -e "分类 JSON 示例: ${YELLOW}https://你的域名/random1.json${RESET}"
     else
-        echo -e "${RED}日志文件不存在${RESET}"
+        echo -e "${RED}Nginx 配置检查失败！正在从 /tmp 自动还原原始配置...${RESET}"
+        cp "$TEMP_BAK" "$NGINX_CONF"
+        systemctl restart nginx
+        echo -e "${YELLOW}已成功恢复原配置，请检查已有 Nginx 配置文件。${RESET}"
     fi
 }
 
+# 卸载 (无损恢复已有的 Nginx 配置并清理文件)
+uninstall_service() {
+    read -p "请输入已有网站的 Nginx 配置文件绝对路径: " NGINX_CONF
+    if [ ! -f "$NGINX_CONF" ]; then
+        echo -e "${RED}文件不存在: $NGINX_CONF${RESET}"
+        return
+    fi
+
+    # 卸载前同样做好备份
+    CONF_NAME=$(basename "$NGINX_CONF")
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    TEMP_BAK="/tmp/${CONF_NAME}_before_uninstall_${TIMESTAMP}"
+    cp "$NGINX_CONF" "$TEMP_BAK"
+    echo -e "${YELLOW}>>> 卸载前已将当前配置备份至: ${TEMP_BAK}${RESET}"
+
+    echo -e "${YELLOW}>>> 正在移除 Nginx 中的 API 配置...${RESET}"
+    # 移除标记之间的所有内容
+    sed -i '/# === RANDOM IMAGE API START ===/,/# === RANDOM IMAGE API END ===/d' "$NGINX_CONF"
+
+    # 删除图片及代码文件
+    rm -rf $BASE_DIR
+
+    if nginx -t; then
+        systemctl restart nginx
+        echo -e "${GREEN}卸载完成，Nginx 配置已无损恢复。${RESET}"
+    else
+        echo -e "${RED}Nginx 配置异常！正在从 /tmp 还原备份...${RESET}"
+        cp "$TEMP_BAK" "$NGINX_CONF"
+        systemctl restart nginx
+    fi
+}
+
+# 查看状态
+status_service() {
+    echo -e "${GREEN}目录结构:${RESET}"
+    if [ -d "$BASE_DIR" ]; then
+        if command -v tree >/dev/null 2>&1; then
+            tree -L 3 $BASE_DIR
+        else
+            ls -R $BASE_DIR
+        fi
+    else
+        echo -e "${RED}服务未安装，基础目录 $BASE_DIR 不存在${RESET}"
+    fi
+}
+
+# 菜单循环
 while true; do
-    show_menu
-    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
-    case $choice in
-        1) install_tim ;;
-        2) uninstall_tim ;;
-        3) update_tim ;;
-        4) view_logs ;;
+    clear
+    # 动态检测是否安装了服务
+    if [ -d "$BASE_DIR/images" ]; then
+        STATUS_TEXT="${YELLOW}[已安装]${RESET}"
+    else
+        STATUS_TEXT="${RED}[未安装]${RESET}"
+    fi
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     ◈   随机图片 API   ◈      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}当前状态: ${STATUS_TEXT}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} 1) 安装服务${RESET}"
+    echo -e "${GREEN} 2) 卸载服务${RESET}"
+    echo -e "${GREEN} 3) 查看状态${RESET}"
+    echo -e "${GREEN} 4) 仅刷新图片目录权限${RESET}"
+    echo -e "${GREEN} 0) 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" CHOICE
+    
+    case $CHOICE in
+        1) install_dependencies; install_service ;;
+        2) uninstall_service ;;
+        3) status_service ;;
+        4) refresh_permissions ;;
         0) exit 0 ;;
-        *) echo -e "${RED}请输入有效选项${RESET}" ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+    
     echo -ne "${YELLOW}按回车键继续...${RESET}"
     read -r
 done

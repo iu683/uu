@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =============================================================================
-#  Snell v6 Server 智能多实例矩阵管理面板 (Linux Systemd 专属强力修复版)
+#  Snell v6 Server 智能多实例矩阵管理面板 (Linux Systemd 专属强力版)
 #  完美兼容: Surge Mac / iOS 客户端 (全面支持多实例隔离、IPv6 自动包裹)
 # =============================================================================
 
@@ -169,19 +169,24 @@ download_and_extract_snell() {
     ok "Snell 二进制核心解压成功！"
 }
 
-# ── 核心写入与 Surge 配置优雅生成 (修复版) ──────────────────────────────────
+# ── 核心写入与 Surge 配置优雅生成 ────────────────────────────────────────────
 write_config() {
     local instance="$1" port="$2" psk="$3" mode="$4" listen_mode="$5" dns_pref="$6" obfs="$7" tfo="$8" dns="$9"
     local conf_file="${BASE_DIR}/config_${instance}.conf"
     
     mkdir -p "$BASE_DIR"
 
-    # 【核心重构修复点】：动态根据新输入的 port 重新渲染 listen 字段，防范旧配置文件脏换行符污染
+    # 优先判定是否包含双栈特征，最后才是单栈兜底，确保回车时完美继承原有双栈配置
     local real_listen=""
     case "$listen_mode" in
-        *"0.0.0.0"*) real_listen="0.0.0.0:${port}" ;;
-        *"[::]"*)    real_listen="[::]:${port}" ;;
-        *)           real_listen="0.0.0.0:${port},[::]:${port}" ;;
+        *"0.0.0.0"*":""*"[::]"*|*"dual"*) 
+            real_listen="0.0.0.0:${port},[::]:${port}" ;; 
+        *"[::]"*)    
+            real_listen="[::]:${port}" ;;                 
+        *"0.0.0.0"*)  
+            real_listen="0.0.0.0:${port}" ;;              
+        *)           
+            real_listen="0.0.0.0:${port},[::]:${port}" ;; 
     esac
 
     cat > "$conf_file" <<EOF
@@ -226,7 +231,7 @@ print_instance_summary() {
     fi
 }
 
-# ── 交互式多开逻辑 (修复版) ──────────────────────────────────────────────────
+# ── 交互式多开与修改逻辑 ──────────────────────────────────────────────────────
 menu_install_instance() {
     create_user
     mkdir -p "$BASE_DIR"
@@ -240,7 +245,7 @@ menu_install_instance() {
     if [ "$is_edit" = "true" ] && [ -f "$conf_file" ]; then
         echo -e "\n${GREEN}==== [正在精细修改实例: ${CURRENT_INSTANCE}] ====${RESET}"
         
-        # 【核心修复点】：添加 || true 阻断 set -eu 的进程强制终止，全面追加清洗规则
+        # 添加 || true 并 tr 清洗，阻断 set -eu 的进程强制终止，解决特殊字符拼接引发的闪退
         old_listen=$(grep '^listen[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
         old_port=$(echo "$old_listen" | awk -F: '{print $NF}' | cut -d',' -f1 || echo "")
         old_key=$(grep '^psk[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
@@ -250,7 +255,7 @@ menu_install_instance() {
         old_dns=$(grep -E '^dns[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
         old_dns_pref=$(grep '^dns-ip-preference[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
         
-        # 空变量精准保底兜底
+        # 空变量兜底保底
         [[ -z "$old_port" ]] && old_port="61234"
         [[ -z "$old_key" ]] && old_key=$(random_key)
         [[ -z "$old_mode" ]] && old_mode="default"
@@ -324,7 +329,7 @@ menu_install_instance() {
         2) opt_listen="0.0.0.0" ;;
         3) opt_listen="[::]" ;;
         1) opt_listen="dual" ;;
-        *) opt_listen="${old_listen:-"dual"}" ;; # 核心修复点：若未定义则默认为 dual 双栈
+        *) opt_listen="${old_listen:-"dual"}" ;; # 加固保底防御组件防止未定义熔断
     esac
 
     # 5. 家族优先级
@@ -526,7 +531,7 @@ while true; do
     echo -e "${GREEN} 7. 重启当前焦点实例${RESET}"
     echo -e "${GREEN} 8. 查看当前实例滚动日志 (Journald)${RESET}"
     echo -e "${GREEN} 9. 查看当前实例 Surge 配置单行${RESET}"
-    echo -e "${GREEN}10. 管理节点矩阵矩阵${RESET}  ${YELLOW}← 添加 / 切换独立实例${RESET}"
+    echo -e "${GREEN}10. 管理节点矩阵中心${RESET}  ${YELLOW}← 添加 / 切换独立实例${RESET}"
     echo -e "${GREEN} 0. 退出管理台面${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     

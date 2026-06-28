@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
 # =============================================================================
-#  Xray VLESS-Reality 智能多实例矩阵管理面板 (数据持久化加固版)
+#  Xray VLESS-Reality 智能多实例矩阵管理面板
 # =============================================================================
 
-set -Eeuo pipefail
+set -Eu
 
 # ── 核心路径与环境变量 ────────────────────────────────────────────────────────
 export TEMPLATE_NAME="vlessreality"
@@ -43,7 +43,7 @@ GITHUB_PROXIES=(
     "https://hub.glowp.xyz/"
 )
 
-# ── 环境清理安全退出 ──────────────────────────────────
+# ── Environment Cleanup & Safe Exit ──────────────────────────────────
 cleanup() {
     local exit_code=$?
     [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
@@ -62,8 +62,8 @@ warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
 error() { echo -e "${RED}[ERROR]${RESET} $1" >&2; }
 die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
 
-# ── 底层依赖检测与补全 ─────────────────────────────
-REQUIRED_CMDS="curl sed grep awk openssl wget ss unzip"
+# ── 底层依赖检测与补全  ─────────────────────────────
+REQUIRED_CMDS="curl sed grep awk openssl wget ss unzip jq"
 MISSING_CMDS=""
 for cmd in $REQUIRED_CMDS; do
     if ! command -v "$cmd" &> /dev/null; then MISSING_CMDS="$MISSING_CMDS $cmd"; fi
@@ -94,14 +94,29 @@ is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 6553
 is_valid_uuid() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; }
 is_valid_alias() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
 
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
+    local mode=${1:-"v4"}
     local ip=""
-    for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-        ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-    done
-    echo "127.0.0.1"
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
 }
-
 get_arch() {
     case "$(uname -m)" in
         x86_64) echo "64" ;;
@@ -111,7 +126,7 @@ get_arch() {
     esac
 }
 
-# ── 注册表核心引擎（你提议的 ENV 记录器） ───────────────────────
+# ── 注册表核心引擎（防闪退安全加固） ───────────────────────
 register_instance() {
     local name="$1"
     mkdir -p "$(dirname "$REGISTRY_FILE")"
@@ -128,7 +143,7 @@ unregister_instance() {
     fi
 }
 
-# 动态校准同步（防止由于手动删文件导致的记录不匹配）
+# 动态校准同步（防空循环、防找不到通配符引发异常）
 sync_registry() {
     mkdir -p "$CONFIG_DIR"
     touch "$REGISTRY_FILE"
@@ -145,6 +160,7 @@ sync_registry() {
         fi
     done
     mv -f "$temp_reg" "$REGISTRY_FILE"
+    return 0
 }
 
 fetch_latest_version() {
@@ -270,11 +286,11 @@ generate_link() {
     
     local ip uuid port domain shortid pubkey display_ip hostname
     ip=$(get_public_ip)
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$file")
-    port=$(jq -r '.inbounds[0].port' "$file")
-    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$file")
-    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$file")
-    pubkey=$(jq -r '._meta.pubkey' "$file")
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$file" 2>/dev/null || echo "")
+    port=$(jq -r '.inbounds[0].port' "$file" 2>/dev/null || echo "")
+    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$file" 2>/dev/null || echo "")
+    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$file" 2>/dev/null || echo "")
+    pubkey=$(jq -r '._meta.pubkey' "$file" 2>/dev/null || echo "")
     
     display_ip="$ip"; [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
     hostname=$(hostname -s 2>/dev/null || echo "Xray")
@@ -294,11 +310,11 @@ print_node_summary() {
     echo -e "\n${GREEN}====== Xray 实例 [ ${instance} ] 配置详情 ======${RESET}"
     echo -e "${GREEN}实例协议     :${RESET} ${YELLOW}VLESS-REALITY (TCP + Vision)${RESET}"
     echo -e "${GREEN}外网绑定 IP  :${RESET} $(get_public_ip)"
-    echo -e "${GREEN}监听端口     :${RESET} $(jq -r '.inbounds[0].port' "$file")"
-    echo -e "${GREEN}用户凭证UUID :${RESET} $(jq -r '.inbounds[0].settings.clients[0].id' "$file")"
-    echo -e "${GREEN}伪装SNI域名  :${RESET} $(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$file")"
-    echo -e "${GREEN}公钥 PBK     :${RESET} $(jq -r '._meta.pubkey' "$file")"
-    echo -e "${GREEN}ShortID      :${RESET} $(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$file")"
+    echo -e "${GREEN}监听端口     :${RESET} $(jq -r '.inbounds[0].port' "$file" 2>/dev/null)"
+    echo -e "${GREEN}用户凭证UUID :${RESET} $(jq -r '.inbounds[0].settings.clients[0].id' "$file" 2>/dev/null)"
+    echo -e "${GREEN}伪装SNI域名  :${RESET} $(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$file" 2>/dev/null)"
+    echo -e "${GREEN}公钥 PBK     :${RESET} $(jq -r '._meta.pubkey' "$file" 2>/dev/null)"
+    echo -e "${GREEN}ShortID      :${RESET} $(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$file" 2>/dev/null)"
     echo -e "${GREEN}配置文件路径 :${RESET} ${file}"
     echo "--------------------------------------------------------"
     if [[ -f "${LINK_DIR}/xray_${instance}.txt" ]]; then
@@ -326,7 +342,7 @@ get_status_info() {
     local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
     if [ -f "$conf_file" ]; then
         local p_num
-        p_num=$(jq -r '.inbounds[0].port // empty' "$conf_file")
+        p_num=$(jq -r '.inbounds[0].port // empty' "$conf_file" 2>/dev/null)
         panel_port="${p_num} (REALITY)"
     else
         panel_port="未创建配置"
@@ -337,27 +353,26 @@ parse_existing_config() {
     local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
     if [ ! -f "$conf_file" ]; then return 1; fi
 
-    OLD_PORT=$(jq -r '.inbounds[0].port' "$conf_file")
-    OLD_UUID=$(jq -r '.inbounds[0].settings.clients[0].id' "$conf_file")
-    OLD_DOMAIN=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$conf_file")
-    OLD_SHORTID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$conf_file")
-    OLD_PRIVKEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$conf_file")
-    OLD_PUBKEY=$(jq -r '._meta.pubkey' "$conf_file")
+    OLD_PORT=$(jq -r '.inbounds[0].port' "$conf_file" 2>/dev/null)
+    OLD_UUID=$(jq -r '.inbounds[0].settings.clients[0].id' "$conf_file" 2>/dev/null)
+    OLD_DOMAIN=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$conf_file" 2>/dev/null)
+    OLD_SHORTID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$conf_file" 2>/dev/null)
+    OLD_PRIVKEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$conf_file" 2>/dev/null)
+    OLD_PUBKEY=$(jq -r '._meta.pubkey' "$conf_file" 2>/dev/null)
     return 0
 }
 
 menu_switch_instance() {
-    echo -e "\n${GREEN}==== [多开实例矩阵管理中心] ====${RESET}"
-    echo -e "当前聚焦的操作目标: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo "目前持久化注册表内的独立实例列表:"
+    echo -e "\n${GREEN}======== [多开实例矩阵管理中心] ========${RESET}"
+    echo -e "${GREEN}当前操作目标:${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+    echo -e "${GREEN}目前独立实例列表:${RESET}"
 
-    # 载入前先自动校准一次 env 文件状态
+    # 优先创建并校准注册表文件
     sync_registry
 
     local instance_list=()
     local count=0
 
-    # 优雅地读取我们建立的注册表文件，绝不发生闪退
     if [ -f "$REGISTRY_FILE" ]; then
         while IFS= read -r name || [ -n "$name" ]; do
             [ -z "$name" ] && continue
@@ -368,21 +383,21 @@ menu_switch_instance() {
             instance_list+=("$name")
             
             local port_num
-            port_num=$(jq -r '.inbounds[0].port // "未知"' "$conf_file")
+            port_num=$(jq -r '.inbounds[0].port // "未知"' "$conf_file" 2>/dev/null || echo "未知")
             local status_str="${RED}已挂起${RESET}"
-            systemctl is-active --quiet "${TEMPLATE_NAME}@${name}" 2>/dev/null && status_str="${GREEN}分流中${RESET}"
+            systemctl is-active --quiet "${TEMPLATE_NAME}@${name}" 2>/dev/null && status_str="${GREEN}运行中${RESET}"
             
-            echo -e " [ ${CYAN}${count}${RESET} ] -> ${YELLOW}${name}${RESET} [端口: ${port_num} | 状态: ${status_str}]"
+            echo -e " ${CYAN}[ ${count} ] -> ${RESET}${YELLOW}${name}${RESET} ${GREEN}[端口: ${port_num} | 状态: ${status_str}${GREEN}]${RESET}"
         done < "$REGISTRY_FILE"
     fi
 
     if [ "$count" -eq 0 ]; then
-        echo " (暂无任何多开实例，请直接输入新名称创建)"
+        echo -e "${YELLOW}(暂无任何多开实例，请直接输入新名称创建)${RESET}"
     fi
     
     echo ""
-    echo -e "👉 ${GREEN}输入现有实例前面的【数字编号】快速切换管理目标${RESET}"
-    echo -e "👉 ${GREEN}或者直接输入一个【全新的英文名字】来新建多开实例${RESET}"
+    echo -e "${YELLOW}👉 输入现有实例前面的【数字编号】快速切换管理目标${RESET}"
+    echo -e "${YELLOW}👉 或者直接输入一个【全新的英文名字】来新建多开实例${RESET}"
     local input_val=""
     read -r -p "请输入选择或名字: " input_val || true
 
@@ -427,7 +442,12 @@ menu_install() {
         echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
         OLD_PORT=$((RANDOM % 50001 + 10000))
         while ! check_port "$OLD_PORT"; do OLD_PORT=$((RANDOM % 50001 + 10000)); done
-        OLD_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
+        # 优先通过 Xray 内置引擎生成标准 UUID，无核心时使用系统兜底
+        if [ -f "$BIN_PATH" ]; then
+            OLD_UUID=$("$BIN_PATH" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
+        else
+            OLD_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
+        fi
         OLD_DOMAIN="www.amazon.com"
         OLD_SHORTID=$(openssl rand -hex 4)
         OLD_PRIVKEY="" OLD_PUBKEY=""
@@ -450,21 +470,22 @@ menu_install() {
     # 3. 伪装 SNI 域名
     local input_domain="" opt_domain=""
     read -r -p "$(echo -e "${GREEN}请输入 SNI 伪装域名 [当前: ${YELLOW}${OLD_DOMAIN}${GREEN} | 回车不改]: ${RESET}")" input_domain || true
-    opt_domain="${input_domain:-$OLD_DOMAIN}"
+    opt_domain="${input_domain:-$OLD_DOMAIN}" # ← 确保这里最后是 $OLD_DOMAIN
 
     # 4. ShortID
     local input_sid="" opt_sid=""
     read -r -p "$(echo -e "${GREEN}请输入自定义 ShortID [当前: ${YELLOW}${OLD_SHORTID}${GREEN} | 回车不改]: ${RESET}")" input_sid || true
     opt_sid="${input_sid:-$OLD_SHORTID}"
 
-    # 5. X25519 密钥对派生
+    # 5. 二进制核心统一保障与 X25519 密钥对派生
+    if [ ! -f "$BIN_PATH" ]; then
+        download_bin
+        install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH"
+        cp -f "$TMP_DIR/extracted/geoip.dat" "$TMP_DIR/extracted/geosite.dat" "${CONFIG_DIR}/" 2>/dev/null || true
+    fi
+
     local opt_privkey="$OLD_PRIVKEY" local opt_pubkey="$OLD_PUBKEY"
     if [ -z "$opt_privkey" ] || [ "$is_edit" = "false" ]; then
-        if [ ! -f "$BIN_PATH" ]; then
-            download_bin
-            install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH"
-            cp -f "$TMP_DIR/extracted/geoip.dat" "$TMP_DIR/extracted/geosite.dat" "${CONFIG_DIR}/" 2>/dev/null || true
-        fi
         local key_pair=""
         key_pair=$(timeout 10 "$BIN_PATH" x25519 2>/dev/null || echo "")
         if [ -n "$key_pair" ]; then
@@ -474,11 +495,6 @@ menu_install() {
             opt_privkey="iOn_8971_fake_private_key_generated_due_to_timeout_xxxxx"
             opt_pubkey="pbk_fake_public_key_generated_due_to_timeout_xxxxxx"
         fi
-    fi
-
-    if [ ! -f "$BIN_PATH" ]; then
-        download_bin
-        install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH"
     fi
 
     write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_uuid" "$opt_domain" "$opt_privkey" "$opt_sid" "$opt_pubkey"
@@ -510,12 +526,13 @@ menu_uninstall() {
     unregister_instance "$CURRENT_INSTANCE"
     ok "实例 [ ${CURRENT_INSTANCE} ] 已被纯净抹除。"
 
-    # 如果没有节点了，执行全局回收
+    # 如果没有节点了，执行全局彻底回收（清理更干净）
     if [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR" | grep 'config_')" ]; then
         info "检测到所有 Reality 节点已排空，执行全局核心组件垃圾回收机制..."
         systemctl stop "${TEMPLATE_NAME}@*" >/dev/null 2>&1 || true
         rm -f "$SERVICE_FILE" "$BIN_PATH" "$REGISTRY_FILE"
         rm -rf "$CONFIG_DIR" "$LOG_DIR"
+        rm -f "${LINK_DIR}"/xray_*.txt 2>/dev/null || true
         systemctl daemon-reload
         ok "全系统已无常驻残留，基础依赖与内核解绑卸载完成！"
         CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "Xray")"
@@ -527,7 +544,7 @@ while true; do
     get_status_info
     clear
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} ◈ Xray VLESS-Reality 多实例管理面板 ◈     ${RESET}"
+    echo -e "${GREEN}    ◈ Xray VLESS-Reality 多实例管理面板 ◈  ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
     echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"

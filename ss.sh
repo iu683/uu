@@ -4,6 +4,7 @@
 #  Xray VLESS-Reality 智能多实例矩阵管理面板
 # =============================================================================
 
+
 set -Eu
 
 # ── 核心路径与环境变量 ────────────────────────────────────────────────────────
@@ -52,17 +53,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
+    echo -e "${RED}[ERROR]请使用 root 权限运行此脚本！${RESET}" >&2
     exit 1
 fi
 
-info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
-ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
-error() { echo -e "${RED}[ERROR]${RESET} $1" >&2; }
-die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
-
-# ── 底层依赖检测与补全  ─────────────────────────────
+# ── 底层依赖检测与补全 ─────────────────────────────
 REQUIRED_CMDS="curl sed grep awk openssl wget ss unzip jq"
 MISSING_CMDS=""
 for cmd in $REQUIRED_CMDS; do
@@ -70,7 +65,7 @@ for cmd in $REQUIRED_CMDS; do
 done
 
 if [ -n "$MISSING_CMDS" ]; then
-    info "检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${RESET}，正在自动安装..."
+    echo -e "${YELLOW}[INFO]检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${YELLOW}，正在自动安装...${RESET}"
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         case "$ID" in
@@ -78,10 +73,13 @@ if [ -n "$MISSING_CMDS" ]; then
             centos|rhel|rocky|almalinux|fedora)
                 if command -v dnf &>/dev/null; then dnf install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1
                 else yum install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1; fi ;;
-            *) die "未知系统，请手动安装组件: $MISSING_CMDS" ;;
+            *) 
+                echo -e "${RED}[ERROR]未知系统，请手动安装组件: $MISSING_CMDS${RESET}" >&2
+                exit 1 
+                ;;
         esac
     fi
-    ok "基础依赖补全成功！"
+    echo -e "${GREEN}[OK]基础依赖补全成功！${RESET}"
 fi
 
 # ── 安全验证组件 ─────────────────────────────────────
@@ -94,7 +92,6 @@ is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 6553
 is_valid_uuid() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; }
 is_valid_alias() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
 
-# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
     local mode=${1:-"v4"}
     local ip=""
@@ -117,16 +114,20 @@ get_public_ip() {
     fi
     echo "127.0.0.1" && return 0
 }
+
 get_arch() {
     case "$(uname -m)" in
         x86_64) echo "64" ;;
         aarch64|arm64) echo "arm64-v8a" ;;
         armv7l) echo "arm32-v7a" ;;
-        *) die "暂不支持的系统架构: $(uname -m)" ;;
+        *) 
+            echo -e "${RED}[ERROR]暂不支持的系统架构: $(uname -m)${RESET}" >&2
+            exit 1 
+            ;;
     esac
 }
 
-# ── 注册表核心引擎（防闪退安全加固） ───────────────────────
+# ── 注册表核心引擎 ───────────────────────────────────────────────────
 register_instance() {
     local name="$1"
     mkdir -p "$(dirname "$REGISTRY_FILE")"
@@ -143,14 +144,12 @@ unregister_instance() {
     fi
 }
 
-# 动态校准同步（防空循环、防找不到通配符引发异常）
 sync_registry() {
     mkdir -p "$CONFIG_DIR"
     touch "$REGISTRY_FILE"
     local temp_reg="${TMP_DIR}/sync.env"
     touch "$temp_reg"
     
-    # 从实际存在的 config_*.json 重新收录
     for f in "${CONFIG_DIR}"/config_*.json; do
         [ -e "$f" ] || continue
         local name
@@ -164,7 +163,7 @@ sync_registry() {
 }
 
 fetch_latest_version() {
-    info "正在轮询获取 Xray-core 最新 Release 版本号..."
+    echo -e "${YELLOW}[INFO]正在轮询获取 Xray-core 最新 Release 版本号...${RESET}"
     VERSION=""
     for proxy in "${GITHUB_PROXIES[@]}"; do
         local api_url="${proxy}https://api.github.com/repos/XTLS/Xray-core/releases/latest"
@@ -174,13 +173,13 @@ fetch_latest_version() {
         tmp_ver=$(echo "$resp" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
         if [[ -n "$tmp_ver" && "$tmp_ver" != "null" ]]; then
             VERSION="${tmp_ver#v}"
-            ok "成功获取到最新版本: ${GREEN}${VERSION}${RESET}"
+            echo -e "${GREEN}[OK]成功获取到最新版本: ${VERSION}${RESET}"
             break
         fi
     done
     if [ -z "$VERSION" ]; then
         VERSION="$BACKUP_VERSION"
-        warn "降级采用稳定默认版本: ${VERSION}"
+        echo -e "${YELLOW}[WARN]降级采用稳定默认版本: ${VERSION}${RESET}"
     fi
 }
 
@@ -192,20 +191,21 @@ download_bin() {
     
     for proxy in "${GITHUB_PROXIES[@]}"; do
         local url_bin="${proxy}https://github.com/XTLS/Xray-core/releases/download/v${VERSION}/Xray-linux-${arch}.zip"
-        info "正在尝试通过镜像源 [ ${CYAN}${proxy:-官方直连}${RESET} ] 下载资产包..."
+        echo -e "${YELLOW}[INFO]正在尝试通过镜像源 [ ${CYAN}${proxy:-官方直连}${YELLOW} ] 下载资产包...${RESET}"
         if curl -fsSL --connect-timeout 8 --max-time 60 -o "$TMP_DIR/xray.zip" "$url_bin"; then
             if [ -s "$TMP_DIR/xray.zip" ]; then
                 download_success=true
                 unzip -qo "$TMP_DIR/xray.zip" -d "$TMP_DIR/extracted"
-                ok "核心包同步下载与解压完成！"
+                echo -e "${GREEN}[OK]核心包同步下载与解压完成！${RESET}"
                 break
             fi
         fi
-        warn "当前源下载失败或连接超时，正在为您自动切换下一个备用源..."
+        echo -e "${YELLOW}[WARN]当前源下载失败或连接超时，正在为您自动切换下一个备用源...${RESET}"
     done
 
     if [ "$download_success" = "false" ]; then
-        die "所有 GitHub 镜像代理源及官方通道均尝试失败，请检查网络后重试！"
+        echo -e "${RED}[ERROR]所有 GitHub 镜像代理源及官方通道均尝试失败，请检查 network 后重试！${RESET}" >&2
+        exit 1
     fi
 }
 
@@ -363,11 +363,10 @@ parse_existing_config() {
 }
 
 menu_switch_instance() {
-    echo -e "\n${GREEN}==== [多开实例矩阵管理中心] ====${RESET}"
+    echo -e "\n${GREEN}======== [多开实例矩阵管理中心] ========${RESET}"
     echo -e "${GREEN}当前操作目标:${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}目前独立实例列表:${RESET}"
+    echo -e "${GREEN}目前持独立实例列表:${RESET}"
 
-    # 优先创建并校准注册表文件
     sync_registry
 
     local instance_list=()
@@ -387,17 +386,17 @@ menu_switch_instance() {
             local status_str="${RED}已挂起${RESET}"
             systemctl is-active --quiet "${TEMPLATE_NAME}@${name}" 2>/dev/null && status_str="${GREEN}运行中${RESET}"
             
-            echo -e " ${CYAN}[ ${count} ] -> ${RESET}${YELLOW}${name}${RESET} ${GREEN}[端口: ${port_num} | 状态: ${status_str}]${RESET}"
+            echo -e " ${CYAN}[ ${count} ] ->${RESET} ${YELLOW}${name}${RESET} ${GREEN}[端口: ${port_num} | 状态: ${status_str}${GREEN}]${RESET}"
         done < "$REGISTRY_FILE"
     fi
 
     if [ "$count" -eq 0 ]; then
-        echo -e "${YELLOW}(暂无任何多开实例，请直接输入新名称创建)${RESET}"
+        echo -e " ${GREEN}(暂无任何多开实例，请直接输入新名称创建)${RESET}"
     fi
     
     echo ""
-    echo -e "${YELLOW}👉 输入现有实例前面的【数字编号】快速切换管理目标${RESET}"
-    echo -e "${YELLOW}👉 或者直接输入一个【全新的英文名字】来新建多开实例${RESET}"
+    echo -e "${GREEN}👉 输入现有实例前面的【数字编号】快速切换管理目标${RESET}"
+    echo -e "${GREEN}👉 或者直接输入一个【全新的英文名字】来新建多开实例${RESET}"
     local input_val=""
     read -r -p "请输入选择或名字: " input_val || true
 
@@ -407,16 +406,16 @@ menu_switch_instance() {
         if [ "$input_val" -gt 0 ] && [ "$input_val" -le "$count" ]; then
             local index=$((input_val - 1))
             CURRENT_INSTANCE="${instance_list[$index]}"
-            ok "操作焦点已成功切为编号 [ ${input_val} ] 的实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+            echo -e "${GREEN}[OK]操作焦点已成功切为编号 [ ${input_val} ] 的实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
         else
-            warn "编号输入超出范围！未做任何变更。"
+            echo -e "${YELLOW}[WARN]编号输入超出范围！未做任何变更。${RESET}"
         fi
     else
         if is_valid_alias "$input_val"; then
             CURRENT_INSTANCE="$input_val"
-            ok "检测到全新实例名称，已将焦点锁定在: ${YELLOW}${CURRENT_INSTANCE}${RESET} (请去主菜单按 1 创建它)"
+            echo -e "${GREEN}[OK]检测到全新实例名称，已将焦点锁定在: ${YELLOW}${CURRENT_INSTANCE}${RESET} (请去主菜单按 1 创建它)"
         else
-            error "名字仅限英文字母/数字/下划线！"
+            echo -e "${RED}[ERROR]名字仅限英文字母/数字/下划线！${RESET}" >&2
         fi
     fi
 }
@@ -428,13 +427,14 @@ menu_install() {
 
     if [ "$is_edit" = "true" ]; then
         if ! parse_existing_config; then
-            die "未检测到实例 [ ${CURRENT_INSTANCE} ] 的旧配置，无法执行修改，请先按 1 进行全新部署！"
+            echo -e "${RED}[ERROR]未检测到实例 [ ${CURRENT_INSTANCE} ] 的旧配置，无法执行修改，请先按 1 进行全新部署！${RESET}" >&2
+            exit 1
         fi
         echo -e "\n${GREEN}==== [💡 正在微调修改实例: ${CURRENT_INSTANCE} (直接回车保持原样)] ====${RESET}"
     else
         local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
         if [ -f "$conf_file" ]; then
-            warn "实例 [ ${CURRENT_INSTANCE} ] 已经存在对应配置文件。"
+            echo -e "${YELLOW}[WARN]实例 [ ${CURRENT_INSTANCE} ] 已经存在对应配置文件。${RESET}"
             local res=""
             read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重写该实例？[y/N]: ${RESET}")" res || true
             [[ "$res" =~ ^[Yy]$ ]] || return
@@ -442,7 +442,6 @@ menu_install() {
         echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
         OLD_PORT=$((RANDOM % 50001 + 10000))
         while ! check_port "$OLD_PORT"; do OLD_PORT=$((RANDOM % 50001 + 10000)); done
-        # 优先通过 Xray 内置引擎生成标准 UUID，无核心时使用系统兜底
         if [ -f "$BIN_PATH" ]; then
             OLD_UUID=$("$BIN_PATH" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
         else
@@ -458,8 +457,13 @@ menu_install() {
     read -r -p "$(echo -e "${GREEN}请输入服务入站端口 [当前: ${YELLOW}${OLD_PORT}${GREEN} | 回车不改]: ${RESET}")" input_port || true
     opt_port="${input_port:-$OLD_PORT}"
     if [ "$opt_port" != "$OLD_PORT" ] || [ "$is_edit" = "false" ]; then
-        if ! is_valid_port "$opt_port"; then error "无效端口，强制应用默认随机端口。"; opt_port="$OLD_PORT"; fi
-        if ! check_port "$opt_port"; then warn "警告：检测到端口 ${opt_port} 可能被占用！"; fi
+        if ! is_valid_port "$opt_port"; then 
+            echo -e "${RED}[ERROR]无效端口，强制应用默认随机端口。${RESET}" >&2
+            opt_port="$OLD_PORT"
+        fi
+        if ! check_port "$opt_port"; then 
+            echo -e "${YELLOW}[WARN]警告：检测到端口 ${opt_port} 可能被占用！${RESET}"
+        fi
     fi
 
     # 2. 用户 UUID
@@ -470,14 +474,13 @@ menu_install() {
     # 3. 伪装 SNI 域名
     local input_domain="" opt_domain=""
     read -r -p "$(echo -e "${GREEN}请输入 SNI 伪装域名 [当前: ${YELLOW}${OLD_DOMAIN}${GREEN} | 回车不改]: ${RESET}")" input_domain || true
-    opt_domain="${input_domain:-$OLD_DOMAIN}" # ← 确保这里最后是 $OLD_DOMAIN
+    opt_domain="${input_domain:-$OLD_DOMAIN}"
 
     # 4. ShortID
     local input_sid="" opt_sid=""
     read -r -p "$(echo -e "${GREEN}请输入自定义 ShortID [当前: ${YELLOW}${OLD_SHORTID}${GREEN} | 回车不改]: ${RESET}")" input_sid || true
     opt_sid="${input_sid:-$OLD_SHORTID}"
 
-    # 5. 二进制核心统一保障与 X25519 密钥对派生
     if [ ! -f "$BIN_PATH" ]; then
         download_bin
         install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH"
@@ -500,21 +503,21 @@ menu_install() {
     write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_uuid" "$opt_domain" "$opt_privkey" "$opt_sid" "$opt_pubkey"
     write_template_service
 
-    info "正在安全重载实例配置项并拉起: ${CURRENT_INSTANCE} ..."
+    echo -e "${YELLOW}[INFO]正在安全重载实例配置项并拉起: ${CURRENT_INSTANCE} ...${RESET}"
     systemctl enable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
     systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
     
     sleep 1.5
     if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
-        ok "Xray Reality 实例 [ ${CURRENT_INSTANCE} ] 部署/微调成功！"
+        echo -e "${GREEN}[OK]Xray Reality 实例 [ ${CURRENT_INSTANCE} ] 部署/微调成功！${RESET}"
         print_node_summary "$CURRENT_INSTANCE"
     else
-        warn "实例重启成功，但检测到异常挂起，请按 [8] 抓取内核滚动日志排查。"
+        echo -e "${YELLOW}[WARN]实例重启成功，但检测到异常挂起，请按 [8] 抓取内核滚动日志排查。${RESET}"
     fi
 }
 
 menu_uninstall() {
-    warn "该操作将彻底销毁当前聚焦选择的 Reality 实例及其占用的端口通道。"
+    echo -e "${YELLOW}[WARN]该操作将彻底销毁当前聚焦选择的 Reality 实例及其占用的端口通道。${RESET}"
     local res=""
     read -r -p "$(echo -e "${RED}确认抹除清理实例 [ ${CURRENT_INSTANCE} ] 吗？[y/N]: ${RESET}")" res || true
     [[ "$res" =~ ^[Yy]$ ]] || return
@@ -524,18 +527,173 @@ menu_uninstall() {
     rm -f "${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
     rm -f "${LINK_DIR}/xray_${CURRENT_INSTANCE}.txt"
     unregister_instance "$CURRENT_INSTANCE"
-    ok "实例 [ ${CURRENT_INSTANCE} ] 已被纯净抹除。"
+    echo -e "${GREEN}[OK]实例 [ ${CURRENT_INSTANCE} ] 已被纯净抹除。${RESET}"
 
-    # 如果没有节点了，执行全局彻底回收（清理更干净）
     if [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR" | grep 'config_')" ]; then
-        info "检测到所有 Reality 节点已排空，执行全局核心组件垃圾回收机制..."
+        echo -e "${YELLOW}[INFO]检测到所有 Reality 节点已排空，执行全局核心组件垃圾回收机制...${RESET}"
         systemctl stop "${TEMPLATE_NAME}@*" >/dev/null 2>&1 || true
         rm -f "$SERVICE_FILE" "$BIN_PATH" "$REGISTRY_FILE"
         rm -rf "$CONFIG_DIR" "$LOG_DIR"
         rm -f "${LINK_DIR}"/xray_*.txt 2>/dev/null || true
         systemctl daemon-reload
-        ok "全系统已无常驻残留，基础依赖与内核解绑卸载完成！"
+        echo -e "${GREEN}[OK]全系统已无常驻残留，基础依赖与内核解绑卸载完成！${RESET}"
         CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "Xray")"
+    fi
+}
+
+# ── 拓展组件：自适应配置当前实例的 Socks5 出口 ──────────────────────────────
+configure_custom_socks5_outbound() {
+    local instance_config="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
+    if [[ ! -f "$instance_config" ]]; then 
+        echo -e "${RED}[ERROR]未安装，无法配置出口模式。${RESET}" >&2
+        return
+    fi
+
+    local mode current_protocol tmp_file
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$instance_config" 2>/dev/null || echo "freedom")
+
+    echo "---------------------------------------------"
+    echo "请选择出口模式："
+    if [[ "$current_protocol" == "socks" ]]; then
+        echo -e "当前模式: ${YELLOW}Socks5${RESET}"
+    else
+        echo -e "当前模式: ${GREEN}直连${RESET}"
+    fi
+    echo "1) 直连出口"
+    echo "2) Socks5 出口"
+    echo "0) 取消"
+    echo "---------------------------------------------"
+
+    read -rp "请输入选项 [0-2]: " mode || true
+    case "$mode" in
+        1)
+            tmp_file=$(mktemp)
+            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$instance_config" > "$tmp_file"
+            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+                rm -f "$tmp_file"
+                echo -e "${RED}[ERROR]生成的直连配置无效。${RESET}" >&2
+                return 1
+            fi
+            cp "$instance_config" "${instance_config}.bak.$(date +%s)"
+            mv "$tmp_file" "$instance_config"
+            chmod 644 "$instance_config" 2>/dev/null || true
+            
+            systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+            sleep 0.5
+            if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+                echo -e "${GREEN}[OK]已成功切换为直连出口！${RESET}"
+            else
+                echo -e "${RED}[ERROR]切换到直连失败。${RESET}" >&2
+                return 1
+            fi
+            return
+            ;;
+        2)
+            ;;
+        0|"")
+            echo -e "${YELLOW}[INFO]已取消配置。${RESET}"
+            return
+            ;;
+        *)
+            echo -e "${RED}[ERROR]无效选项，请输入 0-2 之间的数字。${RESET}" >&2
+            return 1
+            ;;
+    esac
+
+    echo -e "${YELLOW}[INFO]配置自定义 Socks5 出口代理...${RESET}"
+
+    local socks_host socks_port socks_user socks_pass
+
+    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
+    [[ -z "$socks_host" ]] && echo -e "${YELLOW}[INFO]已取消配置。${RESET}" && return
+
+    while true; do
+        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
+        [[ -z "$socks_port" ]] && socks_port=1080
+        if is_valid_port "$socks_port"; then
+            break
+        else
+            echo -e "${RED}[ERROR]端口无效，请输入一个1-65535之间的数字。${RESET}" >&2
+        fi
+    done
+
+    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
+    if [[ -n "$socks_user" ]]; then
+        read -rs -p "请输入 Socks5 密码: " socks_pass || true
+        echo
+    else
+        socks_pass=""
+    fi
+
+    tmp_file=$(mktemp)
+
+    if [[ -n "$socks_user" ]]; then
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            --arg user "$socks_user" \
+            --arg pass "$socks_pass" \
+            '
+            .outbounds = [
+              {
+                "protocol": "socks",
+                "tag": "custom-socks5-out",
+                "settings": {
+                  "servers": [
+                    {
+                      "address": $host,
+                      "port": $port,
+                      "users": [
+                        {
+                          "user": $user,
+                          "pass": $pass
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+            ' "$instance_config" > "$tmp_file"
+    else
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            '
+            .outbounds = [
+              {
+                "protocol": "socks",
+                "tag": "custom-socks5-out",
+                "settings": {
+                  "servers": [
+                    {
+                      "address": $host,
+                      "port": $port
+                    }
+                  ]
+                }
+              }
+            ]
+            ' "$instance_config" > "$tmp_file"
+    fi
+
+    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        echo -e "${RED}[ERROR]生成的 Socks5 配置无效，请检查输入后重试。${RESET}" >&2
+        return 1
+    fi
+
+    cp "$instance_config" "${instance_config}.bak.$(date +%s)"
+    mv "$tmp_file" "$instance_config"
+    chmod 644 "$instance_config" 2>/dev/null || true
+
+    systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+    sleep 0.5
+    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+        echo -e "${GREEN}[OK]已成功切换为 Socks5 出口！${RESET}"
+    else
+        echo -e "${RED}[ERROR]重启服务失败，当前配置可能与 system 境不兼容。${RESET}" >&2
+        return 1
     fi
 }
 
@@ -544,7 +702,7 @@ while true; do
     get_status_info
     clear
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}    ◈ Xray VLESS-Reality 多实例管理面板 ◈  ${RESET}"
+    echo -e "${GREEN} ◈ Xray VLESS-Reality 多实例管理面板 ◈     ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
     echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
@@ -561,6 +719,7 @@ while true; do
     echo -e "${GREEN} 8. 查看当前实例日志${RESET}"
     echo -e "${GREEN} 9. 查看当前实例配置${RESET}"
     echo -e "${GREEN}10. 管理节点${RESET}  ${YELLOW}← 添加 / 切换节点${RESET}"
+    echo -e "${GREEN}11. 自定义Socks5出口${RESET} ${YELLOW}← 链式分流代理${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     
@@ -568,17 +727,18 @@ while true; do
     read -r -p "$(echo -e "${GREEN}选择操作序号: ${RESET}")" choice || true
     case "$choice" in
         1) menu_install "new" ;;
-        2) download_bin && install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH" && ok "Xray 核心覆盖并上调成功" ;;
+        2) download_bin && install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH" && echo -e "${GREEN}[OK]Xray 核心覆盖并上调成功${RESET}" ;;
         3) menu_uninstall ;;
         4) menu_install "edit" ;;
-        5) systemctl start "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && ok "拉起成功" ;;
-        6) systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && ok "挂起成功" ;;
-        7) systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && ok "重启完毕" ;;
+        5) systemctl start "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]拉起成功${RESET}" ;;
+        6) systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]挂起成功${RESET}" ;;
+        7) systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]重启完毕${RESET}" ;;
         8) (trap 'echo -e "\n"' INT; journalctl -u "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" -n 50 -f) ;;
         9) print_node_summary "$CURRENT_INSTANCE" ;;
         10) menu_switch_instance ;;
+        11) configure_custom_socks5_outbound ;;
         0) exit 0 ;;
-        *) warn "无效输入！"; sleep 1 ;;
+        *) echo -e "${YELLOW}[WARN]无效输入！${RESET}"; sleep 1 ;;
     esac
     read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制台面...${RESET}")" || true
 done

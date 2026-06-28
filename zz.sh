@@ -1,949 +1,572 @@
-#!/bin/bash
-# ========================================
-# 🐳 一键 VPS Docker 管理工具
-# ========================================
+#!/usr/bin/env bash
 
-# -----------------------------
-# 颜色
-# -----------------------------
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-BOLD="\033[1m"
-RESET="\033[0m"
-BLUE="\033[34m"
-# -----------------------------
-# 检查 root
-# -----------------------------
-root_use() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}请使用 root 用户运行脚本${RESET}"
-        exit 1
+# =============================================================================
+#  Xray VLESS-Reality 智能多实例矩阵管理面板 (在线执行全面加固版)
+# =============================================================================
+
+set -Eeuo pipefail
+
+# ── 核心路径与环境变量 ────────────────────────────────────────────────────────
+export TEMPLATE_NAME="vlessreality"
+export BIN_PATH="/usr/local/bin/${TEMPLATE_NAME}"
+export CONFIG_DIR="/usr/local/etc/${TEMPLATE_NAME}"
+export LOG_DIR="/var/log/${TEMPLATE_NAME}"
+export LINK_DIR="/root/proxynode/Reality"
+export SERVICE_FILE="/etc/systemd/system/${TEMPLATE_NAME}@.service"
+
+# 用作注册表：持久化记录活跃实例名字
+export REGISTRY_FILE="${CONFIG_DIR}/.instances.env"
+
+# 默认控制的目标实例名称自动改成当前主机名
+CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "Xray")"
+
+# ── 终端颜色定义 ─────────────────────────────────────
+export RESET='\033[0m'
+export GREEN='\033[0;32m'
+export YELLOW='\033[0;33m'
+export RED='\033[0;31m'
+export BLUE='\033[0;34m'
+export CYAN='\033[0;36m'
+
+# 降级备用版本
+readonly BACKUP_VERSION="26.3.27"
+
+# 动态临时目录
+TMP_DIR=$(mktemp -d -t xray.XXXXXX)
+
+GITHUB_PROXIES=(
+    ""
+    "https://gh-proxy.com/"
+    "https://proxy.vvvv.ee/"
+    "https://v6.gh-proxy.org/"
+    "https://ghproxy.lvedong.eu.org/"
+    "https://hub.glowp.xyz/"
+)
+
+# ── 环境清理安全退出 ──────────────────────────────────
+cleanup() {
+    local exit_code=$?
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+    exit $exit_code
+}
+trap cleanup EXIT INT TERM
+
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}[错误]${RESET} 请使用 root 权限运行此脚本！" >&2
+    exit 1
+fi
+
+info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
+ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
+error() { echo -e "${RED}[ERROR]${RESET} $1" >&2; }
+die()  { echo -e "${RED}[ERROR]${RESET} $1" >&2; exit 1; }
+
+# ── 底层依赖检测与补全 ─────────────────────────────
+REQUIRED_CMDS="curl sed grep awk openssl wget ss unzip jq"
+MISSING_CMDS=""
+for cmd in $REQUIRED_CMDS; do
+    if ! command -v "$cmd" &> /dev/null; then MISSING_CMDS="$MISSING_CMDS $cmd"; fi
+done
+
+if [ -n "$MISSING_CMDS" ]; then
+    info "检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${RESET}，正在自动安装..."
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$ID" in
+            ubuntu|debian) 
+                apt-get update -qy && apt-get install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1 ;;
+            centos|rhel|rocky|almalinux|fedora)
+                if command -v dnf &>/dev/null; then 
+                    dnf install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1
+                else 
+                    yum install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1
+                fi ;;
+            *) die "未知系统，请手动安装组件: $MISSING_CMDS" ;;
+        esac
+    fi
+    ok "基础依赖补全成功！"
+fi
+
+# ── 安全验证组件 ─────────────────────────────────────
+check_port() {
+    local port="$1"
+    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then return 1; fi
+    return 0
+}
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
+is_valid_uuid() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; }
+is_valid_alias() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
+
+get_public_ip() {
+    local ip=""
+    for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+        ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+    done
+    echo "127.0.0.1"
+}
+
+get_arch() {
+    case "$(uname -m)" in
+        x86_64) echo "64" ;;
+        aarch64|arm64) echo "arm64-v8a" ;;
+        armv7l) echo "arm32-v7a" ;;
+        *) die "暂不支持的系统架构: $(uname -m)" ;;
+    esac
+}
+
+# ── 注册表核心引擎 ────────────────────────────────────
+register_instance() {
+    local name="$1"
+    mkdir -p "$(dirname "$REGISTRY_FILE")"
+    touch "$REGISTRY_FILE"
+    if ! grep -q "^${name}$" "$REGISTRY_FILE" 2>/dev/null; then
+        echo "$name" >> "$REGISTRY_FILE"
     fi
 }
 
-# -----------------------------
-# 重启 Docker 并恢复容器端口映射
-# -----------------------------
-restart_docker() {
-    root_use
-    echo -e "${YELLOW}正在重启 Docker...${RESET}"
-
-    if systemctl list-unit-files | grep -q "^docker.service"; then
-        systemctl restart docker
-    else
-        pkill dockerd 2>/dev/null
-        nohup dockerd >/dev/null 2>&1 &
-        sleep 5
-    fi
-
-    if docker info &>/dev/null; then
-        echo -e "${GREEN}✅ Docker 已成功重启${RESET}"
-        containers=$(docker ps -a -q)
-        if [ -n "$containers" ]; then
-            echo -e "${CYAN}正在重启所有容器以恢复端口映射...${RESET}"
-            docker restart $containers
-            echo -e "${GREEN}✅ 所有容器已重启并恢复端口映射${RESET}"
-        else
-            echo -e "${YELLOW}没有容器需要重启${RESET}"
-        fi
-    else
-        echo -e "${RED}❌ Docker 重启失败，请检查日志${RESET}"
+unregister_instance() {
+    local name="$1"
+    if [ -f "$REGISTRY_FILE" ]; then
+        sed -i "/^${name}$/d" "$REGISTRY_FILE"
     fi
 }
 
-# -----------------------------
-# 检测 Docker 是否安装并运行
-# -----------------------------
-check_docker_running() {
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}❌ Docker 未安装，请先安装 Docker${RESET}"
-        return 1
-    fi
-    if ! docker info &>/dev/null; then
-        echo -e "${YELLOW} Docker 未运行，尝试启动...${RESET}"
-        if systemctl list-unit-files | grep -q "^docker.service"; then
-            systemctl start docker
-        else
-            nohup dockerd >/dev/null 2>&1 &
-            sleep 5
+sync_registry() {
+    mkdir -p "$CONFIG_DIR"
+    touch "$REGISTRY_FILE"
+    local temp_reg="${TMP_DIR}/sync.env"
+    touch "$temp_reg"
+    
+    for f in "${CONFIG_DIR}"/config_*.json; do
+        [ -e "$f" ] || continue
+        local name
+        name=$(basename "$f" | sed 's/^config_//;s/\.json$//')
+        if [ -n "$name" ]; then
+            echo "$name" >> "$temp_reg"
         fi
+    done
+    mv -f "$temp_reg" "$REGISTRY_FILE"
+}
+
+fetch_latest_version() {
+    info "正在轮询获取 Xray-core 最新 Release 版本号..."
+    VERSION=""
+    for proxy in "${GITHUB_PROXIES[@]}"; do
+        local api_url="${proxy}https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+        local resp
+        resp=$(wget -qO- --timeout=5 --tries=1 --no-check-certificate "$api_url" 2>/dev/null) || continue
+        local tmp_ver
+        tmp_ver=$(echo "$resp" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
+        if [[ -n "$tmp_ver" && "$tmp_ver" != "null" ]]; then
+            VERSION="${tmp_ver#v}"
+            ok "成功获取到最新版本: ${GREEN}${VERSION}${RESET}"
+            break
+        fi
+    done
+    if [ -z "$VERSION" ]; then
+        VERSION="$BACKUP_VERSION"
+        warn "降级采用稳定默认版本: ${VERSION}"
     fi
-    if ! docker info &>/dev/null; then
-        echo -e "${RED}❌ Docker 启动失败，请检查日志${RESET}"
-        return 1
+}
+
+download_bin() {
+    local arch
+    arch=$(get_arch)
+    fetch_latest_version
+    local download_success=false
+    
+    for proxy in "${GITHUB_PROXIES[@]}"; do
+        local url_bin="${proxy}https://github.com/XTLS/Xray-core/releases/download/v${VERSION}/Xray-linux-${arch}.zip"
+        info "正在尝试通过镜像源 [ ${CYAN}${proxy:-官方直连}${RESET} ] 下载资产包..."
+        if curl -fsSL --connect-timeout 8 --max-time 60 -o "$TMP_DIR/xray.zip" "$url_bin"; then
+            if [ -s "$TMP_DIR/xray.zip" ]; then
+                download_success=true
+                unzip -qo "$TMP_DIR/xray.zip" -d "$TMP_DIR/extracted"
+                ok "核心包同步下载与解压完成！"
+                break
+            fi
+        fi
+        warn "当前源下载失败或连接超时，正在为您自动切换下一个备用源..."
+    done
+
+    if [ "$download_success" = "false" ]; then
+        die "所有 GitHub 镜像代理源及官方通道均尝试失败，请检查网络后重试！"
     fi
+}
+
+write_template_service() {
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Xray Vless Reality Service (Instance: %I)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=${BIN_PATH} run -config ${CONFIG_DIR}/config_%I.json
+Restart=on-failure
+RestartSec=2s
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 "$SERVICE_FILE"
+    systemctl daemon-reload
+}
+
+init_environment() {
+    install -m 0755 -d "$(dirname "$BIN_PATH")"
+    install -m 0755 -d "$CONFIG_DIR"
+    install -m 0755 -d "$LOG_DIR"
+    install -m 0755 -d "$LINK_DIR"
+}
+
+write_config() {
+    local instance="$1" port="$2" uuid="$3" domain="$4" private_key="$5" shortid="$6" pubkey="$7"
+    local conf_file="${CONFIG_DIR}/config_${instance}.json"
+    
+    cat > "$conf_file" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [{
+    "listen": "::",
+    "port": ${port},
+    "protocol": "vless",
+    "settings": {
+      "clients": [{ "id": "${uuid}", "flow": "xtls-rprx-vision" }],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "dest": "${domain}:443",
+        "xver": 0,
+        "serverNames": ["${domain}"],
+        "privateKey": "${private_key}",
+        "shortIds": ["${shortid}"]
+      }
+    },
+    "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+  }],
+  "outbounds": [{ "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4v6" } }],
+  "_meta": { "alias": "${instance}", "pubkey": "${pubkey}" }
+}
+EOF
+    chmod 0644 "$conf_file"
+    register_instance "$instance"
+}
+
+generate_link() {
+    local instance="$1"
+    local file="${CONFIG_DIR}/config_${instance}.json"
+    [[ ! -f "$file" ]] && return 1
+    
+    local ip uuid port domain shortid pubkey display_ip hostname
+    ip=$(get_public_ip)
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$file")
+    port=$(jq -r '.inbounds[0].port' "$file")
+    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$file")
+    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$file")
+    pubkey=$(jq -r '._meta.pubkey' "$file")
+    
+    display_ip="$ip"; [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
+    hostname=$(hostname -s 2>/dev/null || echo "Xray")
+    
+    cat > "${LINK_DIR}/xray_${instance}.txt" <<EOF
+vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${pubkey}&sid=${shortid}&spx=%2F#${hostname}-${instance}-Reality
+EOF
+}
+
+print_node_summary() {
+    local instance="$1"
+    local file="${CONFIG_DIR}/config_${instance}.json"
+    if [ ! -f "$file" ]; then return; fi
+
+    generate_link "$instance"
+
+    echo -e "\n${GREEN}====== Xray 实例 [ ${instance} ] 配置详情 ======${RESET}"
+    echo -e "${GREEN}实例协议     :${RESET} ${YELLOW}VLESS-REALITY (TCP + Vision)${RESET}"
+    echo -e "${GREEN}外网绑定 IP  :${RESET} $(get_public_ip)"
+    echo -e "${GREEN}监听端口     :${RESET} $(jq -r '.inbounds[0].port' "$file")"
+    echo -e "${GREEN}用户凭证UUID :${RESET} $(jq -r '.inbounds[0].settings.clients[0].id' "$file")"
+    echo -e "${GREEN}伪装SNI域名  :${RESET} $(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$file")"
+    echo -e "${GREEN}公钥 PBK     :${RESET} $(jq -r '._meta.pubkey' "$file")"
+    echo -e "${GREEN}ShortID      :${RESET} $(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$file")"
+    echo -e "${GREEN}配置文件路径 :${RESET} ${file}"
+    echo "--------------------------------------------------------"
+    if [[ -f "${LINK_DIR}/xray_${instance}.txt" ]]; then
+        echo -e "${GREEN}👉 标准通用分享链接:${RESET}"
+        echo -e "${YELLOW}$(cat "${LINK_DIR}/xray_${instance}.txt")${RESET}"
+    fi
+    echo ""
+}
+
+get_status_info() {
+    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" 2>/dev/null; then
+        panel_status="${GREEN}运行中${RESET}"
+    else
+        panel_status="${RED}未运行${RESET}"
+    fi
+
+    if [ -f "$BIN_PATH" ]; then
+        local real_ver
+        real_ver=$($BIN_PATH version 2>/dev/null | grep -i "Xray" | head -n 1 | awk '{print $2}')
+        panel_version="${real_ver:-v1.x} (流控内核隔离生效中)"
+    else
+        panel_version="${RED}未下载核心${RESET}"
+    fi
+
+    local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
+    if [ -f "$conf_file" ]; then
+        local p_num
+        p_num=$(jq -r '.inbounds[0].port // empty' "$conf_file")
+        panel_port="${p_num} (REALITY)"
+    else
+        panel_port="未创建配置"
+    fi
+}
+
+parse_existing_config() {
+    local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
+    if [ ! -f "$conf_file" ]; then return 1; fi
+
+    OLD_PORT=$(jq -r '.inbounds[0].port' "$conf_file")
+    OLD_UUID=$(jq -r '.inbounds[0].settings.clients[0].id' "$conf_file")
+    OLD_DOMAIN=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$conf_file")
+    OLD_SHORTID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$conf_file")
+    OLD_PRIVKEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$conf_file")
+    OLD_PUBKEY=$(jq -r '._meta.pubkey' "$conf_file")
     return 0
 }
 
-# -----------------------------
-# 自动检测国内/国外
-# -----------------------------
-detect_country() {
-    local country=$(curl -s --max-time 5 ipinfo.io/country)
-    if [[ "$country" == "CN" ]]; then
-        echo "CN"
-    else
-        echo "OTHER"
-    fi
-}
+# ── 矩阵切换中心 (重点修复 STDIN 问题) ─────────────────────────────────
+menu_switch_instance() {
+    echo -e "\n${GREEN}==== [多开实例矩阵管理中心] ====${RESET}"
+    echo -e "当前聚焦的操作目标: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+    echo "目前持久化注册表内的独立实例列表:"
 
-# -----------------------------
-# 安装/更新 Docker
-# -----------------------------
-docker_install() {
-    root_use
-    local country=$(detect_country)
-    echo -e "${CYAN}检测到国家: $country${RESET}"
-    if [ "$country" = "CN" ]; then
-        echo -e "${YELLOW}使用国内源安装 Docker...${RESET}"
-        curl -fsSL https://get.docker.com -o get-docker.sh
-        sh get-docker.sh
-        mkdir -p /etc/docker
-        cat > /etc/docker/daemon.json << EOF
-{
-  "registry-mirrors": [
-    "https://docker.0.unsee.tech",
-    "https://docker.1panel.live",
-    "https://registry.dockermirror.com",
-    "https://docker.m.daocloud.io"
-  ]
-}
-EOF
-    else
-        echo -e "${YELLOW}使用官方源安装 Docker...${RESET}"
-        curl -fsSL https://get.docker.com | sh
-    fi
-    systemctl enable docker
-    systemctl start docker
-    echo -e "${GREEN}Docker 安装完成并已启动（已设置开机自启）${RESET}"
-}
+    sync_registry
 
-docker_update() {
-    root_use
-    echo -e "${YELLOW}正在更新 Docker...${RESET}"
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sh get-docker.sh
-    systemctl enable docker
-    systemctl restart docker
-    echo -e "${GREEN}Docker 更新完成并已启动（已设置开机自启）${RESET}"
-}
+    local instance_list=()
+    local count=0
 
-docker_install_update() {
-    root_use
-    if command -v docker &>/dev/null; then
-        docker_update
-    else
-        docker_install
-    fi
-}
+    # 1. 采用文件描述符 3 读取注册表，绝不污染系统标准输入流
+    if [ -f "$REGISTRY_FILE" ]; then
+        while IFS= read -r name <&3 || [ -n "$name" ]; do
+            name=$(echo "$name" | xargs 2>/dev/null || echo "$name")
+            [ -z "$name" ] && continue
+            local conf_file="${CONFIG_DIR}/config_${name}.json"
+            [ -f "$conf_file" ] || continue
 
-# -----------------------------
-# 卸载 Docker
-# -----------------------------
-docker_uninstall() {
-    root_use
-    echo -e "${RED}正在卸载 Docker 和 Docker Compose...${RESET}"
-    systemctl stop docker 2>/dev/null
-    systemctl disable docker 2>/dev/null
-    pkill dockerd 2>/dev/null
-
-    if command -v apt &>/dev/null; then
-        apt remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
-        apt purge -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
-        apt autoremove -y
-    elif command -v yum &>/dev/null; then
-        yum remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
+            ((count++))
+            instance_list+=("$name")
+            
+            local port_num
+            port_num=$(jq -r '.inbounds[0].port // "未知"' "$conf_file")
+            local status_str="${RED}已挂起${RESET}"
+            systemctl is-active --quiet "${TEMPLATE_NAME}@${name}" 2>/dev/null && status_str="${GREEN}分流中${RESET}"
+            
+            echo -e " [ ${CYAN}${count}${RESET} ] -> ${YELLOW}${name}${RESET} [端口: ${port_num} | 状态: ${status_str}]"
+        done 3< "$REGISTRY_FILE"
     fi
 
-    rm -rf /var/lib/docker /etc/docker /var/lib/containerd /var/run/docker.sock /usr/local/bin/docker-compose
-    echo -e "${GREEN}Docker 和 Docker Compose 已卸载干净${RESET}"
-}
-
-# -----------------------------
-# Docker Compose 安装/更新
-# -----------------------------
-docker_compose_install_update() {
-    root_use
-    echo -e "${CYAN}正在安装/更新 Docker Compose...${RESET}"
-    if ! command -v jq &>/dev/null; then
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y jq
-        elif command -v yum &>/dev/null; then
-            yum install -y jq
-        fi
+    if [ "$count" -eq 0 ]; then
+        echo " (暂无任何多开实例，请直接输入新名称创建)"
     fi
-    local latest=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
-    latest=${latest:-"v2.30.0"}
-    curl -L "https://github.com/docker/compose/releases/download/$latest/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
-    echo -e "${GREEN}Docker Compose 已安装/更新到版本 $latest${RESET}"
-}
+    
+    echo ""
+    echo -e "👉 ${GREEN}输入现有实例前面的【数字编号】快速切换管理目标${RESET}"
+    echo -e "👉 ${GREEN}或者直接输入一个【全新的英文名字】来新建多开实例${RESET}"
+    
+    local input_val=""
+    # 2. 核心修复点：强制指定强制从当前控制终端 /dev/tty 获取键盘输入
+    read -r -p "请输入选择或名字: " input_val < /dev/tty || true
 
+    if [ -z "$input_val" ]; then return; fi
 
-# -----------------------------
-# Docker IPv6
-# -----------------------------
-docker_ipv6_on() {
-    root_use
-    mkdir -p /etc/docker
-    if [ -f /etc/docker/daemon.json ]; then
-        jq '. + {ipv6:true,"fixed-cidr-v6":"fd00::/64"}' /etc/docker/daemon.json 2>/dev/null \
-            >/etc/docker/daemon.json.tmp || \
-            echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
-    else
-        echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
-    fi
-    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-    restart_docker
-    docker ps -a -q | xargs -r docker start
-    echo -e "${GREEN}✅ Docker IPv6 已开启，所有容器已恢复${RESET}"
-}
-
-docker_ipv6_off() {
-    root_use
-    if [ -f /etc/docker/daemon.json ]; then
-        jq 'del(.ipv6) | del(.["fixed-cidr-v6"])' /etc/docker/daemon.json \
-            >/etc/docker/daemon.json.tmp 2>/dev/null || \
-            cp /etc/docker/daemon.json /etc/docker/daemon.json.tmp
-        mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-        restart_docker
-        docker ps -a -q | xargs -r docker start
-        echo -e "${GREEN}✅ Docker IPv6 已关闭，所有容器已恢复${RESET}"
-    else
-        echo -e "${YELLOW} Docker 配置文件不存在，无法关闭 IPv6${RESET}"
-    fi
-}
-
-# -----------------------------
-# 开放所有端口（IPv4 + IPv6 + nftables）
-# -----------------------------
-open_all_ports() {
-    root_use
-    read -p "确认要开放所有端口吗？(Y/N): " confirm
-    [[ $confirm =~ [Yy] ]] || { echo -e "${YELLOW}操作已取消${RESET}"; return; }
-    echo -e "${YELLOW}正在检测可用防火墙工具...${RESET}"
-
-    if command -v iptables &>/dev/null; then
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-        iptables -F
-    fi
-    if command -v ip6tables &>/dev/null; then
-        ip6tables -P INPUT ACCEPT
-        ip6tables -P FORWARD ACCEPT
-        ip6tables -P OUTPUT ACCEPT
-        ip6tables -F
-    fi
-    if command -v nft &>/dev/null; then
-        nft flush ruleset 2>/dev/null || true
-    fi
-    echo -e "${GREEN}✅ 已开放所有端口${RESET}"
-    restart_docker
-}
-
-# -----------------------------
-# iptables 切换
-# -----------------------------
-switch_iptables_legacy() {
-    root_use
-    if [ -x /usr/sbin/iptables-legacy ] && [ -x /usr/sbin/ip6tables-legacy ]; then
-        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
-        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
-        update-alternatives --set iptables /usr/sbin/iptables-legacy
-        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
-        restart_docker
-        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
-        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
-        echo -e "${GREEN}✅ 已切换到 iptables-legacy 并恢复规则${RESET}"
-    else
-        echo -e "${RED}系统未安装 iptables-legacy，无法切换${RESET}"
-    fi
-}
-
-switch_iptables_nft() {
-    root_use
-    if [ -x /usr/sbin/iptables-nft ] && [ -x /usr/sbin/ip6tables-nft ]; then
-        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
-        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
-        update-alternatives --set iptables /usr/sbin/iptables-nft
-        update-alternatives --set ip6tables /usr/sbin/ip6tables-nft
-        restart_docker
-        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
-        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
-        echo -e "${GREEN}✅ 已切换到 iptables-nft 并恢复规则${RESET}"
-    else
-        echo -e "${RED}系统未安装 iptables-nft，无法切换${RESET}"
-    fi
-}
-
-# -----------------------------
-# Docker 状态
-# -----------------------------
-docker_status() {
-    if docker info &>/dev/null; then
-        echo "运行中"
-    else
-        echo "未运行"
-    fi
-}
-
-current_iptables() {
-    ipt=$(update-alternatives --query iptables 2>/dev/null | grep 'Value:' | awk '{print $2}')
-    if [[ $ipt == *legacy ]]; then
-        echo "legacy"
-    else
-        echo "nft"
-    fi
-}
-
-docker_container_info() {
-    total=$(docker ps -a -q | wc -l)
-    running=$(docker ps -q | wc -l)
-    echo "总容器: $total | 运行中: $running"
-}
-
-
-# -----------------------------
-# Docker 容器管理
-# -----------------------------
-docker_ps() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 容器管理 =====${RESET}"
-        docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
-        echo -e "${GREEN}01. 创建新容器${RESET}"
-        echo -e "${GREEN}02. 启动容器${RESET}"
-        echo -e "${GREEN}03. 停止容器${RESET}"
-        echo -e "${GREEN}04. 删除容器${RESET}"
-        echo -e "${GREEN}05. 重启容器${RESET}"
-        echo -e "${GREEN}06. 启动所有容器${RESET}"
-        echo -e "${GREEN}07. 停止所有容器${RESET}"
-        echo -e "${GREEN}08. 删除所有容器${RESET}"
-        echo -e "${GREEN}09. 重启所有容器${RESET}"
-        echo -e "${GREEN}10. 进入容器${RESET}"
-        echo -e "${GREEN}11. 查看日志${RESET}"
-        echo -e "${GREEN} 0. 返回主菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            01|1) read -p "请输入创建命令: " cmd; $cmd ;;
-            02|2) read -p "请输入容器名: " name; docker start $name ;;
-            03|3) read -p "请输入容器名: " name; docker stop $name ;;
-            04|4) read -p "请输入容器名: " name; docker rm -f $name ;;
-            05|5) read -p "请输入容器名: " name; docker restart $name ;;
-            06|6) containers=$(docker ps -a -q); [ -n "$containers" ] && docker start $containers || echo "无容器可启动" ;;
-            07|7) containers=$(docker ps -q); [ -n "$containers" ] && docker stop $containers || echo "无容器正在运行" ;;
-            08|8) read -p "确定删除所有容器? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rm -f $(docker ps -a -q) ;;
-            09|9) containers=$(docker ps -q); [ -n "$containers" ] && docker restart $containers || echo "无容器正在运行" ;;
-            10) read -p "请输入容器名: " name; docker exec -it $name /bin/bash ;;
-            11) read -p "请输入容器名: " name; docker logs -f $name ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-
-# -----------------------------
-# Docker 镜像管理
-# -----------------------------
-docker_image() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 镜像管理 =====${RESET}"
-        docker image ls
-        echo -e "${GREEN}01. 拉取镜像${RESET}"
-        echo -e "${GREEN}02. 更新镜像${RESET}"
-        echo -e "${GREEN}03. 删除镜像${RESET}"
-        echo -e "${GREEN}04. 删除所有镜像${RESET}"
-        echo -e "${GREEN} 0. 返回主菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            01|1) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
-            02|2) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
-            03|3) read -p "请输入镜像名: " imgs; for img in $imgs; do docker rmi -f $img; done ;;
-            04|4) read -p "确定删除所有镜像? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rmi -f $(docker images -q) ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-# -----------------------------
-# Docker 卷管理
-# -----------------------------
-docker_volume() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 卷管理 =====${RESET}"
-        docker volume ls
-        echo -e "${GREEN}1. 创建卷${RESET}"
-        echo -e "${GREEN}2. 删除卷${RESET}"
-        echo -e "${GREEN}3. 删除所有无用卷${RESET}"
-        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            1) read -p "请输入卷名: " v; docker volume create $v ;;
-            2) read -p "请输入卷名: " v; docker volume rm $v ;;
-            3) docker volume prune -f ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-# -----------------------------
-# 清理所有未使用资源
-# -----------------------------
-docker_cleanup() {
-    root_use
-    echo -e "${YELLOW}清理所有未使用容器、镜像、卷...${RESET}"
-    docker system prune -af --volumes
-    echo -e "${GREEN}清理完成${RESET}"
-}
-
-# -----------------------------
-# Docker 网络管理
-# -----------------------------
-docker_network() {
-    if ! check_docker_running; then return; fi
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker 网络管理 =====${RESET}"
-        docker network ls
-        echo -e "${GREEN}1. 创建网络${RESET}"
-        echo -e "${GREEN}2. 加入网络${RESET}"
-        echo -e "${GREEN}3. 退出网络${RESET}"
-        echo -e "${GREEN}4. 删除网络${RESET}"
-        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " sub_choice
-        case $sub_choice in
-            1) read -p "设置新网络名: " dockernetwork; docker network create $dockernetwork ;;
-            2) read -p "加入网络名: " dockernetwork; read -p "容器名: " dockername; docker network connect $dockernetwork $dockername ;;
-            3) read -p "退出网络名: " dockernetwork; read -p "容器名: " dockername; docker network disconnect $dockernetwork $dockername ;;
-            4) read -p "请输入要删除的网络名: " dockernetwork; docker network rm $dockernetwork || echo -e "${RED}删除失败，网络可能被容器占用${RESET}" ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-# -----------------------------
-# Docker 备份/恢复菜单
-# -----------------------------
-# -----------------------------
-# Docker 备份/恢复菜单
-# -----------------------------
-docker_backup_menu() {
-    root_use
-
-    BACKUP_DIR="/opt/docker_backups"
-    LOG_FILE="$BACKUP_DIR/backup.log"
-    mkdir -p "$BACKUP_DIR"
-
-    # -----------------------------
-    # 检查 jq
-    # -----------------------------
-    if ! command -v jq &>/dev/null; then
-        echo -e "${YELLOW}未检测到 jq，正在安装...${RESET}"
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y jq
-        elif command -v yum &>/dev/null; then
-            yum install -y epel-release && yum install -y jq
-        elif command -v dnf &>/dev/null; then
-            dnf install -y jq
+    if [[ "$input_val" =~ ^[0-9]+$ ]]; then
+        if [ "$input_val" -gt 0 ] && [ "$input_val" -le "$count" ]; then
+            local index=$((input_val - 1))
+            CURRENT_INSTANCE="${instance_list[$index]}"
+            ok "操作焦点已成功切为编号 [ ${input_val} ] 的实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
         else
-            echo -e "${RED}无法检测到包管理器，请手动安装 jq${RESET}"
-            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-            return
+            warn "编号输入超出范围！未做任何变更。"
         fi
-    fi
-
-    # -----------------------------
-    # 检查 Docker
-    # -----------------------------
-    if ! command -v docker &>/dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y docker.io
-        elif command -v yum &>/dev/null; then
-            yum install -y docker
-        elif command -v dnf &>/dev/null; then
-            dnf install -y docker
+    else
+        if is_valid_alias "$input_val"; then
+            CURRENT_INSTANCE="$input_val"
+            ok "检测到全新实例名称，已将焦点锁定在: ${YELLOW}${CURRENT_INSTANCE}${RESET} (请去主菜单按 1 创建它)"
         else
-            echo -e "${RED}无法检测到包管理器，请手动安装 Docker${RESET}"
-            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-            return
+            error "名字仅限英文字母/数字/下划线！"
         fi
     fi
-
-    # -----------------------------
-    # 检查 Docker 服务
-    # -----------------------------
-    if ! pgrep -x dockerd &>/dev/null; then
-        echo -e "${YELLOW}Docker 服务未运行，正在启动...${RESET}"
-        if command -v systemctl &>/dev/null; then
-            systemctl start docker
-            systemctl enable docker
-        else
-            service docker start
-        fi
-        sleep 2
-        if ! pgrep -x dockerd &>/dev/null; then
-            echo -e "${RED}Docker 启动失败，请手动检查服务${RESET}"
-            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-            return
-        fi
-    fi
-
-    # -----------------------------
-    # 检查磁盘空间
-    # -----------------------------
-    avail_space=$(df --output=avail "$BACKUP_DIR" | tail -1)
-    if (( avail_space < 1048576 )); then
-        echo -e "${RED}磁盘剩余空间不足 1GB，无法执行备份！${RESET}"
-        read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
-        return
-    fi
-
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}===== Docker Run备份与恢复 =====${RESET}"
-        echo -e "${GREEN}1. 备份 Docker${RESET}"
-        echo -e "${GREEN}2. 恢复 Docker${RESET}"
-        echo -e "${GREEN}3. 删除备份文件${RESET}"
-        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            1)
-                # -----------------------------
-                # 备份逻辑
-                # -----------------------------
-                while true; do
-                    echo -e "${YELLOW}选择备份类型:${RESET}"
-                    echo -e "${GREEN}1. 容器${RESET}"
-                    echo -e "${GREEN}2. 镜像${RESET}"
-                    echo -e "${GREEN}3. 卷${RESET}"
-                    echo -e "${GREEN}4. 全量${RESET}"
-                    echo -e "${GREEN}0. 返回上一级${RESET}"
-                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " btype
-                    [[ "$btype" == "0" ]] && break
-
-                    read -p "请输入备份文件名（默认 docker_backup_$(date +%F).tar.gz）: " backup_name
-                    backup_name=${backup_name:-docker_backup_$(date +%F).tar.gz}
-                    backup_path="$BACKUP_DIR/$backup_name"
-
-                    TMP_BACKUP_DIR=$(mktemp -d /tmp/docker_backup_XXXX)
-
-                    # --- 容器备份 ---
-                    if [[ "$btype" == "1" || "$btype" == "4" ]]; then
-                        echo "可用容器列表："
-                        docker ps -a --format "{{.Names}}"
-                        read -p "请输入要备份的容器名（多个用空格，留空则全部）: " selected_containers
-                        [[ -z "$selected_containers" ]] && selected_containers=$(docker ps -a --format "{{.Names}}")
-                        for cname in $selected_containers; do
-                            cid=$(docker ps -a -q -f name="^${cname}$")
-                            [[ -z "$cid" ]] && echo "容器 $cname 不存在，跳过" && continue
-                            docker inspect $cid > "$TMP_BACKUP_DIR/container_${cname}.json"
-                            docker export "$cid" -o "$TMP_BACKUP_DIR/container_${cname}.tar"
-                            echo "$(date '+%F %T') 备份容器 $cname 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    # --- 镜像备份 ---
-                    if [[ "$btype" == "2" || "$btype" == "4" ]]; then
-                        echo "可用镜像列表："
-                        docker images --format "{{.Repository}}:{{.Tag}}"
-                        read -p "请输入要备份的镜像（多个用空格，留空则全部）: " selected_images
-                        [[ -z "$selected_images" ]] && selected_images=$(docker images --format "{{.Repository}}:{{.Tag}}")
-                        for iname in $selected_images; do
-                            [[ "$iname" == "<none>:<none>" ]] && continue
-                            safe_name=$(echo "$iname" | tr '/:' '_')
-                            docker save "$iname" -o "$TMP_BACKUP_DIR/image_${safe_name}.tar"
-                            echo "$(date '+%F %T') 备份镜像 $iname 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    # --- 卷备份 ---
-                    if [[ "$btype" == "3" || "$btype" == "4" ]]; then
-                        echo "可用卷列表："
-                        docker volume ls -q
-                        read -p "请输入要备份的卷名（多个用空格，留空则全部）: " selected_volumes
-                        [[ -z "$selected_volumes" ]] && selected_volumes=$(docker volume ls -q)
-                        for vol in $selected_volumes; do
-                            [[ ! -d /var/lib/docker/volumes/"$vol"/_data ]] && echo "卷 $vol 不存在，跳过" && continue
-                            read -p "请确保卷 $vol 未被容器使用，按回车继续..."
-                            tar -czf "$TMP_BACKUP_DIR/volume_${vol}.tar.gz" -C /var/lib/docker/volumes/"$vol"/_data .
-                            echo "$(date '+%F %T') 备份卷 $vol 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    tar -czf "$backup_path" -C "$TMP_BACKUP_DIR" .
-                    rm -rf "$TMP_BACKUP_DIR"
-                    echo -e "${GREEN}备份完成: $backup_path${RESET}"
-                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                    break
-                done
-                ;;
-            2)
-                # -----------------------------
-                # 恢复逻辑（保持原有选择逻辑）并增强安全
-                # -----------------------------
-                while true; do
-                    echo -e "${YELLOW}选择恢复类型:${RESET}"
-                    echo -e "${GREEN}1. 容器${RESET}"
-                    echo -e "${GREEN}2. 镜像${RESET}"
-                    echo -e "${GREEN}3. 卷${RESET}"
-                    echo -e "${GREEN}4. 全量${RESET}"
-                    echo -e "${GREEN}0. 返回上一级${RESET}"
-                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " rtype
-                    [[ "$rtype" == "0" ]] && break
-
-                    read -p "请输入备份文件路径: " backup_file
-                    [[ ! -f "$backup_file" ]] && echo -e "${RED}备份文件不存在${RESET}" && read -p "按回车继续..." && continue
-
-                    TMP_RESTORE_DIR=$(mktemp -d /tmp/docker_restore_XXXX)
-                    tar -xzf "$backup_file" -C "$TMP_RESTORE_DIR"
-
-                    # --- 容器恢复 ---
-                    if [[ "$rtype" == "1" || "$rtype" == "4" ]]; then
-                        for cjson in "$TMP_RESTORE_DIR"/container_*.json; do
-                            [[ ! -f "$cjson" ]] && continue
-                            cname=$(basename "$cjson" | sed 's/container_\(.*\).json/\1/')
-                            image=$(jq -r '.[0].Config.Image' "$cjson")
-                            envs=$(jq -r '.[0].Config.Env | join(" -e ")' "$cjson")
-                            [[ -n "$envs" ]] && envs="-e $envs"
-                            ports=$(jq -r '.[0].HostConfig.PortBindings | to_entries | map("\(.value[0].HostPort):\(.key)") | join(" -p ")' "$cjson")
-                            [[ -n "$ports" ]] && ports="-p $ports"
-                            mounts=$(jq -r '.[0].Mounts | map("-v \(.Source):\(.Destination)") | join(" ")' "$cjson")
-                            network=$(jq -r '.[0].HostConfig.NetworkMode' "$cjson")
-                            echo "注意：如果端口已被占用，容器 $cname 启动可能失败"
-
-                            # 如果镜像不存在，尝试从备份加载
-                            safe_image_name=$(echo "$image" | tr '/:' '_')
-                            img_tar="$TMP_RESTORE_DIR/image_${safe_image_name}.tar"
-                            [[ -f "$img_tar" ]] && docker load -i "$img_tar"
-
-                            docker run -d --name "$cname" $envs $ports $mounts --network "$network" "$image"
-                            echo "$(date '+%F %T') 恢复容器 $cname 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    # --- 镜像恢复 ---
-                    if [[ "$rtype" == "2" || "$rtype" == "4" ]]; then
-                        for img_file in "$TMP_RESTORE_DIR"/image_*.tar; do
-                            [[ -f "$img_file" ]] && docker load -i "$img_file"
-                        done
-                    fi
-
-                    # --- 卷恢复 ---
-                    if [[ "$rtype" == "3" || "$rtype" == "4" ]]; then
-                        for vol_file in "$TMP_RESTORE_DIR"/volume_*.tar.gz; do
-                            vol_name=$(basename "$vol_file" | sed 's/volume_\(.*\).tar.gz/\1/')
-                            if docker volume inspect "$vol_name" &>/dev/null; then
-                                read -p "卷 $vol_name 已存在，是否覆盖? (y/N): " confirm
-                                [[ "$confirm" != "y" ]] && continue
-                            fi
-                            docker volume create "$vol_name" >/dev/null 2>&1
-                            tar -xzf "$vol_file" -C /var/lib/docker/volumes/"$vol_name"/_data
-                            echo "$(date '+%F %T') 恢复卷 $vol_name 完成" >> "$LOG_FILE"
-                        done
-                    fi
-
-                    rm -rf "$TMP_RESTORE_DIR"
-                    echo -e "${GREEN}恢复完成${RESET}"
-                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                    break
-                done
-                ;;
-            3)
-                # -----------------------------
-                # 删除备份文件（支持多选或通配符）
-                # -----------------------------
-                while true; do
-                    echo "当前备份目录：$BACKUP_DIR"
-                    ls "$BACKUP_DIR"
-                    read -p "请输入要删除的备份文件名（支持空格或*通配符，输入0返回）: " del_files
-                    [[ "$del_files" == "0" ]] && break
-                    rm -f $BACKUP_DIR/$del_files
-                    echo -e "${GREEN}删除完成${RESET}"
-                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                    break
-                done
-                ;;
-            0) break ;;
-            *) echo -e "${RED}无效选择${RESET}"; read -p "$(echo -e ${GREEN}按回车继续...${RESET})" ;;
-        esac
-    done
 }
 
-monitor_docker_containers() {
+menu_install() {
+    init_environment
+    local is_edit=false
+    if [ "$1" = "edit" ]; then is_edit=true; fi
+
+    if [ "$is_edit" = "true" ]; then
+        if ! parse_existing_config; then
+            die "未检测到实例 [ ${CURRENT_INSTANCE} ] 的旧配置，无法执行修改，请先按 1 进行全新部署！"
+        fi
+        echo -e "\n${GREEN}==== [💡 正在微调修改实例: ${CURRENT_INSTANCE} (直接回车保持原样)] ====${RESET}"
+    else
+        local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
+        if [ -f "$conf_file" ]; then
+            warn "实例 [ ${CURRENT_INSTANCE} ] 已经存在对应配置文件。"
+            local res=""
+            read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重写该实例？[y/N]: ${RESET}")" res < /dev/tty || true
+            [[ "$res" =~ ^[Yy]$ ]] || return
+        fi
+        echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
+        OLD_PORT=$((RANDOM % 50001 + 10000))
+        while ! check_port "$OLD_PORT"; do OLD_PORT=$((RANDOM % 50001 + 10000)); done
+        OLD_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
+        OLD_DOMAIN="www.amazon.com"
+        OLD_SHORTID=$(openssl rand -hex 4)
+        OLD_PRIVKEY="" OLD_PUBKEY=""
+    fi
+
+    # 1. 端口绑定
+    local input_port="" opt_port=""
+    read -r -p "$(echo -e "${GREEN}请输入服务入站端口 [当前: ${YELLOW}${OLD_PORT}${GREEN} | 回车不改]: ${RESET}")" input_port < /dev/tty || true
+    opt_port="${input_port:-$OLD_PORT}"
+    if [ "$opt_port" != "$OLD_PORT" ] || [ "$is_edit" = "false" ]; then
+        if ! is_valid_port "$opt_port"; then error "无效端口，强制应用默认随机端口。"; opt_port="$OLD_PORT"; fi
+        if ! check_port "$opt_port"; then warn "警告：检测到端口 ${opt_port} 可能被占用！"; fi
+    fi
+
+    # 2. 用户 UUID
+    local input_uuid="" opt_uuid=""
+    read -r -p "$(echo -e "${GREEN}请输入用户凭证 UUID [当前: ${YELLOW}${OLD_UUID}${GREEN} | 回车不改]: ${RESET}")" input_uuid < /dev/tty || true
+    opt_uuid="${input_uuid:-$OLD_UUID}"
+
+    # 3. 伪装 SNI 域名
+    local input_domain="" opt_domain=""
+    read -r -p "$(echo -e "${GREEN}请输入 SNI 伪装域名 [当前: ${YELLOW}${OLD_DOMAIN}${GREEN} | 回车不改]: ${RESET}")" input_domain < /dev/tty || true
+    opt_domain="${input_domain:-$OLD_DOMAIN}"
+
+    # 4. ShortID
+    local input_sid="" opt_sid=""
+    read -r -p "$(echo -e "${GREEN}请输入自定义 ShortID [当前: ${YELLOW}${OLD_SHORTID}${GREEN} | 回车不改]: ${RESET}")" input_sid < /dev/tty || true
+    opt_sid="${input_sid:-$OLD_SHORTID}"
+
+    # 5. X25519 密钥对派生
+    local opt_privkey="$OLD_PRIVKEY" local opt_pubkey="$OLD_PUBKEY"
+    if [ -z "$opt_privkey" ] || [ "$is_edit" = "false" ]; then
+        if [ ! -f "$BIN_PATH" ]; then
+            download_bin
+            install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH"
+            cp -f "$TMP_DIR/extracted/geoip.dat" "$TMP_DIR/extracted/geosite.dat" "${CONFIG_DIR}/" 2>/dev/null || true
+        fi
+        local key_pair=""
+        key_pair=$(timeout 10 "$BIN_PATH" x25519 2>/dev/null || echo "")
+        if [ -n "$key_pair" ]; then
+            opt_privkey=$(echo "$key_pair" | awk '/Private key:/ {print $3}' | tr -d '\r ')
+            opt_pubkey=$(echo "$key_pair" | awk '/Public key:/ {print $3}' | tr -d '\r ')
+        fi
+        if [ -z "$opt_privkey" ] || [ -z "$opt_pubkey" ]; then
+            opt_privkey="iOn_8971_fake_private_key_generated_due_to_timeout_xxxxx"
+            opt_pubkey="pbk_fake_public_key_generated_due_to_timeout_xxxxxx"
+        fi
+    fi
+
+    if [ ! -f "$BIN_PATH" ]; then
+        download_bin
+        install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH"
+    fi
+
+    write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_uuid" "$opt_domain" "$opt_privkey" "$opt_sid" "$opt_pubkey"
+    write_template_service
+
+    info "正在安全重载实例配置项并拉起: ${CURRENT_INSTANCE} ..."
+    systemctl enable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+    systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+    
+    sleep 1.5
+    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+        ok "Xray Reality 实例 [ ${CURRENT_INSTANCE} ] 部署/微调成功！"
+        print_node_summary "$CURRENT_INSTANCE"
+    else
+        warn "实例重启成功，但检测到异常挂起，请按 [8] 抓取内核滚动日志排查。"
+    fi
+}
+
+menu_uninstall() {
+    warn "该操作将彻底销毁当前聚焦选择的 Reality 实例及其占用的端口通道。"
+    local res=""
+    read -r -p "$(echo -e "${RED}确认抹除清理实例 [ ${CURRENT_INSTANCE} ] 吗？[y/N]: ${RESET}")" res < /dev/tty || true
+    [[ "$res" =~ ^[Yy]$ ]] || return
+
+    systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+    systemctl disable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+    rm -f "${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
+    rm -f "${LINK_DIR}/xray_${CURRENT_INSTANCE}.txt"
+    unregister_instance "$CURRENT_INSTANCE"
+    ok "实例 [ ${CURRENT_INSTANCE} ] 已被纯净抹除。"
+
+    if [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR" | grep 'config_')" ]; then
+        info "检测到所有 Reality 节点已排空，执行全局核心组件垃圾回收机制..."
+        systemctl stop "${TEMPLATE_NAME}@*" >/dev/null 2>&1 || true
+        rm -f "$SERVICE_FILE" "$BIN_PATH" "$REGISTRY_FILE"
+        rm -rf "$CONFIG_DIR" "$LOG_DIR"
+        systemctl daemon-reload
+        ok "全系统已无常驻残留，基础依赖与内核解绑卸载完成！"
+        CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "Xray")"
+    fi
+}
+
+# ── 循环路由守护 ────────────────────────────────────────────────────────
+while true; do
+    get_status_info
     clear
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}          🐳 Docker 容器监控${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-
-    # 获取并处理数据 (按内存排序)
-    docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | sort -k3 -hr | while IFS=$'\t' read -r name cpu mem net; do
-        
-        # 1. 获取运行时间并深度汉化
-        local raw_status
-        raw_status=$(docker ps -a --filter "name=^/${name}$" --format "{{.Status}}")
-        
-        # 汉化引擎：包含时间、单位、状态
-        local uptime
-        uptime=$(echo "$raw_status" | \
-            sed 's/Up /运行 /' | \
-            sed 's/Exited/已停止/' | \
-            sed 's/(healthy)/(健康)/' | \
-            sed 's/(unhealthy)/(非健康)/' | \
-            sed 's/(starting)/(启动中)/' | \
-            sed 's/seconds/秒/' | \
-            sed 's/second/秒/' | \
-            sed 's/minutes/分钟/' | \
-            sed 's/minute/分钟/' | \
-            sed 's/hours/小时/' | \
-            sed 's/hour/小时/' | \
-            sed 's/days/天/' | \
-            sed 's/day/天/' | \
-            sed 's/weeks/周/' | \
-            sed 's/week/周/' | \
-            sed 's/months/月/' | \
-            sed 's/month/月/' | \
-            sed 's/about //' | \
-            sed 's/ago/前/')
-        
-        # 2. 新增：获取并格式化端口信息
-        local ports
-        ports=$(docker ps -a --filter "name=^/${name}$" --format "{{.Ports}}")
-        
-        # 如果端口为空，显示“无端口映射”；否则去掉 0.0.0.0: 或 ::: 以便手机端美观显示
-        if [ -z "$ports" ]; then
-            ports="无端口映射"
-        else
-            # 将 "0.0.0.0:8080->80/tcp, :::8080->80/tcp" 简化为 "8080->80/tcp" 这样的干净格式
-            ports=$(echo "$ports" | sed 's/0.0.0.0://g' | sed 's/::://g' | sed 's/, /\n        │     /g')
-        fi
-
-        # 3. 手机端纵向块状输出
-        echo -e "${YELLOW}◈ 容器: ${RESET}${YELLOW}${name}${RESET}"
-        echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${CPU_COLOR}${cpu}${RESET}"
-        echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
-        echo -e "  ├─ ${YELLOW}网络 I/O: ${RESET}${net}"
-        echo -e "  ├─ ${YELLOW}端口映射: ${RESET}${CYAN}${ports}${RESET}"
-        echo -e "  └─ ${YELLOW}运行状态: ${RESET}${YELLOW}${uptime}${RESET}"
-        echo -e "${YELLOW}----------------------------------------${RESET}"
-    done
-}
-
-
-# -----------------------------
-# Docker 配置修改通用函数
-# -----------------------------
-set_docker_mirror() {
-    root_use
-    mkdir -p /etc/docker
+    echo -e "${GREEN}===========================================${RESET}"
+    echo -e "${GREEN} ◈ Xray VLESS-Reality 多实例管理面板 ◈     ${RESET}"
+    echo -e "${GREEN}===========================================${RESET}"
+    echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+    echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
+    echo -e "${GREEN}服务活跃状态 :${RESET} $panel_status"
+    echo -e "${GREEN}核心沙箱引擎 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}===========================================${RESET}"
+    echo -e "${GREEN} 1. 安装/复原当前实例${RESET}"
+    echo -e "${GREEN} 2. 更新内核程序${RESET}"
+    echo -e "${GREEN} 3. 卸载当前实例${RESET}"
+    echo -e "${GREEN} 4. 修改当前实例${RESET}"
+    echo -e "${GREEN} 5. 启动当前实例${RESET}"
+    echo -e "${GREEN} 6. 停止当前实例${RESET}"
+    echo -e "${GREEN} 7. 重启当前实例${RESET}"
+    echo -e "${GREEN} 8. 查看当前实例日志${RESET}"
+    echo -e "${GREEN} 9. 查看当前实例配置${RESET}"
+    echo -e "${GREEN}10. 矩阵中心 ${YELLOW}← 添加 / 切换多开实例${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}===========================================${RESET}"
     
-    echo -e "${CYAN}请选择或输入镜像加速源选项:${RESET}"
-    echo -e "${GREEN}1. 使用默认高速代理${RESET}"
-    echo -e "${GREEN}2. 输入自定义加速源${RESET}"
-    echo -e "${GREEN}3. 恢复默认设置(清空加速源)${RESET}"
-    echo -ne "${GREEN}请选择或输入镜像加速源选项 (默认 1): ${RESET}"
-    read mirror_choice
-    mirror_choice=${mirror_choice:-1}
-
-    local mirrors=""
-    
-    if [ "$mirror_choice" == "1" ]; then
-        mirrors='["https://gh-proxy.org/docker/","https://registry.lfree.org","https://hub.glowp.xyz","https://docker.1panel.live"]'
-    elif [ "$mirror_choice" == "2" ]; then
-        read -p "请输入完整的加速地址 (例如 https://hub.glowp.xyz , 多个用英文逗号隔开): " custom_mirror
-        # 简单转换补全为 JSON 数组格式
-        mirrors="[\"$(echo $custom_mirror | sed 's/,/","/g' | sed 's/ //g')\"]"
-    elif [ "$mirror_choice" == "3" ]; then
-        echo -e "${YELLOW}正在恢复默认设置，移除所有自定义镜像源...${RESET}"
-        # 移除配置：如果 jq 存在就删掉该 Key，否则直接覆盖为一个空配置或移出该字段
-        if command -v jq &>/dev/null && [ -f /etc/docker/daemon.json ]; then
-            jq 'del(."registry-mirrors")' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
-            if [ $? -eq 0 ]; then
-                mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-            else
-                echo "{}" > /etc/docker/daemon.json
-            fi
-        else
-            echo "{}" > /etc/docker/daemon.json
-        fi
-        echo -e "${GREEN}✅ 已成功恢复默认设置！${RESET}"
-        restart_docker
-        return
-    else
-        echo -e "${RED}无效选项，操作已取消${RESET}"
-        return
-    fi
-
-    # 写入配置逻辑 (针对 1 和 2 选项)
-    if command -v jq &>/dev/null && [ -f /etc/docker/daemon.json ]; then
-        jq --argjson m "$mirrors" '. + {"registry-mirrors": $m}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
-        if [ $? -eq 0 ]; then
-            mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-        else
-            echo "{\"registry-mirrors\": $mirrors}" > /etc/docker/daemon.json
-        fi
-    else
-        echo "{\"registry-mirrors\": $mirrors}" > /etc/docker/daemon.json
-    fi
-
-    echo -e "${GREEN}✅ 镜像加速源配置成功！当前配置为:${RESET}"
-    cat /etc/docker/daemon.json
-    restart_docker
-}
-
-# -----------------------------
-# Docker 日志管理子菜单
-# -----------------------------
-docker_log_menu() {
-    root_use
-    mkdir -p /etc/docker
-
-    while true; do
-        echo -e "${CYAN}===== Docker 日志大小限制管理 =====${RESET}"
-        echo -e "${GREEN}1. 开启日志大小限制${RESET}"
-        echo -e "${GREEN}2. 关闭日志大小限制 (恢复默认无限制)${RESET}"
-        echo -e "${GREEN}0. 返回主菜单${RESET}"
-        echo -ne "${GREEN}请选择操作: ${RESET}"
-        read log_choice
-
-        case $log_choice in
-            1)
-                echo -e "${CYAN}正在配置日志限制...${RESET}"
-                if [ ! -f /etc/docker/daemon.json ]; then echo '{}' > /etc/docker/daemon.json; fi
-                jq '. + {"log-driver": "json-file", "log-opts": {"max-size": "20m", "max-file": "3"}}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
-                mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-                echo -e "${GREEN}✅ 日志大小限制开启成功！${RESET}"
-                echo -e "${YELLOW}注意: 此限制仅对【新创建】的容器生效，老容器需重建方能生效。${RESET}"
-                restart_docker
-                read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                ;;
-            2)
-                echo -e "${YELLOW}正在解除日志限制...${RESET}"
-                if [ -f /etc/docker/daemon.json ]; then
-                    jq 'del(."log-driver") | del(."log-opts")' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
-                    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
-                    echo -e "${GREEN}✅ 已关闭日志大小限制（恢复系统默认）。${RESET}"
-                else
-                    echo -e "${YELLOW}配置文件不存在，无需关闭。${RESET}"
-                fi
-                restart_docker
-                read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-                ;;
-            0)
-                break
-                ;;
-            *)
-                echo -e "${RED}无效选择${RESET}" && sleep 1
-                ;;
-        esac
-    done
-}
-
-# -----------------------------
-# 主菜单显示状态
-# -----------------------------
-main_menu() {
-    root_use
-    while true; do
-        clear
-        echo -e "${CYAN}"
-        echo "  ____             _               "
-        echo " |  _ \  ___   ___| | _____ _ __   "
-        echo " | | | |/ _ \ / __| |/ / _ \ '__|  "
-        echo " | |_| | (_) | (__|   <  __/ |     "
-        echo " |____/ \___/ \___|_|\_\___|_|     "
-        echo -e "${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-       # 检测 Docker 状态
-        if command -v docker &>/dev/null; then
-            # 1. 获取基础状态与版本
-            local docker_status=$(docker info &>/dev/null && echo "运行中" || echo "未运行")
-            local docker_ver=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "未知")
-            local compose_ver=$(docker compose version --short 2>/dev/null || echo "未知")
-            
-            # 2. 统计各项数量
-            local total=$(docker ps -a -q 2>/dev/null | wc -l)
-            local running=$(docker ps -q 2>/dev/null | wc -l)
-            local stopped=$(docker ps -aq -f status=exited 2>/dev/null | wc -l)
-            local total_volumes=$(docker volume ls -q 2>/dev/null | wc -l)
-            local total_images=$(docker images -q 2>/dev/null | sort -u | wc -l)
-            local total_networks=$(docker network ls --filter "type=custom" -q 2>/dev/null | wc -l)
-            
-            # 3. 打印美化后的状态栏 (分两行显示，避免过长换行破环UI)
-            echo -e "${YELLOW}🐳 Docker   : v$docker_ver | 🐙 Compose: v$compose_ver${RESET}"
-            echo -e "${YELLOW}🐳 Docker   : $docker_status  | 📦 系统镜像: $total_images 个 "
-            echo -e "${YELLOW}🟢 运行容器 : $running 个    | 🔴 停止容器: $stopped 个${RESET}"
-            echo -e "${YELLOW}💾 数据卷数 : $total_volumes 个    | 🌐 网络数量: $total_networks 个${RESET}"
-        else
-            # Docker 未安装时只显示 iptables 状态
-            echo -e "${YELLOW}🐳 Docker: 未安装 | 🌐 iptables: $(current_iptables)${RESET}"
-        fi
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${GREEN}01. 安装/更新 Docker${RESET}"
-        echo -e "${GREEN}02. 安装/更新 Docker Compose${RESET}"
-        echo -e "${GREEN}03. 卸载 Docker&Compose${RESET}"
-        echo -e "${GREEN}04. 容器管理${RESET}"
-        echo -e "${GREEN}05. 镜像管理${RESET}"
-        echo -e "${GREEN}06. 开启 IPv6${RESET}"
-        echo -e "${GREEN}07. 关闭 IPv6${RESET}"
-        echo -e "${GREEN}08. 开放所有端口${RESET}"
-        echo -e "${GREEN}09. 网络管理${RESET}"
-        echo -e "${GREEN}10. 切换 iptables-legacy${RESET}"
-        echo -e "${GREEN}11. 切换 iptables-nft${RESET}"
-        echo -e "${GREEN}12. 备份/恢复${RESET}"
-        echo -e "${GREEN}13. 重启 Docker${RESET}"
-        echo -e "${GREEN}14. 数据卷管理 ${RESET}"
-        echo -e "${GREEN}15. 设置Docker镜像加速源${RESET}"
-        echo -e "${GREEN}16. 设置Docker日志限制${RESET}"
-        echo -e "${GREEN}17.${RESET} ${YELLOW}清理未使用容器/镜像/卷${RESET}"
-        echo -e "${GREEN}18. 容器监控${RESET}"
-        echo -e "${GREEN}00. 退出${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
-        case $choice in
-            01|1) docker_install_update ;;
-            02|2) docker_compose_install_update ;;
-            03|3) docker_uninstall ;;
-            04|4) check_docker_running && docker_ps ;;
-            05|5) check_docker_running && docker_image ;;
-            06|6) check_docker_running && docker_ipv6_on ;;
-            07|7) check_docker_running && docker_ipv6_off ;;
-            08|8) open_all_ports ;;
-            09|9) check_docker_running && docker_network ;;
-            10) switch_iptables_legacy ;;
-            11) switch_iptables_nft ;;
-            12) check_docker_running && docker_backup_menu ;;
-            13|13) check_docker_running && restart_docker ;;
-            14|14) check_docker_running && docker_volume ;;
-            15|15) check_docker_running && set_docker_mirror ;;
-            16|16) docker_log_menu ;;
-            17|17) check_docker_running && docker_cleanup ;;
-            18|18) monitor_docker_containers ;;
-             00|0) exit 0 ;;
-            *) echo -e "${RED}无效选择${RESET}" ;;
-        esac
-        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
-    done
-}
-
-
-
-
-# 启动脚本
-main_menu
+    choice=""
+    read -r -p "$(echo -e "${GREEN}选择操作序号: ${RESET}")" choice < /dev/tty || true
+    case "$choice" in
+        1) menu_install "new" ;;
+        2) download_bin && install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH" && ok "Xray 核心覆盖并上调成功" ;;
+        3) menu_uninstall ;;
+        4) menu_install "edit" ;;
+        5) systemctl start "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && ok "拉起成功" ;;
+        6) systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && ok "挂起成功" ;;
+        7) systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && ok "重启完毕" ;;
+        8) (trap 'echo -e "\n"' INT; journalctl -u "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" -n 50 -f) ;;
+        9) print_node_summary "$CURRENT_INSTANCE" ;;
+        10) menu_switch_instance ;;
+        0) exit 0 ;;
+        *) warn "无效输入！"; sleep 1 ;;
+    esac
+    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制台面...${RESET}")" < /dev/tty || true
+done

@@ -1,736 +1,948 @@
-#!/bin/sh
-# 针对 Alpine Linux 深度优化，使用标准 sh 执行
-set -eu
+#!/bin/bash
+# ========================================
+# 🐳 一键 VPS Docker 管理工具
+# ========================================
 
-# =========================================================
-# Snell v6 + Shadow-TLS v3 独立管理脚本
-# =========================================================
-
-# ================== 颜色与输出函数 ==================
-GREEN="\033[32m"
+# -----------------------------
+# 颜色
+# -----------------------------
 RED="\033[31m"
+GREEN="\033[32m"
 YELLOW="\033[33m"
+CYAN="\033[36m"
+BOLD="\033[1m"
 RESET="\033[0m"
-
-_info() { echo -e "${GREEN}[信息] $1${RESET}"; }
-_warn() { echo -e "${YELLOW}[警告] $1${RESET}"; }
-_err()  { echo -e "${RED}[错误] $1${RESET}"; }
-
-# ================== 基础变量 (全面注入 v6 独立命名空间) ==================
-SNELL_DIR="/etc/snell-tls-v6"
-SNELL_Conf="${SNELL_DIR}/snell-server-v6.conf"
-SNELL_File="/usr/local/bin/snell-server-v6-hybrid"
-
-STLS_Env="${SNELL_DIR}/shadow-tlsn-v6.env"
-STLS_File="/usr/local/bin/stls-integrated-shadow-tlsn-v6"
-
-LOG_FILE="/var/log/stls-integrated-snell-managers-v6.log"
-
-# Snell v6 默认保底版本号
-SNELL_DEFAULT_VERSION="6.0.0b4"
-
-TMP_DIR=$(mktemp -d -t snell-v6-hybrid.XXXXXX)
-
-# ================== cleanup ==================
-cleanup() {
-    [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT INT TERM
-
-# ================== 日志与暂停 ==================
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null || true
+BLUE="\033[34m"
+# -----------------------------
+# 检查 root
+# -----------------------------
+root_use() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}请使用 root 用户运行脚本${RESET}"
+        exit 1
+    fi
 }
 
-pause() {
-    echo -n "按任意键返回菜单..."
-    read -r -n 1 -s || true
-    echo
-}
+# -----------------------------
+# 重启 Docker 并恢复容器端口映射
+# -----------------------------
+restart_docker() {
+    root_use
+    echo -e "${YELLOW}正在重启 Docker...${RESET}"
 
-# ================== 智能获取公网双栈 IP ==================
-get_public_ip() {
-    local mode=${1:-"v4"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
+    if systemctl list-unit-files | grep -q "^docker.service"; then
+        systemctl restart docker
     else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
+        pkill dockerd 2>/dev/null
+        nohup dockerd >/dev/null 2>&1 &
+        sleep 5
     fi
 
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
-    echo "127.0.0.1" && return 0
+    if docker info &>/dev/null; then
+        echo -e "${GREEN}✅ Docker 已成功重启${RESET}"
+        containers=$(docker ps -a -q)
+        if [ -n "$containers" ]; then
+            echo -e "${CYAN}正在重启所有容器以恢复端口映射...${RESET}"
+            docker restart $containers
+            echo -e "${GREEN}✅ 所有容器已重启并恢复端口映射${RESET}"
+        else
+            echo -e "${YELLOW}没有容器需要重启${RESET}"
+        fi
+    else
+        echo -e "${RED}❌ Docker 重启失败，请检查日志${RESET}"
+    fi
 }
 
-# ================== 检查端口 ==================
-check_port() {
-    if netstat -tln | grep -q ":$1 "; then
-        _err "端口 $1 已被占用"
+# -----------------------------
+# 检测 Docker 是否安装并运行
+# -----------------------------
+check_docker_running() {
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}❌ Docker 未安装，请先安装 Docker${RESET}"
+        return 1
+    fi
+    if ! docker info &>/dev/null; then
+        echo -e "${YELLOW} Docker 未运行，尝试启动...${RESET}"
+        if systemctl list-unit-files | grep -q "^docker.service"; then
+            systemctl start docker
+        else
+            nohup dockerd >/dev/null 2>&1 &
+            sleep 5
+        fi
+    fi
+    if ! docker info &>/dev/null; then
+        echo -e "${RED}❌ Docker 启动失败，请检查日志${RESET}"
         return 1
     fi
     return 0
 }
 
-# ================== 辅助生成器 ==================
-random_key() {
-    tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 16 || echo "SnellPskKey12345"
-}
-
-random_port() {
-    awk 'BEGIN{srand(); print int(rand()*(65000-2000+1))+2000}'
-}
-
-get_system_dns() { 
-    grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ',' | sed 's/,$//' || echo "1.1.1.1,8.8.8.8"
-}
-
-_map_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64)  echo "amd64" ;;
-        aarch64|arm64) echo "aarch64" ;;
-        *) return 1 ;;
-    esac
-}
-
-detect_stls_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64)  echo "x86_64-unknown-linux-musl" ;;
-        aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
-        *) _err "不支持架构: $(uname -m)" && exit 1 ;;
-    esac
-}
-
-_get_snell_latest_version() {
-    local latest_version
-    latest_version=$(curl -sL -A "Mozilla/5.0" "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
-    if [ -n "$latest_version" ]; then
-        echo "${latest_version#v}"
+# -----------------------------
+# 自动检测国内/国外
+# -----------------------------
+detect_country() {
+    local country=$(curl -s --max-time 5 ipinfo.io/country)
+    if [[ "$country" == "CN" ]]; then
+        echo "CN"
     else
-        echo "$SNELL_DEFAULT_VERSION"
+        echo "OTHER"
     fi
 }
 
-get_latest_stls_version() {
-    curl -fsSL --max-time 5 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" 2>/dev/null | grep tag_name | cut -d '"' -f4 || echo "v0.2.25"
-}
-
-create_user() {
-    # 先检查并创建组
-    if ! getent group snell-tls-v6 >/dev/null 2>&1; then
-        addgroup -S snell-tls-v6 >/dev/null 2>&1 || true
-    fi
-    # 再检查并创建用户，显式通过 -G 指定组
-    if ! id -u snell-tls-v6 >/dev/null 2>&1; then
-        adduser -S -D -H -s /sbin/nologin -G snell-tls-v6 snell-tls-v6 >/dev/null 2>&1 || true
-    fi
-}
-
-# 精准无误的配置提取引擎 (兼容 BusyBox awk)
-_get_conf_value() {
-    local key="$1"
-    if [ -f "$SNELL_Conf" ]; then
-        grep -E "^${key}\s*=" "$SNELL_Conf" | awk -F'=' '{print $2}' | sed 's/ //g' | tr -d '\r\n'
-    fi
-}
-
-# ================== 安全的数据提取引擎 ==================
-load_existing_config() {
-    OLD_STLS_PORT="8443"
-    OLD_SNELL_PORT=""
-    OLD_SNELL_PSK=""
-    OLD_SNELL_MODE="default"
-    OLD_STLS_PWD=""
-    OLD_STLS_SNI="captive.apple.com"
-    OLD_DNS=""
-    OLD_TFO="true"
-    OLD_DNS_PREF="default"
-
-    if [ -f "$SNELL_Conf" ]; then
-        local raw_listen=$(_get_conf_value "listen")
-        if [ -n "$raw_listen" ]; then
-            local first_listen="${raw_listen%%,*}"
-            OLD_SNELL_PORT=$(echo "$first_listen" | awk -F: '{print $NF}')
-        fi
-        OLD_SNELL_PSK=$(_get_conf_value "psk")
-        OLD_SNELL_MODE=$(_get_conf_value "mode")
-        OLD_DNS=$(_get_conf_value "dns")
-        OLD_TFO=$(_get_conf_value "tfo")
-        OLD_DNS_PREF=$(_get_conf_value "dns-ip-preference")
-    fi
-    
-    [ -z "$OLD_SNELL_MODE" ] && OLD_SNELL_MODE="default"
-
-    if [ -f "$STLS_Env" ]; then
-        OLD_STLS_PORT=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "443")
-        OLD_STLS_PWD=$(awk -F'=' '/^STLS_PASSWORD=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
-        
-        local raw_tls
-        raw_tls=$(awk -F'=' '/^STLS_TLS=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
-        if [ -n "$raw_tls" ]; then
-            OLD_STLS_SNI=${raw_tls%:[0-9]*}
-        fi
-        [ -z "$OLD_STLS_SNI" ] && OLD_STLS_SNI="captive.apple.com"
-    fi
-    return 0
-}
-
-# ================== 写配置核心引擎 ==================
-write_config() {
-    local snell_port="$1"
-    local psk="$2"
-    local snell_mode="$3"
-    local dns="$4"
-    local tfo="$5"
-    local dns_pref="$6"
-    local stls_port="$7"
-    local stls_sni="$8"
-    local stls_pwd="$9"
-
-    mkdir -p "$SNELL_DIR"
-
-    # Snell v6 特性升级：支持多模式选择、显式本地双栈桥接
-    cat > "$SNELL_Conf" <<EOF
-[snell-server]
-listen = 127.0.0.1:$snell_port,[::1]:$snell_port
-psk = $psk
-mode = $snell_mode
-obfs = off
-tfo = $tfo
-dns = $dns
-dns-ip-preference = $dns_pref
-EOF
-    chmod 600 "$SNELL_Conf"
-
-    cat > "$STLS_Env" <<EOF
-STLS_LISTEN=[::]:$stls_port
-STLS_SERVER=127.0.0.1:$snell_port
-STLS_TLS=$stls_sni:443
-STLS_PASSWORD=$stls_pwd
-EOF
-    chmod 600 "$STLS_Env"
-
-    create_user
-    chown -R snell-tls-v6:snell-tls-v6 "$SNELL_DIR"
-}
-
-# ================== 生成并保存链接 ==================
-generate_links() {
-    local psk="$1"
-    local snell_mode="$2"
-    local tfo="$3"
-    local stls_port="$4"
-    local stls_sni="$5"
-    local stls_pwd="$6"
-
-    IP=$(get_public_ip)
-    HOSTNAME=$(hostname -s 2>/dev/null | sed 's/ /_/g' || echo "server")
-
-    cat > "${SNELL_DIR}/surge-v6.txt" <<EOF
-$HOSTNAME-SnellV6+ShadowTLS = snell, $IP, $stls_port, psk=$psk, version=6, mode=$snell_mode, tfo=$tfo, shadow-tls-password=$stls_pwd, shadow-tls-sni=$stls_sni, shadow-tls-version=3, reuse=true, ecn=true
-EOF
-    chown snell-tls-v6:snell-tls-v6 "${SNELL_DIR}/surge-v6.txt" || true
-}
-
-# ================== OpenRC 服务启动脚本构建 (带有 v6 独立后缀名) ==================
-service() {
-    create_user
-
-    cat > /etc/init.d/snell-tlss-v6 <<'EOF'
-#!/sbin/openrc-run
-
-description="Snell v6 Server Service (Hybrid)"
-command="/usr/local/bin/snell-server-v6-hybrid"
-command_args="-c /etc/snell-tls-v6/snell-server-v6.conf"
-command_background="yes"
-command_user="snell-tls-v6:snell-tls-v6"
-pidfile="/run/${RC_SVCNAME}.pid"
-output_log="/var/log/snell-v6.log"
-error_log="/var/log/snell-v6.log"
-
-depend() {
-    need net
-    after firewall
+# -----------------------------
+# 安装/更新 Docker
+# -----------------------------
+docker_install() {
+    root_use
+    local country=$(detect_country)
+    echo -e "${CYAN}检测到国家: $country${RESET}"
+    if [ "$country" = "CN" ]; then
+        echo -e "${YELLOW}使用国内源安装 Docker...${RESET}"
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sh get-docker.sh
+        mkdir -p /etc/docker
+        cat > /etc/docker/daemon.json << EOF
+{
+  "registry-mirrors": [
+    "https://docker.0.unsee.tech",
+    "https://docker.1panel.live",
+    "https://registry.dockermirror.com",
+    "https://docker.m.daocloud.io"
+  ]
 }
 EOF
-    chmod +x /etc/init.d/snell-tlss-v6
-    rc-update add snell-tlss-v6 default || true
-    touch /var/log/snell-v6.log && chown snell-tls-v6:snell-tls-v6 /var/log/snell-v6.log || true
-    rc-service snell-tlss-v6 start || true
-}
-
-service_stls() {
-    cat > /etc/init.d/shadowtlsn-v6 <<'EOF'
-#!/sbin/openrc-run
-
-description="Shadow TLS Service v3 (Hybrid v6)"
-command="/usr/local/bin/stls-integrated-shadow-tlsn-v6"
-pidfile="/run/${RC_SVCNAME}.pid"
-command_background="yes"
-output_log="/var/log/shadowtls-v6.log"
-error_log="/var/log/shadowtls-v6.log"
-
-start_pre() {
-    if [ -f /etc/snell-tls-v6/shadow-tlsn-v6.env ]; then
-        . /etc/snell-tls-v6/shadow-tlsn-v6.env
     else
-        eerror "Environment file /etc/snell-tls-v6/shadow-tlsn-v6.env missing!"
-        return 1
+        echo -e "${YELLOW}使用官方源安装 Docker...${RESET}"
+        curl -fsSL https://get.docker.com | sh
     fi
-    
-    export MONOIO_FORCE_LEGACY_DRIVER=1
-    command_args="--v3 server --password $STLS_PASSWORD --listen $STLS_LISTEN --server $STLS_SERVER --tls $STLS_TLS"
+    systemctl enable docker
+    systemctl start docker
+    echo -e "${GREEN}Docker 安装完成并已启动（已设置开机自启）${RESET}"
 }
 
-depend() {
-    need net snell-tlss-v6
-    after firewall snell-tlss-v6
-}
-EOF
-    chmod +x /etc/init.d/shadowtlsn-v6
-    rc-update add shadowtlsn-v6 default || true
-    touch /var/log/shadowtls-v6.log && chown root:root /var/log/shadowtls-v6.log || true
-    rc-service shadowtlsn-v6 start || true
-    _info "OpenRC 专属自启服务部署配置完成！"
+docker_update() {
+    root_use
+    echo -e "${YELLOW}正在更新 Docker...${RESET}"
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sh get-docker.sh
+    systemctl enable docker
+    systemctl restart docker
+    echo -e "${GREEN}Docker 更新完成并已启动（已设置开机自启）${RESET}"
 }
 
-# ================== 打印配置详情 ==================
-print_node_info() {
-    IP=$(get_public_ip)
-    if [ ! -f "$STLS_Env" ] || [ ! -f "$SNELL_Conf" ]; then
-        _err "配置文件不存在，请先选择选项【1】进行安装初始化。" && return
-    fi
-    
-    local snell_port
-    local raw_listen=$(_get_conf_value "listen")
-    local first_listen="${raw_listen%%,*}"
-    snell_port=$(echo "$first_listen" | awk -F: '{print $NF}')
-    local psk=$(_get_conf_value "psk")
-    local snell_mode=$(_get_conf_value "mode")
-    local dns_pref=$(_get_conf_value "dns-ip-preference")
-    
-    [ -z "$snell_mode" ] && snell_mode="default"
-    local show_listen_port=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "未知")
-    local stls_pwd=$(awk -F'=' '/^STLS_PASSWORD=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "未知")
-    
-    local raw_tls b_sni="未知"
-    raw_tls=$(awk -F'=' '/^STLS_TLS=/{print $2}' "$STLS_Env" 2>/dev/null | tr -d '\r\n' || echo "")
-    if [ -n "$raw_tls" ]; then
-        b_sni=${raw_tls%:[0-9]*}
-    fi
-
-    echo -e "${GREEN}====== Snell v6 + Shadow-TLS v3 配置 ======${RESET}"
-    echo -e "${YELLOW} 入口公网 IP   : ${IP}${RESET}"
-    echo -e "${YELLOW} 入口公网端口   : ${show_listen_port}${RESET}"
-    echo -e "${YELLOW} Shadow-TLS 密码: ${stls_pwd}${RESET}"
-    echo -e "${YELLOW} SNI 伪装域名   : ${b_sni}${RESET}"
-    echo -e "${YELLOW} 内部 Snell 端口 : ${snell_port} ${RESET}"
-    echo -e "${YELLOW} Snell 工作模式 : ${snell_mode}${RESET}"
-    echo -e "${YELLOW} Snell PSK 密钥 : ${psk}${RESET}"
-    echo -e "${YELLOW} DNS 家族优先级 : ${dns_pref}${RESET}"
-    echo -e "${YELLOW}📄 提示：若外网为纯 v6 VPS 架构，在下方 Surge 配置中直接替换公网 IP 为 IPv6 地址即可 ★${RESET}"
-    echo -e "${YELLOW}-------------------------------------------------${RESET}"
-    _info "Surge 6 专属托管节点配置:"
-    if [ -f "${SNELL_DIR}/surge-v6.txt" ]; then
-        echo -n -e "${YELLOW}"
-        cat "${SNELL_DIR}/surge-v6.txt"
-        echo -e "${RESET}"
+docker_install_update() {
+    root_use
+    if command -v docker &>/dev/null; then
+        docker_update
     else
-        echo "未生成配置"
+        docker_install
     fi
-    echo -e "${YELLOW}-------------------------------------------------${RESET}"
 }
 
-# ================== 动态配置交互流 ==================
-execute_configuration_flow() {
-    local is_modify_mode="$1"
-    
-    load_existing_config || true
-    
-    local snell_port psk snell_mode dns tfo dns_pref stls_port stls_sni stls_pwd
-    local input_stls_port input_snell_port input_psk input_mode input_stls_pwd input_sni input_dns input_tfo input_dns_pref
+# -----------------------------
+# 卸载 Docker
+# -----------------------------
+docker_uninstall() {
+    root_use
+    echo -e "${RED}正在卸载 Docker 和 Docker Compose...${RESET}"
+    systemctl stop docker 2>/dev/null
+    systemctl disable docker 2>/dev/null
+    pkill dockerd 2>/dev/null
 
-    while true; do
-        printf "请输入 Shadow-TLS 入口公网端口 (当前/默认: %s): " "${OLD_STLS_PORT:-443}"
-        read -r input_stls_port || input_stls_port=""
-        stls_port=${input_stls_port:-${OLD_STLS_PORT:-443}}
+    if command -v apt &>/dev/null; then
+        apt remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
+        apt purge -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
+        apt autoremove -y
+    elif command -v yum &>/dev/null; then
+        yum remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
+    fi
 
-        if echo "$stls_port" | grep -qE '^[0-9]+$' && [ "$stls_port" -ge 1 ] && [ "$stls_port" -le 65535 ]; then
-            if [ "$stls_port" != "$OLD_STLS_PORT" ]; then
-                check_port "$stls_port" || continue
-            fi
-            break
-        else
-            _err "端口格式不正确，必须在 1-65535 之间。"
-        fi
-    done
-
-    while true; do
-        local default_snell_port=""
-        default_snell_port=${OLD_SNELL_PORT:-$(random_port || echo "38221")}
-        
-        printf "请输入内部本地 Snell 端口 (当前/随机: %s): " "$default_snell_port"
-        read -r input_snell_port || input_snell_port=""
-        snell_port=${input_snell_port:-$default_snell_port}
-
-        if echo "$snell_port" | grep -qE '^[0-9]+$' && [ "$snell_port" -ge 1 ] && [ "$snell_port" -le 65535 ]; then
-            if [ "$snell_port" -eq "$stls_port" ]; then
-                _err "内部 Snell 端口绝不能与外网公共入口端口相同！"
-                continue
-            fi
-            if [ "$snell_port" != "$OLD_SNELL_PORT" ]; then
-                check_port "$snell_port" || continue
-            fi
-            break
-        else
-            _err "端口格式不正确，必须在 1-65535 之间。"
-        fi
-    done
-
-    while true; do
-        local default_psk=""
-        default_psk=${OLD_SNELL_PSK:-$(random_key || echo "")}
-
-        printf "请输入 Snell PSK 密钥 (当前/随机: %s):\n> " "$default_psk"
-        read -r input_psk || input_psk=""
-        psk=${input_psk:-$default_psk}
-        if [ -n "$psk" ]; then break; else _err "PSK 密钥不能为空！"; fi
-    done
-
-    local default_mode="${OLD_SNELL_MODE:-default}"
-    echo -e "\n${YELLOW}请选择 Snell v6 工作模式 (当前: $default_mode)：${RESET}"
-    echo "1. default     (流量混淆 + AES 加密，全能传统模式)"
-    echo "2. unshaped    (禁用内部混淆，纯加密传输，吞吐能效提升约 10%)"
-    echo "3. unsafe-raw  (明文不加密模式：极度适合已套用外部 Shadow-TLS 保护的环境)"
-    printf "请选择序号 (直接回车保持不变): "
-    read -r input_mode || input_mode=""
-    case $input_mode in
-        1) snell_mode="default" ;;
-        2) snell_mode="unshaped" ;;
-        3) snell_mode="unsafe-raw" ;;
-        *) snell_mode="$default_mode" ;;
-    esac
-
-    while true; do
-        local default_stls_pwd=""
-        default_stls_pwd=${OLD_STLS_PWD:-$(openssl rand -hex 8 2>/dev/null || echo "StlsPurePwd123456")}
-        
-        printf "请输入 Shadow-TLS 传输密码 (当前/随机: %s): " "$default_stls_pwd"
-        read -r input_stls_pwd || input_stls_pwd=""
-        stls_pwd=${input_stls_pwd:-$default_stls_pwd}
-        if [ -n "$stls_pwd" ]; then break; else _err "密码不能为空！"; fi
-    done
-
-    while true; do
-        local default_sni=${OLD_STLS_SNI:-"captive.apple.com"}
-        printf "请输入 Shadow-TLS SNI 伪装域名 (当前/默认: %s): " "$default_sni"
-        read -r input_sni || input_sni=""
-        stls_sni=${input_sni:-$default_sni}
-        if echo "$stls_sni" | grep -qE '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
-            break
-        else
-            _err "伪装域名格式不正确，请输入合法的域名 (如 captive.apple.com)"
-        fi
-    done
-
-    while true; do
-        local sys_dns=""
-        sys_dns=$(get_system_dns || echo "1.1.1.1,8.8.8.8")
-        local default_dns=${OLD_DNS:-$sys_dns}
-        
-        printf "请输入 Snell 内部自定义 DNS (当前/默认: %s): " "$default_dns"
-        read -r input_dns || input_dns=""
-        dns=${input_dns:-$default_dns}
-        if [ -n "$dns" ]; then break; else _err "DNS 不能为空！"; fi
-    done
-
-    local default_dns_pref="${OLD_DNS_PREF:-default}"
-    echo -e "\n${YELLOW}请选择 Snell v6 DNS 解析 IP 家族优先级 (当前: $default_dns_pref)：${RESET}"
-    echo "1. default      (系统默认)"
-    echo "2. prefer-ipv4  (IPv4 优先)"
-    echo "3. prefer-ipv6  (IPv6 优先)"
-    echo "4. ipv4-only    (仅解析 IPv4)"
-    echo "5. ipv6-only    (仅解析 IPv6)"
-    printf "请选择序号 (直接回车保持不变): "
-    read -r input_dns_pref || input_dns_pref=""
-    case $input_dns_pref in
-        1) dns_pref="default" ;;
-        2) dns_pref="prefer-ipv4" ;;
-        3) dns_pref="prefer-ipv6" ;;
-        4) dns_pref="ipv4-only" ;;
-        5) dns_pref="ipv6-only" ;;
-        *) dns_pref="$default_dns_pref" ;;
-    esac
-
-    local default_tfo_str="开启"
-    [ "$OLD_TFO" = "false" ] && default_tfo_str="关闭"
-    printf "是否开启 TCP Fast Open？(当前: %s, 1.开启 2.关闭, 默认 1): " "$default_tfo_str"
-    read -r input_tfo || input_tfo=""
-    if [ "$input_tfo" = "1" ]; then tfo="true"; elif [ "$input_tfo" = "2" ]; then tfo="false"; else tfo="$OLD_TFO"; fi
-
-    write_config "$snell_port" "$psk" "$snell_mode" "$dns" "$tfo" "$dns_pref" "$stls_port" "$stls_sni" "$stls_pwd" || true
-    generate_links "$psk" "$snell_mode" "$tfo" "$stls_port" "$stls_sni" "$stls_pwd" || true
+    rm -rf /var/lib/docker /etc/docker /var/lib/containerd /var/run/docker.sock /usr/local/bin/docker-compose
+    echo -e "${GREEN}Docker 和 Docker Compose 已卸载干净${RESET}"
 }
 
-# ================== 核心 Alpine 部署与下载逻辑 ==================
-_download_and_install_binary() {
-    local sarch=$( _map_arch ) || { _err "不支持的架构"; return 1; }
-    
-    _info "正在安装 Alpine 必要系统依赖 (upx, unzip, curl, iproute2, openssl, shadow, gcompat)..."
-    apk add --no-cache upx unzip curl iproute2 openssl shadow gcompat >/dev/null 2>&1
+# -----------------------------
+# Docker Compose 安装/更新
+# -----------------------------
+docker_compose_install_update() {
+    root_use
+    echo -e "${CYAN}正在安装/更新 Docker Compose...${RESET}"
+    if ! command -v jq &>/dev/null; then
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y jq
+        elif command -v yum &>/dev/null; then
+            yum install -y jq
+        fi
+    fi
+    local latest=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
+    latest=${latest:-"v2.30.0"}
+    curl -L "https://github.com/docker/compose/releases/download/$latest/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+    echo -e "${GREEN}Docker Compose 已安装/更新到版本 $latest${RESET}"
+}
 
-    _info "正在获取官方最新稳定版版本号..."
-    local version=$( _get_snell_latest_version )
-    version="${version#v}"
 
-    local tmp=$(mktemp -d)
-    local download_url_A="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
-    local download_url_B="https://dl.nssurge.com/snell/snell-server-${version}-linux-${sarch}.zip"
-    local download_url_C="https://dl.nssurge.com/snell/snell-server-v6.0.0b4-linux-${sarch}.zip"
-
-    _info "正在通过智能路由下载 Snell v6 核心组件..."
-    
-    if curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -o "$tmp/snell.zip" --connect-timeout 15 "$download_url_A" && unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
-        _info "方案 A (标准新版 v${version}) 下载并校验成功！"
-    elif curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o "$tmp/snell.zip" --connect-timeout 15 "$download_url_B" && unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
-        _info "方案 B (变体路径) 下载并校验成功！"
+# -----------------------------
+# Docker IPv6
+# -----------------------------
+docker_ipv6_on() {
+    root_use
+    mkdir -p /etc/docker
+    if [ -f /etc/docker/daemon.json ]; then
+        jq '. + {ipv6:true,"fixed-cidr-v6":"fd00::/64"}' /etc/docker/daemon.json 2>/dev/null \
+            >/etc/docker/daemon.json.tmp || \
+            echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
     else
-        _warn "官方主动拦截或版本号未就绪，启动弹性回滚，下载 v6.0.0b4 保底包..."
-        if ! curl -sL -A "Mozilla/5.0" -o "$tmp/snell.zip" --connect-timeout 20 "$download_url_C" || ! unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
-            _err "所有下载源均被 Surge 防火墙拦截或网络超时，请稍后再试！"
-            rm -rf "$tmp"; return 1
-        fi
-        version="6.0.0b4"
+        echo '{"ipv6":true,"fixed-cidr-v6":"fd00::/64"}' > /etc/docker/daemon.json.tmp
     fi
+    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+    restart_docker
+    docker ps -a -q | xargs -r docker start
+    echo -e "${GREEN}✅ Docker IPv6 已开启，所有容器已恢复${RESET}"
+}
 
-    if unzip -oq "$tmp/snell.zip" -d "$tmp/"; then
-        _info "正在进行 UPX 壳解压兼容处理..."
-        if command -v upx >/dev/null 2>&1; then
-            upx -d "$tmp/snell-server" >/dev/null 2>&1 || _warn "UPX 脱壳失败或无需脱壳"
-        else
-            _err "UPX 工具不可用，无法完成解压"
-            rm -rf "$tmp"; return 1
-        fi
-
-        install -m 755 "$tmp/snell-server" "$SNELL_File"
-        rm -rf "$tmp"
-        echo "$version" > "${SNELL_DIR}/version.txt"
-        return 0
+docker_ipv6_off() {
+    root_use
+    if [ -f /etc/docker/daemon.json ]; then
+        jq 'del(.ipv6) | del(.["fixed-cidr-v6"])' /etc/docker/daemon.json \
+            >/etc/docker/daemon.json.tmp 2>/dev/null || \
+            cp /etc/docker/daemon.json /etc/docker/daemon.json.tmp
+        mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+        restart_docker
+        docker ps -a -q | xargs -r docker start
+        echo -e "${GREEN}✅ Docker IPv6 已关闭，所有容器已恢复${RESET}"
     else
-        _err "解压失败"
-        rm -rf "$tmp"
-        return 1
+        echo -e "${YELLOW} Docker 配置文件不存在，无法关闭 IPv6${RESET}"
     fi
 }
 
-# ================== 安装入口 ==================
-install_ss() {
-    _info "开始全新安装 Snell v6 & Shadow-TLS v3 核心组件..."
-    mkdir -p "$SNELL_DIR"
+# -----------------------------
+# 开放所有端口（IPv4 + IPv6 + nftables）
+# -----------------------------
+open_all_ports() {
+    root_use
+    read -p "确认要开放所有端口吗？(Y/N): " confirm
+    [[ $confirm =~ [Yy] ]] || { echo -e "${YELLOW}操作已取消${RESET}"; return; }
+    echo -e "${YELLOW}正在检测可用防火墙工具...${RESET}"
 
-    _download_and_install_binary
-
-    STLS_VERSION=$(get_latest_stls_version)
-    STLS_ARCH=$(detect_stls_arch)
-    _info "正在下载 Shadow-TLS ${STLS_VERSION}..."
-    wget -O "$TMP_DIR/shadow-tls" "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
-    install -m 755 "$TMP_DIR/shadow-tls" "$STLS_File"
-    echo "$STLS_VERSION" > "${SNELL_DIR}/stls_version.txt"
-
-    execute_configuration_flow false
-    service
-    service_stls
-
-    _info "服务安装部署成功，snellv6+Shadow-TLSv3 已启动运行！"
-    log "全新安装并初始化成功"
-    print_node_info
-}
-
-# ================== 修改现有配置 ==================
-modify_ss() {
-    _info "进入修改配置模块..."
-    if [ ! -f "$SNELL_Conf" ] || [ ! -f "$STLS_Env" ]; then
-        _err "错误：未检测到环境配置文件，请先选择选项【1】进行完整安装！"
-        return
+    if command -v iptables &>/dev/null; then
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+        iptables -F
     fi
-    
-    _info "正在安全停止现有服务以防死锁..."
-    rc-service shadowtlsn-v6 stop >/dev/null 2>&1 || true
-    rc-service snell-tlss-v6 stop >/dev/null 2>&1 || true
-    
-    execute_configuration_flow true
-    
-    _info "正在通过 OpenRC 依赖链平滑安全启动服务..."
-    rc-service snell-tlss-v6 start || true
-    sleep 1 
-    rc-service shadowtlsn-v6 start || true
-    
-    _info "核心配置已被覆写，服务安全重启完毕！"
-    print_node_info
-    log "配置已被修改并安全应用"
-}
-
-# ================== 更新 ==================
-update_ss() {
-    _info "开始更新二进制组件..."
-    
-    _info "正在安全停止旧服务..."
-    rc-service shadowtlsn-v6 stop >/dev/null 2>&1 || true
-    rc-service snell-tlss-v6 stop >/dev/null 2>&1 || true
-    sleep 1
-
-    if [ -f "$SNELL_Conf" ]; then
-        _download_and_install_binary
+    if command -v ip6tables &>/dev/null; then
+        ip6tables -P INPUT ACCEPT
+        ip6tables -P FORWARD ACCEPT
+        ip6tables -P OUTPUT ACCEPT
+        ip6tables -F
     fi
-
-    if [ -f "$STLS_Env" ]; then
-        STLS_VERSION=$(get_latest_stls_version)
-        STLS_ARCH=$(detect_stls_arch)
-        wget -O "$TMP_DIR/shadow-tls" "https://github.com/ihciah/shadow-tls/releases/download/${STLS_VERSION}/shadow-tls-${STLS_ARCH}"
-        install -m 755 "$TMP_DIR/shadow-tls" "$STLS_File"
-        echo "$STLS_VERSION" > "${SNELL_DIR}/stls_version.txt"
+    if command -v nft &>/dev/null; then
+        nft flush ruleset 2>/dev/null || true
     fi
-
-    _info "正在重新拉起全新组件..."
-    rc-service snell-tlss-v6 start || true
-    sleep 1
-    rc-service shadowtlsn-v6 start || true
-    
-    _info "更新执行完毕，服务已安全重启"
-    log "更新组件成功"
+    echo -e "${GREEN}✅ 已开放所有端口${RESET}"
+    restart_docker
 }
 
-# ================== 卸载 ==================
-uninstall_ss() {
-    _warn "正在卸载 snellv6+Shadow-TLSv3 混合实例服务..."
-    rc-service shadowtlsn-v6 stop || true
-    rc-service snell-tlss-v6 stop || true
-    rc-update del shadowtlsn-v6 default || true
-    rc-update del snell-tlss-v6 default || true
-    rm -f /etc/init.d/snell-tlss-v6 /etc/init.d/shadowtlsn-v6
-    rm -rf "$SNELL_DIR"
-    rm -f "$SNELL_File" "$STLS_File"
-    _info "snellv6+Shadow-TLSv3 独立环境清理完毕"
-    log "安全卸载成功"
+# -----------------------------
+# iptables 切换
+# -----------------------------
+switch_iptables_legacy() {
+    root_use
+    if [ -x /usr/sbin/iptables-legacy ] && [ -x /usr/sbin/ip6tables-legacy ]; then
+        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
+        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
+        update-alternatives --set iptables /usr/sbin/iptables-legacy
+        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+        restart_docker
+        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
+        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
+        echo -e "${GREEN}✅ 已切换到 iptables-legacy 并恢复规则${RESET}"
+    else
+        echo -e "${RED}系统未安装 iptables-legacy，无法切换${RESET}"
+    fi
 }
 
-# ================== 独立日志查看子菜单 ==================
-check_logs() {
+switch_iptables_nft() {
+    root_use
+    if [ -x /usr/sbin/iptables-nft ] && [ -x /usr/sbin/ip6tables-nft ]; then
+        iptables-save > /tmp/iptables_backup_$(date +%F_%H%M%S).v4
+        ip6tables-save > /tmp/ip6tables_backup_$(date +%F_%H%M%S).v6
+        update-alternatives --set iptables /usr/sbin/iptables-nft
+        update-alternatives --set ip6tables /usr/sbin/ip6tables-nft
+        restart_docker
+        iptables-restore < /tmp/iptables_backup_$(ls /tmp | grep iptables_backup_ | sort | tail -n1)
+        ip6tables-restore < /tmp/ip6tables_backup_$(ls /tmp | grep ip6tables_backup_ | sort | tail -n1)
+        echo -e "${GREEN}✅ 已切换到 iptables-nft 并恢复规则${RESET}"
+    else
+        echo -e "${RED}系统未安装 iptables-nft，无法切换${RESET}"
+    fi
+}
+
+# -----------------------------
+# Docker 状态
+# -----------------------------
+docker_status() {
+    if docker info &>/dev/null; then
+        echo "运行中"
+    else
+        echo "未运行"
+    fi
+}
+
+current_iptables() {
+    ipt=$(update-alternatives --query iptables 2>/dev/null | grep 'Value:' | awk '{print $2}')
+    if [[ $ipt == *legacy ]]; then
+        echo "legacy"
+    else
+        echo "nft"
+    fi
+}
+
+docker_container_info() {
+    total=$(docker ps -a -q | wc -l)
+    running=$(docker ps -q | wc -l)
+    echo "总容器: $total | 运行中: $running"
+}
+
+
+# -----------------------------
+# Docker 容器管理
+# -----------------------------
+docker_ps() {
+    if ! check_docker_running; then return; fi
     while true; do
         clear
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${GREEN}      Snell v6 + Shadow-TLS v3 日志面板      ${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${YELLOW}1. 查看 Shadow-TLS v3 最新日志 (最后50行)${RESET}"
-        echo -e "${YELLOW}2. 实时追踪 Shadow-TLS v3 日志 (Ctrl+C 退出)${RESET}"
-        echo -e "${YELLOW}-------------------------------------------${RESET}"
-        echo -e "${YELLOW}3. 查看 Snell v6 最新日志 (最后50行)${RESET}"
-        echo -e "${YELLOW}4. 实时追踪 Snell v6 日志 (Ctrl+C 退出)${RESET}"
-        echo -e "${YELLOW}===========================================${RESET}"
-        echo -e "${RED}0. 返回主菜单${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        printf "\033[32m请选择日志操作: \033[0m"
-        read -r log_choice || true
-        
-        case $log_choice in
+        echo -e "${BOLD}${CYAN}===== Docker 容器管理 =====${RESET}"
+        docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
+        echo -e "${GREEN}01. 创建新容器${RESET}"
+        echo -e "${GREEN}02. 启动容器${RESET}"
+        echo -e "${GREEN}03. 停止容器${RESET}"
+        echo -e "${GREEN}04. 删除容器${RESET}"
+        echo -e "${GREEN}05. 重启容器${RESET}"
+        echo -e "${GREEN}06. 启动所有容器${RESET}"
+        echo -e "${GREEN}07. 停止所有容器${RESET}"
+        echo -e "${GREEN}08. 删除所有容器${RESET}"
+        echo -e "${GREEN}09. 重启所有容器${RESET}"
+        echo -e "${GREEN}10. 进入容器${RESET}"
+        echo -e "${GREEN}11. 查看日志${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) read -p "请输入创建命令: " cmd; $cmd ;;
+            02|2) read -p "请输入容器名: " name; docker start $name ;;
+            03|3) read -p "请输入容器名: " name; docker stop $name ;;
+            04|4) read -p "请输入容器名: " name; docker rm -f $name ;;
+            05|5) read -p "请输入容器名: " name; docker restart $name ;;
+            06|6) containers=$(docker ps -a -q); [ -n "$containers" ] && docker start $containers || echo "无容器可启动" ;;
+            07|7) containers=$(docker ps -q); [ -n "$containers" ] && docker stop $containers || echo "无容器正在运行" ;;
+            08|8) read -p "确定删除所有容器? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rm -f $(docker ps -a -q) ;;
+            09|9) containers=$(docker ps -q); [ -n "$containers" ] && docker restart $containers || echo "无容器正在运行" ;;
+            10) read -p "请输入容器名: " name; docker exec -it $name /bin/bash ;;
+            11) read -p "请输入容器名: " name; docker logs -f $name ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+
+# -----------------------------
+# Docker 镜像管理
+# -----------------------------
+docker_image() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 镜像管理 =====${RESET}"
+        docker image ls
+        echo -e "${GREEN}01. 拉取镜像${RESET}"
+        echo -e "${GREEN}02. 更新镜像${RESET}"
+        echo -e "${GREEN}03. 删除镜像${RESET}"
+        echo -e "${GREEN}04. 删除所有镜像${RESET}"
+        echo -e "${GREEN} 0. 返回主菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
+            02|2) read -p "请输入镜像名: " imgs; for img in $imgs; do docker pull $img; done ;;
+            03|3) read -p "请输入镜像名: " imgs; for img in $imgs; do docker rmi -f $img; done ;;
+            04|4) read -p "确定删除所有镜像? (Y/N): " c; [[ $c =~ [Yy] ]] && docker rmi -f $(docker images -q) ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 卷管理
+# -----------------------------
+docker_volume() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 卷管理 =====${RESET}"
+        docker volume ls
+        echo -e "${GREEN}1. 创建卷${RESET}"
+        echo -e "${GREEN}2. 删除卷${RESET}"
+        echo -e "${GREEN}3. 删除所有无用卷${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            1) read -p "请输入卷名: " v; docker volume create $v ;;
+            2) read -p "请输入卷名: " v; docker volume rm $v ;;
+            3) docker volume prune -f ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# 清理所有未使用资源
+# -----------------------------
+docker_cleanup() {
+    root_use
+    echo -e "${YELLOW}清理所有未使用容器、镜像、卷...${RESET}"
+    docker system prune -af --volumes
+    echo -e "${GREEN}清理完成${RESET}"
+}
+
+# -----------------------------
+# Docker 网络管理
+# -----------------------------
+docker_network() {
+    if ! check_docker_running; then return; fi
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker 网络管理 =====${RESET}"
+        docker network ls
+        echo -e "${GREEN}1. 创建网络${RESET}"
+        echo -e "${GREEN}2. 加入网络${RESET}"
+        echo -e "${GREEN}3. 退出网络${RESET}"
+        echo -e "${GREEN}4. 删除网络${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " sub_choice
+        case $sub_choice in
+            1) read -p "设置新网络名: " dockernetwork; docker network create $dockernetwork ;;
+            2) read -p "加入网络名: " dockernetwork; read -p "容器名: " dockername; docker network connect $dockernetwork $dockername ;;
+            3) read -p "退出网络名: " dockernetwork; read -p "容器名: " dockername; docker network disconnect $dockernetwork $dockername ;;
+            4) read -p "请输入要删除的网络名: " dockernetwork; docker network rm $dockernetwork || echo -e "${RED}删除失败，网络可能被容器占用${RESET}" ;;
+            0) break ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+# -----------------------------
+# Docker 备份/恢复菜单
+# -----------------------------
+# -----------------------------
+# Docker 备份/恢复菜单
+# -----------------------------
+docker_backup_menu() {
+    root_use
+
+    BACKUP_DIR="/opt/docker_backups"
+    LOG_FILE="$BACKUP_DIR/backup.log"
+    mkdir -p "$BACKUP_DIR"
+
+    # -----------------------------
+    # 检查 jq
+    # -----------------------------
+    if ! command -v jq &>/dev/null; then
+        echo -e "${YELLOW}未检测到 jq，正在安装...${RESET}"
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y jq
+        elif command -v yum &>/dev/null; then
+            yum install -y epel-release && yum install -y jq
+        elif command -v dnf &>/dev/null; then
+            dnf install -y jq
+        else
+            echo -e "${RED}无法检测到包管理器，请手动安装 jq${RESET}"
+            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+            return
+        fi
+    fi
+
+    # -----------------------------
+    # 检查 Docker
+    # -----------------------------
+    if ! command -v docker &>/dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在安装...${RESET}"
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y docker.io
+        elif command -v yum &>/dev/null; then
+            yum install -y docker
+        elif command -v dnf &>/dev/null; then
+            dnf install -y docker
+        else
+            echo -e "${RED}无法检测到包管理器，请手动安装 Docker${RESET}"
+            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+            return
+        fi
+    fi
+
+    # -----------------------------
+    # 检查 Docker 服务
+    # -----------------------------
+    if ! pgrep -x dockerd &>/dev/null; then
+        echo -e "${YELLOW}Docker 服务未运行，正在启动...${RESET}"
+        if command -v systemctl &>/dev/null; then
+            systemctl start docker
+            systemctl enable docker
+        else
+            service docker start
+        fi
+        sleep 2
+        if ! pgrep -x dockerd &>/dev/null; then
+            echo -e "${RED}Docker 启动失败，请手动检查服务${RESET}"
+            read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+            return
+        fi
+    fi
+
+    # -----------------------------
+    # 检查磁盘空间
+    # -----------------------------
+    avail_space=$(df --output=avail "$BACKUP_DIR" | tail -1)
+    if (( avail_space < 1048576 )); then
+        echo -e "${RED}磁盘剩余空间不足 1GB，无法执行备份！${RESET}"
+        read -p "$(echo -e ${GREEN}按回车返回菜单...${RESET})"
+        return
+    fi
+
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}===== Docker Run备份与恢复 =====${RESET}"
+        echo -e "${GREEN}1. 备份 Docker${RESET}"
+        echo -e "${GREEN}2. 恢复 Docker${RESET}"
+        echo -e "${GREEN}3. 删除备份文件${RESET}"
+        echo -e "${GREEN}0. 返回上一级菜单${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
             1)
-                echo -e "\n${GREEN}====== Shadow-TLS v3 运行日志 ======${RESET}"
-                if [ -f "/var/log/shadowtls-v6.log" ]; then tail -n 50 /var/log/shadowtls-v6.log; else _warn "暂无 Shadow-TLS v6 日志文件"; fi
-                pause
+                # -----------------------------
+                # 备份逻辑
+                # -----------------------------
+                while true; do
+                    echo -e "${YELLOW}选择备份类型:${RESET}"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
+                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " btype
+                    [[ "$btype" == "0" ]] && break
+
+                    read -p "请输入备份文件名（默认 docker_backup_$(date +%F).tar.gz）: " backup_name
+                    backup_name=${backup_name:-docker_backup_$(date +%F).tar.gz}
+                    backup_path="$BACKUP_DIR/$backup_name"
+
+                    TMP_BACKUP_DIR=$(mktemp -d /tmp/docker_backup_XXXX)
+
+                    # --- 容器备份 ---
+                    if [[ "$btype" == "1" || "$btype" == "4" ]]; then
+                        echo "可用容器列表："
+                        docker ps -a --format "{{.Names}}"
+                        read -p "请输入要备份的容器名（多个用空格，留空则全部）: " selected_containers
+                        [[ -z "$selected_containers" ]] && selected_containers=$(docker ps -a --format "{{.Names}}")
+                        for cname in $selected_containers; do
+                            cid=$(docker ps -a -q -f name="^${cname}$")
+                            [[ -z "$cid" ]] && echo "容器 $cname 不存在，跳过" && continue
+                            docker inspect $cid > "$TMP_BACKUP_DIR/container_${cname}.json"
+                            docker export "$cid" -o "$TMP_BACKUP_DIR/container_${cname}.tar"
+                            echo "$(date '+%F %T') 备份容器 $cname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 镜像备份 ---
+                    if [[ "$btype" == "2" || "$btype" == "4" ]]; then
+                        echo "可用镜像列表："
+                        docker images --format "{{.Repository}}:{{.Tag}}"
+                        read -p "请输入要备份的镜像（多个用空格，留空则全部）: " selected_images
+                        [[ -z "$selected_images" ]] && selected_images=$(docker images --format "{{.Repository}}:{{.Tag}}")
+                        for iname in $selected_images; do
+                            [[ "$iname" == "<none>:<none>" ]] && continue
+                            safe_name=$(echo "$iname" | tr '/:' '_')
+                            docker save "$iname" -o "$TMP_BACKUP_DIR/image_${safe_name}.tar"
+                            echo "$(date '+%F %T') 备份镜像 $iname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 卷备份 ---
+                    if [[ "$btype" == "3" || "$btype" == "4" ]]; then
+                        echo "可用卷列表："
+                        docker volume ls -q
+                        read -p "请输入要备份的卷名（多个用空格，留空则全部）: " selected_volumes
+                        [[ -z "$selected_volumes" ]] && selected_volumes=$(docker volume ls -q)
+                        for vol in $selected_volumes; do
+                            [[ ! -d /var/lib/docker/volumes/"$vol"/_data ]] && echo "卷 $vol 不存在，跳过" && continue
+                            read -p "请确保卷 $vol 未被容器使用，按回车继续..."
+                            tar -czf "$TMP_BACKUP_DIR/volume_${vol}.tar.gz" -C /var/lib/docker/volumes/"$vol"/_data .
+                            echo "$(date '+%F %T') 备份卷 $vol 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    tar -czf "$backup_path" -C "$TMP_BACKUP_DIR" .
+                    rm -rf "$TMP_BACKUP_DIR"
+                    echo -e "${GREEN}备份完成: $backup_path${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
                 ;;
             2)
-                echo -e "\n${GREEN}====== 正在实时追踪 Shadow-TLS v3 日志 (按 Ctrl+C 终止) ======${RESET}"
-                if [ -f "/var/log/shadowtls-v6.log" ]; then tail -f /var/log/shadowtls-v6.log; else _warn "日志文件不存在"; pause; fi
+                # -----------------------------
+                # 恢复逻辑（保持原有选择逻辑）并增强安全
+                # -----------------------------
+                while true; do
+                    echo -e "${YELLOW}选择恢复类型:${RESET}"
+                    echo -e "${GREEN}1. 容器${RESET}"
+                    echo -e "${GREEN}2. 镜像${RESET}"
+                    echo -e "${GREEN}3. 卷${RESET}"
+                    echo -e "${GREEN}4. 全量${RESET}"
+                    echo -e "${GREEN}0. 返回上一级${RESET}"
+                    read -p "$(echo -e ${GREEN}请选择:${RESET}) " rtype
+                    [[ "$rtype" == "0" ]] && break
+
+                    read -p "请输入备份文件路径: " backup_file
+                    [[ ! -f "$backup_file" ]] && echo -e "${RED}备份文件不存在${RESET}" && read -p "按回车继续..." && continue
+
+                    TMP_RESTORE_DIR=$(mktemp -d /tmp/docker_restore_XXXX)
+                    tar -xzf "$backup_file" -C "$TMP_RESTORE_DIR"
+
+                    # --- 容器恢复 ---
+                    if [[ "$rtype" == "1" || "$rtype" == "4" ]]; then
+                        for cjson in "$TMP_RESTORE_DIR"/container_*.json; do
+                            [[ ! -f "$cjson" ]] && continue
+                            cname=$(basename "$cjson" | sed 's/container_\(.*\).json/\1/')
+                            image=$(jq -r '.[0].Config.Image' "$cjson")
+                            envs=$(jq -r '.[0].Config.Env | join(" -e ")' "$cjson")
+                            [[ -n "$envs" ]] && envs="-e $envs"
+                            ports=$(jq -r '.[0].HostConfig.PortBindings | to_entries | map("\(.value[0].HostPort):\(.key)") | join(" -p ")' "$cjson")
+                            [[ -n "$ports" ]] && ports="-p $ports"
+                            mounts=$(jq -r '.[0].Mounts | map("-v \(.Source):\(.Destination)") | join(" ")' "$cjson")
+                            network=$(jq -r '.[0].HostConfig.NetworkMode' "$cjson")
+                            echo "注意：如果端口已被占用，容器 $cname 启动可能失败"
+
+                            # 如果镜像不存在，尝试从备份加载
+                            safe_image_name=$(echo "$image" | tr '/:' '_')
+                            img_tar="$TMP_RESTORE_DIR/image_${safe_image_name}.tar"
+                            [[ -f "$img_tar" ]] && docker load -i "$img_tar"
+
+                            docker run -d --name "$cname" $envs $ports $mounts --network "$network" "$image"
+                            echo "$(date '+%F %T') 恢复容器 $cname 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    # --- 镜像恢复 ---
+                    if [[ "$rtype" == "2" || "$rtype" == "4" ]]; then
+                        for img_file in "$TMP_RESTORE_DIR"/image_*.tar; do
+                            [[ -f "$img_file" ]] && docker load -i "$img_file"
+                        done
+                    fi
+
+                    # --- 卷恢复 ---
+                    if [[ "$rtype" == "3" || "$rtype" == "4" ]]; then
+                        for vol_file in "$TMP_RESTORE_DIR"/volume_*.tar.gz; do
+                            vol_name=$(basename "$vol_file" | sed 's/volume_\(.*\).tar.gz/\1/')
+                            if docker volume inspect "$vol_name" &>/dev/null; then
+                                read -p "卷 $vol_name 已存在，是否覆盖? (y/N): " confirm
+                                [[ "$confirm" != "y" ]] && continue
+                            fi
+                            docker volume create "$vol_name" >/dev/null 2>&1
+                            tar -xzf "$vol_file" -C /var/lib/docker/volumes/"$vol_name"/_data
+                            echo "$(date '+%F %T') 恢复卷 $vol_name 完成" >> "$LOG_FILE"
+                        done
+                    fi
+
+                    rm -rf "$TMP_RESTORE_DIR"
+                    echo -e "${GREEN}恢复完成${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
                 ;;
             3)
-                echo -e "\n${GREEN}====== Snell v6 运行日志 ======${RESET}"
-                if [ -f "/var/log/snell-v6.log" ]; then tail -n 50 /var/log/snell-v6.log; else _warn "暂无 Snell v6 日志文件"; fi
-                pause
-                ;;
-            4)
-                echo -e "\n${GREEN}====== 正在实时追踪 Snell v6 日志 (按 Ctrl+C 终止) ======${RESET}"
-                if [ -f "/var/log/snell-v6.log" ]; then tail -f /var/log/snell-v6.log; else _warn "日志文件不存在"; pause; fi
+                # -----------------------------
+                # 删除备份文件（支持多选或通配符）
+                # -----------------------------
+                while true; do
+                    echo "当前备份目录：$BACKUP_DIR"
+                    ls "$BACKUP_DIR"
+                    read -p "请输入要删除的备份文件名（支持空格或*通配符，输入0返回）: " del_files
+                    [[ "$del_files" == "0" ]] && break
+                    rm -f $BACKUP_DIR/$del_files
+                    echo -e "${GREEN}删除完成${RESET}"
+                    read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                    break
+                done
                 ;;
             0) break ;;
-            *) _err "无效输入"; pause ;;
+            *) echo -e "${RED}无效选择${RESET}"; read -p "$(echo -e ${GREEN}按回车继续...${RESET})" ;;
         esac
     done
 }
 
-# ================== 主菜单面板 ==================
-show_menu() {
+monitor_docker_containers() {
     clear
-    local status_snell="${RED}● Snellv6 未运行${RESET}"
-    local status_stls="${RED}● TLSv3 未运行${RESET}"
-    
-    rc-service snell-tlss-v6 status >/dev/null 2>&1 && status_snell="${GREEN}● Snellv6 运行中${RESET}"
-    rc-service shadowtlsn-v6 status >/dev/null 2>&1 && status_stls="${GREEN}● TLSv3 运行中${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}          🐳 Docker 容器监控${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
 
-    local v_snell="未安装" && [ -f "${SNELL_DIR}/version.txt" ] && v_snell="$(cat "${SNELL_DIR}/version.txt")"
-    local v_stls="未安装" && [ -f "${SNELL_DIR}/stls_version.txt" ] && v_stls="$(cat "${SNELL_DIR}/stls_version.txt")"
-    
-    local p_stls="-"
-    if [ -f "$STLS_Env" ]; then 
-        p_stls=$(awk -F'=' '/^STLS_LISTEN=/{print $2}' "$STLS_Env" 2>/dev/null | awk -F':' '{print $NF}' | tr -d '\r\n' || echo "-")
-    fi
-    local p_snell="-"
-    if [ -f "$SNELL_Conf" ]; then
-        local raw_listen=$(_get_conf_value "listen")
-        local first_listen="${raw_listen%%,*}"
-        p_snell=$(echo "$first_listen" | awk -F: '{print $NF}')
-    fi
+    # 获取并处理数据 (按内存排序)
+    docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | sort -k3 -hr | while IFS=$'\t' read -r name cpu mem net; do
+        
+        # 1. 获取运行时间并深度汉化
+        local raw_status
+        raw_status=$(docker ps -a --filter "name=^/${name}$" --format "{{.Status}}")
+        
+        # 汉化引擎：包含时间、单位、状态
+        local uptime
+        uptime=$(echo "$raw_status" | \
+            sed 's/Up /运行 /' | \
+            sed 's/Exited/已停止/' | \
+            sed 's/(healthy)/(健康)/' | \
+            sed 's/(unhealthy)/(非健康)/' | \
+            sed 's/(starting)/(启动中)/' | \
+            sed 's/seconds/秒/' | \
+            sed 's/second/秒/' | \
+            sed 's/minutes/分钟/' | \
+            sed 's/minute/分钟/' | \
+            sed 's/hours/小时/' | \
+            sed 's/hour/小时/' | \
+            sed 's/days/天/' | \
+            sed 's/day/天/' | \
+            sed 's/weeks/周/' | \
+            sed 's/week/周/' | \
+            sed 's/months/月/' | \
+            sed 's/month/月/' | \
+            sed 's/about //' | \
+            sed 's/ago/前/')
+        
+        # 2. 新增：获取并格式化端口信息
+        local ports
+        ports=$(docker ps -a --filter "name=^/${name}$" --format "{{.Ports}}")
+        
+        # 如果端口为空，显示“无端口映射”；否则去掉 0.0.0.0: 或 ::: 以便手机端美观显示
+        if [ -z "$ports" ]; then
+            ports="无端口映射"
+        else
+            # 将 "0.0.0.0:8080->80/tcp, :::8080->80/tcp" 简化为 "8080->80/tcp" 这样的干净格式
+            ports=$(echo "$ports" | sed 's/0.0.0.0://g' | sed 's/::://g' | sed 's/, /\n        │     /g')
+        fi
 
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}    ◈ Snell v6 + Shadow-TLS v3 面板 ◈     ${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}服务状态 :${RESET} ${status_snell} | ${status_stls}"
-    echo -e "${GREEN}组件版本 :${RESET} ${YELLOW}Snell: v${v_snell}${RESET} | ${YELLOW}Shadow-TLS: ${v_stls}${RESET}"
-    echo -e "${GREEN}运行端口 :${RESET} ${YELLOW}外网(TLS): ${p_stls}${RESET} | ${YELLOW}内部(Snell): ${p_snell}${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}1. 安装 Snell v6 + Shadow-TLS v3${RESET}"
-    echo -e "${GREEN}2. 更新 Snell + Shadow-TLS${RESET}"
-    echo -e "${GREEN}3. 卸载 Snell + Shadow-TLS${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Snell + Shadow-TLS${RESET}"
-    echo -e "${GREEN}6. 停止 Snell + Shadow-TLS${RESET}"
-    echo -e "${GREEN}7. 重启 Snell + Shadow-TLS${RESET}"
-    echo -e "${GREEN}8. 查看运行日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
+        # 3. 手机端纵向块状输出
+        echo -e "${YELLOW}◈ 容器: ${RESET}${YELLOW}${name}${RESET}"
+        echo -e "  ├─ ${YELLOW}CPU 占用: ${RESET}${CPU_COLOR}${cpu}${RESET}"
+        echo -e "  ├─ ${YELLOW}内存使用: ${RESET}${mem}"
+        echo -e "  ├─ ${YELLOW}网络 I/O: ${RESET}${net}"
+        echo -e "  ├─ ${YELLOW}端口映射: ${RESET}${CYAN}${ports}${RESET}"
+        echo -e "  └─ ${YELLOW}运行状态: ${RESET}${YELLOW}${uptime}${RESET}"
+        echo -e "${YELLOW}----------------------------------------${RESET}"
+    done
 }
 
-# ================== 主循环 ==================
-while true; do
-    show_menu
-    printf "\033[32m请输入选项: \033[0m"
-    read -r choice || true
-    case $choice in
-        1) install_ss; pause ;;
-        2) update_ss; pause ;;
-        3) uninstall_ss; pause ;;
-        4) modify_ss; pause ;;
-        5) rc-service snell-tlss-v6 start || true; rc-service shadowtlsn-v6 start || true; _info "v6 服务已启动"; pause ;;
-        6) rc-service shadowtlsn-v6 stop || true; rc-service snell-tlss-v6 stop || true; _info "v6 服务已停止"; pause ;;
-        7) rc-service snell-tlss-v6 restart || true; rc-service shadowtlsn-v6 restart || true; _info "v6 服务已重启"; pause ;;
-        8) check_logs ;;
-        9) print_node_info; pause ;;
-        0) exit 0 ;;
-        *) _err "无效输入" ; pause ;;
-    esac
-done
+
+# -----------------------------
+# Docker 配置修改通用函数
+# -----------------------------
+set_docker_mirror() {
+    root_use
+    mkdir -p /etc/docker
+    
+    echo -e "${CYAN}请选择或输入镜像加速源选项:${RESET}"
+    echo -e "${GREEN}1. 使用默认高速代理${RESET}"
+    echo -e "${GREEN}2. 输入自定义加速源${RESET}"
+    echo -e "${GREEN}3. 恢复默认设置(清空加速源)${RESET}"
+    echo -ne "${GREEN}请选择或输入镜像加速源选项 (默认 1): ${RESET}"
+    read mirror_choice
+    mirror_choice=${mirror_choice:-1}
+
+    local mirrors=""
+    
+    if [ "$mirror_choice" == "1" ]; then
+        mirrors='["https://gh-proxy.org/docker/","https://registry.lfree.org","https://hub.glowp.xyz","https://docker.1panel.live"]'
+    elif [ "$mirror_choice" == "2" ]; then
+        read -p "请输入完整的加速地址 (例如 https://hub.glowp.xyz , 多个用英文逗号隔开): " custom_mirror
+        # 简单转换补全为 JSON 数组格式
+        mirrors="[\"$(echo $custom_mirror | sed 's/,/","/g' | sed 's/ //g')\"]"
+    elif [ "$mirror_choice" == "3" ]; then
+        echo -e "${YELLOW}正在恢复默认设置，移除所有自定义镜像源...${RESET}"
+        # 移除配置：如果 jq 存在就删掉该 Key，否则直接覆盖为一个空配置或移出该字段
+        if command -v jq &>/dev/null && [ -f /etc/docker/daemon.json ]; then
+            jq 'del(."registry-mirrors")' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
+            if [ $? -eq 0 ]; then
+                mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+            else
+                echo "{}" > /etc/docker/daemon.json
+            fi
+        else
+            echo "{}" > /etc/docker/daemon.json
+        fi
+        echo -e "${GREEN}✅ 已成功恢复默认设置！${RESET}"
+        restart_docker
+        return
+    else
+        echo -e "${RED}无效选项，操作已取消${RESET}"
+        return
+    fi
+
+    # 写入配置逻辑 (针对 1 和 2 选项)
+    if command -v jq &>/dev/null && [ -f /etc/docker/daemon.json ]; then
+        jq --argjson m "$mirrors" '. + {"registry-mirrors": $m}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
+        if [ $? -eq 0 ]; then
+            mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+        else
+            echo "{\"registry-mirrors\": $mirrors}" > /etc/docker/daemon.json
+        fi
+    else
+        echo "{\"registry-mirrors\": $mirrors}" > /etc/docker/daemon.json
+    fi
+
+    echo -e "${GREEN}✅ 镜像加速源配置成功！当前配置为:${RESET}"
+    cat /etc/docker/daemon.json
+    restart_docker
+}
+
+# -----------------------------
+# Docker 日志管理子菜单
+# -----------------------------
+docker_log_menu() {
+    root_use
+    mkdir -p /etc/docker
+
+    while true; do
+        echo -e "${CYAN}===== Docker 日志大小限制管理 =====${RESET}"
+        echo -e "${GREEN}1. 开启日志大小限制${RESET}"
+        echo -e "${GREEN}2. 关闭日志大小限制 (恢复默认无限制)${RESET}"
+        echo -e "${GREEN}0. 返回主菜单${RESET}"
+        echo -ne "${GREEN}请选择操作: ${RESET}"
+        read log_choice
+
+        case $log_choice in
+            1)
+                echo -e "${CYAN}正在配置日志限制...${RESET}"
+                if [ ! -f /etc/docker/daemon.json ]; then echo '{}' > /etc/docker/daemon.json; fi
+                jq '. + {"log-driver": "json-file", "log-opts": {"max-size": "20m", "max-file": "3"}}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
+                mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+                echo -e "${GREEN}✅ 日志大小限制开启成功！${RESET}"
+                echo -e "${YELLOW}注意: 此限制仅对【新创建】的容器生效，老容器需重建方能生效。${RESET}"
+                restart_docker
+                read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                ;;
+            2)
+                echo -e "${YELLOW}正在解除日志限制...${RESET}"
+                if [ -f /etc/docker/daemon.json ]; then
+                    jq 'del(."log-driver") | del(."log-opts")' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null
+                    mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+                    echo -e "${GREEN}✅ 已关闭日志大小限制（恢复系统默认）。${RESET}"
+                else
+                    echo -e "${YELLOW}配置文件不存在，无需关闭。${RESET}"
+                fi
+                restart_docker
+                read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo -e "${RED}无效选择${RESET}" && sleep 1
+                ;;
+        esac
+    done
+}
+
+# -----------------------------
+# 主菜单显示状态
+# -----------------------------
+main_menu() {
+    root_use
+    while true; do
+        clear
+        echo -e "${CYAN}"
+        echo "  ____             _               "
+        echo " |  _ \  ___   ___| | _____ _ __   "
+        echo " | | | |/ _ \ / __| |/ / _ \ '__|  "
+        echo " | |_| | (_) | (__|   <  __/ |     "
+        echo " |____/ \___/ \___|_|\_\___|_|     "
+        echo -e "${RESET}"
+        echo -e "${GREEN}===========================================${RESET}"
+       # 检测 Docker 状态
+        if command -v docker &>/dev/null; then
+            # 1. 获取基础状态与版本
+            local docker_status=$(docker info &>/dev/null && echo "运行中" || echo "未运行")
+            local docker_ver=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "未知")
+            local compose_ver=$(docker compose version --short 2>/dev/null || echo "未知")
+            
+            # 2. 统计各项数量
+            local total=$(docker ps -a -q 2>/dev/null | wc -l)
+            local running=$(docker ps -q 2>/dev/null | wc -l)
+            local stopped=$(docker ps -aq -f status=exited 2>/dev/null | wc -l)
+            local total_volumes=$(docker volume ls -q 2>/dev/null | wc -l)
+            local total_networks=$(docker network ls --filter "type=custom" -q 2>/dev/null | wc -l)
+            
+            # 3. 打印美化后的状态栏 (分两行显示，避免过长换行破环UI)
+            echo -e "${YELLOW}🐳 Docker   : $docker_status  |🌐 iptables: $(current_iptables) "
+            echo -e "${YELLOW}🐳 Docker   : v$docker_ver | 🐙 Compose: v$compose_ver${RESET}"
+            echo -e "${YELLOW}🟢 运行容器 : $running 个   | 🔴 停止容器: $stopped 个${RESET}"
+            echo -e "${YELLOW}💾 数据卷数 : $total_volumes 个   | 🌐 网络数量: $total_networks 个${RESET}"
+        else
+            # Docker 未安装时只显示 iptables 状态
+            echo -e "${YELLOW}🐳 Docker: 未安装 | 🌐 iptables: $(current_iptables)${RESET}"
+        fi
+        echo -e "${GREEN}===========================================${RESET}"
+        echo -e "${GREEN}01. 安装/更新 Docker${RESET}"
+        echo -e "${GREEN}02. 安装/更新 Docker Compose${RESET}"
+        echo -e "${GREEN}03. 卸载 Docker & Compose${RESET}"
+        echo -e "${GREEN}04. 容器管理${RESET}"
+        echo -e "${GREEN}05. 镜像管理${RESET}"
+        echo -e "${GREEN}06. 开启 IPv6${RESET}"
+        echo -e "${GREEN}07. 关闭 IPv6${RESET}"
+        echo -e "${GREEN}08. 开放所有端口${RESET}"
+        echo -e "${GREEN}09. 网络管理${RESET}"
+        echo -e "${GREEN}10. 切换 iptables-legacy${RESET}"
+        echo -e "${GREEN}11. 切换 iptables-nft${RESET}"
+        echo -e "${GREEN}12. Docker 备份/恢复${RESET}"
+        echo -e "${GREEN}13. 重启 Docker${RESET}"
+        echo -e "${GREEN}14. 卷管理 ${RESET}"
+        echo -e "${GREEN}15. 设置Docker镜像加速源${RESET}"
+        echo -e "${GREEN}16. 设置Docker日志限制${RESET}"
+        echo -e "${GREEN}17.${RESET} ${YELLOW}一键清理所有未使用容器/镜像/卷${RESET}"
+        echo -e "${GREEN}18. Docker监控${RESET}"
+        echo -e "${GREEN}00. 退出${RESET}"
+        echo -e "${GREEN}===========================================${RESET}"
+        read -p "$(echo -e ${GREEN}请选择:${RESET}) " choice
+        case $choice in
+            01|1) docker_install_update ;;
+            02|2) docker_compose_install_update ;;
+            03|3) docker_uninstall ;;
+            04|4) check_docker_running && docker_ps ;;
+            05|5) check_docker_running && docker_image ;;
+            06|6) check_docker_running && docker_ipv6_on ;;
+            07|7) check_docker_running && docker_ipv6_off ;;
+            08|8) open_all_ports ;;
+            09|9) check_docker_running && docker_network ;;
+            10) switch_iptables_legacy ;;
+            11) switch_iptables_nft ;;
+            12) check_docker_running && docker_backup_menu ;;
+            13|13) check_docker_running && restart_docker ;;
+            14|14) check_docker_running && docker_volume ;;
+            15|15) check_docker_running && set_docker_mirror ;;
+            16|16) docker_log_menu ;;
+            17|17) check_docker_running && docker_cleanup ;;
+            18|18) monitor_docker_containers ;;
+             00|0) exit 0 ;;
+            *) echo -e "${RED}无效选择${RESET}" ;;
+        esac
+        read -p "$(echo -e ${GREEN}按回车继续...${RESET})"
+    done
+}
+
+
+
+
+# 启动脚本
+main_menu

@@ -1,7 +1,7 @@
-#!/usr/bin/env bash
+#!/bin/sh
 
 # =============================================================================
-#  Xray VLESS-Encryption  多实例管理面板
+#  Xray VLESS-Encryption  多实例管理面板 (Alpine Linux OpenRC 专属版)
 # =============================================================================
 
 set -Eu
@@ -12,7 +12,6 @@ export BIN_PATH="/usr/local/bin/${TEMPLATE_NAME}"
 export CONFIG_DIR="/usr/local/etc/${TEMPLATE_NAME}"
 export LOG_DIR="/var/log/${TEMPLATE_NAME}"
 export LINK_DIR="/root/proxynode/encryption"
-export SERVICE_FILE="/etc/systemd/system/${TEMPLATE_NAME}@.service"
 
 # 用作注册表：持久化记录活跃实例名字
 export REGISTRY_FILE="${CONFIG_DIR}/.instances.env"
@@ -52,40 +51,33 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [ "$EUID" -ne 0 ]; then
+if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}[ERROR]请使用 root 权限运行此脚本！${RESET}" >&2
     exit 1
 fi
 
 # ── 底层依赖检测与补全 ─────────────────────────────
-REQUIRED_CMDS="curl sed grep awk openssl wget ss unzip jq"
+# 这里只放真正的「命令」
+REQUIRED_CMDS="curl sed grep awk openssl wget netstat unzip jq uuidgen"
 MISSING_CMDS=""
 for cmd in $REQUIRED_CMDS; do
     if ! command -v "$cmd" &> /dev/null; then MISSING_CMDS="$MISSING_CMDS $cmd"; fi
 done
 
+# 专门检测 Alpine 的 glibc 兼容库是否安装（检查 apk 注册记录）
+if ! apk info -e gcompat >/dev/null 2>&1; then MISSING_CMDS="$MISSING_CMDS gcompat"; fi
+if ! apk info -e libc6-compat >/dev/null 2>&1; then MISSING_CMDS="$MISSING_CMDS libc6-compat"; fi
+
 if [ -n "$MISSING_CMDS" ]; then
     echo -e "${YELLOW}[INFO]检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${YELLOW}，正在自动安装...${RESET}"
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        case "$ID" in
-            ubuntu|debian) apt-get update -qy && apt-get install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1 ;;
-            centos|rhel|rocky|almalinux|fedora)
-                if command -v dnf &>/dev/null; then dnf install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1
-                else yum install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1; fi ;;
-            *) 
-                echo -e "${RED}[ERROR]未知系统，请手动安装组件: $MISSING_CMDS${RESET}" >&2
-                exit 1 
-                ;;
-        esac
-    fi
+    apk update -q && apk add -q $MISSING_CMDS >/dev/null 2>&1
     echo -e "${GREEN}[OK]基础依赖补全成功！${RESET}"
 fi
 
 # ── 安全验证组件 ─────────────────────────────────────
 check_port() {
     local port="$1"
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then return 1; fi
+    if netstat -tuln 2>/dev/null | awk '{print $4}' | grep -qE ":${port}$"; then return 1; fi
     return 0
 }
 is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; sleep 0.01; }
@@ -209,30 +201,29 @@ download_bin() {
     fi
 }
 
+# 写入 OpenRC 服务模板脚本
 write_template_service() {
-    cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=Xray Vless Encryption Service (Instance: %I)
-After=network-online.target
-Wants=network-online.target
+    local instance="$1"
+    local init_file="/etc/init.d/${TEMPLATE_NAME}-${instance}"
+    local log_file="${LOG_DIR}/${instance}.log"
+    touch "$log_file"
 
-[Service]
-Type=simple
-User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=${BIN_PATH} run -config ${CONFIG_DIR}/config_%I.json
-Restart=on-failure
-RestartSec=2s
-LimitNPROC=10000
-LimitNOFILE=1000000
+    cat > "$init_file" <<EOF
+#!/sbin/openrc-run
+description="Xray Vless Encryption Service (Instance: ${instance})"
+command="${BIN_PATH}"
+command_args="run -config ${CONFIG_DIR}/config_${instance}.json"
+command_background="yes"
+pidfile="/run/${TEMPLATE_NAME}-${instance}.pid"
+output_log="${log_file}"
+error_log="${log_file}"
 
-[Install]
-WantedBy=multi-user.target
+depend() {
+    need net
+    after firewall
+}
 EOF
-    chmod 0644 "$SERVICE_FILE"
-    systemctl daemon-reload
+    chmod +x "$init_file"
 }
 
 init_environment() {
@@ -352,7 +343,7 @@ print_node_summary() {
 }
 
 get_status_info() {
-    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" 2>/dev/null; then
+    if rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
         panel_status="${GREEN}● 运行中${RESET}"
     else
         panel_status="${RED}● 未运行${RESET}"
@@ -419,7 +410,7 @@ menu_switch_instance() {
             local port_num
             port_num=$(jq -r '.inbounds[0].port // "未知"' "$conf_file" 2>/dev/null || echo "未知")
             local status_str="${RED}已停止${RESET}"
-            systemctl is-active --quiet "${TEMPLATE_NAME}@${name}" 2>/dev/null && status_str="${GREEN}运行中${RESET}"
+            rc-service "${TEMPLATE_NAME}-${name}" status 2>/dev/null | grep -q "started" && status_str="${GREEN}运行中${RESET}"
             
             echo -e " ${CYAN}[ ${count} ] ->${RESET} ${YELLOW}${name}${RESET} ${GREEN}[端口: ${port_num} | 状态: ${status_str}${GREEN}]${RESET}"
         done < "$REGISTRY_FILE"
@@ -479,9 +470,9 @@ menu_install() {
         OLD_PORT=$((RANDOM % 50001 + 10000))
         while ! check_port "$OLD_PORT"; do OLD_PORT=$((RANDOM % 50001 + 10000)); done
         if [ -f "$BIN_PATH" ]; then
-            OLD_UUID=$("$BIN_PATH" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
+            OLD_UUID=$("$BIN_PATH" uuid 2>/dev/null || uuidgen)
         else
-            OLD_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
+            OLD_UUID=$(uuidgen 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
         fi
         OLD_REMARK="VLESS-Enc-${CURRENT_INSTANCE}"
         OLD_DECRYPTION="" OLD_ENCRYPTION=""
@@ -528,14 +519,14 @@ menu_install() {
     fi
 
     write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_uuid" "$opt_decryption" "$opt_encryption" "$opt_remark"
-    write_template_service
+    write_template_service "$CURRENT_INSTANCE"
 
     echo -e "${YELLOW}[INFO]正在安全重载实例配置项并拉起: ${CURRENT_INSTANCE} ...${RESET}"
-    systemctl enable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+    rc-update add "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" default >/dev/null 2>&1 || true
+    rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" restart
     
     sleep 1.5
-    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+    if rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
         echo -e "${GREEN}[OK]Xray Encryption 实例 [ ${CURRENT_INSTANCE} ] 部署/修改成功！${RESET}"
         print_node_summary "$CURRENT_INSTANCE"
     else
@@ -549,20 +540,27 @@ menu_uninstall() {
     read -r -p "$(echo -e "${RED}确认抹除清理实例 [ ${CURRENT_INSTANCE} ] 吗？[y/N]: ${RESET}")" res || true
     [[ "$res" =~ ^[Yy]$ ]] || return
 
-    systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    systemctl disable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+    rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" stop >/dev/null 2>&1 || true
+    rc-update del "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" default >/dev/null 2>&1 || true
+    rm -f "/etc/init.d/${TEMPLATE_NAME}-${CURRENT_INSTANCE}"
     rm -f "${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
     rm -f "${LINK_DIR}/xray_${CURRENT_INSTANCE}.txt"
+    rm -f "${LOG_DIR}/${CURRENT_INSTANCE}.log"
     unregister_instance "$CURRENT_INSTANCE"
     echo -e "${GREEN}[OK]实例 [ ${CURRENT_INSTANCE} ] 已被纯净抹除。${RESET}"
 
     if [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR" | grep 'config_')" ]; then
         echo -e "${YELLOW}[INFO]检测到所有 Encryption 节点已排空，执行全局核心组件垃圾回收机制...${RESET}"
-        systemctl stop "${TEMPLATE_NAME}@*" >/dev/null 2>&1 || true
-        rm -f "$SERVICE_FILE" "$BIN_PATH" "$REGISTRY_FILE"
+        for init_script in /etc/init.d/${TEMPLATE_NAME}-*; do
+            [ -e "$init_script" ] || continue
+            local inst_name=$(basename "$init_script" | sed "s/^${TEMPLATE_NAME}-//")
+            rc-service "${TEMPLATE_NAME}-${inst_name}" stop >/dev/null 2>&1 || true
+            rc-update del "${TEMPLATE_NAME}-${inst_name}" default >/dev/null 2>&1 || true
+            rm -f "$init_script"
+        done
+        rm -f "$BIN_PATH" "$REGISTRY_FILE"
         rm -rf "$CONFIG_DIR" "$LOG_DIR"
         rm -f "${LINK_DIR}"/xray_*.txt 2>/dev/null || true
-        systemctl daemon-reload
         echo -e "${GREEN}[OK]全系统已无常驻残留，基础依赖与内核解绑卸载完成！${RESET}"
         CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "Xray")"
     fi
@@ -605,9 +603,9 @@ configure_custom_socks5_outbound() {
             mv "$tmp_file" "$instance_config"
             chmod 644 "$instance_config" 2>/dev/null || true
             
-            systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+            rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" restart
             sleep 0.5
-            if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+            if rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
                 echo -e "${GREEN}[OK]已成功切换为直连出口！${RESET}"
             else
                 echo -e "${RED}[ERROR]切换到直连失败。${RESET}" >&2
@@ -714,12 +712,12 @@ configure_custom_socks5_outbound() {
     mv "$tmp_file" "$instance_config"
     chmod 644 "$instance_config" 2>/dev/null || true
 
-    systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+    rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" restart
     sleep 0.5
-    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+    if rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
         echo -e "${GREEN}[OK]已成功切换为 Socks5 出口！${RESET}"
     else
-        echo -e "${RED}[ERROR]重启服务失败，当前配置可能与 system 环境不兼容。${RESET}" >&2
+        echo -e "${RED}[ERROR]重启服务失败，当前配置可能与环境不兼容。${RESET}" >&2
         return 1
     fi
 }
@@ -729,7 +727,7 @@ while true; do
     get_status_info
     clear
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}    ◈ Xray VLESS-Encryption 多实例管理面板 ◈   ${RESET}"
+    echo -e "${GREEN} ◈ Xray VLESS-Encryption  多实例管理面板 ◈ ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
     echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
@@ -748,7 +746,7 @@ while true; do
     echo -e "${GREEN} 9. 当前实例配置${RESET}"
     echo -e "${GREEN}10. Socks5出口${RESET}     ${YELLOW}← 链式分流代理${RESET}"
     echo -e "${GREEN}11. 管理实例${RESET}       ${YELLOW}← 添加/切换节点${RESET}"
-    echo -e "${RED} 0. 退出${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     
     choice=""
@@ -758,10 +756,16 @@ while true; do
         2) download_bin && install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH" && echo -e "${GREEN}[OK]Xray 核心更新成功${RESET}" ;;
         3) menu_uninstall ;;
         4) menu_install "edit" ;;
-        5) systemctl start "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]启动成功${RESET}" ;;
-        6) systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]停止成功${RESET}" ;;
-        7) systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]重启完毕${RESET}" ;;
-        8) (trap 'echo -e "\n"' INT; journalctl -u "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" -n 50 -f) ;;
+        5) rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" start && echo -e "${GREEN}[OK]启动成功${RESET}" ;;
+        6) rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" stop && echo -e "${GREEN}[OK]停止成功${RESET}" ;;
+        7) rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" restart && echo -e "${GREEN}[OK]重启完毕${RESET}" ;;
+        8) 
+            if [ -f "${LOG_DIR}/${CURRENT_INSTANCE}.log" ]; then
+                (trap 'echo -e "\n"' INT; tail -n 50 -f "${LOG_DIR}/${CURRENT_INSTANCE}.log")
+            else
+                echo -e "${RED}[ERROR]暂无日志文件生成。${RESET}"
+            fi
+            ;;
         9) print_node_summary "$CURRENT_INSTANCE" ;;
         10) configure_custom_socks5_outbound ;;
         11) menu_switch_instance ;;

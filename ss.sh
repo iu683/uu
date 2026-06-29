@@ -369,43 +369,59 @@ inst_cert() {
     certInput=${certInput:-1}
 
     if [[ $certInput == 2 ]]; then
-    local vps_ip=$(get_public_ip)
-    read -rp "请输入要绑定的域名: " domain
-    [[ -z $domain ]] && error "未输入域名，操作取消！" && return 1
+        local vps_ip=$(get_public_ip)
+        read -rp "请输入要绑定的域名: " domain
+        [[ -z $domain ]] && error "未输入域名，操作取消！" && return 1
 
-    local acme_cmd="/root/.acme.sh/acme.sh"
-    if [[ ! -f "$acme_cmd" ]]; then
-        local random_email="sb_hy2_$(date +%s | cut -c 5-10)@gmail.com"
-
-        info "正在通过官方管道一键安装 acme.sh (不使用代理)..."
-        
-        if curl -fsSL "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" | sh -s -- --install \
-            --home /root/.acme.sh \
-            --email "$random_email" \
-            --nocron; then
-            acme_installed=true
+        local acme_cmd="/root/.acme.sh/acme.sh"
+        if [[ ! -f "$acme_cmd" ]]; then
+            local random_email="sb_hy2_$(date +%s | cut -c 5-10)@gmail.com"
+            info "正在直连官方 Raw 源下载 acme.sh..."
+            
+            # 核心修复 1：文件名必须严格叫 acme.sh，否则它内部的 cp 命令会找不到自己
+            if curl -fsSL "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" -o "$TMP_DIR/acme.sh"; then
+                if [ -s "$TMP_DIR/acme.sh" ]; then
+                    info "下载成功，正在开始本地无依赖安装..."
+                    
+                    # 核心修复 2：切进临时目录执行，确保 acme.sh 内部环境上下游逻辑完全一致
+                    pushd "$TMP_DIR" >/dev/null || true
+                    
+                    if sh acme.sh --install \
+                        --home /root/.acme.sh \
+                        --email "$random_email" \
+                        --nocron; then
+                        info "acme.sh 核心引擎释放成功。"
+                    fi
+                    
+                    popd >/dev/null || true
+                fi
+            fi
         fi
         
-        [[ "$acme_installed" != true ]] && error "安装 acme.sh 失败，请检查机器的公网网络是否能正常连接 GitHub！" && return 1
-    fi
-        
-        [[ "$acme_installed" != true ]] && error "从官方源下载 acme.sh 失败，请检查机器的公网网络！" && return 1
-    fi
         "$acme_cmd" --set-default-ca --server letsencrypt
+        
+        # 核心适配：将 systemctl 替换为 Alpine 的 OpenRC 多实例服务重启命令
         local reload_cmd="/sbin/rc-service sing-box-hy2.${instance} restart"
+        
+        info "正在向 Let's Encrypt 申请证书..."
         if [[ "$vps_ip" =~ ":" ]]; then
             "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
         else
             "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
         fi
 
-        if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "$reload_cmd"; then
+        if "$acme_cmd" --install-cert -d "${domain}" \
+            --key-file "$key_path" \
+            --fullchain-file "$cert_path" \
+            --ecc \
+            --reloadcmd "$reload_cmd"; then
             hy_domain=$domain
             info "Acme 独立实例证书部署成功！"
         else
-            error "Acme 申请失败，降级回自签模式。"
+            error "Acme 申请失败，自动切换回自签模式。"
             certInput=1
         fi
+
     elif [[ $certInput == 3 ]]; then
         while true; do
             local user_cert user_key
@@ -418,11 +434,14 @@ inst_cert() {
                 ln -sf "$user_cert" "$cert_path"
                 ln -sf "$user_key" "$key_path"
                 break
-            else error "路径未找到，请重新输入！"; fi
+            else 
+                error "路径未找到，请重新输入！"
+            fi
         done
     fi
 
     if [[ $certInput == 1 ]]; then
+        info "将使用必应自签证书作为 Hysteria 2 外壳的节点证书..."
         rm -f "$cert_path" "$key_path"
         openssl ecparam -genkey -name prime256v1 -out "$key_path"
         openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"

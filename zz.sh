@@ -118,7 +118,7 @@ download_and_extract_snell() {
     
     echo -e "${YELLOW}[INFO] 正在检测并安装系统必要组件...${RESET}"
     # 移除 >/dev/null 2>&1，让错误暴露出来，方便排查
-    if ! apk add --no-cache unzip curl gcompat; then
+    if ! apk add --no-cache unzip curl libstdc++ libgcc; then
         echo -e "${RED}[错误] 依赖安装失败！请检查系统 apk 包管理器状态。${RESET}" >&2
         exit 1
     fi
@@ -190,7 +190,8 @@ write_config() {
     case "$listen_mode" in
         *"0.0.0.0"*) real_listen="0.0.0.0:${port}" ;;
         *"[::]"*)    real_listen="[::]:${port}" ;;
-        *)           real_listen="0.0.0.0:${port},[::]:${port}" ;; # 默认双栈
+        *)           # 严格遵循新版 --help 规范，双栈用逗号分隔，且中间不留空格
+                     real_listen="0.0.0.0:${port},[::]:${port}" ;; 
     esac
 
     cat > "$conf_file" <<EOF
@@ -510,7 +511,8 @@ get_panel_status_info() {
 
     local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
     if [ -f "$conf_file" ]; then
-        panel_port=$(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')
+        # 提取等号后面的完整字符串（保留逗号及后面的 IPv6），只去掉空格
+        panel_port=$(grep '^listen' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n')
     else
         panel_port="未创建节点配置"
     fi

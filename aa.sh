@@ -31,6 +31,33 @@ get_public_ip() {
     echo "127.0.0.1"
 }
 
+
+
+# 获取当前生效的配置信息与安装状态
+get_current_status() {
+    # 1. 严格基于 index.html 文件判断状态
+    if [ -f "$WEB_ROOT/index.html" ]; then
+        INSTALL_STATUS="${GREEN}[已安装]${RESET}"
+        
+        # 2. 当文件存在时，再尝试提取 Nginx 中启用的自定义域名 (排除 default)
+        CURRENT_DOMAIN=$(ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "default" | head -n 1)
+        
+        # 3. 如果能找到域名配置文件，则精准提取证书路径
+        if [ -n "$CURRENT_DOMAIN" ] && [ -f "$NGINX_CONF_DIR/$CURRENT_DOMAIN" ]; then
+            CURRENT_CERT=$(grep -E '^\s*ssl_certificate\s' "$NGINX_CONF_DIR/$CURRENT_DOMAIN" | awk '{print $2}' | sed 's/;//')
+            CURRENT_KEY=$(grep -E '^\s*ssl_certificate_key\s' "$NGINX_CONF_DIR/$CURRENT_DOMAIN" | awk '{print $2}' | sed 's/;//')
+        else
+            CURRENT_DOMAIN="未绑定域名(仅本地文件存在)"
+            CURRENT_CERT="无"
+            CURRENT_KEY="无"
+        fi
+    else
+        INSTALL_STATUS="${RED}[未安装]${RESET}"
+        CURRENT_DOMAIN="无"
+        CURRENT_CERT="无"
+        CURRENT_KEY="无"
+    fi
+}
 install_site() {
     read -p "请输入你的自定义域名： " DOMAIN
 
@@ -137,20 +164,18 @@ EOF
     echo -e "${GREEN}正在测试 Nginx 配置并平滑重载...${RESET}"
     nginx -t && systemctl reload nginx
 
-    echo -e "${GREEN}✅ HTML 网站配置修改完成！${RESET}"
-    echo -e "${GREEN}页面路径：$WEB_ROOT/index.html${RESET}"
-    echo -e "${GREEN}当前生效的证书路径：${RESET}"
-    echo -e "   Certificate Path: $CERT_PATH"
-    echo -e "   Private Key Path: $KEY_PATH"
-    echo -e "${GREEN}访问：https://$DOMAIN${RESET}"
+    echo -e "${GREEN}=========================${RESET}"
+    echo -e "${GREEN}✅ HTML 网站部署完成！${RESET}"
+    echo -e "${YELLOW}页面路径：$WEB_ROOT/index.html${RESET}"
+    echo -e "${YELLOW}访问：https://$DOMAIN${RESET}"
+    echo -e "${GREEN}=========================${RESET}"
 }
 
 uninstall_site() {
     read -p "请输入要卸载的域名： " DOMAIN
     
-    echo -e "${GREEN}正在清理 $DOMAIN 的 Nginx 配置...${RESET}"
-    rm -f "$NGINX_CONF_DIR/$DOMAIN"
-    rm -f /etc/nginx/sites-enabled/$DOMAIN
+    echo -e "${GREEN}正在清理配置...${RESET}"
+  
     rm -rf "$WEB_ROOT"
     
     # 仅仅重载 Nginx 使配置生效
@@ -177,6 +202,9 @@ while true; do
     clear
     echo -e "${GREEN}=========================${RESET}"
     echo -e "${GREEN}    ◈  网站管理菜单  ◈   ${RESET}"
+    echo -e "${GREEN}=========================${RESET}"
+    echo -e "${GREEN} 运行状态 : ${RESET}${INSTALL_STATUS}"
+    echo -e "${GREEN} 网页文件 : ${RESET}${WEB_ROOT}/index.html"
     echo -e "${GREEN}=========================${RESET}"
     echo -e "${GREEN}1) 部署网站${RESET}" 
     echo -e "${GREEN}2) 卸载网站${RESET}"

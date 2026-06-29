@@ -33,56 +33,9 @@ get_public_ip() {
 
 
 
-# 获取当前生效的配置信息与安装状态
-get_current_status() {
-    # 1. 直接判断网站根目录是否存在
-    if [ -d "$WEB_ROOT" ]; then
-        INSTALL_STATUS="已安装"
-        
-        # 2. 提取 Nginx 中启用的自定义域名 (排除 default)
-        CURRENT_DOMAIN=$(ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "default" | head -n 1)
-        
-        if [ -n "$CURRENT_DOMAIN" ] && [ -f "$NGINX_CONF_DIR/$CURRENT_DOMAIN" ]; then
-            # 精准提取证书与私钥路径，并清理掉末尾的分号、空格和换行
-            CURRENT_CERT=$(sed -n 's/^\s*ssl_certificate\s\+\([^;]\+\);.*/\1/p' "$NGINX_CONF_DIR/$CURRENT_DOMAIN" | tr -d '\r\n ' | head -n 1)
-            CURRENT_KEY=$(sed -n 's/^\s*ssl_certificate_key\s\+\([^;]\+\);.*/\1/p' "$NGINX_CONF_DIR/$CURRENT_DOMAIN" | tr -d '\r\n ' | head -n 1)
-        fi
-    else
-        INSTALL_STATUS="未安装"
-    fi
-
-    # 3. 变量空值兜底，防止挂起终端
-    [ -z "$INSTALL_STATUS" ] && INSTALL_STATUS="未安装"
-    [ -z "$CURRENT_DOMAIN" ] && CURRENT_DOMAIN="无"
-    [ -z "$CURRENT_CERT" ] && CURRENT_CERT="无"
-    [ -z "$CURRENT_KEY" ] && CURRENT_KEY="无"
-}
-
 install_site() {
-    read -p "请输入你的自定义域名： " DOMAIN
 
-    echo -e "${GREEN}正在检查并安装必要依赖(dnsutils/curl)...${RESET}"
-    apt update
-    apt install -y dnsutils curl
-
-    # 检查域名解析 (仅限 IPv4)
-    VPS_IPv4=$(get_public_ip)
-    DOMAIN_A=$(dig +short A "$DOMAIN" | tail -n1)
-
-    echo -e "${GREEN}VPS IPv4: $VPS_IPv4${RESET}"
-    echo -e "${GREEN}域名 A 记录: $DOMAIN_A${RESET}"
-
-    if [[ -n "$VPS_IPv4" && "$VPS_IPv4" != "$DOMAIN_A" ]]; then
-        echo -e "${RED}❌ A 记录未指向本机 IPv4${RESET}"
-    fi
-    
-    if [[ "$VPS_IPv4" == "$DOMAIN_A" ]]; then
-        echo -e "${GREEN}✅ IPv4 解析正确，继续配置${RESET}"
-    else
-        echo -e "${RED}❌ 域名未解析到本机，停止安装${RESET}"
-        return
-    fi
-
+    read -p "$(echo -e "${GREEN}请输入你的自定义域名：${RESET}")" DOMAIN
     # --- 自定义证书路径逻辑 ---
     DEFAULT_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
     DEFAULT_KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
@@ -200,11 +153,17 @@ view_logs() {
 
 while true; do
     clear
+    # 根据目录是否存在判断状态
+    if [ -d "$WEB_ROOT" ]; then
+        COLOR_STATUS="${YELLOW}已安装${RESET}"
+    else
+        COLOR_STATUS="${RED}未安装${RESET}"
+    fi
     echo -e "${GREEN}=========================${RESET}"
     echo -e "${GREEN}    ◈  网站管理菜单  ◈   ${RESET}"
     echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN} 运行状态 : ${RESET}${INSTALL_STATUS}"
-    echo -e "${GREEN} 网页文件 : ${RESET}${WEB_ROOT}/index.html"
+    echo -e "${GREEN} 运行状态 :${RESET} $COLOR_STATUS"
+    echo -e "${GREEN} 网页文件 :${RESET} ${YELLOW}${WEB_ROOT}/index.html${RESET}"
     echo -e "${GREEN}=========================${RESET}"
     echo -e "${GREEN}1) 部署网站${RESET}" 
     echo -e "${GREEN}2) 卸载网站${RESET}"

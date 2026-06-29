@@ -55,20 +55,33 @@ generate_random_password() {
 is_alpine() { [[ -f /etc/alpine-release ]]; }
 
 install_packages() {
-    info "正在刷新 Alpine 仓库并安装核心依赖..."
-    apk update
-    apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables gcompat socat python3
-    
-    if [[ -f /etc/init.d/iptables ]]; then
-        rc-update add iptables default >/dev/null 2>&1 || true
-        rc-service iptables start >/dev/null 2>&1 || true
-    fi
-    if [[ -f /etc/init.d/ip6tables ]]; then
-        rc-update add ip6tables default >/dev/null 2>&1 || true
-        rc-service ip6tables start >/dev/null 2>&1 || true
+    # 建立核心命令依赖列表
+    local req_cmds=("curl" "wget" "tar" "openssl" "rc-service" "ip" "jq" "grep" "sed" "coreutils" "dig" "iptables" "socat")
+    local missing_cmds=()
+
+    for cmd in "${req_cmds[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_cmds+=("$cmd")
+        fi
+    done
+
+    # 只有当存在缺失的命令时，才执行 apk 安装，否则直接跳过
+    if [ ${#missing_cmds[@]} -ne 0 ]; then
+        info "检测到系统缺少必要组件 [ ${missing_cmds[*]} ]，正在安装..."
+        apk update
+        # 映射一些包名和命令名不一致的情况
+        apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables gcompat socat python3
+        
+        if [[ -f /etc/init.d/iptables ]]; then
+            rc-update add iptables default >/dev/null 2>&1 || true
+            rc-service iptables start >/dev/null 2>&1 || true
+        fi
+        if [[ -f /etc/init.d/ip6tables ]]; then
+            rc-update add ip6tables default >/dev/null 2>&1 || true
+            rc-service ip6tables start >/dev/null 2>&1 || true
+        fi
     fi
 }
-
 create_user() {
     getent group "singbox-hy2" &>/dev/null || addgroup -S "singbox-hy2"
     id "singbox-hy2" &>/dev/null || adduser -S -D -H -G "singbox-hy2" -s /sbin/nologin "singbox-hy2"
@@ -362,29 +375,34 @@ inst_cert() {
 
         local acme_cmd="/root/.acme.sh/acme.sh"
         if [[ ! -f "$acme_cmd" ]]; then
-            local acme_installed=false
-            for proxy in "${GITHUB_PROXY[@]}"; do
-                if curl -fsSL --max-time 15 "${proxy}https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com; then
-                    acme_installed=true && break
-                fi
-            done
-            [[ "$acme_installed" = false ]] && error "Acme.sh 安装失败！" && return 1
+            local random_email="sb_hy2_$(date +%s | cut -c 5-10)@gmail.com"
+            info "正在通过官方通道一键安装 acme.sh ..."
+            curl -fsSL https://get.acme.sh | sh -s -- --install-cert --email "$random_email" --nocron
         fi
+        
         "$acme_cmd" --set-default-ca --server letsencrypt
+        
         local reload_cmd="/sbin/rc-service sing-box-hy2.${instance} restart"
+        
+        info "正在向 Let's Encrypt 申请证书..."
         if [[ "$vps_ip" =~ ":" ]]; then
             "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
         else
             "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
         fi
 
-        if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "$reload_cmd"; then
+        if "$acme_cmd" --install-cert -d "${domain}" \
+            --key-file "$key_path" \
+            --fullchain-file "$cert_path" \
+            --ecc \
+            --reloadcmd "$reload_cmd"; then
             hy_domain=$domain
             info "Acme 独立实例证书部署成功！"
         else
-            error "Acme 申请失败，降级回自签模式。"
+            error "Acme 申请失败，自动切换回自签模式。"
             certInput=1
         fi
+
     elif [[ $certInput == 3 ]]; then
         while true; do
             local user_cert user_key

@@ -337,112 +337,121 @@ fix_external_cert_permission() {
 }
 
 inst_cert() {
-  mkdir -p "$CONFIG_DIR/certs"
+    local instance="$1"
+    local cert_path="${BASE_DIR}/server_${instance}.crt"
+    local key_path="${BASE_DIR}/server_${instance}.key"
+    local conf_file="${BASE_DIR}/config_${instance}.json"
 
-  echo "---------------------------------------------"
-  echo -e "Hysteria 2 协议证书申请方式如下："
-  echo -e " 1) 必应自签证书${YELLOW}（默认）${RESET} "
-  echo -e " 2) Acme自动申请(需放行80端口)"
-  echo -e " 3) 自定义证书路径"
-  echo "---------------------------------------------"
-  local certInput
-  read -rp "请输入选项 [1-3] (直接回车默认自签证书): " certInput
-  certInput=${certInput:-1}
-
-  cert_path="$CONFIG_DIR/certs/cert.pem"
-  key_path="$CONFIG_DIR/certs/key.pem"
-
-  if [[ $certInput == 2 ]]; then
-    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
-      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。"
-    fi
-
-    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f "$CONFIG_DIR/certs/ca.log" ]]; then
-      hy2_domain=$(cat "$CONFIG_DIR/certs/ca.log")
-      info "检测到已有域名 [${hy2_domain}] 的安全区证书，正在复用..."
-    else
-      read -rp "请输入需要申请证书的域名: " domain
-      [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
-      
-      local acme_cmd="/root/.acme.sh/acme.sh"
-      if [[ ! -f "$acme_cmd" ]]; then
-        local random_email="sb_hy2_$(date +%s | cut -c 5-10)@gmail.com"
-        local acme_installed=false
-
-        info "正在通过官方管道一键安装 acme.sh (不使用代理)..."
-        if curl -fsSL "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" | sh -s -- --install \
-            --home /root/.acme.sh \
-            --email "$random_email" \
-            --nocron; then
-          acme_installed=true
-        fi
-        
-        [[ "$acme_installed" != true ]] && error "安装 acme.sh 失败，请检查机器的公网网络是否能正常连接 GitHub！" && return 1
-      fi
-      
-      "$acme_cmd" --set-default-ca --server letsencrypt
-      
-      info "正在向 Let's Encrypt 申请证书..."
-      if [[ "$(get_public_ip)" =~ ":" ]]; then
-        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
-      else
-        "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
-      fi
-      
-      local reload_cmd="[ -f /etc/sing-box-hy2/config.json ] && /sbin/rc-service sing-box-hy2 restart || echo '[信息] 初次部署，跳过服务同步'"
-      
-      if "$acme_cmd" --install-cert -d "${domain}" \
-        --key-file "$key_path" \
-        --fullchain-file "$cert_path" \
-        --ecc \
-        --reloadcmd "$reload_cmd"; then
-        echo "$domain" > "$CONFIG_DIR/certs/ca.log"
-        hy2_domain=$domain
-        info "Acme 证书申请并成功分发！"
-      else
-        error "Acme 证书申请失败，自动切换回自签模式。"
-        certInput=1
-      fi
-    fi
-
-  elif [[ $certInput == 3 ]]; then
-    while true; do
-      local user_cert user_key
-      read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
-      read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
-      read -rp "请输入证书对应的域名: " hy2_domain
-      
-      if [[ -f "$user_cert" && -f "$user_key" ]]; then
-        rm -f "$cert_path" "$key_path"
-        
-        if fix_external_cert_permission "$user_cert" "$user_key"; then
-          ln -sf "$user_cert" "$cert_path"
-          ln -sf "$user_key" "$key_path"
-          info "自定义外部证书已通过安全软链接无缝同步。"
-          break
-        else
-          return 1
-        fi
-      else
-        error "找不到输入的证书文件，请重新确认路径。"
+    if [[ -f "$cert_path" && -f "$key_path" ]]; then
         echo "---------------------------------------------"
-      fi
-    done
-  fi
+        echo -e "${YELLOW}[提示] 检测到实例 [ ${instance} ] 已有历史证书文件。${RESET}"
+        read -rp "是否要重新更改证书配置？[y/N] (直接回车保持不变): " cert_change_choice
+        cert_change_choice=${cert_change_choice:-n}
+        if [[ ! "$cert_change_choice" =~ ^[Yy]$ ]]; then
+            info "保持原有证书配置不变。"
+            local old_sni="www.bing.com"
+            [[ -f "$conf_file" ]] && old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$conf_file")
+            export EVAL_CERT_PATH="$cert_path"
+            export EVAL_KEY_PATH="$key_path"
+            export EVAL_DOMAIN="${old_sni}"
+            return 0
+        fi
+    fi
 
-  if [[ $certInput == 1 ]]; then
-    info "将使用必应自签证书作为 Hysteria 2 外壳的节点证书"
-    rm -f "$cert_path" "$key_path"
-    openssl ecparam -genkey -name prime256v1 -out "$key_path"
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    hy2_domain="www.bing.com"
-    
-    chmod 644 "$cert_path" || true
-    chmod 600 "$key_path" || true
-  fi
+    echo "---------------------------------------------"
+    echo -e "实例 [ ${instance} ] 证书配置选择："
+    echo -e " 1) 必应自签证书${YELLOW}（默认）${RESET}"
+    echo -e " 2) Acme自动申请 (需临时放行公网 80 端口)"
+    echo -e " 3) 自定义外部证书路径"
+    echo "---------------------------------------------"
+    local certInput
+    read -rp "请输入选项 [1-3] (回车默认自签): " certInput
+    certInput=${certInput:-1}
 
-  chown -R ${RUN_USER}:${RUN_USER} "$CONFIG_DIR"
-  chown -h ${RUN_USER}:${RUN_USER} "$cert_path" "$key_path" 2>/dev/null || true
+    if [[ $certInput == 2 ]]; then
+        local vps_ip=$(get_public_ip)
+        read -rp "请输入要绑定的域名: " domain
+        [[ -z $domain ]] && error "未输入域名，操作取消！" && return 1
+
+        local acme_cmd="/root/.acme.sh/acme.sh"
+        if [[ ! -f "$acme_cmd" ]]; then
+            local random_email="sb_hy2_$(date +%s | cut -c 5-10)@gmail.com"
+            info "正在直连官方 Raw 源下载 acme.sh..."
+            
+            # 核心修复 1：文件名必须严格叫 acme.sh，否则它内部的 cp 命令会找不到自己
+            if curl -fsSL "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" -o "$TMP_DIR/acme.sh"; then
+                if [ -s "$TMP_DIR/acme.sh" ]; then
+                    info "下载成功，正在开始本地无依赖安装..."
+                    
+                    # 核心修复 2：切进临时目录执行，确保 acme.sh 内部环境上下游逻辑完全一致
+                    pushd "$TMP_DIR" >/dev/null || true
+                    
+                    if sh acme.sh --install \
+                        --home /root/.acme.sh \
+                        --email "$random_email" \
+                        --nocron; then
+                        info "acme.sh 核心引擎释放成功。"
+                    fi
+                    
+                    popd >/dev/null || true
+                fi
+            fi
+        fi
+        
+        "$acme_cmd" --set-default-ca --server letsencrypt
+        
+        # 核心修复：如果服务存在则重启；如果服务不存在（初次部署），则优雅地输出信息并返回 0，不破坏 acme 的流程
+        local reload_cmd="/sbin/rc-service sing-box-hy2.${instance} restart 2>/dev/null || echo '[信息] 初次部署，跳过服务同步'"
+        
+        info "正在向 Let's Encrypt 申请证书..."
+        if [[ "$vps_ip" =~ ":" ]]; then
+            "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+        else
+            "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+        fi
+
+        if "$acme_cmd" --install-cert -d "${domain}" \
+            --key-file "$key_path" \
+            --fullchain-file "$cert_path" \
+            --ecc \
+            --reloadcmd "$reload_cmd"; then
+            hy_domain=$domain
+            info "Acme 独立实例证书部署成功！"
+        else
+            error "Acme 申请失败，自动切换回自签模式。"
+            certInput=1
+        fi
+
+    elif [[ $certInput == 3 ]]; then
+        while true; do
+            local user_cert user_key
+            read -rp "请输入公钥文件 (fullchain.pem/crt) 绝对路径: " user_cert
+            read -rp "请输入密钥文件 (privkey.pem/key) 绝对路径: " user_key
+            read -rp "请输入对应域名: " hy_domain
+            if [[ -f "$user_cert" && -f "$user_key" ]]; then
+                rm -f "$cert_path" "$key_path"
+                fix_external_cert_permission "$user_cert" "$user_key" || continue
+                ln -sf "$user_cert" "$cert_path"
+                ln -sf "$user_key" "$key_path"
+                break
+            else 
+                error "路径未找到，请重新输入！"
+            fi
+        done
+    fi
+
+    if [[ $certInput == 1 ]]; then
+        info "将使用必应自签证书作为 Hysteria 2 外壳的节点证书..."
+        rm -f "$cert_path" "$key_path"
+        openssl ecparam -genkey -name prime256v1 -out "$key_path"
+        openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
+        hy_domain="www.bing.com"
+    fi
+
+    chown -R singbox-hy2:singbox-hy2 "$cert_path" "$key_path" 2>/dev/null || true
+    export EVAL_CERT_PATH="$cert_path"
+    export EVAL_KEY_PATH="$key_path"
+    export EVAL_DOMAIN="$hy_domain"
 }
 
 inst_port() {

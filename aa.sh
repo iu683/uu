@@ -1,301 +1,405 @@
 #!/bin/bash
+# =================================================================
+# 哆啦A梦转发面板 Docker Compose 管理面板
+# =================================================================
 
-# MTPROTO TG代理 控制面板
-
-# ================== 颜色定义 ==================
-GREEN="\033[32m"
+# 颜色
 RED="\033[31m"
-YELLOW="\033[33m" 
-PURPLE="\033[35m"
-SKYBLUE="\033[36m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
+APP_NAME="flux-panel"
+BASE_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
+GOST_SQL_URL="https://github.com/bqlpfy/flux-panel/releases/download/1.4.3/gost.sql"
+NODE_SCRIPT_URL="https://github.com/bqlpfy/flux-panel/raw/main/install.sh"
 
-# ================== 基础环境变量 ==================
-HOSTNAME=$(hostname)
-USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
-export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32)}
-WORKDIR="/root/proxynode/mtproto"
-# 【已修改】改为开机后等待 30 秒再执行重启脚本，防止网卡未准备就绪
-CRON_CMD="@reboot sleep 30 && /bin/bash $WORKDIR/restart.sh >/dev/null 2>&1"
-LOG_FILE="$WORKDIR/mtg.log"
+DOCKER_CMD="docker compose"
 
-# ================== 工具函数 ==================
-red_echo() { echo -e "${RED}$1${RESET}"; }
-green_echo() { echo -e "${GREEN}$1${RESET}"; }
-yellow_echo() { echo -e "${YELLOW}$1${RESET}"; }
-purple_echo() { echo -e "${PURPLE}$1${RESET}"; }
+# 代理前缀列表（第一个留空代表直连尝试）
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+    'https://ghproxy.lvedong.eu.org/'
+)
 
-# 获取正在运行的端口
-get_running_port() {
-    local pid=$(pgrep -x mtg)
-    if [[ -n "$pid" ]]; then
-        # 尝试从进程参数中抓取绑定的端口
-        local port=$(ps -p "$pid" -o args= | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d':' -f2)
-        # 如果找不到，尝试从预留文件读取
-        [[ -z "$port" && -f "$WORKDIR/port.txt" ]] && port=$(cat "$WORKDIR/port.txt")
-        echo "${port:-未知}"
-    else
-        echo "无"
+# 检测依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
+    fi
+    if ! $DOCKER_CMD version &>/dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker Compose v2，请升级 Docker！${RESET}"
+        exit 1
     fi
 }
 
+# 代理轮询下载通用函数
+download_file() {
+    local url="$1" local output="$2" local success=false
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local target_url="${proxy}${url}"
+        echo -e "${YELLOW}📡 正在尝试通过 [${proxy:-直连}] 下载...${RESET}"
+        curl -L -k --max-time 15 -o "$output" "$target_url"
+        if [ -s "$output" ]; then success=true; break; else rm -f "$output"; fi
+    done
+    [[ "$success" = true ]] && return 0 || return 1
+}
+
+# 动态获取容器状态、映射端口
+get_status_info() {
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/vite-frontend$)" ]; then
+        status_front="${GREEN}运行中${RESET}"
+    else
+        status_front="${RED}已停止/未创建${RESET}"
+    fi
+
+    if [ "$(docker ps -q -f name=^/springboot-backend$)" ]; then
+        status_back="${GREEN}运行中${RESET}"
+    else
+        status_back="${RED}已停止/未创建${RESET}"
+    fi
+
+    if [ "$(docker ps -q -f name=^/gost-mysql$)" ]; then
+        status_mysql="${GREEN}运行中${RESET}"
+    else
+        status_mysql="${YELLOW}未创建或外部数据库${RESET}"
+    fi
+
+    # 2. 从环境变量或容器中提取端口
+    if [ -f "$ENV_FILE" ]; then
+        web_front=$(grep 'FRONTEND_PORT=' "$ENV_FILE" | cut -d= -f2)
+        web_back=$(grep 'BACKEND_PORT=' "$ENV_FILE" | cut -d= -f2)
+    else
+        web_front="-"
+        web_back="-"
+    fi
+}
+
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+    local mode=${1:-"auto"} local ip=""
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
         done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://ip6.n0at.com" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "无法获取公网 IP"
-}
-
-random_port() {
-    shuf -i 2000-65000 -n 1
-}
-
-check_vps_port() {
-    local port=$1
-    while [[ -n $(lsof -i :$port 2>/dev/null) ]]; do
-        red_echo "${port} 端口已经被其他程序占用，请更换端口重试。"
-        read -p "请输入新端口（回车使用随机端口）: " port
-        [[ -z $port ]] && port=$(random_port) && green_echo "使用随机端口: $port"
-    done
-    echo "$port"
-}
-
-check_devil_port () {
-    port_list=$(devil port list)
-    tcp_ports=$(echo "$port_list" | grep -c "tcp")
-    udp_ports=$(echo "$port_list" | grep -c "udp")
-
-    if [[ $tcp_ports -lt 1 ]]; then
-        yellow_echo "没有可用的 TCP 端口，正在尝试自动调整..."
-        if [[ $udp_ports -ge 3 ]]; then
-            udp_port_to_delete=$(echo "$port_list" | awk '/udp/ {print $1}' | head -n 1)
-            devil port del udp "$udp_port_to_delete" >/dev/null 2>&1
-        fi
-
-        while true; do
-            local rand_p=$(shuf -i 10000-65535 -n 1)
-            result=$(devil port add tcp "$rand_p" 2>&1)
-            if [[ $result == *"Ok"* ]]; then
-                MTP_PORT=$rand_p
-                break
-            fi
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
         done
     else
-        MTP_PORT=$(echo "$port_list" | awk '/tcp/ {print $1}' | sed -n '1p')
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
-    devil binexec on >/dev/null 2>&1
+    echo "127.0.0.1" && return 0
 }
 
-install_lsof() {
-    if ! command -v lsof &>/dev/null; then
-        if [ -f "/etc/debian_version" ]; then
-            apt update && apt install -y lsof
-        elif [ -f "/etc/alpine-release" ]; then
-            apk add lsof
+# 检测本地 IPv6 支持
+check_ipv6_support() {
+    ping6 -c 1 ::1 &>/dev/null && return 0 || return 1
+}
+
+# 部署 哆啦A梦转发面板
+install_app() {
+    check_dependencies
+    mkdir -p "$BASE_DIR"
+
+    echo -e "${CYAN}====== 数据库模式配置 ======${RESET}"
+    echo -e "${GREEN}1) 使用本地 Docker 自动安装 MySQL${RESET}"
+    echo -e "${GREEN}2) 连接已有的远程外部 MySQL 数据库 (自动导入结构)${RESET}"
+    echo -ne "${YELLOW}请选择数据库部署模式 [默认 1]: ${RESET}"
+    read -r db_mode
+    db_mode=${db_mode:-1}
+
+    echo -e "${YELLOW}📡 准备下载数据库初始化文件...${RESET}"
+    if [ ! -f "$BASE_DIR/gost.sql" ] || [ ! -s "$BASE_DIR/gost.sql" ]; then
+        if ! download_file "$GOST_SQL_URL" "$BASE_DIR/gost.sql"; then
+            echo -e "${RED}❌ 数据库文件下载失败，请检查网络通道${RESET}"
+            return 1
         fi
     fi
-}
 
-# ================== Crontab 管理 ==================
-check_cron_status() {
-    # 用更稳健的方式检查 restart.sh 是否已存在于 crontab 中
-    crontab -l 2>/dev/null | grep -q "restart.sh"
-}
-
-set_cron() {
-    if ! check_cron_status; then
-        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
-    fi
-}
-
-remove_cron() {
-    # 【核心修改】去掉 if check 判断，直接强制过滤！
-    # 这样不管你的路径是 /root/proxynode/mtproto 还是 ~/mtp，只要有 restart.sh 统统杀掉
-    crontab -l 2>/dev/null | grep -v "restart.sh" | crontab -
-}
-# ================== 核心控制服务 ==================
-start_proxy() {
-    if pgrep -x mtg >/dev/null; then
-        yellow_echo "MTProto Proxy 已经在运行中。"
-        return 0
-    fi
-    
-    if [ ! -f "$WORKDIR/mtg" ]; then
-        red_echo "未检测到安装文件，请先选择 1 安装。"
-        return 1
-    fi
-
-    local port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
-    if [[ -z "$port" || "$port" == "无" ]]; then
-        red_echo "未检测到配置端口，请重新安装或修改配置。"
-        return 1
-    fi
-
-    cd "$WORKDIR" || return
-    nohup ./mtg run -b 0.0.0.0:$port "$SECRET" --stats-bind=127.0.0.1:$((port + 1)) >> "$LOG_FILE" 2>&1 &
-    green_echo "MTProto Proxy 启动成功！"
-}
-
-stop_proxy() {
-    if pgrep -x mtg >/dev/null; then
-        pkill -9 mtg >/dev/null 2>&1
-        clear
-        green_echo "MTProto Proxy 已成功停止。"
+    if [ "$db_mode" == "2" ]; then
+        echo -ne "${YELLOW}请输入远程数据库 IP/域名: ${RESET}"
+        read -r DB_HOST
+        echo -ne "${YELLOW}请输入远程数据库端口 [默认: 3306]: ${RESET}"
+        read -r DB_PORT
+        DB_PORT=${DB_PORT:-3306}
     else
-        yellow_echo "MTProto Proxy 本就处于停止状态。"
+        DB_HOST="mysql"
+        DB_PORT="3306"
     fi
-}
 
-show_config() {
-    if [ ! -f "$WORKDIR/link.txt" ]; then
-        red_echo "未找到连接配置，请确保已成功安装。"
-    else
-        purple_echo "==== 当前 MTProto 连接配置 (V6VPS 替换IP地址为V6)===="
-        cat "$WORKDIR/link.txt"
+    echo -ne "${YELLOW}请输入前端访问端口 [默认: 6366]: ${RESET}"
+    read -r FRONTEND_PORT
+    FRONTEND_PORT=${FRONTEND_PORT:-6366}
+
+    echo -ne "${YELLOW}请输入后端访问端口 [默认: 6365]: ${RESET}"
+    read -r BACKEND_PORT
+    BACKEND_PORT=${BACKEND_PORT:-6365}
+
+    echo -ne "${YELLOW}请输入数据库用户名 [默认: gost]: ${RESET}"
+    read -r DB_USER
+    DB_USER=${DB_USER:-gost}
+
+    echo -ne "${YELLOW}请输入数据库名称 [默认: gost]: ${RESET}"
+    read -r DB_NAME
+    DB_NAME=${DB_NAME:-gost}
+
+    echo -ne "${YELLOW}请输入数据库密码 [默认: 123456]: ${RESET}"
+    read -r DB_PASSWORD
+    DB_PASSWORD=${DB_PASSWORD:-123456}
+
+    if [ "$db_mode" == "2" ]; then
+        echo -e "${YELLOW}🔄 正在尝试连接远程数据库并自动导入结构...${RESET}"
+        docker run --rm -i --net=host mysql:5.7 mysql -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" < "$BASE_DIR/gost.sql" 2>/tmp/gost_db_err.log
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}❌ 远程数据库导入失败！错误信息如下：${RESET}"
+            cat /tmp/gost_db_err.log
+            return 1
+        fi
     fi
-}
 
-# ================== 安装与配置修改 ==================
-download_and_run_mtg() {
-    local arch="amd64"
-    cmd=$(uname -m)
-    if [ "$cmd" == "386" ]; then arch="386"; fi
-    if [ "$cmd" == "arm" ]; then arch="arm"; fi
-    if [ "$cmd" == "aarch64" ]; then arch="arm64"; fi
+    JWT_SECRET=$(openssl rand -hex 16 2>/dev/null || echo "gost_jwt_secret_$(date +%s)")
 
-    mkdir -p "$WORKDIR"
-    pkill -9 mtg >/dev/null 2>&1
-
-    yellow_echo "正在下载 mtg 核心组件..."
-    wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
-    
-    if [ ! -s "${WORKDIR}/mtg" ]; then
-        red_echo "下载核心失败，请检查网络！"
-        return 1
+    ENABLE_IPV6=false
+    if check_ipv6_support; then
+        echo -e "${GREEN}🚀 系统支持 IPv6，默认开启 Docker IPv6 支持${RESET}"
+        ENABLE_IPV6=true
     fi
-    
-    chmod +x "${WORKDIR}/mtg"
-    echo "$MTP_PORT" > "$WORKDIR/port.txt"
-    cd "$WORKDIR" || return
 
-    # 运行服务并重定向日志
-    nohup ./mtg run -b 0.0.0.0:$MTP_PORT "$SECRET" --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> "$LOG_FILE" 2>&1 &
-    
-    # 创建守护/重启脚本
-    cat > "${WORKDIR}/restart.sh" <<EOF
-#!/bin/bash
-pkill -9 mtg >/dev/null 2>&1
-cd ${WORKDIR}
-nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> ${LOG_FILE} 2>&1 &
+    # 生成 .env
+    cat <<EOF > "$ENV_FILE"
+DB_HOST=$DB_HOST
+DB_PORT=$DB_PORT
+DB_NAME=$DB_NAME
+DB_USER=$DB_USER
+DB_PASSWORD=$DB_PASSWORD
+JWT_SECRET=$JWT_SECRET
+FRONTEND_PORT=$FRONTEND_PORT
+BACKEND_PORT=$BACKEND_PORT
 EOF
-    chmod +x "${WORKDIR}/restart.sh"
-    return 0
+
+    # 生成 docker-compose.yml
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+EOF
+
+    if [ "$db_mode" == "1" ]; then
+    cat <<EOF >> "$COMPOSE_FILE"
+  mysql:
+    image: mysql:5.7
+    container_name: gost-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./gost.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=1000
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 10s
+      retries: 10
+EOF
+    fi
+
+    cat <<EOF >> "$COMPOSE_FILE"
+  backend:
+    image: bqlpfy/springboot-backend:1.4.3
+    container_name: springboot-backend
+    restart: unless-stopped
+    environment:
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      LOG_DIR: /app/logs
+      JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
+    ports:
+      - "${BACKEND_PORT}:6365"
+    volumes:
+      - backend_logs:/app/logs
+$( [ "$db_mode" == "1" ] && echo "    depends_on:
+      mysql:
+        condition: service_healthy" )
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  frontend:
+    image: bqlpfy/vite-frontend:1.4.3
+    container_name: vite-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT}:80"
+$( [ "$db_mode" == "1" ] && echo "    depends_on:
+      backend:
+        condition: service_healthy" )
+    networks:
+      - gost-network
+
+volumes:
+$( [ "$db_mode" == "1" ] && echo "  mysql_data:
+    name: mysql_data
+    driver: local" )
+  backend_logs:
+    name: backend_logs
+    driver: local
+
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+$( [ "$ENABLE_IPV6" = true ] && echo "    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+        - subnet: fd00:dead:beef::/48" )
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动面板...${RESET}"
+    cd "$BASE_DIR" && $DOCKER_CMD up -d --force-recreate
+
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    哆啦A梦转发面板 部署成功！  ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}前端访问: http://${DETECT_IP}:${FRONTEND_PORT}${RESET}"
+    echo -e "${YELLOW}后端访问: http://${DETECT_IP}:${BACKEND_PORT}${RESET}"
+    echo -e "${YELLOW}默认账号: admin_user / 密码: admin_user${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-core_install() {
-    purple_echo "正在配置 MTProto 代理端口...\n"
-    
-    if [[ "$HOSTNAME" =~ mtp ]] || command -v devil &>/dev/null; then
-        check_devil_port
-        IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
-        IP1=${IP_LIST[0]:-$(get_public_ip)}
+update_app() { [[ -f "$COMPOSE_FILE" ]] && cd "$BASE_DIR" && $DOCKER_CMD pull && $DOCKER_CMD up -d && echo -e "${GREEN}更新完成！${RESET}" || echo -e "${RED}错误: 未部署！${RESET}"; }
+uninstall_app() {
+    echo -ne "${YELLOW}确定要卸载并删除容器吗？(y/n): ${RESET}"
+    read -r confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && $DOCKER_CMD down
+            echo -ne "${YELLOW}是否同时删除本地所有挂载数据及目录？(y/n): ${RESET}"
+            read -r clean_data
+            [[ "$clean_data" == "y" || "$clean_data" == "Y" ]] && rm -rf "$BASE_DIR" && echo -e "${GREEN}本地数据已彻底清理。${RESET}"
+        else
+            docker rm -f vite-frontend springboot-backend gost-mysql 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
+}
+
+check_compose_exist() { [[ -f "$COMPOSE_FILE" ]] && return 0 || { echo -e "${RED}错误: 未检测到配置文件！${RESET}"; return 1; }; }
+start_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD restart && echo -e "${GREEN}服务已重启${RESET}"; }
+
+view_logs() {
+    echo -e "${GREEN}选择容器查看日志:${RESET}"
+    echo "1) MySQL"
+    echo "2) Backend (后端)"
+    echo "3) Frontend (前端)"
+    read -p "选择: " c
+    case $c in
+        1) docker logs -f gost-mysql 2>/dev/null || echo -e "${RED}容器未创建${RESET}" ;;
+        2) docker logs -f springboot-backend 2>/dev/null || echo -e "${RED}容器未创建${RESET}" ;;
+        3) docker logs -f vite-frontend 2>/dev/null || echo -e "${RED}容器未创建${RESET}" ;;
+        *) echo -e "${RED}无效选择${RESET}" ;;
+    esac
+}
+
+manage_nodes() {
+    echo "📡 正在获取节点管理..."
+    if download_file "$NODE_SCRIPT_URL" "$BASE_DIR/node_install.sh"; then
+        chmod +x "$BASE_DIR/node_install.sh"
+        "$BASE_DIR/node_install.sh"
+        rm -f "$BASE_DIR/node_install.sh"
     else
-        install_lsof
-        read -p "请输入 MTProto 代理端口 (回车使用随机端口): " user_port
-        [[ -z $user_port ]] && user_port=$(random_port)
-        MTP_PORT=$(check_vps_port "$user_port")
-        IP1=$(get_public_ip)
-    fi
-
-    if download_and_run_mtg; then
-        purple_echo "\n🎉 MTProto 安装/修改成功！"
-        LINKS="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
-        green_echo "$LINKS\n"
-        echo -e "$LINKS" > "${WORKDIR}/link.txt"
-        
-        read -p "是否同时将MTProto加入开机自启（Crontab）？[回车默认加入,Y/n]: " choice_cron
-        case "$choice_cron" in
-            [nN][oO]|[nN]) remove_cron ;;
-            *) set_cron ;;
-        esac
+        echo -e "${RED}❌ 无法下载节点管理，请检查网络！${RESET}"
     fi
 }
 
-# ================== 主菜单循环 ==================
-while true; do
+show_info() {
+    get_status_info
+    local DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}前端状态 : $status_front"
+    echo -e "${YELLOW}后端状态 : $status_back"
+    echo -e "${YELLOW}数据状态 : $status_mysql"
+    echo -e "${YELLOW}前端地址 : http://${DETECT_IP}:${web_front}${RESET}"
+    echo -e "${YELLOW}后端地址 : http://${DETECT_IP}:${web_back}${RESET}"
+    echo -e "${YELLOW}配置目录 : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+menu() {
     clear
-    # 状态与端口动态获取
-    if pgrep -x mtg >/dev/null; then
-        status_display="${GREEN}●运行中${RESET}"
-    else
-        status_display="${RED}●已停止${RESET}"
-    fi
-    
-    # 获取自启状态
-    if check_cron_status; then
-        cron_display="${GREEN}●已开启${RESET}"
-    else
-        cron_display="${RED}●已关闭${RESET}"
-    fi
-
-    port_display=$(get_running_port)
-
-    # 打印精美面板样式
+    get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     MTProto Proxy 管理面板      ${RESET}"
+    echo -e "${GREEN} ◈    哆啦A梦转发面板管理    ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态     :${RESET} ${status_display}"
-    echo -e "${GREEN}端口     :${RESET} ${YELLOW}${port_display}${RESET}"
-    echo -e "${GREEN}开机自启 :${RESET} ${cron_display}"
+    echo -e "${GREEN}前端状态 :${RESET} $status_front ${GREEN}端口 :${RESET} ${YELLOW}${web_front}${RESET}"
+    echo -e "${GREEN}后端状态 :${RESET} $status_back  ${GREEN}端口 :${RESET} ${YELLOW}${web_back}${RESET}"
+    echo -e "${GREEN}数据状态 :${RESET} $status_mysql"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 MTProto${RESET}"
-    echo -e "${GREEN}2. 修改配置${RESET}"
-    echo -e "${GREEN}3. 卸载 MTProto${RESET}"
-    echo -e "${GREEN}4. 启动 MTProto${RESET}"
-    echo -e "${GREEN}5. 停止 MTProto${RESET}"
-    echo -e "${GREEN}6. 重启 MTProto${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看连接配置${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 节点管理${RESET}  ${YELLOW}← 添加节点${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    read -p "$(echo -e ${GREEN}请选择:${RESET} )" choice
-
-    case $choice in
-        1|2)
-            clear; core_install; read -p "按回车返回菜单..." ;;
-        3)
-            clear
-            stop_proxy; remove_cron; rm -rf "$WORKDIR"
-            clear; red_echo "MTProto 已彻底从系统中卸载！"; read -p "按回车返回菜单..." ;;
-        4)
-            clear; start_proxy; read -p "按回车返回菜单..." ;;
-        5)
-            clear; stop_proxy; read -p "按回车返回菜单..." ;;
-        6)
-            clear; stop_proxy; sleep 1; start_proxy; read -p "按回车返回菜单..." ;;
-        7)
-            clear
-            if [ -f "$LOG_FILE" ]; then
-                purple_echo "=== 正在查看最新 50 行运行日志 ==="
-                tail -n 50 "$LOG_FILE"
-            else
-                yellow_echo "暂无日志文件。"
-            fi
-            read -p "按回车返回菜单..." ;;
-        8)
-            clear; show_config; read -p "按回车返回菜单..." ;;
-        0)
-            exit 0 ;;
-        *)
-            red_echo "无效输入！" ; sleep 1 ;;
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) start_app ;;
+        5) stop_app ;;
+        6) restart_app ;;
+        7) view_logs ;;
+        8) show_info ;;
+        9) manage_nodes ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+}
+
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
 done

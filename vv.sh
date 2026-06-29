@@ -1,26 +1,18 @@
-#!/usr/bin/env bash
+#!/bin/sh
+set -e
 
 # =============================================================================
-#  Xray VLESS-Reality 多实例管理面板 (Alpine Linux OpenRC 专属版)
+#  Snell v6 Server 多实例管理面板 (Alpine Linux OpenRC 专属)
 # =============================================================================
 
-set -Eu
+export TEMPLATE_NAME="snellv6"
+export BASE_DIR="/etc/${TEMPLATE_NAME}"
+export LOG_FILE="/var/log/${TEMPLATE_NAME}_manager.log"
+export SNELL_USER="snellv6"
+export REGISTRY_FILE="${BASE_DIR}/.instances.env"
 
-# ── 核心路径与环境变量 ────────────────────────────────────────────────────────
-export TEMPLATE_NAME="xray-reality"
-export BIN_PATH="/usr/local/bin/${TEMPLATE_NAME}"
-export CONFIG_DIR="/etc/${TEMPLATE_NAME}"
-export LOG_DIR="/var/log/${TEMPLATE_NAME}"
-export LINK_DIR="/root/proxynode/Reality"
-export BASE_INIT_FILE="/etc/init.d/${TEMPLATE_NAME}"
+CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "snell")"
 
-# 用作注册表：持久化记录活跃实例名字
-export REGISTRY_FILE="${CONFIG_DIR}/.instances.env"
-
-# 默认控制的目标实例名称自动改成当前主机名
-CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "Xray")"
-
-# ── 终端颜色定义 ─────────────────────────────────────
 export RESET='\033[0m'
 export GREEN='\033[0;32m'
 export YELLOW='\033[0;33m'
@@ -28,97 +20,62 @@ export RED='\033[0;31m'
 export BLUE='\033[0;34m'
 export CYAN='\033[0;36m'
 
-# 降级备用版本
-readonly BACKUP_VERSION="26.3.27"
-
-# 动态临时目录
-TMP_DIR=$(mktemp -d -t xray.XXXXXX)
-
-GITHUB_PROXIES=(
-    ""
-    "https://v6.gh-proxy.org/"
-    "https://ghfast.top/"
-    "https://gh-proxy.com/"
-    "https://hub.glowp.xyz/"
-    "https://proxy.vvvv.ee/"
-    "https://ghproxy.lvedong.eu.org/"
-)
-
-# ── Environment Cleanup & Safe Exit ──────────────────────────────────
-cleanup() {
-    local exit_code=$?
-    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
-    exit $exit_code
-}
-trap cleanup EXIT INT TERM
-
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[ERROR]请使用 root 权限运行此脚本！${RESET}" >&2
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}[错误] 请使用 root 权限运行此脚本！${RESET}" >&2
     exit 1
 fi
 
-# ── 底层依赖检测与补全 ─────────────────────────────
-REQUIRED_CMDS="curl sed grep awk openssl wget ss unzip jq uuidgen"
-MISSING_CMDS=""
-for cmd in $REQUIRED_CMDS; do
-    if ! command -v "$cmd" &> /dev/null; then MISSING_CMDS="$MISSING_CMDS $cmd"; fi
-done
+# ── 工具函数 ────────────────────────────────────────────────────────────────
+info() { echo -e "${BLUE}[信息] $*${RESET}"; }
+warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
+error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
+ok()   { echo -e "${GREEN}[成功] $*${RESET}"; }
+pause() { echo; echo -ne "${GREEN}按任意键重新返回控制面板...${RESET}"; read -n 1 -s; echo; }
 
-if [ -n "$MISSING_CMDS" ]; then
-    echo -e "${YELLOW}[INFO]检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${YELLOW}，正在自动安装...${RESET}"
-    apk update -q && apk add -q curl unzip openssl jq uuidgen gcompat libc6-compat bc >/dev/null 2>&1
-    echo -e "${GREEN}[OK]基础依赖补全成功！${RESET}"
-fi
+create_user() {
+    id -u "$SNELL_USER" >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin "$SNELL_USER" 2>/dev/null || true
+}
 
-# ── 安全验证组件 ─────────────────────────────────────
-check_port() {
+check_port_occupied() {
     local port="$1"
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then return 1; fi
+    if netstat -tln | grep -q ":${port} "; then
+        return 1
+    fi
     return 0
 }
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-is_valid_alias() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
+
+is_valid_port() { echo "$1" | grep -Eq '^[0-9]+$' && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+is_valid_alias() { echo "$1" | grep -Eq '^[a-zA-Z0-9_-]+$'; }
+random_key() { cat /dev/urandom | tr -dc A-Za-z0-9 | head -c 16; }
+random_port() { awk 'BEGIN{srand();print int(rand()*(65000-2000+1))+2000}'; }
+get_system_dns() { grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | paste -sd "," -; }
 
 get_public_ip() {
     local mode=${1:-"auto"}
     local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
+    if [ "$mode" = "v4" ]; then
         for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return 0
         done
-    elif [[ "$mode" == "v6" ]]; then
+    elif [ "$mode" = "v6" ]; then
         for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return 0
         done
     else
         for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return 0
         done
         for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return 0
         done
     fi
     echo "127.0.0.1"
 }
 
-get_arch() {
-    case "$(uname -m)" in
-        x86_64) echo "64" ;;
-        aarch64|arm64) echo "arm64-v8a" ;;
-        armv7l) echo "arm32-v7a" ;;
-        *) 
-            echo -e "${RED}[ERROR]暂不支持的系统架构: $(uname -m)${RESET}" >&2
-            exit 1 
-            ;;
-    esac
-}
-
-# ── 注册表核心引擎 ───────────────────────────────────────────────────
+# ── 注册表管理系统 ──────────────────────────────────────────────────────────
 register_instance() {
     local name="$1"
-    mkdir -p "$(dirname "$REGISTRY_FILE")"
-    touch "$REGISTRY_FILE"
+    mkdir -p "$BASE_DIR" && touch "$REGISTRY_FILE"
     if ! grep -q "^${name}$" "$REGISTRY_FILE" 2>/dev/null; then
         echo "$name" >> "$REGISTRY_FILE"
     fi
@@ -132,525 +89,444 @@ unregister_instance() {
 }
 
 sync_registry() {
-    mkdir -p "$CONFIG_DIR"
-    touch "$REGISTRY_FILE"
-    local temp_reg="${TMP_DIR}/sync.env"
-    touch "$temp_reg"
-    
-    for f in "${CONFIG_DIR}"/config_*.json; do
+    mkdir -p "$BASE_DIR" && touch "$REGISTRY_FILE"
+    local temp_reg=$(mktemp)
+    for f in "${BASE_DIR}"/config_*.conf; do
         [ -e "$f" ] || continue
-        local name
-        name=$(basename "$f" | sed 's/^config_//;s/\.json$//')
-        if [ -n "$name" ]; then
-            echo "$name" >> "$temp_reg"
-        fi
+        local name=$(basename "$f" | sed 's/^config_//;s/\.conf$//')
+        if [ -n "$name" ]; then echo "$name" >> "$temp_reg"; fi
     done
     mv -f "$temp_reg" "$REGISTRY_FILE"
-    return 0
 }
 
-fetch_latest_version() {
-    echo -e "${YELLOW}[INFO]正在轮询获取 Xray-core 最新 Release 版本号...${RESET}"
-    VERSION=""
-    for proxy in "${GITHUB_PROXIES[@]}"; do
-        local api_url="${proxy}https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-        local resp
-        resp=$(wget -qO- --timeout=5 --tries=1 --no-check-certificate "$api_url" 2>/dev/null) || continue
-        local tmp_ver
-        tmp_ver=$(echo "$resp" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
-        if [[ -n "$tmp_ver" && "$tmp_ver" != "null" ]]; then
-            VERSION="${tmp_ver#v}"
-            echo -e "${GREEN}[OK]成功获取到最新版本: ${VERSION}${RESET}"
-            break
-        fi
-    done
-    if [ -z "$VERSION" ]; then
-        VERSION="$BACKUP_VERSION"
-        echo -e "${YELLOW}[WARN]降级采用稳定默认版本: ${VERSION}${RESET}"
+# ── 智能内核管理 ────────────────────────────────────────────────────────────
+get_latest_snell_version() {
+    local latest_version=""
+    latest_version=$(curl -sL --connect-timeout 4 -A "Mozilla/5.0" \
+        "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | \
+        grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
+        
+    if [ -z "$latest_version" ]; then
+        latest_version="v6.0.0b4" 
     fi
+    echo "$latest_version"
 }
 
-download_bin() {
-    local arch
-    arch=$(get_arch)
-    fetch_latest_version
-    local download_success=false
+download_and_extract_snell() {
+    local RAW_VERSION=$1
+    local ARCH=$(uname -m)
     
-    for proxy in "${GITHUB_PROXIES[@]}"; do
-        local url_bin="${proxy}https://github.com/XTLS/Xray-core/releases/download/v${VERSION}/Xray-linux-${arch}.zip"
-        echo -e "${YELLOW}[INFO]正在尝试通过镜像源 [ ${CYAN}${proxy:-官方直连}${YELLOW} ] 下载资产包...${RESET}"
-        if curl -fsSL --connect-timeout 8 --max-time 60 -o "$TMP_DIR/xray.zip" "$url_bin"; then
-            if [ -s "$TMP_DIR/xray.zip" ]; then
-                download_success=true
-                unzip -qo "$TMP_DIR/xray.zip" -d "$TMP_DIR/extracted"
-                echo -e "${GREEN}[OK]核心包同步下载与解压完成！${RESET}"
-                break
-            fi
-        fi
-        echo -e "${YELLOW}[WARN]当前源下载失败或连接超时，正在为您自动切换下一个备用源...${RESET}"
-    done
-
-    if [ "$download_success" = "false" ]; then
-        echo -e "${RED}[ERROR]所有 GitHub 镜像代理源及官方通道均尝试失败，请检查 network 后重试！${RESET}" >&2
+    echo -e "${YELLOW}[INFO] 正在检测并安装系统必要组件...${RESET}"
+    # 移除 >/dev/null 2>&1，让错误暴露出来，方便排查
+    if ! apk add --no-cache unzip curl gcompat libstdc++ libgcc; then
+        echo -e "${RED}[错误] 依赖安装失败！请检查系统 apk 包管理器状态。${RESET}" >&2
         exit 1
     fi
+
+    local URL_ARCH
+    case "$ARCH" in
+        aarch64|arm64)              URL_ARCH="linux-aarch64" ;;
+        x86_64|amd64)               URL_ARCH="linux-amd64" ;;
+        *) error "不支持的系统架构: ${ARCH}"; return 1 ;;
+    esac
+
+    local VERSION_WITHOUT_V="${RAW_VERSION#v}"
+    local VERSION_WITH_V="v${VERSION_WITHOUT_V}"
+
+    local URLS="
+    https://dl.nssurge.com/snell/snell-server-${VERSION_WITH_V}-${URL_ARCH}.zip
+    https://dl.nssurge.com/snell/snell-server-${VERSION_WITHOUT_V}-${URL_ARCH}.zip
+    "
+
+    local success=false
+    local tmp=$(mktemp -d)
+    for url in $URLS; do
+        echo -e "${YELLOW}正在尝试下载内核: ${url}${RESET}"
+        if curl -sL -A "Mozilla/5.0" -o "$tmp/snell.zip" --connect-timeout 8 "$url" && unzip -t "$tmp/snell.zip" >/dev/null 2>&1; then
+            success=true && break
+        fi
+    done
+
+    if [ "$success" = false ]; then
+        echo -e "${YELLOW}动态获取的路径可能已失效，使用标准保底渠道下载...${RESET}"
+        local FALLBACK_URL="https://dl.nssurge.com/snell/snell-server-v6.0.0b4-${URL_ARCH}.zip"
+        curl -sL -A "Mozilla/5.0" -o "$tmp/snell.zip" "$FALLBACK_URL" || { error "下载 Snell 核心引擎失败！"; rm -rf "$tmp"; return 1; }
+    fi
+
+    unzip -oq "$tmp/snell.zip" -d "$BASE_DIR"
+    rm -rf "$tmp"
+    chmod +x "$BASE_DIR/snell-server"
+    echo -e "${YELLOW}Snell 二进制核心解压成功！${RESET}"
 }
 
-write_template_service() {
-    # 建立 OpenRC 的基础核心多实例模版守护脚本
-    cat > "$BASE_INIT_FILE" <<'EOF'
+# ── 【核心修复】补齐并增强配置摘要打印函数 ───────────────────────────────────
+print_instance_summary() {
+    local instance="$1"
+    local conf_file="${BASE_DIR}/config_${instance}.conf"
+    if [ ! -f "$conf_file" ]; then
+        echo -e "${RED}无法找到实例 [ ${instance} ] 的配置文件！${RESET}"
+        return
+    fi
+
+    echo -e "\n${GREEN}====== Snell v6 实例${RESET} ${YELLOW}[ ${instance} ]${RESET} ${GREEN}配置详情 ======${RESET}"
+    echo -e "${GREEN} 绑定监听 (Listen) :${RESET} $(grep '^listen' "$conf_file" | awk -F'=[ ]*' '{print $2}')"
+    echo -e "${GREEN} 密钥 (PSK)        :${RESET} $(grep '^psk' "$conf_file" | awk -F'=[ ]*' '{print $2}')"
+    echo -e "${GREEN} 工作模式 (Mode)   :${RESET} $(grep '^mode' "$conf_file" | awk -F'=[ ]*' '{print $2}')"
+    echo -e "${GREEN} Fast Open (TFO)   :${RESET} $(grep '^tfo' "$conf_file" | awk -F'=[ ]*' '{print $2}')"
+    echo -e "${GREEN}---------------------------------------${RESET}"
+    if [ -f "${BASE_DIR}/link_${instance}.txt" ]; then
+        echo -e "${GREEN}[Surge 节点配置] :${RESET}"
+        echo -e "${YELLOW}$(cat "${BASE_DIR}/link_${instance}.txt")${RESET}\n"
+    fi
+}
+
+write_config() {
+    local instance="$1" port="$2" psk="$3" mode="$4" listen_mode="$5" dns_pref="$6" obfs="$7" tfo="$8" dns="$9"
+    local conf_file="${BASE_DIR}/config_${instance}.conf"
+    
+    mkdir -p "$BASE_DIR"
+
+    local real_listen=""
+    case "$listen_mode" in
+        *"0.0.0.0"*) real_listen="0.0.0.0:${port}" ;;
+        *"[::]"*)    real_listen="[::]:${port}" ;;
+        *)           real_listen="0.0.0.0:${port},[::]:${port}" ;; # 默认双栈
+    esac
+
+    cat > "$conf_file" <<EOF
+[snell-server]
+listen = ${real_listen}
+psk = ${psk}
+mode = ${mode}
+obfs = ${obfs}
+tfo = ${tfo}
+dns = ${dns}
+dns-ip-preference = ${dns_pref}
+EOF
+
+    chmod 600 "$conf_file"
+    chown -R "$SNELL_USER" "$BASE_DIR" 2>/dev/null || true
+    register_instance "$instance"
+
+    local ip=$(get_public_ip "auto")
+    local display_ip="$ip"
+    if echo "$ip" | grep -q ":"; then display_ip="[$ip]"; fi
+    
+    cat > "${BASE_DIR}/link_${instance}.txt" <<EOF
+Alpine-${instance}-SnellV6 = snell, ${display_ip}, ${port}, psk=${psk}, version=6, mode=${mode}, tfo=${tfo}, reuse=true, ecn=true
+EOF
+}
+
+write_openrc_template() {
+    cat > /etc/init.d/snellv6 << 'EOF'
 #!/sbin/openrc-run
 
-# 自动推导 OpenRC 的多实例软链接名
-INSTANCE_NAME="${RC_SVCNAME#xray-reality.}"
-if [ "${INSTANCE_NAME}" = "xray-reality" ]; then
-    # 兜底避免裸启动模版
-    INSTANCE_NAME="Xray"
-fi
+INSTANCE_NAME="${RC_SVCNAME#snellv6.}"
+[ "$INSTANCE_NAME" = "snellv6" ] && INSTANCE_NAME="snell"
 
-command="/usr/local/bin/xray-reality"
-command_args="run -config /etc/xray-reality/config_${INSTANCE_NAME}.json"
+description="Snell Server v6 Dynamic Instance Node (${INSTANCE_NAME})"
+command="/etc/snellv6/snell-server"
+command_args="-c /etc/snellv6/config_${INSTANCE_NAME}.conf"
 command_background="yes"
-pidfile="/run/xray-reality.${INSTANCE_NAME}.pid"
-output_log="/var/log/xray-reality/xray_${INSTANCE_NAME}.log"
-error_log="/var/log/xray-reality/xray_${INSTANCE_NAME}.log"
+pidfile="/run/snellv6_${INSTANCE_NAME}.pid"
+output_log="/var/log/snellv6_${INSTANCE_NAME}.log"
+error_log="/var/log/snellv6_${INSTANCE_NAME}.log"
 
 depend() {
     need net
     after firewall
 }
 EOF
-    chmod 0755 "$BASE_INIT_FILE"
+    chmod +x /etc/init.d/snellv6
 }
 
-manage_rc_link() {
-    local name="$1" action="$2"
-    local target_init="/etc/init.d/${TEMPLATE_NAME}.${name}"
+menu_install_instance() {
+    create_user
+    mkdir -p "$BASE_DIR"
+
+    local is_edit=false
+    if [ "${1:-}" = "edit" ]; then is_edit=true; fi
+
+    local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
     
-    if [ "$action" = "add" ]; then
-        if [ ! -L "$target_init" ] && [ ! -f "$target_init" ]; then
-            ln -sf "$BASE_INIT_FILE" "$target_init"
-        fi
-        rc-update add "${TEMPLATE_NAME}.${name}" default >/dev/null 2>&1 || true
-    elif [ "$action" = "del" ]; then
-        rc-service "${TEMPLATE_NAME}.${name}" stop >/dev/null 2>&1 || true
-        rc-update del "${TEMPLATE_NAME}.${name}" default >/dev/null 2>&1 || true
-        rm -f "$target_init"
-    fi
-}
-
-init_environment() {
-    install -m 0755 -d "$(dirname "$BIN_PATH")"
-    install -m 0755 -d "$CONFIG_DIR"
-    install -m 0755 -d "$LOG_DIR"
-    install -m 0755 -d "$LINK_DIR"
-}
-
-write_config() {
-    local instance="$1" port="$2" uuid="$3" domain="$4" private_key="$5" shortid="$6" pubkey="$7"
-    local conf_file="${CONFIG_DIR}/config_${instance}.json"
-    local outbound=${8:-'{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'}
-    
-    cat > "$conf_file" <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [{
-    "listen": "::",
-    "port": ${port},
-    "protocol": "vless",
-    "settings": {
-      "clients": [{ "id": "${uuid}", "flow": "xtls-rprx-vision" }],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
-      "realitySettings": {
-        "show": false,
-        "dest": "${domain}:443",
-        "xver": 0,
-        "serverNames": ["${domain}"],
-        "privateKey": "${private_key}",
-        "shortIds": ["${shortid}"],
-        "fingerprint": "chrome"
-      }
-    },
-    "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
-  }],
-  "outbounds": [${outbound}],
-  "_meta": { "alias": "${instance}", "pubkey": "${pubkey}" }
-}
-EOF
-    chmod 0644 "$conf_file"
-    register_instance "$instance"
-}
-
-generate_link() {
-    local instance="$1"
-    local file="${CONFIG_DIR}/config_${instance}.json"
-    [[ ! -f "$file" ]] && return 1
-    
-    local ip uuid port domain shortid pubkey display_ip hostname
-    ip=$(get_public_ip "auto")
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$file" 2>/dev/null || echo "")
-    port=$(jq -r '.inbounds[0].port' "$file" 2>/dev/null || echo "")
-    domain=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$file" 2>/dev/null || echo "")
-    shortid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$file" 2>/dev/null || echo "")
-    pubkey=$(jq -r '._meta.pubkey' "$file" 2>/dev/null || echo "")
-    
-    display_ip="$ip"
-    if [[ "$ip" == *":"* ]]; then
-        display_ip="[$ip]"
-    fi
-    hostname=$(hostname -s 2>/dev/null | sed 's/ /_/g' || echo "Xray")
-    
-    cat > "${LINK_DIR}/xray_${instance}.txt" <<EOF
-vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${pubkey}&sid=${shortid}#${hostname}-${instance}-Reality
-EOF
-}
-
-
-
-print_node_summary() {
-    local instance="$1"
-    local file="${CONFIG_DIR}/config_${instance}.json"
-    if [ ! -f "$file" ]; then return; fi
-
-    generate_link "$instance"
-
-    echo -e "\n${GREEN}====== Xray 实例${RESET}${YELLOW} [ ${instance} ]${RESET} ${GREEN}配置详情 ======${RESET}"
-    echo -e "${GREEN}实例协议     :${RESET} ${YELLOW}VLESS-REALITY (TCP + Vision)${RESET}"
-    echo -e "${GREEN}外网绑定 IP  :${RESET} $(get_public_ip "auto")"
-    echo -e "${GREEN}监听端口     :${RESET} $(jq -r '.inbounds[0].port' "$file" 2>/dev/null)"
-    echo -e "${GREEN}用户凭证UUID :${RESET} $(jq -r '.inbounds[0].settings.clients[0].id' "$file" 2>/dev/null)"
-    echo -e "${GREEN}伪装SNI域名  :${RESET} $(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$file" 2>/dev/null)"
-    echo -e "${GREEN}公钥 PBK     :${RESET} $(jq -r '._meta.pubkey' "$file" 2>/dev/null)"
-    echo -e "${GREEN}ShortID      :${RESET} $(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$file" 2>/dev/null)"
-    echo -e "${GREEN}配置文件路径 :${RESET} ${file}"
-    echo "--------------------------------------------------------"
-    if [[ -f "${LINK_DIR}/xray_${instance}.txt" ]]; then
-        echo -e "${GREEN}👉 标准通用分享链接:${RESET}"
-        echo -e "${YELLOW}$(cat "${LINK_DIR}/xray_${instance}.txt")${RESET}"
-    fi
-    echo ""
-}
-
-get_status_info() {
-    if rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
-        panel_status="${GREEN}运行中${RESET}"
-    else
-        panel_status="${RED}未运行${RESET}"
-    fi
-
-    if [ -f "$BIN_PATH" ]; then
-        local real_ver
-        real_ver=$($BIN_PATH version 2>/dev/null | head -n 1 | awk '{print $2}')
-        panel_version="${real_ver:-v1.x}"
-    else
-        panel_version="${RED}未下载核心${RESET}"
-    fi
-
-    local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
-    if [ -f "$conf_file" ]; then
-        local p_num
-        p_num=$(jq -r '.inbounds[0].port // empty' "$conf_file" 2>/dev/null)
-        panel_port="${p_num}"
+    local old_port old_key old_mode old_listen old_dns_pref old_obfs old_tfo old_dns
+    if [ "$is_edit" = "true" ] && [ -f "$conf_file" ]; then
+        echo -e "\n${GREEN}==== [正在修改实例: ${CURRENT_INSTANCE}] ====${RESET}"
+        old_listen=$(grep '^listen[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
+        old_port=$(echo "$old_listen" | awk -F: '{print $NF}' | cut -d',' -f1 || echo "")
+        old_key=$(grep '^psk[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
+        old_mode=$(grep '^mode[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
+        old_obfs=$(grep '^obfs[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
+        old_tfo=$(grep '^tfo[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
+        old_dns=$(grep -E '^dns[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
+        old_dns_pref=$(grep '^dns-ip-preference[ ]*=' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n ' || echo "")
         
-
-        local out_proto
-        out_proto=$(jq -r '.outbounds[0].protocol // "freedom"' "$conf_file" 2>/dev/null)
-        if [[ "$out_proto" == "socks" ]]; then
-            panel_outbound="${YELLOW}Socks5出口${RESET}"
-        else
-            panel_outbound="${YELLOW}直连出口${RESET}"
-        fi
+        # 兜底保底，防止配置文件残缺导致空变量
+        [ -z "$old_port" ] && old_port="6522"
+        [ -z "$old_key" ] && old_key=$(random_key)
+        [ -z "$old_mode" ] && old_mode="default"
+        [ -z "$old_obfs" ] && old_obfs="off"
+        [ -z "$old_tfo" ] && old_tfo="true"
+        [ -z "$old_dns" ] && old_dns="8.8.8.8,8.8.4.4"
+        [ -z "$old_dns_pref" ] && old_dns_pref="default"
     else
-        panel_port="未创建配置"
-        panel_outbound="${RED}未创建配置${RESET}"
+        if [ -f "$conf_file" ]; then
+            echo -e "${YELLOW}[WARN]检测到该实例 [ ${CURRENT_INSTANCE} ] 已经存在配置。${RESET}"
+            local confirm=""
+            read -r -p "$(echo -e "${GREEN}是否强行完全覆盖并重置该实例？[y/N]: ${RESET}")" confirm || true
+            [[ "$confirm" =~ ^[Yy]$ ]] || return
+        fi
+        echo -e "\n${GREEN}==== [配置新 Snell 矩阵实例: ${CURRENT_INSTANCE}] ====${RESET}"
+        old_port=$(random_port)
+        while ! check_port_occupied "$old_port"; do old_port=$(random_port); done
+        old_key=$(random_key)
+        old_mode="default"
+        old_obfs="off"
+        old_tfo="true"
+        old_dns=$(get_system_dns)
+        [ -z "$old_dns" ] && old_dns="1.1.1.1,8.8.8.8"
+        old_dns_pref="default"
+    fi
+
+    # 1. 端口引导
+    local input_port="" opt_port=""
+    while true; do
+        echo -n -e "${GREEN}请输入服务端口 [当前: ${YELLOW}${old_port}${GREEN}]: ${RESET}"
+        read -r input_port
+        opt_port="${input_port:-$old_port}"
+        if is_valid_port "$opt_port"; then
+            if [ "$opt_port" != "$old_port" ] || [ "$is_edit" = "false" ]; then
+                if ! check_port_occupied "$opt_port"; then
+                    echo -e "${RED}[ERROR]端口 ${opt_port} 目前正被其他进程占用，请换个端口！${RESET}" >&2
+                    continue
+                fi
+            fi
+            break
+        else
+            echo -e "${RED}[ERROR]端口无效，请输入 1-65535 之间的整数数值。${RESET}" >&2
+        fi
+    done
+
+    # 2. 密钥引导
+    local input_key="" opt_key=""
+    echo -n -e "${GREEN}请输入 PSK 密钥 [当前: ${YELLOW}${old_key}${GREEN}]: ${RESET}"
+    read -r input_key
+    opt_key="${input_key:-$old_key}"
+
+    # 3. 混淆加密模式
+    echo -e "${YELLOW}请选择 Snell 工作模式 (mode):${RESET}"
+    echo "1. default     (流量混淆 + AES 加密)"
+    echo "2. unshaped    (禁用混淆，仅加密。吞吐增高，等同于 v3)"
+    echo "3. unsafe-raw  (纯明文传输模式：禁用加密混淆)"
+    local choice_mode="" opt_mode="$old_mode"
+    echo -n "请选择 (直接回车保持当前): "
+    read -r choice_mode
+    case "$choice_mode" in
+        1) opt_mode="default" ;;
+        2) opt_mode="unshaped" ;;
+        3) opt_mode="unsafe-raw" ;;
+    esac
+
+    # 4. 监听网络模式
+    echo -e "${YELLOW}请选择网络双栈绑定模式:${RESET}"
+    echo "1. 同时绑定监听 IPv4 & IPv6 (双栈共存推荐)"
+    echo "2. 仅绑定监听 IPv4 (0.0.0.0)"
+    echo "3. 仅绑定监听 IPv6 ([::])"
+    local choice_listen="" opt_listen=""
+    echo -n "请选择 (直接回车保持默认/当前): "
+    read -r choice_listen
+    case "$choice_listen" in
+        2) opt_listen="0.0.0.0:${opt_port}" ;;
+        3) opt_listen="[::]:${opt_port}" ;;
+        1) opt_listen="0.0.0.0:${opt_port},[::]:${opt_port}" ;;
+        *) opt_listen=${old_listen:-"0.0.0.0:${opt_port},[::]:${opt_port}"} ;;
+    esac
+
+    # 5. 家族优先级
+    echo -e "${YELLOW}请选择 DNS 解析家族优先级 (dns-ip-preference):${RESET}"
+    echo "1. default     2. prefer-ipv4     3. prefer-ipv6     4. ipv4-only     5. ipv6-only"
+    local choice_pref="" opt_pref="$old_dns_pref"
+    echo -n "请选择 (回车保持): "
+    read -r choice_pref
+    case "$choice_pref" in
+        1) opt_pref="default" ;;
+        2) opt_pref="prefer-ipv4" ;;
+        3) opt_pref="prefer-ipv6" ;;
+        4) opt_pref="ipv4-only" ;;
+        5) opt_pref="ipv6-only" ;;
+    esac
+
+    # 6. OBFS 混淆
+    echo -e "${YELLOW}配置高级 OBFS 混淆 [不推荐无故开启]:${RESET}"
+    echo "1. TLS    2. HTTP    3. 关闭"
+    local choice_obfs="" opt_obfs="$old_obfs"
+    echo -n "请选择 (回车保持): "
+    read -r choice_obfs
+    case "$choice_obfs" in
+        1) opt_obfs="tls" ;;
+        2) opt_obfs="http" ;;
+        3) opt_obfs="off" ;;
+    esac
+
+    # 7. TFO
+    local choice_tfo="" opt_tfo="$old_tfo"
+    echo -n -e "${GREEN}是否开启 TCP Fast Open？(1.开启 2.关闭) [当前: ${old_tfo}]: ${RESET}"
+    read -r choice_tfo
+    [ "$choice_tfo" = "1" ] && opt_tfo="true"
+    [ "$choice_tfo" = "2" ] && opt_tfo="false"
+
+    # 8. DNS
+    local input_dns="" opt_dns=""
+    echo -n -e "${GREEN}请输入上游解析 DNS [当前: ${YELLOW}${old_dns}${GREEN}]: ${RESET}"
+    read -r input_dns
+    opt_dns="${input_dns:-$old_dns}"
+
+    # 下发安装与应用
+    if [ ! -f "$BASE_DIR/snell-server" ]; then
+        echo -e "${YELLOW}正在检测并部署 Snell 核心运行时...${RESET}"
+        local VER=$(get_latest_snell_version)
+        download_and_extract_snell "$VER"
+    fi
+
+    write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_key" "$opt_mode" "$opt_listen" "$opt_pref" "$opt_obfs" "$opt_tfo" "$opt_dns"
+    write_openrc_template
+
+    echo -e "${YELLOW}正在通知 OpenRC 矩阵控制系统生成独立子服务...${RESET}"
+    ln -sf "/etc/init.d/snellv6" "/etc/init.d/snellv6.${CURRENT_INSTANCE}"
+    rc-update add "snellv6.${CURRENT_INSTANCE}" default >/dev/null 2>&1 || true
+    
+    rc-service "snellv6.${CURRENT_INSTANCE}" stop >/dev/null 2>&1 || true
+    pkill -9 -f "config_${CURRENT_INSTANCE}.conf" || true
+    rc-service "snellv6.${CURRENT_INSTANCE}" start >/dev/null 2>&1 || true
+
+    sleep 1
+    if rc-service "snellv6.${CURRENT_INSTANCE}" status 2>&1 | grep -q "started"; then
+        echo -e "${YELLOW}实例 [ ${CURRENT_INSTANCE} ] 多开分流矩阵启动成功！${RESET}"
+        print_instance_summary "$CURRENT_INSTANCE"
+    else
+        echo -e "${RED}[INFO]实例下发完成，但 OpenRC 响应拉起失败，请检查端口是否冲突或选择 [8] 查看实时日志。${RESET}"
     fi
 }
 
-parse_existing_config() {
-    local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
-    if [ ! -f "$conf_file" ]; then return 1; fi
+menu_uninstall_instance() {
+    echo -e "${YELLOW}[WARN]该操作将彻底销毁清理当前控制聚焦的 [ ${CURRENT_INSTANCE} ] 独立服务。${RESET}"
+    local confirm=""
+    read -r -p "$(echo -e "${RED}确定完全卸载移除此实例？[y/N]: ${RESET}")" confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return
 
-    OLD_PORT=$(jq -r '.inbounds[0].port' "$conf_file" 2>/dev/null)
-    OLD_UUID=$(jq -r '.inbounds[0].settings.clients[0].id' "$conf_file" 2>/dev/null)
-    OLD_DOMAIN=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$conf_file" 2>/dev/null)
-    OLD_SHORTID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$conf_file" 2>/dev/null)
-    OLD_PRIVKEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$conf_file" 2>/dev/null)
-    OLD_PUBKEY=$(jq -r '._meta.pubkey' "$conf_file" 2>/dev/null)
-    OLD_OUTBOUND=$(jq -c '.outbounds[0]' "$conf_file" 2>/dev/null || echo '{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}')
-    return 0
+    rc-service "snellv6.${CURRENT_INSTANCE}" stop >/dev/null 2>&1 || true
+    rc-update del "snellv6.${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+    rm -f "/etc/init.d/snellv6.${CURRENT_INSTANCE}"
+    
+    rm -f "${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
+    rm -f "${BASE_DIR}/link_${CURRENT_INSTANCE}.txt"
+    rm -f "/var/log/snellv6_${CURRENT_INSTANCE}.log"
+    unregister_instance "$CURRENT_INSTANCE"
+    echo -e "${GREEN}[OK]实例 [ ${CURRENT_INSTANCE} ] 现场清理干净。${RESET}"
+
+    if [ -d "$BASE_DIR" ] && [ -z "$(ls -A "$BASE_DIR" | grep 'config_')" ]; then
+        echo -e "${YELLOW}[INFO]检测到矩阵内所有实例已被排空，自动触发全局常驻组件垃圾回收机制...${RESET}"
+        rm -f /etc/init.d/snellv6
+        rm -rf "$BASE_DIR"
+        echo -e "${GREEN}[OK]全系统干净卸载，基础常驻依赖与核心已全部解绑！${RESET}"
+        CURRENT_INSTANCE="snell"
+    fi
 }
 
-menu_switch_instance() {
-    echo -e "\n${GREEN}==== [多开实例矩阵管理中心] ====${RESET}"
-    echo -e "${GREEN}当前操作目标${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}目前持独立实例列表:${RESET}"
+menu_switch_matrix() {
+    echo -e "\n${GREEN}==== [多开实例 OpenRC 节点矩阵管理中心] ====${RESET}"
+    echo -e "${GREEN}当前操作目标实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+    echo -e "${GREEN}当前独立实例列表:${RESET}"
 
     sync_registry
-
-    local instance_list=()
+    local instance_list=""
     local count=0
 
     if [ -f "$REGISTRY_FILE" ]; then
         while IFS= read -r name || [ -n "$name" ]; do
             [ -z "$name" ] && continue
-            local conf_file="${CONFIG_DIR}/config_${name}.json"
-            [ -f "$conf_file" ] || continue
+            local c_file="${BASE_DIR}/config_${name}.conf"
+            [ -f "$c_file" ] || continue
 
-            ((count++))
-            instance_list+=("$name")
+            count=$((count + 1))
+            instance_list="${instance_list} ${name}"
             
-            local port_num
-            port_num=$(jq -r '.inbounds[0].port // "未知"' "$conf_file" 2>/dev/null || echo "未知")
+            local port_num=$(grep '^listen' "$c_file" | awk -F: '{print $NF}' | cut -d',' -f1)
             local status_str="${RED}已停止${RESET}"
-            rc-service "${TEMPLATE_NAME}.${name}" status 2>/dev/null | grep -q "started" && status_str="${GREEN}运行中${RESET}"
+            rc-service "snellv6.${name}" status 2>&1 | grep -q "started" && status_str="${GREEN}运行中${RESET}"
             
-            echo -e " ${CYAN}[ ${count} ] ->${RESET} ${YELLOW}${name}${RESET} ${GREEN}[端口: ${port_num} | 状态: ${status_str}${GREEN}]${RESET}"
+            echo -e " ${CYAN}[ ${count} ] ->${GREEN} 实例名: ${YELLOW}${name}${RESET} ${GREEN}[绑定端口: ${port_num} | 运行状态: ${status_str}]${GREEN}"
         done < "$REGISTRY_FILE"
     fi
 
-    if [ "$count" -eq 0 ]; then
-       echo -e " ${GREEN}(暂无任何多开实例，请直接输入新名称创建)${RESET}"
-    fi
+    [ "$count" -eq 0 ] && echo -e " ${YELLOW}(当前矩阵内空空如也，请直接在下方输入新名字创建第一个多开实例)${RESET}"
     
     echo ""
-    echo -e "${GREEN}👉 输入现有实例前面的【数字编号】快速切换管理目标${RESET}"
-    echo -e "${GREEN}👉 或者直接输入一个【全新的英文名字】来新建多开实例${RESET}"
+    echo -e "${GREEN}👉 输入已有实例前面的【数字编号】快速切换管理目标${RESET}"
+    echo -e "${GREEN}👉 或者直接输入一个【全新的英文别名】来新建独立多开实例${RESET}"
     local input_val=""
     echo -ne "${YELLOW}请输入选择或名字: ${RESET}"
     read -r input_val || true
 
     if [ -z "$input_val" ]; then return; fi
 
-    if [[ "$input_val" =~ ^[0-9]+$ ]]; then
+    if echo "$input_val" | grep -Eq '^[0-9]+$'; then
         if [ "$input_val" -gt 0 ] && [ "$input_val" -le "$count" ]; then
-            local index=$((input_val - 1))
-            CURRENT_INSTANCE="${instance_list[$index]}"
-            echo -e "${GREEN}[OK]操作焦点已成功切为编号 [ ${input_val} ] 的实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+            local idx=1
+            for item in $instance_list; do
+                if [ "$idx" -eq "$input_val" ]; then
+                    CURRENT_INSTANCE="$item"
+                    break
+                fi
+                idx=$((idx + 1))
+            done
+            echo -e "${GREEN}操作焦点成功切为已有实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
         else
-            echo -e "${YELLOW}[WARN]编号输入超出范围！未做任何变更。${RESET}"
+            echo -e "${RED}编号超出可用范围！${RESET}"
         fi
     else
         if is_valid_alias "$input_val"; then
             CURRENT_INSTANCE="$input_val"
-            echo -e "${GREEN}[OK]检测到全新实例名称，已将焦点锁定在: ${YELLOW}${CURRENT_INSTANCE}${RESET} ${GREEN}(请去主菜单按 1 创建它)${RESET}"
+            echo -e "${GREEN}成功锁定并创建新焦点: ${YELLOW}${CURRENT_INSTANCE}${RESET}${GREEN} (请在主菜单选择 [1] 下发部署服务)${RESET}"
         else
-            echo -e "${RED}[ERROR]名字仅限英文字母/数字/下划线/中划线！${RESET}" >&2
+            echo -e "${RED}命名不规范，仅限使用英文字母、数字、中划线和下划线！${RESET}"
         fi
     fi
 }
 
-menu_install() {
-    init_environment
-    local is_edit=false
-    if [ "$1" = "edit" ]; then is_edit=true; fi
-
-    if [ "$is_edit" = "true" ]; then
-        if ! parse_existing_config; then
-            echo -e "${RED}[ERROR]未检测到实例 [ ${CURRENT_INSTANCE} ] 的旧配置，无法执行修改，请先按 1 进行全新部署！${RESET}" >&2
-            return
-        fi
-        echo -e "\n${GREEN}==== [💡 正在修改实例: ${CURRENT_INSTANCE} (直接回车保持原样)] ====${RESET}"
+get_panel_status_info() {
+    if rc-service "snellv6.${CURRENT_INSTANCE}" status 2>&1 | grep -q "started"; then
+        panel_status="${GREEN}运行中${RESET}"
     else
-        local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
-        if [ -f "$conf_file" ]; then
-            echo -e "${YELLOW}[WARN]实例 [ ${CURRENT_INSTANCE} ] 已经存在对应配置文件。${RESET}"
-            local res=""
-            read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重写该实例？[y/N]: ${RESET}")" res || true
-            [[ "$res" =~ ^[Yy]$ ]] || return
-        fi
-        echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
-        OLD_PORT=$((RANDOM % 45535 + 10000))
-        while ! check_port "$OLD_PORT"; do OLD_PORT=$((RANDOM % 45535 + 10000)); done
-        if [ -f "$BIN_PATH" ]; then
-            OLD_UUID=$("$BIN_PATH" uuid 2>/dev/null || uuidgen 2>/dev/null)
-        else
-            OLD_UUID=$(uuidgen 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
-        fi
-        OLD_DOMAIN="www.amazon.com"
-        OLD_SHORTID=$(openssl rand -hex 4)
-        OLD_PRIVKEY="" OLD_PUBKEY=""
-        OLD_OUTBOUND='{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}'
+        panel_status="${RED}未运行${RESET}"
     fi
 
-    # 1. 端口绑定
-    local input_port="" opt_port=""
-    while true; do
-        read -r -p "$(echo -e "${GREEN}请输入服务入站端口 [当前: ${YELLOW}${OLD_PORT}${GREEN} | 回车不改]: ${RESET}")" input_port || true
-        opt_port="${input_port:-$OLD_PORT}"
-        if is_valid_port "$opt_port"; then break; else echo -e "${RED}[ERROR]端口无效，请输入 1-65535 之间的数字。${RESET}" >&2; fi
-    done
-
-    # 2. 用户 UUID
-    local input_uuid="" opt_uuid=""
-    while true; do
-        read -r -p "$(echo -e "${GREEN}请输入用户凭证 UUID [当前: ${YELLOW}${OLD_UUID}${GREEN} | 回车不改]: ${RESET}")" input_uuid || true
-        opt_uuid="${input_uuid:-$OLD_UUID}"
-        if [[ "$opt_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then break; else echo -e "${RED}[ERROR]UUID 格式错误，请重新输入。${RESET}" >&2; fi
-    done
-
-    # 3. 伪装 SNI 域名
-    local input_domain="" opt_domain=""
-    read -r -p "$(echo -e "${GREEN}请输入 SNI 伪装域名 [当前: ${YELLOW}${OLD_DOMAIN}${GREEN} | 回车不改]: ${RESET}")" input_domain || true
-    opt_domain="${input_domain:-$OLD_DOMAIN}"
-
-    # 4. ShortID
-    local input_sid="" opt_sid=""
-    while true; do
-        read -r -p "$(echo -e "${GREEN}请输入自定义 ShortID [当前: ${YELLOW}${OLD_SHORTID}${GREEN} | 回车不改]: ${RESET}")" input_sid || true
-        opt_sid="${input_sid:-$OLD_SHORTID}"
-        if [[ "$opt_sid" =~ ^[0-9a-fA-F]+$ ]] && (( ${#opt_sid} % 2 == 0 )) && (( ${#opt_sid} >= 2 && ${#opt_sid} <= 16 )); then break; else echo -e "${RED}[ERROR]ShortID 必须是 2-16 位的偶数长度十六进制字符。${RESET}" >&2; fi
-    done
-
-    if [ ! -f "$BIN_PATH" ]; then
-        download_bin
-        install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH"
-    fi
-
-    write_template_service
-
-    local opt_privkey="$OLD_PRIVKEY" local opt_pubkey="$OLD_PUBKEY"
-    if [ -z "$opt_privkey" ] || [ "$is_edit" = "false" ]; then
-        local key_pair=""
-        key_pair=$(timeout 10 "$BIN_PATH" x25519 2>/dev/null || echo "")
-        if [ -n "$key_pair" ]; then
-            opt_privkey=$(echo "$key_pair" | grep -i "Private" | awk '{print $NF}' | tr -d '\r ')
-            opt_pubkey=$(echo "$key_pair" | grep -i "Public" | awk '{print $NF}' | tr -d '\r ')
-        else
-            opt_privkey="iOn_8971_fake_private_key_generated_due_to_timeout_xxxxx"
-            opt_pubkey="pbk_fake_public_key_generated_due_to_timeout_xxxxxx"
-        fi
-    fi
-
-    write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_uuid" "$opt_domain" "$opt_privkey" "$opt_sid" "$opt_pubkey" "$OLD_OUTBOUND"
-    manage_rc_link "$CURRENT_INSTANCE" "add"
-
-    echo -e "${YELLOW}[INFO]正在安全重载 OpenRC 实例配置并拉起: ${CURRENT_INSTANCE} ...${RESET}"
-    rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" restart
-    
-    sleep 1.5
-    if rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}[OK]Xray Reality 实例 [ ${CURRENT_INSTANCE} ] 部署/修改成功！${RESET}"
-        print_node_summary "$CURRENT_INSTANCE"
+    if [ -x "$BASE_DIR/snell-server" ]; then
+        panel_version=$("$BASE_DIR/snell-server" -v 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n1)
+        [ -z "$panel_version" ] && panel_version="v6.X 内核"
     else
-        echo -e "${YELLOW}[WARN]实例重构成功，但检测到异常挂起，请按 [8] 抓取内核滚动日志排查。${RESET}"
+        panel_version="${RED}未下载内核${RESET}"
+    fi
+
+    local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
+    if [ -f "$conf_file" ]; then
+        panel_port=$(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')
+    else
+        panel_port="未创建节点配置"
     fi
 }
 
-menu_uninstall() {
-    echo -e "${YELLOW}[WARN]该操作将彻底销毁当前聚焦选择的 Reality 实例及其占用的端口通道。${RESET}"
-    local res=""
-    read -r -p "$(echo -e "${RED}确认抹除清理实例 [ ${CURRENT_INSTANCE} ] 吗？[y/N]: ${RESET}")" res || true
-    [[ "$res" =~ ^[Yy]$ ]] || return
-
-    manage_rc_link "$CURRENT_INSTANCE" "del"
-    rm -f "${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
-    rm -f "${LINK_DIR}/xray_${CURRENT_INSTANCE}.txt"
-    unregister_instance "$CURRENT_INSTANCE"
-    echo -e "${GREEN}[OK]实例 [ ${CURRENT_INSTANCE} ] 已被纯净抹除。${RESET}"
-
-    if [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR" | grep 'config_')" ]; then
-        echo -e "${YELLOW}[INFO]检测到所有 Reality 节点已排空，执行全局核心组件垃圾回收机制...${RESET}"
-        rm -f "$BASE_INIT_FILE" "$BIN_PATH" "$REGISTRY_FILE"
-        rm -rf "$CONFIG_DIR" "$LOG_DIR"
-        rm -f "${LINK_DIR}"/xray_*.txt 2>/dev/null || true
-        echo -e "${GREEN}[OK]全系统已无常驻残留，基础依赖与内核解绑卸载完成！${RESET}"
-        CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "Xray")"
-    fi
-}
-
-configure_custom_socks5_outbound() {
-    local instance_config="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
-    if [[ ! -f "$instance_config" ]]; then 
-        echo -e "${RED}[ERROR]未安装，无法配置出口模式。${RESET}" >&2
-        return
-    fi
-
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$instance_config" 2>/dev/null || echo "freedom")
-
-    echo -e "${GREEN}-------------------------------------------${RESET}"
-    echo -e "${YELLOW}请选择出口模式：${RESET}"
-    if [[ "$current_protocol" == "socks" ]]; then
-        echo -e "${GREEN}当前模式:${RESET} ${YELLOW}Socks5${RESET}"
-    else
-        echo -e "${GREEN}当前模式:${RESET} ${YELLOW}直连${RESET}"
-    fi
-    echo -e "${GREEN}1) 直连出口${RESET}"
-    echo -e "${GREEN}2) Socks5出口${RESET}"
-    echo -e "${GREEN}0) 取消${RESET}"
-    echo -e "${GREEN}-------------------------------------------${RESET}"
-
-    echo -ne "${YELLOW}请输入选项: ${RESET}"
-    read -r mode || true
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$instance_config" > "$tmp_file"
-            cp "$instance_config" "${instance_config}.bak.$(date +%s)"
-            mv "$tmp_file" "$instance_config"
-            rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" restart && echo -e "${GREEN}[OK]已成功切换为直连出口！${RESET}" || echo -e "${RED}[ERROR]切换失败。${RESET}" >&2
-            return
-            ;;
-        2)
-            ;;
-        *)
-            echo -e "${YELLOW}[INFO]已取消配置。${RESET}"
-            return
-            ;;
-    esac
-
-    echo -e "${YELLOW}[INFO]配置自定义 Socks5 出口代理...${RESET}"
-    local socks_host socks_port socks_user socks_pass
-
-    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
-    [[ -z "$socks_host" ]] && echo -e "${BLUE}[INFO]已取消配置。${RESET}" && return
-
-    while true; do
-        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
-        [[ -z "$socks_port" ]] && socks_port=1080
-        if is_valid_port "$socks_port"; then break; else echo -e "${RED}[ERROR]端口无效，请输入 1-65535 之间的数字。${RESET}" >&2; fi
-    done
-
-    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
-    if [[ -n "$socks_user" ]]; then
-        read -rs -p "请输入 Socks5 密码: " socks_pass || true
-        echo
-    else
-        socks_pass=""
-    fi
-
-    tmp_file=$(mktemp)
-    if [[ -n "$socks_user" ]]; then
-        jq --arg host "$socks_host" --argjson port "$socks_port" --arg user "$socks_user" --arg pass "$socks_pass" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port, "users": [{"user": $user, "pass": $pass}]}]}}]' \
-            "$instance_config" > "$tmp_file"
-    else
-        jq --arg host "$socks_host" --argjson port "$socks_port" \
-            '.outbounds = [{"protocol": "socks", "tag": "custom-out", "settings": {"servers": [{"address": $host, "port": $port}]}}]' \
-            "$instance_config" > "$tmp_file"
-    fi
-
-    cp "$instance_config" "${instance_config}.bak.$(date +%s)"
-    mv "$tmp_file" "$instance_config"
-    rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" restart && echo -e "${GREEN}[OK]已成功切换为 Socks5 出口！${RESET}" || echo -e "${RED}[ERROR]重启失败，请检查 Socks5 联通性。${RESET}" >&2
-}
-
-# ── 循环路由守护 ────────────────────────────────────────────────────────
+# ── 主轮询路由中心 ────────────────────────────────────────────────────────────
 while true; do
-    get_status_info
+    get_panel_status_info
     clear
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}   ◈ Xray VLESS-Reality 多实例管理面板 ◈   ${RESET}"
+    echo -e "${GREEN}       ◈  Snell v6 多实例管理面板  ◈       ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
+    echo -e "${GREEN}目标节点监听 :${RESET} ${YELLOW}${panel_port}${RESET}"
     echo -e "${GREEN}服务活跃状态 :${RESET} $panel_status"
     echo -e "${GREEN}核心沙箱引擎 :${RESET} ${YELLOW}${panel_version}${RESET}"
-    echo -e "${GREEN}链式分流代理 :${RESET} $panel_outbound"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN} 1. 安装当前实例${RESET}"
     echo -e "${GREEN} 2. 更新内核程序${RESET}"
@@ -661,27 +537,36 @@ while true; do
     echo -e "${GREEN} 7. 重启当前实例${RESET}"
     echo -e "${GREEN} 8. 当前实例日志${RESET}"
     echo -e "${GREEN} 9. 当前实例配置${RESET}"
-    echo -e "${GREEN}10. Socks5出口${RESET}     ${YELLOW}← 链式分流代理${RESET}"
-    echo -e "${GREEN}11. 管理实例${RESET}       ${YELLOW}← 添加/切换节点${RESET}"
+    echo -e "${GREEN}10. 管理实例${RESET}      ${YELLOW}← 添加/切换节点${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     
     choice=""
-    read -r -p "$(echo -e "${GREEN}选择操作序号: ${RESET}")" choice || true
+    echo -n -e "${GREEN}选择操作序号: ${RESET}"
+    read -r choice
     case "$choice" in
-        1) menu_install "new" ;;
-        2) download_bin && install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH" && echo -e "${GREEN}[OK]Xray 核心更新成功${RESET}" ;;
-        3) menu_uninstall ;;
-        4) menu_install "edit" ;;
-        5) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" start && echo -e "${GREEN}[OK]启动成功${RESET}" ;;
-        6) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" stop && echo -e "${GREEN}[OK]停止成功${RESET}" ;;
-        7) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" restart && echo -e "${GREEN}[OK]重启完毕${RESET}" ;;
-        8) [[ -f "${LOG_DIR}/xray_${CURRENT_INSTANCE}.log" ]] && tail -n 50 -f "${LOG_DIR}/xray_${CURRENT_INSTANCE}.log" || echo -e "${RED}[ERROR]暂无滚动日志${RESET}" ;;
-        9) print_node_summary "$CURRENT_INSTANCE" ;;
-        10) configure_custom_socks5_outbound ;;
-        11) menu_switch_instance ;;
+        1) menu_install_instance "new" ; pause ;;
+        2) 
+            VER=$(get_latest_snell_version)
+            download_and_extract_snell "$VER" && echo -e "${GREEN}[OK]二进制核心覆盖升级完毕，请视情况手动重启各运行中的实例。${RESET}" ; pause
+            ;;
+        3) menu_uninstall_instance ; pause ;;
+        4) menu_install_instance "edit" ; pause ;;
+        5) rc-service "snellv6.${CURRENT_INSTANCE}" start >/dev/null 2>&1 && echo -e "${GREEN}[OK]启动成功${RESET}"; pause ;;
+        6) rc-service "snellv6.${CURRENT_INSTANCE}" stop >/dev/null 2>&1 && echo -e "${GREEN}[OK]停止成功${RESET}"; pause ;;
+        7) rc-service "snellv6.${CURRENT_INSTANCE}" restart >/dev/null 2>&1 && echo -e "${GREEN}[OK]重启完毕${RESET}"; pause ;;
+        8) 
+            echo -e "${YELLOW}[信息] 正在查看当前实例最新运行日志输出 (按 Ctrl+C 退出):${RESET}"
+            if [ -f "/var/log/snellv6_${CURRENT_INSTANCE}.log" ]; then
+                tail -f -n 50 "/var/log/snellv6_${CURRENT_INSTANCE}.log"
+            else
+                echo -e "${YELLOW}该实例暂未产生任何活动日志。${RESET}"
+                pause
+            fi
+            ;;
+        9) print_instance_summary "$CURRENT_INSTANCE" ; pause ;;
+        10) menu_switch_matrix ;;
         0) exit 0 ;;
-        *) echo -e "${YELLOW}[WARN]无效输入！${RESET}"; sleep 1 ;;
+        *) echo -e "${YELLOW}[警告] 输入未知操作序号！${RESET}" ; sleep 0.5 ;;
     esac
-    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制台面...${RESET}")" || true
 done

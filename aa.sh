@@ -1,18 +1,17 @@
-#!/usr/bin/env bash
+#!/bin/sh
 
 # =============================================================================
-#  Xray VLESS-Encryption  多实例管理面板
+#  Xray VLESS-Encryption  多实例管理面板 (Alpine Linux OpenRC 专属版)
 # =============================================================================
 
 set -Eu
 
 # ── 核心路径与环境变量 ────────────────────────────────────────────────────────
-export TEMPLATE_NAME="vlessencryption"
+export TEMPLATE_NAME="vlessenc"
 export BIN_PATH="/usr/local/bin/${TEMPLATE_NAME}"
 export CONFIG_DIR="/usr/local/etc/${TEMPLATE_NAME}"
 export LOG_DIR="/var/log/${TEMPLATE_NAME}"
-export LINK_DIR="/root/proxynode/Encryption"
-export SERVICE_FILE="/etc/systemd/system/${TEMPLATE_NAME}@.service"
+export LINK_DIR="/root/proxynode/encryption"
 
 # 用作注册表：持久化记录活跃实例名字
 export REGISTRY_FILE="${CONFIG_DIR}/.instances.env"
@@ -52,13 +51,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [ "$EUID" -ne 0 ]; then
+if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}[ERROR]请使用 root 权限运行此脚本！${RESET}" >&2
     exit 1
 fi
 
 # ── 底层依赖检测与补全 ─────────────────────────────
-REQUIRED_CMDS="curl sed grep awk openssl wget ss unzip jq"
+REQUIRED_CMDS="curl sed grep awk openssl wget netstat unzip jq uuidgen gcompat libc6-compat"
 MISSING_CMDS=""
 for cmd in $REQUIRED_CMDS; do
     if ! command -v "$cmd" &> /dev/null; then MISSING_CMDS="$MISSING_CMDS $cmd"; fi
@@ -66,29 +65,17 @@ done
 
 if [ -n "$MISSING_CMDS" ]; then
     echo -e "${YELLOW}[INFO]检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${YELLOW}，正在自动安装...${RESET}"
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        case "$ID" in
-            ubuntu|debian) apt-get update -qy && apt-get install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1 ;;
-            centos|rhel|rocky|almalinux|fedora)
-                if command -v dnf &>/dev/null; then dnf install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1
-                else yum install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1; fi ;;
-            *) 
-                echo -e "${RED}[ERROR]未知系统，请手动安装组件: $MISSING_CMDS${RESET}" >&2
-                exit 1 
-                ;;
-        esac
-    fi
+    apk update -q && apk add -q jq curl wget openssl unzip gcompat libc6-compat >/dev/null 2>&1
     echo -e "${GREEN}[OK]基础依赖补全成功！${RESET}"
 fi
 
 # ── 安全验证组件 ─────────────────────────────────────
 check_port() {
     local port="$1"
-    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then return 1; fi
+    if netstat -tuln 2>/dev/null | awk '{print $4}' | grep -qE ":${port}$"; then return 1; fi
     return 0
 }
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; sleep 0.01; }
 is_valid_uuid() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; }
 is_valid_alias() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
 
@@ -209,30 +196,29 @@ download_bin() {
     fi
 }
 
+# 写入 OpenRC 服务模板脚本
 write_template_service() {
-    cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=Xray Vless Encryption Service (Instance: %I)
-After=network-online.target
-Wants=network-online.target
+    local instance="$1"
+    local init_file="/etc/init.d/${TEMPLATE_NAME}-${instance}"
+    local log_file="${LOG_DIR}/${instance}.log"
+    touch "$log_file"
 
-[Service]
-Type=simple
-User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=${BIN_PATH} run -config ${CONFIG_DIR}/config_%I.json
-Restart=on-failure
-RestartSec=2s
-LimitNPROC=10000
-LimitNOFILE=1000000
+    cat > "$init_file" <<EOF
+#!/sbin/openrc-run
+description="Xray Vless Encryption Service (Instance: ${instance})"
+command="${BIN_PATH}"
+command_args="run -config ${CONFIG_DIR}/config_${instance}.json"
+command_background="yes"
+pidfile="/run/${TEMPLATE_NAME}-${instance}.pid"
+output_log="${log_file}"
+error_log="${log_file}"
 
-[Install]
-WantedBy=multi-user.target
+depend() {
+    need net
+    after firewall
+}
 EOF
-    chmod 0644 "$SERVICE_FILE"
-    systemctl daemon-reload
+    chmod +x "$init_file"
 }
 
 init_environment() {
@@ -242,36 +228,69 @@ init_environment() {
     install -m 0755 -d "$LINK_DIR"
 }
 
+# ── VLESS Encryption 专用加解密提取对提取引擎 ─────────────────────────
+generate_vless_encryption_pair() {
+    local vlessenc_output
+    vlessenc_output=$($BIN_PATH vlessenc 2>/dev/null || true)
+    if [ -z "$vlessenc_output" ]; then return 1; fi
+
+    local decryption_config=""
+    local encryption_config=""
+    local in_mlkem_section=false
+
+    while IFS= read -r line; do
+        if [[ "$line" == *"Authentication: ML-KEM-768, Post-Quantum"* ]]; then
+            in_mlkem_section=true
+            continue
+        fi
+        if [ "$in_mlkem_section" = true ]; then
+            if [[ "$line" == *'"decryption":'* ]]; then
+                decryption_config=$(echo "$line" | sed 's/.*"decryption": "\([^"]*\)".*/\1/')
+            elif [[ "$line" == *'"encryption":'* ]]; then
+                if echo "$line" | grep -q '.*"encryption": "[^"]*"'; then
+                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\)..*/\1/')
+                else
+                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\).*/\1/')
+                    read -r next_line
+                    encryption_config="${encryption_config}${next_line}"
+                    encryption_config=$(echo "$encryption_config" | tr -d '"' | tr -d '[:space:]')
+                fi
+                break
+            fi
+        fi
+    done <<< "$vlessenc_output"
+
+    if [ -z "$decryption_config" ] || [ -z "$encryption_config" ]; then return 1; fi
+    echo "${decryption_config}|${encryption_config}"
+}
+
 write_config() {
-    local instance="$1" port="$2" uuid="$3" encryption_method="$4" flow_value="$5" header_type="$6"
+    local instance="$1" port="$2" uuid="$3" decryption="$4" encryption="$5" remark="$6"
     local conf_file="${CONFIG_DIR}/config_${instance}.json"
     
-    cat > "$conf_file" <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [{
-    "listen": "::",
-    "port": ${port},
-    "protocol": "vless",
-    "settings": {
-      "clients": [{ "id": "${uuid}", "flow": "${flow_value}" }],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "none",
-      "tcpSettings": {
-        "header": {
-          "type": "${header_type}"
+    jq -n \
+        --arg port_str "${port}" \
+        --arg uuid "${uuid}" \
+        --arg decryption "${decryption}" \
+        --arg flow "xtls-rprx-vision" \
+        --arg instance "${instance}" \
+        --arg encryption "${encryption}" \
+        --arg remark "${remark}" \
+    '{
+      "log": { "loglevel": "warning" },
+      "inbounds": [{
+        "listen": "::",
+        "port": ($port_str | tonumber),
+        "protocol": "vless",
+        "settings": {
+          "clients": [{ "id": $uuid, "flow": $flow }],
+          "decryption": $decryption
         }
-      }
-    },
-    "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
-  }],
-  "outbounds": [{ "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4v6" } }],
-  "_meta": { "alias": "${instance}", "encryption": "${encryption_method}" }
-}
-EOF
+      }],
+      "outbounds": [{ "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4v6" } }],
+      "_meta": { "alias": $instance, "encryption": $encryption, "remark": $remark }
+    }' > "$conf_file"
+
     chmod 0644 "$conf_file"
     register_instance "$instance"
 }
@@ -281,19 +300,18 @@ generate_link() {
     local file="${CONFIG_DIR}/config_${instance}.json"
     [[ ! -f "$file" ]] && return 1
     
-    local ip uuid port enc flow header display_ip hostname
+    local ip uuid port encryption remark display_ip encoded_remark
     ip=$(get_public_ip)
     uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$file" 2>/dev/null || echo "")
     port=$(jq -r '.inbounds[0].port' "$file" 2>/dev/null || echo "")
-    flow=$(jq -r '.inbounds[0].settings.clients[0].flow // "none"' "$file" 2>/dev/null || echo "none")
-    header=$(jq -r '.inbounds[0].streamSettings.tcpSettings.header.type // "none"' "$file" 2>/dev/null || echo "none")
-    enc=$(jq -r '._meta.encryption // "none"' "$file" 2>/dev/null || echo "none")
+    encryption=$(jq -r '._meta.encryption // empty' "$file" 2>/dev/null || echo "")
+    remark=$(jq -r '._meta.remark // empty' "$file" 2>/dev/null || echo "VLESS-Enc")
     
     display_ip="$ip"; [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
-    hostname=$(hostname -s 2>/dev/null || echo "Xray")
+    encoded_remark=$(jq -rn --arg x "$remark" '$x|@uri')
     
     cat > "${LINK_DIR}/xray_${instance}.txt" <<EOF
-vless://${uuid}@${display_ip}:${port}?encryption=${enc}&flow=${flow}&type=tcp&headerType=${header}#${hostname}-${instance}-Encryption
+vless://${uuid}@${display_ip}:${port}?encryption=${encryption}&flow=xtls-rprx-vision&type=tcp&security=none#${encoded_remark}
 EOF
 }
 
@@ -305,13 +323,11 @@ print_node_summary() {
     generate_link "$instance"
 
     echo -e "\n${GREEN}== Xray 实例${RESET}${YELLOW} [ ${instance} ]${RESET} ${GREEN}配置详情 ==${RESET}"
-    echo -e "${GREEN}实例协议     :${RESET} ${YELLOW}VLESS-Encryption (TCP + Custom Channel)${RESET}"
+    echo -e "${GREEN}实例协议     :${RESET} ${YELLOW}VLESS-Encryption (ML-KEM-768)${RESET}"
     echo -e "${GREEN}外网绑定 IP  :${RESET} $(get_public_ip)"
     echo -e "${GREEN}监听端口     :${RESET} $(jq -r '.inbounds[0].port' "$file" 2>/dev/null)"
     echo -e "${GREEN}用户凭证UUID :${RESET} $(jq -r '.inbounds[0].settings.clients[0].id' "$file" 2>/dev/null)"
-    echo -e "${GREEN}加密算法方式 :${RESET} $(jq -r '._meta.encryption' "$file" 2>/dev/null)"
-    echo -e "${GREEN}流控策略Flow :${RESET} $(jq -r '.inbounds[0].settings.clients[0].flow // "none"' "$file" 2>/dev/null)"
-    echo -e "${GREEN}伪装类型Header:${RESET} $(jq -r '.inbounds[0].streamSettings.tcpSettings.header.type // "none"' "$file" 2>/dev/null)"
+    echo -e "${GREEN}自定义备注   :${RESET} $(jq -r '._meta.remark // empty' "$file" 2>/dev/null)"
     echo -e "${GREEN}配置文件路径 :${RESET} ${file}"
     echo -e "${GREEN}--------------------------------------------${RESET}"
     if [[ -f "${LINK_DIR}/xray_${instance}.txt" ]]; then
@@ -322,7 +338,7 @@ print_node_summary() {
 }
 
 get_status_info() {
-    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" 2>/dev/null; then
+    if rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
         panel_status="${GREEN}● 运行中${RESET}"
     else
         panel_status="${RED}● 未运行${RESET}"
@@ -340,7 +356,7 @@ get_status_info() {
     if [ -f "$conf_file" ]; then
         local p_num
         p_num=$(jq -r '.inbounds[0].port // empty' "$conf_file" 2>/dev/null)
-        panel_port="${p_num} (ENCRYPTION)"
+        panel_port="${p_num} (Encryption)"
         
         local out_proto
         out_proto=$(jq -r '.outbounds[0].protocol // "freedom"' "$conf_file" 2>/dev/null)
@@ -361,9 +377,9 @@ parse_existing_config() {
 
     OLD_PORT=$(jq -r '.inbounds[0].port' "$conf_file" 2>/dev/null)
     OLD_UUID=$(jq -r '.inbounds[0].settings.clients[0].id' "$conf_file" 2>/dev/null)
-    OLD_ENC=$(jq -r '._meta.encryption // "none"' "$conf_file" 2>/dev/null)
-    OLD_FLOW=$(jq -r '.inbounds[0].settings.clients[0].flow // "none"' "$conf_file" 2>/dev/null)
-    OLD_HEADER=$(jq -r '.inbounds[0].streamSettings.tcpSettings.header.type // "none"' "$conf_file" 2>/dev/null)
+    OLD_DECRYPTION=$(jq -r '.inbounds[0].settings.decryption' "$conf_file" 2>/dev/null)
+    OLD_ENCRYPTION=$(jq -r '._meta.encryption' "$conf_file" 2>/dev/null)
+    OLD_REMARK=$(jq -r '._meta.remark // empty' "$conf_file" 2>/dev/null)
     return 0
 }
 
@@ -389,7 +405,7 @@ menu_switch_instance() {
             local port_num
             port_num=$(jq -r '.inbounds[0].port // "未知"' "$conf_file" 2>/dev/null || echo "未知")
             local status_str="${RED}已停止${RESET}"
-            systemctl is-active --quiet "${TEMPLATE_NAME}@${name}" 2>/dev/null && status_str="${GREEN}运行中${RESET}"
+            rc-service "${TEMPLATE_NAME}-${name}" status 2>/dev/null | grep -q "started" && status_str="${GREEN}运行中${RESET}"
             
             echo -e " ${CYAN}[ ${count} ] ->${RESET} ${YELLOW}${name}${RESET} ${GREEN}[端口: ${port_num} | 状态: ${status_str}${GREEN}]${RESET}"
         done < "$REGISTRY_FILE"
@@ -449,13 +465,12 @@ menu_install() {
         OLD_PORT=$((RANDOM % 50001 + 10000))
         while ! check_port "$OLD_PORT"; do OLD_PORT=$((RANDOM % 50001 + 10000)); done
         if [ -f "$BIN_PATH" ]; then
-            OLD_UUID=$("$BIN_PATH" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
+            OLD_UUID=$("$BIN_PATH" uuid 2>/dev/null || uuidgen)
         else
-            OLD_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
+            OLD_UUID=$(uuidgen 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
         fi
-        OLD_ENC="none"
-        OLD_FLOW="none"
-        OLD_HEADER="none"
+        OLD_REMARK="VLESS-Enc-${CURRENT_INSTANCE}"
+        OLD_DECRYPTION="" OLD_ENCRYPTION=""
     fi
 
     # 1. 端口绑定
@@ -477,20 +492,10 @@ menu_install() {
     read -r -p "$(echo -e "${GREEN}请输入用户凭证 UUID [当前: ${YELLOW}${OLD_UUID}${GREEN} | 回车不改]: ${RESET}")" input_uuid || true
     opt_uuid="${input_uuid:-$OLD_UUID}"
 
-    # 3. Encryption 加密算法
-    local input_enc="" opt_enc=""
-    read -r -p "$(echo -e "${GREEN}请输入 Encryption 算法 [当前: ${YELLOW}${OLD_ENC}${GREEN} | 回车不改]: ${RESET}")" input_enc || true
-    opt_enc="${input_enc:-$OLD_ENC}"
-
-    # 4. Flow流控设置
-    local input_flow="" opt_flow=""
-    read -r -p "$(echo -e "${GREEN}请输入流控策略 Flow (如 xtls-rprx-vision/none) [当前: ${YELLOW}${OLD_FLOW}${GREEN} | 回车不改]: ${RESET}")" input_flow || true
-    opt_flow="${input_flow:-$OLD_FLOW}"
-
-    # 5. Header 伪装类型
-    local input_header="" opt_header=""
-    read -r -p "$(echo -e "${GREEN}请输入 TCP 伪装类型 Header (如 http/none) [当前: ${YELLOW}${OLD_HEADER}${GREEN} | 回车不改]: ${RESET}")" input_header || true
-    opt_header="${input_header:-$OLD_HEADER}"
+    # 3. 自定义备注
+    local input_remark="" opt_remark=""
+    read -r -p "$(echo -e "${GREEN}请输入节点自定义备注 [当前: ${YELLOW}${OLD_REMARK}${GREEN} | 回车不改]: ${RESET}")" input_remark || true
+    opt_remark="${input_remark:-$OLD_REMARK}"
 
     if [ ! -f "$BIN_PATH" ]; then
         download_bin
@@ -498,15 +503,25 @@ menu_install() {
         cp -f "$TMP_DIR/extracted/geoip.dat" "$TMP_DIR/extracted/geosite.dat" "${CONFIG_DIR}/" 2>/dev/null || true
     fi
 
-    write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_uuid" "$opt_enc" "$opt_flow" "$opt_header"
-    write_template_service
+    # 4. 处理底层加解密对生成 (编辑模式下原地继承，防掉线)
+    local opt_decryption="$OLD_DECRYPTION" local opt_encryption="$OLD_ENCRYPTION"
+    if [ -z "$opt_decryption" ] || [ "$is_edit" = "false" ]; then
+        echo -e "${YELLOW}[INFO]正在为您动态生成 ML-KEM 抗量子加解密对基础底座...${RESET}"
+        local enc_pair
+        enc_pair=$(generate_vless_encryption_pair) || { echo -e "${RED}[ERROR]获取内核加解密底座对失败，请检查核心兼容性。${RESET}" >&2; return 1; }
+        opt_decryption=$(echo "$enc_pair" | cut -d'|' -f1)
+        opt_encryption=$(echo "$enc_pair" | cut -d'|' -f2)
+    fi
+
+    write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_uuid" "$opt_decryption" "$opt_encryption" "$opt_remark"
+    write_template_service "$CURRENT_INSTANCE"
 
     echo -e "${YELLOW}[INFO]正在安全重载实例配置项并拉起: ${CURRENT_INSTANCE} ...${RESET}"
-    systemctl enable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+    rc-update add "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" default >/dev/null 2>&1 || true
+    rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" restart
     
     sleep 1.5
-    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+    if rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
         echo -e "${GREEN}[OK]Xray Encryption 实例 [ ${CURRENT_INSTANCE} ] 部署/修改成功！${RESET}"
         print_node_summary "$CURRENT_INSTANCE"
     else
@@ -520,26 +535,32 @@ menu_uninstall() {
     read -r -p "$(echo -e "${RED}确认抹除清理实例 [ ${CURRENT_INSTANCE} ] 吗？[y/N]: ${RESET}")" res || true
     [[ "$res" =~ ^[Yy]$ ]] || return
 
-    systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    systemctl disable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+    rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" stop >/dev/null 2>&1 || true
+    rc-update del "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" default >/dev/null 2>&1 || true
+    rm -f "/etc/init.d/${TEMPLATE_NAME}-${CURRENT_INSTANCE}"
     rm -f "${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
     rm -f "${LINK_DIR}/xray_${CURRENT_INSTANCE}.txt"
+    rm -f "${LOG_DIR}/${CURRENT_INSTANCE}.log"
     unregister_instance "$CURRENT_INSTANCE"
     echo -e "${GREEN}[OK]实例 [ ${CURRENT_INSTANCE} ] 已被纯净抹除。${RESET}"
 
     if [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR" | grep 'config_')" ]; then
-        echo -e "${YELLOW}[INFO]检测到所有 节点已排空，执行全局核心组件垃圾回收机制...${RESET}"
-        systemctl stop "${TEMPLATE_NAME}@*" >/dev/null 2>&1 || true
-        rm -f "$SERVICE_FILE" "$BIN_PATH" "$REGISTRY_FILE"
+        echo -e "${YELLOW}[INFO]检测到所有 Encryption 节点已排空，执行全局核心组件垃圾回收机制...${RESET}"
+        for init_script in /etc/init.d/${TEMPLATE_NAME}-*; do
+            [ -e "$init_script" ] || continue
+            local inst_name=$(basename "$init_script" | sed "s/^${TEMPLATE_NAME}-//")
+            rc-service "${TEMPLATE_NAME}-${inst_name}" stop >/dev/null 2>&1 || true
+            rc-update del "${TEMPLATE_NAME}-${inst_name}" default >/dev/null 2>&1 || true
+            rm -f "$init_script"
+        done
+        rm -f "$BIN_PATH" "$REGISTRY_FILE"
         rm -rf "$CONFIG_DIR" "$LOG_DIR"
         rm -f "${LINK_DIR}"/xray_*.txt 2>/dev/null || true
-        systemctl daemon-reload
         echo -e "${GREEN}[OK]全系统已无常驻残留，基础依赖与内核解绑卸载完成！${RESET}"
         CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "Xray")"
     fi
 }
 
-# ── 拓展组件：自适应配置当前实例的 Socks5 出口 ──────────────────────────────
 configure_custom_socks5_outbound() {
     local instance_config="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
     if [[ ! -f "$instance_config" ]]; then 
@@ -577,9 +598,9 @@ configure_custom_socks5_outbound() {
             mv "$tmp_file" "$instance_config"
             chmod 644 "$instance_config" 2>/dev/null || true
             
-            systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+            rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" restart
             sleep 0.5
-            if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+            if rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
                 echo -e "${GREEN}[OK]已成功切换为直连出口！${RESET}"
             else
                 echo -e "${RED}[ERROR]切换到直连失败。${RESET}" >&2
@@ -686,12 +707,12 @@ configure_custom_socks5_outbound() {
     mv "$tmp_file" "$instance_config"
     chmod 644 "$instance_config" 2>/dev/null || true
 
-    systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+    rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" restart
     sleep 0.5
-    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+    if rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
         echo -e "${GREEN}[OK]已成功切换为 Socks5 出口！${RESET}"
     else
-        echo -e "${RED}[ERROR]重启服务失败，当前配置可能与 system 境不兼容。${RESET}" >&2
+        echo -e "${RED}[ERROR]重启服务失败，当前配置可能与环境不兼容。${RESET}" >&2
         return 1
     fi
 }
@@ -701,7 +722,7 @@ while true; do
     get_status_info
     clear
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}  ◈ Xray VLESS-Encryption 多实例管理面板 ◈  ${RESET}"
+    echo -e "${GREEN} ◈ Xray VLESS-Encryption  多实例管理面板 ◈ ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
     echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
@@ -730,10 +751,16 @@ while true; do
         2) download_bin && install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH" && echo -e "${GREEN}[OK]Xray 核心更新成功${RESET}" ;;
         3) menu_uninstall ;;
         4) menu_install "edit" ;;
-        5) systemctl start "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]启动成功${RESET}" ;;
-        6) systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]停止成功${RESET}" ;;
-        7) systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]重启完毕${RESET}" ;;
-        8) (trap 'echo -e "\n"' INT; journalctl -u "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" -n 50 -f) ;;
+        5) rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" start && echo -e "${GREEN}[OK]启动成功${RESET}" ;;
+        6) rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" stop && echo -e "${GREEN}[OK]停止成功${RESET}" ;;
+        7) rc-service "${TEMPLATE_NAME}-${CURRENT_INSTANCE}" restart && echo -e "${GREEN}[OK]重启完毕${RESET}" ;;
+        8) 
+            if [ -f "${LOG_DIR}/${CURRENT_INSTANCE}.log" ]; then
+                (trap 'echo -e "\n"' INT; tail -n 50 -f "${LOG_DIR}/${CURRENT_INSTANCE}.log")
+            else
+                echo -e "${RED}[ERROR]暂无日志文件生成。${RESET}"
+            fi
+            ;;
         9) print_node_summary "$CURRENT_INSTANCE" ;;
         10) configure_custom_socks5_outbound ;;
         11) menu_switch_instance ;;

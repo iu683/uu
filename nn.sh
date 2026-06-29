@@ -1,122 +1,136 @@
 #!/usr/bin/env bash
-#
-# sing-box Hysteria 2 多实例管理面板 [Alpine 专属增强版]
-# SPDX-License-Identifier: MIT
-# =========================================================
-set -Eop pipefail
-export LANG=en_US.UTF-8
 
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
-export TEMPLATE_NAME="sing-box-hy2"
-export BASE_DIR="/etc/mo-sb-hy2"
-export INSTALL_BIN="/usr/local/bin/sing-box-hy2"
-export DATA_BASE_DIR="/var/lib/sing-box-hy2"
-export HY_DIR_BASE="/root/proxynode/sb-hy2"
-export REGISTRY_FILE="${BASE_DIR}/.instances.env"
-export OPENRC_TEMPLATE_PATH="/etc/init.d/sing-box-hy2"
+# =============================================================================
+#  Xray VLESS-Encryption  多实例管理面板
+# =============================================================================
 
-CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "hy2")"
-TMP_DIR=$(mktemp -d -t sb-hy2.XXXXXX)
+set -Eu
 
-# 颜色标准规范
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-BLUE="\033[34m"
-CYAN="\033[36m"
-RESET="\033[0m"
+# ── 核心路径与环境变量 ────────────────────────────────────────────────────────
+export TEMPLATE_NAME="vlessenc"
+export BIN_PATH="/usr/local/bin/${TEMPLATE_NAME}"
+export CONFIG_DIR="/usr/local/etc/${TEMPLATE_NAME}"
+export LOG_DIR="/var/log/${TEMPLATE_NAME}"
+export LINK_DIR="/root/proxynode/encryption"
+export SERVICE_FILE="/etc/systemd/system/${TEMPLATE_NAME}@.service"
 
-# GITHUB 代理列表
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://ghfast.top/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
+# 用作注册表：持久化记录活跃实例名字
+export REGISTRY_FILE="${CONFIG_DIR}/.instances.env"
+
+# 默认控制的目标实例名称自动改成当前主机名
+CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "Xray")"
+
+# ── 终端颜色定义 ─────────────────────────────────────
+export RESET='\033[0m'
+export GREEN='\033[0;32m'
+export YELLOW='\033[0;33m'
+export RED='\033[0;31m'
+export BLUE='\033[0;34m'
+export CYAN='\033[0;36m'
+
+# 降级备用版本
+readonly BACKUP_VERSION="26.3.27"
+
+# 动态临时目录
+TMP_DIR=$(mktemp -d -t xray.XXXXXX)
+
+GITHUB_PROXIES=(
+    ""
+    "https://v6.gh-proxy.org/"
+    "https://ghfast.top/"
+    "https://gh-proxy.com/"
+    "https://proxy.vvvv.ee/"
+    "https://ghproxy.lvedong.eu.org/"
+    "https://hub.glowp.xyz/"
 )
 
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-ok() { echo -e "${GREEN}[成功] $*${RESET}" >&2; }
-pause() { echo; read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制面板...${RESET}")" || true; echo; }
-
-cleanup() { [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; }
+# ── Environment Cleanup & Safe Exit ──────────────────────────────────
+cleanup() {
+    local exit_code=$?
+    [[ -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+    exit $exit_code
+}
 trap cleanup EXIT INT TERM
 
-generate_random_password() {
-    dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
-}
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}[ERROR]请使用 root 权限运行此脚本！${RESET}" >&2
+    exit 1
+fi
 
-is_alpine() { [[ -f /etc/alpine-release ]]; }
+# ── 底层依赖检测与补全 ─────────────────────────────
+REQUIRED_CMDS="curl sed grep awk openssl wget ss unzip jq"
+MISSING_CMDS=""
+for cmd in $REQUIRED_CMDS; do
+    if ! command -v "$cmd" &> /dev/null; then MISSING_CMDS="$MISSING_CMDS $cmd"; fi
+done
 
-install_packages() {
-    # 建立核心命令依赖列表
-    local req_cmds=("curl" "wget" "tar" "openssl" "rc-service" "ip" "jq" "grep" "sed" "coreutils" "dig" "iptables" "socat")
-    local missing_cmds=()
-
-    for cmd in "${req_cmds[@]}"; do
-        if ! command -v "$cmd" &>/dev/null; then
-            missing_cmds+=("$cmd")
-        fi
-    done
-
-    # 只有当存在缺失的命令时，才执行 apk 安装，否则直接跳过
-    if [ ${#missing_cmds[@]} -ne 0 ]; then
-        info "检测到系统缺少必要组件 [ ${missing_cmds[*]} ]，正在安装..."
-        apk update
-        # 映射一些包名和命令名不一致的情况
-        apk add --no-cache bash curl wget tar openssl openrc iproute2 jq grep sed coreutils bind-tools iptables ip6tables gcompat socat python3
-        
-        if [[ -f /etc/init.d/iptables ]]; then
-            rc-update add iptables default >/dev/null 2>&1 || true
-            rc-service iptables start >/dev/null 2>&1 || true
-        fi
-        if [[ -f /etc/init.d/ip6tables ]]; then
-            rc-update add ip6tables default >/dev/null 2>&1 || true
-            rc-service ip6tables start >/dev/null 2>&1 || true
-        fi
+if [ -n "$MISSING_CMDS" ]; then
+    echo -e "${YELLOW}[INFO]检测到系统缺失必要组件:${YELLOW}$MISSING_CMDS${YELLOW}，正在自动安装...${RESET}"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$ID" in
+            ubuntu|debian) apt-get update -qy && apt-get install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1 ;;
+            centos|rhel|rocky|almalinux|fedora)
+                if command -v dnf &>/dev/null; then dnf install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1
+                else yum install -y jq curl wget openssl iproute2 unzip >/dev/null 2>&1; fi ;;
+            *) 
+                echo -e "${RED}[ERROR]未知系统，请手动安装组件: $MISSING_CMDS${RESET}" >&2
+                exit 1 
+                ;;
+        esac
     fi
+    echo -e "${GREEN}[OK]基础依赖补全成功！${RESET}"
+fi
+
+# ── 安全验证组件 ─────────────────────────────────────
+check_port() {
+    local port="$1"
+    if ss -tuln | awk '{print $5}' | grep -qE "[:.]${port}$"; then return 1; fi
+    return 0
 }
-create_user() {
-    getent group "singbox-hy2" &>/dev/null || addgroup -S "singbox-hy2"
-    id "singbox-hy2" &>/dev/null || adduser -S -D -H -G "singbox-hy2" -s /sbin/nologin "singbox-hy2"
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; sleep 0.01; }
+is_valid_uuid() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; }
+is_valid_alias() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
+
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
 }
 
-detect_arch() {
+get_arch() {
     case "$(uname -m)" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        armv7l|armv7) echo "armv7" ;;
-        *) error "不支持当前架构: $(uname -m)"; exit 8 ;;
+        x86_64) echo "64" ;;
+        aarch64|arm64) echo "arm64-v8a" ;;
+        armv7l) echo "arm32-v7a" ;;
+        *) 
+            echo -e "${RED}[ERROR]暂不支持的系统架构: $(uname -m)${RESET}" >&2
+            exit 1 
+            ;;
     esac
 }
 
-check_environment() {
-    if ! is_alpine; then
-        error "本脚本仅支持 Alpine Linux 系统。"
-        exit 95
-    fi
-    install_packages
-    create_user
-}
-
-get_installed_version() {
-    if [[ -f "$INSTALL_BIN" ]]; then
-        "$INSTALL_BIN" version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知版本"
-    else echo "未安装核心"; fi
-}
-
-# =========================================================
-# 注册表与实例发现控制 (矩阵核心)
-# =========================================================
+# ── 注册表核心引擎 ───────────────────────────────────────────────────
 register_instance() {
     local name="$1"
-    [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
+    mkdir -p "$(dirname "$REGISTRY_FILE")"
     touch "$REGISTRY_FILE"
     if ! grep -q "^${name}$" "$REGISTRY_FILE" 2>/dev/null; then
         echo "$name" >> "$REGISTRY_FILE"
@@ -131,716 +145,628 @@ unregister_instance() {
 }
 
 sync_registry() {
-    [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
+    mkdir -p "$CONFIG_DIR"
     touch "$REGISTRY_FILE"
-    local temp_reg=$(mktemp)
-    for f in "${BASE_DIR}"/config_*.json; do
+    local temp_reg="${TMP_DIR}/sync.env"
+    touch "$temp_reg"
+    
+    for f in "${CONFIG_DIR}"/config_*.json; do
         [ -e "$f" ] || continue
-        local name=$(basename "$f" | sed 's/^config_//;s/\.json$//')
-        if [ -n "$name" ]; then echo "$name" >> "$temp_reg"; fi
+        local name
+        name=$(basename "$f" | sed 's/^config_//;s/\.json$//')
+        if [ -n "$name" ]; then
+            echo "$name" >> "$temp_reg"
+        fi
     done
     mv -f "$temp_reg" "$REGISTRY_FILE"
-}
-
-write_openrc_template() {
-    # 写入基础服务模板
-    cat << 'EOF' > "$OPENRC_TEMPLATE_PATH"
-#!/sbin/openrc-run
-
-# 动态获取当前软链接的服务后缀名作为实例名
-INSTANCE_NAME="${RC_SVCNAME#sing-box-hy2.}"
-if [ "$INSTANCE_NAME" = "sing-box-hy2" ]; then
-    eerror "请勿直接运行主模板，必须通过多实例软链接调用！"
-    exit 1
-fi
-
-name="sing-box-hy2 (${INSTANCE_NAME})"
-description="sing-box Hysteria 2 OpenRC Isolated Service - Instance: ${INSTANCE_NAME}"
-cfgfile="/etc/mo-sb-hy2/config_${INSTANCE_NAME}.json"
-logfile="/var/log/sing-box-hy2_${INSTANCE_NAME}.log"
-command="/usr/local/bin/sing-box-hy2"
-command_args="run -c ${cfgfile}"
-
-depend() {
-    need net
-    after iptables ip6tables firewall
-}
-
-start_pre() {
-    if [ ! -f "$cfgfile" ]; then
-        eerror "Configuration file $cfgfile missing!"
-        return 1
-    fi
-    
-    touch "$logfile"
-    chown singbox-hy2:singbox-hy2 "$logfile"
-    chmod 644 "$logfile"
-    
-    command_background="yes"
-    pidfile="/run/${RC_SVCNAME}.pid"
-    
-    output_log="$logfile"
-    error_log="$logfile"
-    
-    local port
-    port=$(jq -r '.inbounds[0].listen_port // 0' "$cfgfile" 2>/dev/null)
-    if [ "$port" -lt 1024 ] && [ "$port" -ne 0 ]; then
-        command_user="root:root"
-    else
-        command_user="singbox-hy2:singbox-hy2"
-    fi
-}
-EOF
-    chmod +x "$OPENRC_TEMPLATE_PATH"
-}
-
-# =========================================================
-# 网络代理与云端核心交互
-# =========================================================
-request_github_api() {
-    local path="$1"
-    local response=""
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        if [[ -z "$proxy" ]]; then
-            response=$(curl -fsSL --max-time 8 "https://api.github.com/${path}" 2>/dev/null || true)
-        else
-            response=$(curl -fsSL --max-time 8 "${proxy}https://api.github.com/${path}" 2>/dev/null || true)
-        fi
-        if [[ -n "$response" && "$response" != "null" ]]; then
-            echo "$response" && return 0
-        fi
-    done
-    return 1
-}
-
-get_latest_version() {
-    info "正在从 GitHub 获取 sing-box 最新版本号..."
-    local latest_v=""
-    local api_res
-    if api_res=$(request_github_api "repos/SagerNet/sing-box/releases/latest"); then
-        latest_v=$(echo "$api_res" | jq -r .tag_name 2>/dev/null | sed 's/^v//')
-    fi
-    if [[ -z "$latest_v" || "$latest_v" == "null" ]]; then
-        for proxy in "${GITHUB_PROXY[@]}"; do
-            latest_v=$(curl -fsSL --max-time 8 "${proxy}https://github.com/SagerNet/sing-box/releases/latest" 2>/dev/null | grep -oE 'releases/tag/v[0-9.]+' | head -n1 | sed 's|releases/tag/v||' || true)
-            [[ -n "$latest_v" ]] && break
-        done
-    fi
-    if [[ -n "$latest_v" ]]; then
-        SINGBOX_VERSION="$latest_v"
-        info "成功获取最新版本: v$SINGBOX_VERSION"
-    else
-        SINGBOX_VERSION="1.13.12"
-        warn "无法获取最新版本，将使用保底版本: v$SINGBOX_VERSION"
-    fi
-}
-
-download_core() {
-    local arch url
-    arch=$(detect_arch)
-    get_latest_version
-    local download_success=false
-    cd "$TMP_DIR"
-    
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        url=$(printf '%ssing-box-%s-linux-%s.tar.gz' "https://github.com/SagerNet/sing-box/releases/download/v$SINGBOX_VERSION/" "$SINGBOX_VERSION" "$arch")
-        [[ -n "$proxy" ]] && url="${proxy}${url}"
-        info "正在通过代理 [ ${proxy:-直连保底} ] 下载官方核心 sing-box v$SINGBOX_VERSION..."
-        if wget -O sing-box.tar.gz -q "$url" || curl -fsSL -o sing-box.tar.gz "$url"; then
-            if [[ -s sing-box.tar.gz ]]; then download_success=true; break; fi
-        fi
-    done
-
-    if [[ "$download_success" = false ]]; then
-        error "所有渠道均下载核心文件失败，请检查网络。"
-        return 1
-    fi
-    
-    tar -xzf sing-box.tar.gz -C "$TMP_DIR"
-    local extracted
-    extracted=$(find "$TMP_DIR" -type f -name sing-box | head -n 1)
-    [[ -n "$extracted" ]] || { error "解压目标核心错误"; return 1; }
-    
-    install -m 755 "$extracted" "$INSTALL_BIN"
-    info "sing-box 共享引擎内核释放完毕。"
     return 0
 }
 
-# =========================================================
-# 端口流控与安全隔离型 OpenRC 规则下发
-# =========================================================
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "127.0.0.1"
-}
-
-check_port() {
-    local port="$1"
-    if ss -tunlp 2>/dev/null | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
-        return 1
-    fi
-    return 0
-}
-
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-
-get_random_port() {
-    local rand_port
-    while true; do
-        rand_port=$(shuf -i 2000-65535 -n 1)
-        check_port "$rand_port" && echo "$rand_port" && return 0
-    done
-}
-
-get_hy_status() {
-    if rc-service "sing-box-hy2.${CURRENT_INSTANCE}" status 2>/dev/null | grep -q "started"; then
-        echo -e "${GREEN}● 运行中${RESET}"
-    else
-        echo -e "${RED}● 未运行${RESET}"
-    fi
-}
-
-get_current_port_display() {
-    local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
-    local hy_dir="${HY_DIR_BASE}/${CURRENT_INSTANCE}"
-    if [[ -f "$conf_file" ]]; then
-        local main_port
-        main_port=$(jq -r '.inbounds[0].listen_port // empty' "$conf_file" 2>/dev/null)
-        if [[ -f "${BASE_DIR}/hopping_${CURRENT_INSTANCE}.txt" ]]; then
-            local jump_range=$(cat "${BASE_DIR}/hopping_${CURRENT_INSTANCE}.txt")
-            [[ -n "$jump_range" ]] && echo "${main_port} [跳跃: ${jump_range}]" && return
-        fi
-        echo "${main_port:- -}"
-    else echo "实例未初始化"; fi
-}
-
-fix_external_cert_permission() {
-    local cert="$1" key="$2"
-    if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
-        error "拒绝: 检测到您的证书位于 /root/ 目录下！非 root 运行用户无权穿透读取。"
-        return 1
-    fi
-    local cert_dir=$(dirname "$cert")
-    chmod +x "$cert_dir" 2>/dev/null || true
-    chmod 644 "$cert" "$key" 2>/dev/null || true
-    return 0
-}
-
-inst_cert() {
-    local instance="$1"
-    local cert_path="${BASE_DIR}/server_${instance}.crt"
-    local key_path="${BASE_DIR}/server_${instance}.key"
-    local conf_file="${BASE_DIR}/config_${instance}.json"
-
-    if [[ -f "$cert_path" && -f "$key_path" ]]; then
-        echo "---------------------------------------------"
-        echo -e "${YELLOW}[提示] 检测到实例 [ ${instance} ] 已有历史证书文件。${RESET}"
-        read -rp "是否要重新更改证书配置？[y/N] (直接回车保持不变): " cert_change_choice
-        cert_change_choice=${cert_change_choice:-n}
-        if [[ ! "$cert_change_choice" =~ ^[Yy]$ ]]; then
-            info "保持原有证书配置不变。"
-            local old_sni="www.bing.com"
-            [[ -f "$conf_file" ]] && old_sni=$(jq -r '.inbounds[0].tls.server_name // "www.bing.com"' "$conf_file")
-            export EVAL_CERT_PATH="$cert_path"
-            export EVAL_KEY_PATH="$key_path"
-            export EVAL_DOMAIN="${old_sni}"
-            return 0
-        fi
-    fi
-
-    echo "---------------------------------------------"
-    echo -e "实例 [ ${instance} ] 证书配置选择："
-    echo -e " 1) 必应自签证书${YELLOW}（默认）${RESET}"
-    echo -e " 2) Acme自动申请 (需临时放行公网 80 端口)"
-    echo -e " 3) 自定义外部证书路径"
-    echo "---------------------------------------------"
-    local certInput
-    read -rp "请输入选项 [1-3] (回车默认自签): " certInput
-    certInput=${certInput:-1}
-
-    if [[ $certInput == 2 ]]; then
-        local vps_ip=$(get_public_ip)
-        read -rp "请输入要绑定的域名: " domain
-        [[ -z $domain ]] && error "未输入域名，操作取消！" && return 1
-
-        local acme_cmd="/root/.acme.sh/acme.sh"
-        if [[ ! -f "$acme_cmd" ]]; then
-            local random_email="sb_hy2_$(date +%s | cut -c 5-10)@gmail.com"
-            info "正在通过官方通道一键安装 acme.sh ..."
-            # 核心修复：改回标准的 --install 并强制指定 --home 目录，添加 --nocron 适配 Alpine
-            curl -fsSL https://get.acme.sh | sh -s -- --install \
-                --home /root/.acme.sh \
-                --email "$random_email" \
-                --nocron
-        fi
-        
-        # 兜底验证安装结果
-        if [[ ! -f "$acme_cmd" ]]; then
-            error "acme.sh 安装失败，请检查机器的公网网络是否能正常连接 GitHub！"
-            return 1
-        fi
-        
-        "$acme_cmd" --set-default-ca --server letsencrypt
-        
-        # 核心适配：将 systemctl 替换为 Alpine 的 OpenRC 多实例服务重启命令
-        local reload_cmd="/sbin/rc-service sing-box-hy2.${instance} restart"
-        
-        info "正在向 Let's Encrypt 申请证书..."
-        if [[ "$vps_ip" =~ ":" ]]; then
-            "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
-        else
-            "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
-        fi
-
-        if "$acme_cmd" --install-cert -d "${domain}" \
-            --key-file "$key_path" \
-            --fullchain-file "$cert_path" \
-            --ecc \
-            --reloadcmd "$reload_cmd"; then
-            hy_domain=$domain
-            info "Acme 独立实例证书部署成功！"
-        else
-            error "Acme 申请失败，自动切换回自签模式。"
-            certInput=1
-        fi
-
-    elif [[ $certInput == 3 ]]; then
-        while true; do
-            local user_cert user_key
-            read -rp "请输入公钥文件 (fullchain.pem/crt) 绝对路径: " user_cert
-            read -rp "请输入密钥文件 (privkey.pem/key) 绝对路径: " user_key
-            read -rp "请输入对应域名: " hy_domain
-            if [[ -f "$user_cert" && -f "$user_key" ]]; then
-                rm -f "$cert_path" "$key_path"
-                fix_external_cert_permission "$user_cert" "$user_key" || continue
-                ln -sf "$user_cert" "$cert_path"
-                ln -sf "$user_key" "$key_path"
-                break
-            else 
-                error "路径未找到，请重新输入！"
-            fi
-        done
-    fi
-
-    if [[ $certInput == 1 ]]; then
-        info "将使用必应自签证书作为 Hysteria 2 外壳的节点证书..."
-        rm -f "$cert_path" "$key_path"
-        openssl ecparam -genkey -name prime256v1 -out "$key_path"
-        openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-        hy_domain="www.bing.com"
-    fi
-
-    chown -R singbox-hy2:singbox-hy2 "$cert_path" "$key_path" 2>/dev/null || true
-    export EVAL_CERT_PATH="$cert_path"
-    export EVAL_KEY_PATH="$key_path"
-    export EVAL_DOMAIN="$hy_domain"
-}
-
-inst_port() {
-    local instance="$1"
-    local conf_file="${BASE_DIR}/config_${instance}.json"
-    local default_port=""
-    local old_first="" old_end=""
-
-    [[ -f "$conf_file" ]] && default_port=$(jq -r '.inbounds[0].listen_port // empty' "$conf_file" 2>/dev/null)
-    if [[ -f "${BASE_DIR}/hopping_${instance}.txt" ]]; then
-        local old_range=$(cat "${BASE_DIR}/hopping_${instance}.txt")
-        if [[ -n "$old_range" && "$old_range" == *"-"* ]]; then
-            old_first=$(echo "$old_range" | cut -d'-' -f1)
-            old_end=$(echo "$old_range" | cut -d'-' -f2)
-        fi
-    fi
-
-    local prompt_msg="设置该实例监听主端口 (回车随机分配): "
-    [[ -n "$default_port" ]] && prompt_msg="设置该实例监听主端口 [当前: ${default_port}, 回车不修改]: "
-
-    while true; do
-        read -rp "$prompt_msg" port
-        port=${port:-$default_port}
-        [[ -z "$port" ]] && port=$(get_random_port) && info "为您分发未占用端口: $port" && break
-        if is_valid_port "$port"; then
-            if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
-                error "端口 ${port} 已被占用，请更换。" && continue
-            fi
+fetch_latest_version() {
+    echo -e "${YELLOW}[INFO]正在轮询获取 Xray-core 最新 Release 版本号...${RESET}"
+    VERSION=""
+    for proxy in "${GITHUB_PROXIES[@]}"; do
+        local api_url="${proxy}https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+        local resp
+        resp=$(wget -qO- --timeout=5 --tries=1 --no-check-certificate "$api_url" 2>/dev/null) || continue
+        local tmp_ver
+        tmp_ver=$(echo "$resp" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
+        if [[ -n "$tmp_ver" && "$tmp_ver" != "null" ]]; then
+            VERSION="${tmp_ver#v}"
+            echo -e "${GREEN}[OK]成功获取到最新版本: ${VERSION}${RESET}"
             break
-        else error "请输入合法端口数字！"; fi
+        fi
+    done
+    if [ -z "$VERSION" ]; then
+        VERSION="$BACKUP_VERSION"
+        echo -e "${YELLOW}[WARN]降级采用稳定默认版本: ${VERSION}${RESET}"
+    fi
+}
+
+download_bin() {
+    local arch
+    arch=$(get_arch)
+    fetch_latest_version
+    local download_success=false
+    
+    for proxy in "${GITHUB_PROXIES[@]}"; do
+        local url_bin="${proxy}https://github.com/XTLS/Xray-core/releases/download/v${VERSION}/Xray-linux-${arch}.zip"
+        echo -e "${YELLOW}[INFO]正在尝试通过镜像源 [ ${CYAN}${proxy:-官方直连}${YELLOW} ] 下载资产包...${RESET}"
+        if curl -fsSL --connect-timeout 8 --max-time 60 -o "$TMP_DIR/xray.zip" "$url_bin"; then
+            if [ -s "$TMP_DIR/xray.zip" ]; then
+                download_success=true
+                unzip -qo "$TMP_DIR/xray.zip" -d "$TMP_DIR/extracted"
+                echo -e "${GREEN}[OK]核心包同步下载与解压完成！${RESET}"
+                break
+            fi
+        fi
+        echo -e "${YELLOW}[WARN]当前源下载失败或连接超时，正在为您自动切换下一个备用源...${RESET}"
     done
 
-    # 清理当前专属实例历史旧防火墙链条
-    iptables -t nat -F "SB_HY2_${instance}" >/dev/null 2>&1 || true
-    iptables -t nat -D PREROUTING -j "SB_HY2_${instance}" >/dev/null 2>&1 || true
-    iptables -t nat -X "SB_HY2_${instance}" >/dev/null 2>&1 || true
-    ip6tables -t nat -F "SB_HY2_${instance}" >/dev/null 2>&1 || true
-    ip6tables -t nat -D PREROUTING -j "SB_HY2_${instance}" >/dev/null 2>&1 || true
-    ip6tables -t nat -X "SB_HY2_${instance}" >/dev/null 2>&1 || true
-
-    echo "---------------------------------------------"
-    echo -e "实例端口流控模式选择："
-    echo -e " 1) 单端口独立模式"
-    echo -e " 2) 端口跳跃分流模式${YELLOW}（默认）${RESET}"
-    echo "---------------------------------------------"
-    local jumpInput
-    read -rp "请选择模式 [1-2] (直接回车默认跳跃模式): " jumpInput
-    jumpInput=${jumpInput:-2}
-
-    if [[ $jumpInput == 2 ]]; then
-        while true; do
-            local p_start_msg="设置起始端口: "
-            [[ -n "$old_first" ]] && p_start_msg="设置起始端口 [当前: ${old_first}, 回车不修改]: "
-            read -rp "$p_start_msg" firstport
-            firstport=${firstport:-$old_first}
-
-            local p_end_msg="设置结束端口: "
-            [[ -n "$old_end" ]] && p_end_msg="设置结束端口 [当前: ${old_end}, 回车不修改]: "
-            read -rp "$p_end_msg" endport
-            endport=${endport:-$old_end}
-
-            if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then 
-                break
-            else 
-                error "输入无效，起始端口必须小于末尾端口且不为空！"
-                old_first="" old_end=""
-            fi
-        done
-
-        # 针对当前实例下发独立隔离自定义子链
-        iptables -t nat -N "SB_HY2_${instance}" 2>/dev/null || true
-        iptables -t nat -A "SB_HY2_${instance}" -p udp --dport "$firstport:$endport" -j REDIRECT --to-ports "$port"
-        iptables -t nat -I PREROUTING -j "SB_HY2_${instance}"
-        
-        ip6tables -t nat -N "SB_HY2_${instance}" 2>/dev/null || true
-        ip6tables -t nat -A "SB_HY2_${instance}" -p udp --dport "$firstport:$endport" -j REDIRECT --to-ports "$port"
-        ip6tables -t nat -I PREROUTING -j "SB_HY2_${instance}"
-
-        if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
-        if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
-        echo "$firstport-$endport" > "${BASE_DIR}/hopping_${instance}.txt"
-        info "已成功下发隔离型端口跳跃规则: $firstport-$endport -> $port"
-    else
-        rm -f "${BASE_DIR}/hopping_${instance}.txt"
-        firstport="" && endport=""
+    if [ "$download_success" = "false" ]; then
+        echo -e "${RED}[ERROR]所有 GitHub 镜像代理源及官方通道均尝试失败，请检查 network 后重试！${RESET}" >&2
+        exit 1
     fi
+}
+
+write_template_service() {
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Xray Vless Encryption Service (Instance: %I)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=${BIN_PATH} run -config ${CONFIG_DIR}/config_%I.json
+Restart=on-failure
+RestartSec=2s
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 "$SERVICE_FILE"
+    systemctl daemon-reload
+}
+
+init_environment() {
+    install -m 0755 -d "$(dirname "$BIN_PATH")"
+    install -m 0755 -d "$CONFIG_DIR"
+    install -m 0755 -d "$LOG_DIR"
+    install -m 0755 -d "$LINK_DIR"
+}
+
+# ── VLESS Encryption 专用加解密提取对提取引擎 ─────────────────────────
+generate_vless_encryption_pair() {
+    local vlessenc_output
+    vlessenc_output=$($BIN_PATH vlessenc 2>/dev/null || true)
+    if [ -z "$vlessenc_output" ]; then return 1; fi
+
+    local decryption_config=""
+    local encryption_config=""
+    local in_mlkem_section=false
+
+    while IFS= read -r line; do
+        if [[ "$line" == *"Authentication: ML-KEM-768, Post-Quantum"* ]]; then
+            in_mlkem_section=true
+            continue
+        fi
+        if [ "$in_mlkem_section" = true ]; then
+            if [[ "$line" == *'"decryption":'* ]]; then
+                decryption_config=$(echo "$line" | sed 's/.*"decryption": "\([^"]*\)".*/\1/')
+            elif [[ "$line" == *'"encryption":'* ]]; then
+                if echo "$line" | grep -q '.*"encryption": "[^"]*"'; then
+                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\)..*/\1/')
+                else
+                    encryption_config=$(echo "$line" | sed 's/.*"encryption": "\([^"]*\).*/\1/')
+                    read -r next_line
+                    encryption_config="${encryption_config}${next_line}"
+                    encryption_config=$(echo "$encryption_config" | tr -d '"' | tr -d '[:space:]')
+                fi
+                break
+            fi
+        fi
+    done <<< "$vlessenc_output"
+
+    if [ -z "$decryption_config" ] || [ -z "$encryption_config" ]; then return 1; fi
+    echo "${decryption_config}|${encryption_config}"
+}
+
+write_config() {
+    local instance="$1" port="$2" uuid="$3" decryption="$4" encryption="$5" remark="$6"
+    local conf_file="${CONFIG_DIR}/config_${instance}.json"
+    
+    jq -n \
+        --arg port_str "${port}" \
+        --arg uuid "${uuid}" \
+        --arg decryption "${decryption}" \
+        --arg flow "xtls-rprx-vision" \
+        --arg instance "${instance}" \
+        --arg encryption "${encryption}" \
+        --arg remark "${remark}" \
+    '{
+      "log": { "loglevel": "warning" },
+      "inbounds": [{
+        "listen": "::",
+        "port": ($port_str | tonumber),
+        "protocol": "vless",
+        "settings": {
+          "clients": [{ "id": $uuid, "flow": $flow }],
+          "decryption": $decryption
+        }
+      }],
+      "outbounds": [{ "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4v6" } }],
+      "_meta": { "alias": $instance, "encryption": $encryption, "remark": $remark }
+    }' > "$conf_file"
+
+    chmod 0644 "$conf_file"
+    register_instance "$instance"
+}
+
+generate_link() {
+    local instance="$1"
+    local file="${CONFIG_DIR}/config_${instance}.json"
+    [[ ! -f "$file" ]] && return 1
+    
+    local ip uuid port encryption remark display_ip encoded_remark
+    ip=$(get_public_ip)
+    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$file" 2>/dev/null || echo "")
+    port=$(jq -r '.inbounds[0].port' "$file" 2>/dev/null || echo "")
+    encryption=$(jq -r '._meta.encryption // empty' "$file" 2>/dev/null || echo "")
+    remark=$(jq -r '._meta.remark // empty' "$file" 2>/dev/null || echo "VLESS-Enc")
+    
+    display_ip="$ip"; [[ "$ip" =~ ":" ]] && display_ip="[$ip]"
+    encoded_remark=$(jq -rn --arg x "$remark" '$x|@uri')
+    
+    cat > "${LINK_DIR}/xray_${instance}.txt" <<EOF
+vless://${uuid}@${display_ip}:${port}?encryption=${encryption}&flow=xtls-rprx-vision&type=tcp&security=none#${encoded_remark}
+EOF
 }
 
 print_node_summary() {
     local instance="$1"
-    local conf_file="${BASE_DIR}/config_${instance}.json"
-    local hy_dir="${HY_DIR_BASE}/${instance}"
-    if [ ! -f "$conf_file" ]; then return; fi
+    local file="${CONFIG_DIR}/config_${instance}.json"
+    if [ ! -f "$file" ]; then return; fi
 
-    local vps_ip=$(get_public_ip)
-    local main_port=$(jq -r '.inbounds[0].listen_port' "$conf_file")
-    local auth_pwd=$(jq -r '.inbounds[0].users[0].password' "$conf_file")
-    local current_sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_file")
-    local hostname=$(hostname -s 2>/dev/null || echo "Alpine")
+    generate_link "$instance"
 
-    local is_insecure="false"
-    [[ "$current_sni" == "www.bing.com" ]] && is_insecure="true"
-
-    local jump_range="无 (单端口)"
-    [[ -f "${BASE_DIR}/hopping_${instance}.txt" ]] && jump_range=$(cat "${BASE_DIR}/hopping_${instance}.txt")
-
-    local last_ip="$vps_ip"
-    [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
-
-    echo -e "\n${GREEN}== sing-box Hy2 实例${RESET}${YELLOW} [ ${instance} ]${RESET} ${GREEN}配置详情 ==${RESET}"
-    echo -e "${GREEN}实例协议     :${RESET} ${YELLOW}Hysteria 2 (sing-box 内核)${RESET}"
-    echo -e "${GREEN}外网绑定 IP  :${RESET} $vps_ip"
-    echo -e "${GREEN}监听主端口   :${RESET} $main_port"
-    echo -e "${GREEN}端口跳跃范围 :${RESET} $jump_range"
-    echo -e "${GREEN}验证鉴权密码 :${RESET} $auth_pwd"
-    echo -e "${GREEN}伪装 SNI 域名:${RESET} $current_sni"
-    echo -e "${GREEN}配置文件路径 :${RESET} $conf_file"
+    echo -e "\n${GREEN}== Xray 实例${RESET}${YELLOW} [ ${instance} ]${RESET} ${GREEN}配置详情 ==${RESET}"
+    echo -e "${GREEN}实例协议     :${RESET} ${YELLOW}VLESS-Encryption (ML-KEM-768)${RESET}"
+    echo -e "${GREEN}外网绑定 IP  :${RESET} $(get_public_ip)"
+    echo -e "${GREEN}监听端口     :${RESET} $(jq -r '.inbounds[0].port' "$file" 2>/dev/null)"
+    echo -e "${GREEN}用户凭证UUID :${RESET} $(jq -r '.inbounds[0].settings.clients[0].id' "$file" 2>/dev/null)"
+    echo -e "${GREEN}自定义备注   :${RESET} $(jq -r '._meta.remark // empty' "$file" 2>/dev/null)"
+    echo -e "${GREEN}配置文件路径 :${RESET} ${file}"
     echo -e "${GREEN}--------------------------------------------${RESET}"
-    if [[ -f "$hy_dir/url.txt" ]]; then
+    if [[ -f "${LINK_DIR}/xray_${instance}.txt" ]]; then
         echo -e "${GREEN}👉 标准通用分享链接:${RESET}"
-        echo -e "${YELLOW}$(cat "$hy_dir/url.txt")${RESET}"
-        echo ""
-        echo -e "${GREEN}👉 Surge 专属配置格式:${RESET}"
-        echo -e "${YELLOW}${hostname}-${instance}-Hy2 = hysteria2, ${vps_ip}, ${main_port}, password=${auth_pwd}, skip-cert-verify=${is_insecure}, sni=${current_sni}${RESET}"
+        echo -e "${YELLOW}$(cat "${LINK_DIR}/xray_${instance}.txt")${RESET}"
     fi
     echo ""
 }
 
-write_and_show_config() {
-    local instance="$1"
-    local conf_file="${BASE_DIR}/config_${instance}.json"
-    local hy_dir="${HY_DIR_BASE}/${instance}"
-    local HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    local vps_ip=$(get_public_ip)
-    local log_path="/var/log/sing-box-hy2_${instance}.log"
-
-    local is_insecure="0"
-    if [[ "$EVAL_DOMAIN" == "www.bing.com" ]]; then is_insecure="1"; fi
-
-    cat << EOF > "$conf_file"
-{
-  "log": {
-    "level": "info",
-    "output": "$log_path",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "hysteria2",
-      "tag": "hy2-in-${instance}",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "password": "$auth_pwd"
-        }
-      ],
-      "ignore_client_bandwidth": true,
-      "tls": {
-        "enabled": true,
-        "server_name": "$EVAL_DOMAIN",
-        "certificate_path": "$EVAL_CERT_PATH",
-        "key_path": "$EVAL_KEY_PATH"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "final": "direct"
-  }
-}
-EOF
-
-    local last_port=$port
-    if [[ -f "${BASE_DIR}/hopping_${instance}.txt" ]]; then
-        last_port=$(cat "${BASE_DIR}/hopping_${instance}.txt")
-    fi
-    local last_ip="$vps_ip"
-    [[ "$vps_ip" =~ ":" ]] && last_ip="[$vps_ip]"
-
-    mkdir -p "$hy_dir"
-    cat << EOF > "$hy_dir/url.txt"
-hysteria2://$auth_pwd@$last_ip:$port?insecure=${is_insecure}&sni=$EVAL_DOMAIN#$HOSTNAME-sbhy2-${instance}
-EOF
-
-    chmod 640 "$conf_file"
-    chown -R singbox-hy2:singbox-hy2 "$BASE_DIR"
-    register_instance "$instance"
-
-    # OpenRC 通过创建独立服务命名的软链接实现多实例运行机制
-    local instance_service="/etc/init.d/sing-box-hy2.${instance}"
-    if [[ ! -L "$instance_service" ]]; then
-        ln -sf "$OPENRC_TEMPLATE_PATH" "$instance_service"
-    fi
-
-    rc-update add "sing-box-hy2.${instance}" default >/dev/null 2>&1 || true
-    rc-service "sing-box-hy2.${instance}" restart >/dev/null 2>&1 || true
-
-    if rc-service "sing-box-hy2.${instance}" status 2>/dev/null | grep -q "started"; then
-        print_node_summary "$instance"
+get_status_info() {
+    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" 2>/dev/null; then
+        panel_status="${GREEN}● 运行中${RESET}"
     else
-        error "实例服务下发完成，但拉起响应失败。请通过菜单 [8] 排查错误日志。"
-    fi
-}
-
-insthysteria() {
-    local mode="${1:-new}"
-    check_environment
-    
-    [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
-    write_openrc_template
-
-    if [[ ! -f "$INSTALL_BIN" ]]; then
-        echo -e "${YELLOW}全局引擎内核缺失，准备同步拉取核心组件...${RESET}"
-        download_core || return 1
+        panel_status="${RED}● 未运行${RESET}"
     fi
 
-    local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
-    if [[ "$mode" == "new" && -f "$conf_file" ]]; then
-        echo -e "${YELLOW}[WARN]检测到该实例 [ ${CURRENT_INSTANCE} ] 已经存在配置。${RESET}"
-        read -r -p "$(echo -e "${GREEN}是否强行覆盖并重置该实例？[y/N]: ${RESET}")" confirm || true
-        [[ "$confirm" =~ ^[Yy]$ ]] || return
-    fi
-
-    if [[ "$mode" == "edit" ]]; then
-        echo -e "\n${GREEN}==== [正在修改实例参数: ${CURRENT_INSTANCE}] ====${RESET}"
-        local old_pwd=$(jq -r '.inbounds[0].users[0].password // empty' "$conf_file")
-    fi
-
-    inst_cert "$CURRENT_INSTANCE" || return 1
-    inst_port "$CURRENT_INSTANCE"
-
-    if [[ "$mode" == "edit" ]]; then
-        read -rp "配置鉴权验证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
-        auth_pwd=${auth_pwd:-$old_pwd}
+    if [ -f "$BIN_PATH" ]; then
+        local real_ver
+        real_ver=$($BIN_PATH version 2>/dev/null | grep -i "Xray" | head -n 1 | awk '{print $2}')
+        panel_version="${real_ver:-v1.x}"
     else
-        read -rp "设置验证密码 (回车分配高强度随机密钥): " auth_pwd
-        auth_pwd=${auth_pwd:-$(generate_random_password)}
+        panel_version="${RED}未下载核心${RESET}"
     fi
 
-    write_and_show_config "$CURRENT_INSTANCE"
+    local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
+    if [ -f "$conf_file" ]; then
+        local p_num
+        p_num=$(jq -r '.inbounds[0].port // empty' "$conf_file" 2>/dev/null)
+        panel_port="${p_num} (Encryption)"
+        
+        local out_proto
+        out_proto=$(jq -r '.outbounds[0].protocol // "freedom"' "$conf_file" 2>/dev/null)
+        if [[ "$out_proto" == "socks" ]]; then
+            panel_outbound="${YELLOW}Socks5出口${RESET}"
+        else
+            panel_outbound="${YELLOW}直连出口${RESET}"
+        fi
+    else
+        panel_port="未创建配置"
+        panel_outbound="${RED}未创建配置${RESET}"
+    fi
 }
 
-unsthysteria() {
-    echo -e "${YELLOW}[WARN]该操作将彻底销毁清理当前控制聚焦的 [ ${CURRENT_INSTANCE} ] 独立服务。${RESET}"
-    read -r -p "$(echo -e "${RED}确定完全卸载移除此实例？[y/N]: ${RESET}")" confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
+parse_existing_config() {
+    local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
+    if [ ! -f "$conf_file" ]; then return 1; fi
 
-    rc-service "sing-box-hy2.${CURRENT_INSTANCE}" stop >/dev/null 2>&1 || true
-    rc-update del "sing-box-hy2.${CURRENT_INSTANCE}" default >/dev/null 2>&1 || true
-    rm -f "/etc/init.d/sing-box-hy2.${CURRENT_INSTANCE}"
-    
-    iptables -t nat -F "SB_HY2_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    iptables -t nat -D PREROUTING -j "SB_HY2_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    iptables -t nat -X "SB_HY2_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    ip6tables -t nat -F "SB_HY2_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    ip6tables -t nat -D PREROUTING -j "SB_HY2_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    ip6tables -t nat -X "SB_HY2_${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-    if [[ -f /etc/init.d/iptables ]]; then /etc/init.d/iptables save &>/dev/null || true; fi
-    if [[ -f /etc/init.d/ip6tables ]]; then /etc/init.d/ip6tables save &>/dev/null || true; fi
+    OLD_PORT=$(jq -r '.inbounds[0].port' "$conf_file" 2>/dev/null)
+    OLD_UUID=$(jq -r '.inbounds[0].settings.clients[0].id' "$conf_file" 2>/dev/null)
+    OLD_DECRYPTION=$(jq -r '.inbounds[0].settings.decryption' "$conf_file" 2>/dev/null)
+    OLD_ENCRYPTION=$(jq -r '._meta.encryption' "$conf_file" 2>/dev/null)
+    OLD_REMARK=$(jq -r '._meta.remark // empty' "$conf_file" 2>/dev/null)
+    return 0
+}
 
-    rm -f "${BASE_DIR}/config_${CURRENT_INSTANCE}.json" "${BASE_DIR}/hopping_${CURRENT_INSTANCE}.txt"
-    rm -f "${BASE_DIR}/server_${CURRENT_INSTANCE}.crt" "${BASE_DIR}/server_${CURRENT_INSTANCE}.key"
-    rm -f "/var/log/sing-box-hy2_${CURRENT_INSTANCE}.log"
-    rm -rf "${HY_DIR_BASE}/${CURRENT_INSTANCE}"
-
-    unregister_instance "$CURRENT_INSTANCE"
-    echo -e "${GREEN}矩阵实例 [ ${CURRENT_INSTANCE} ] 彻底安全移除。${RESET}"
+menu_switch_instance() {
+    echo -e "\n${GREEN}======== [多开实例矩阵管理中心] ========${RESET}"
+    echo -e "${GREEN}当前操作目标:${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+    echo -e "${GREEN}目前独立实例列表:${RESET}"
 
     sync_registry
-    if [ ! -s "$REGISTRY_FILE" ]; then
-        echo -e "${GREEN}检测到矩阵内已无任何活跃节点，深度自动卸载全系统共享组件...${RESET}"
-        rm -f "$OPENRC_TEMPLATE_PATH" "$INSTALL_BIN"
-        rm -rf "$BASE_DIR" "$HY_DIR_BASE"
-        echo -e "${GREEN}全系统宿主机残留已深度彻底清洗清除。${RESET}"
-        CURRENT_INSTANCE="hy2"
-    fi
-}
 
-menu_switch_matrix() {
-    echo -e "\n${GREEN}==== [sing-box Hysteria 2 多开实例中心] ====${RESET}"
-    echo -e "${GREEN}当前操作目标实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}当前独立实例列表:${RESET}"
-
-    sync_registry
+    local instance_list=()
     local count=0
-    local -a instance_list=()
 
     if [ -f "$REGISTRY_FILE" ]; then
         while IFS= read -r name || [ -n "$name" ]; do
             [ -z "$name" ] && continue
-            local c_file="${BASE_DIR}/config_${name}.json"
-            [ -f "$c_file" ] || continue
+            local conf_file="${CONFIG_DIR}/config_${name}.json"
+            [ -f "$conf_file" ] || continue
 
-            count=$((count + 1))
-            instance_list[$count]="$name"
+            ((count++))
+            instance_list+=("$name")
             
-            local port_num=$(jq -r '.inbounds[0].listen_port // empty' "$c_file")
+            local port_num
+            port_num=$(jq -r '.inbounds[0].port // "未知"' "$conf_file" 2>/dev/null || echo "未知")
             local status_str="${RED}已停止${RESET}"
-            if rc-service "sing-box-hy2.${name}" status 2>/dev/null | grep -q "started"; then 
-                status_str="${GREEN}运行中${RESET}"
-            fi
-            echo -e " ${CYAN}[ ${count} ] ->${GREEN} 实例名: ${YELLOW}${name}${RESET} ${GREEN}[绑定端口: ${port_num} | 运行状态: ${status_str}]${GREEN}"
+            systemctl is-active --quiet "${TEMPLATE_NAME}@${name}" 2>/dev/null && status_str="${GREEN}运行中${RESET}"
+            
+            echo -e " ${CYAN}[ ${count} ] ->${RESET} ${YELLOW}${name}${RESET} ${GREEN}[端口: ${port_num} | 状态: ${status_str}${GREEN}]${RESET}"
         done < "$REGISTRY_FILE"
     fi
 
-    if [ "$count" -eq 0 ]; then echo -e " ${YELLOW}(当前矩阵内空空如也，请直接在下方输入新名字创建第一个多开实例)${RESET}"; fi
+    if [ "$count" -eq 0 ]; then
+        echo -e " ${YELLOW}(暂无任何多开实例，请直接输入新名称创建)${RESET}"
+    fi
     
     echo ""
-    echo -e "${GREEN}👉 输入已有实例前面的【数字编号】快速切换管理目标${RESET}"
-    echo -e "${GREEN}👉 或者直接输入一个【全新的英文别名】来新建独立多开实例${RESET}"
+    echo -e "${GREEN}👉 输入现有实例前面的【数字编号】快速切换管理目标${RESET}"
+    echo -e "${GREEN}👉 或者直接输入一个【全新的英文名字】来新建多开实例${RESET}"
+    local input_val=""
     echo -ne "${YELLOW}请输入选择或名字: ${RESET}"
     read -r input_val || true
-    [[ -z "$input_val" ]] && return
+
+    if [ -z "$input_val" ]; then return; fi
 
     if [[ "$input_val" =~ ^[0-9]+$ ]]; then
         if [ "$input_val" -gt 0 ] && [ "$input_val" -le "$count" ]; then
-            CURRENT_INSTANCE="${instance_list[$input_val]}"
-            echo -e "${GREEN}操作焦点成功切为已有实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-        else echo -e "${RED}编号超出可用范围！${RESET}"; fi
+            local index=$((input_val - 1))
+            CURRENT_INSTANCE="${instance_list[$index]}"
+            echo -e "${GREEN}[OK]操作焦点已成功切为编号 [ ${input_val} ] 的实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+        else
+            echo -e "${YELLOW}[WARN]编号输入超出范围！未做任何变更。${RESET}"
+        fi
     else
-        if [[ "$input_val" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        if is_valid_alias "$input_val"; then
             CURRENT_INSTANCE="$input_val"
-            echo -e "${GREEN}成功锁定并创建新焦点: ${YELLOW}${CURRENT_INSTANCE}${RESET}${GREEN} (请在主菜单选择 [1] 下发部署服务)${RESET}"
-        else echo -e "${RED}命名不规范，仅限使用英文字母、数字、中划线和下划线！${RESET}"; fi
+            echo -e "${GREEN}[OK]检测到全新实例名称，已将焦点锁定在:${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET} ${GREEN}(请去主菜单按 1 创建它)${RESET}"
+        else
+            echo -e "${RED}[ERROR]名字仅限英文字母/数字/下划线！${RESET}" >&2
+        fi
     fi
 }
 
-showconf() {
-    print_node_summary "$CURRENT_INSTANCE"
+menu_install() {
+    init_environment
+    local is_edit=false
+    if [ "$1" = "edit" ]; then is_edit=true; fi
+
+    if [ "$is_edit" = "true" ]; then
+        if ! parse_existing_config; then
+            echo -e "${RED}[ERROR]未检测到实例 [ ${CURRENT_INSTANCE} ] 的旧配置，无法执行修改，请先按 1 进行全新部署！${RESET}" >&2
+            exit 1
+        fi
+        echo -e "\n${GREEN}==== [💡 正在修改实例: ${CURRENT_INSTANCE} (直接回车保持原样)] ====${RESET}"
+    else
+        local conf_file="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
+        if [ -f "$conf_file" ]; then
+            echo -e "${YELLOW}[WARN]实例 [ ${CURRENT_INSTANCE} ] 已经存在对应配置文件。${RESET}"
+            local res=""
+            read -r -p "$(echo -e "${GREEN}是否确定完全覆盖重写该实例？[y/N]: ${RESET}")" res || true
+            [[ "$res" =~ ^[Yy]$ ]] || return
+        fi
+        echo -e "\n${GREEN}==== [配置新实例 ${CURRENT_INSTANCE} 参数] ====${RESET}"
+        OLD_PORT=$((RANDOM % 50001 + 10000))
+        while ! check_port "$OLD_PORT"; do OLD_PORT=$((RANDOM % 50001 + 10000)); done
+        if [ -f "$BIN_PATH" ]; then
+            OLD_UUID=$("$BIN_PATH" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
+        else
+            OLD_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "7415d2b8-1454-4da8-963b-4663e8322851")
+        fi
+        OLD_REMARK="VLESS-Enc-${CURRENT_INSTANCE}"
+        OLD_DECRYPTION="" OLD_ENCRYPTION=""
+    fi
+
+    # 1. 端口绑定
+    local input_port="" opt_port=""
+    read -r -p "$(echo -e "${GREEN}请输入服务入站端口 [当前: ${YELLOW}${OLD_PORT}${GREEN} | 回车不改]: ${RESET}")" input_port || true
+    opt_port="${input_port:-$OLD_PORT}"
+    if [ "$opt_port" != "$OLD_PORT" ] || [ "$is_edit" = "false" ]; then
+        if ! is_valid_port "$opt_port"; then 
+            echo -e "${RED}[ERROR]无效端口，强制应用默认随机端口。${RESET}" >&2
+            opt_port="$OLD_PORT"
+        fi
+        if ! check_port "$opt_port"; then 
+            echo -e "${YELLOW}[WARN]警告：检测到端口 ${opt_port} 可能被占用！${RESET}"
+        fi
+    fi
+
+    # 2. 用户 UUID
+    local input_uuid="" opt_uuid=""
+    read -r -p "$(echo -e "${GREEN}请输入用户凭证 UUID [当前: ${YELLOW}${OLD_UUID}${GREEN} | 回车不改]: ${RESET}")" input_uuid || true
+    opt_uuid="${input_uuid:-$OLD_UUID}"
+
+    # 3. 自定义备注
+    local input_remark="" opt_remark=""
+    read -r -p "$(echo -e "${GREEN}请输入节点自定义备注 [当前: ${YELLOW}${OLD_REMARK}${GREEN} | 回车不改]: ${RESET}")" input_remark || true
+    opt_remark="${input_remark:-$OLD_REMARK}"
+
+    if [ ! -f "$BIN_PATH" ]; then
+        download_bin
+        install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH"
+        cp -f "$TMP_DIR/extracted/geoip.dat" "$TMP_DIR/extracted/geosite.dat" "${CONFIG_DIR}/" 2>/dev/null || true
+    fi
+
+    # 4. 处理底层加解密对生成 (编辑模式下原地继承，防掉线)
+    local opt_decryption="$OLD_DECRYPTION" local opt_encryption="$OLD_ENCRYPTION"
+    if [ -z "$opt_decryption" ] || [ "$is_edit" = "false" ]; then
+        echo -e "${YELLOW}[INFO]正在为您动态生成 ML-KEM 抗量子加解密对基础底座...${RESET}"
+        local enc_pair
+        enc_pair=$(generate_vless_encryption_pair) || { echo -e "${RED}[ERROR]获取内核加解密底座对失败，请检查核心兼容性。${RESET}" >&2; return 1; }
+        opt_decryption=$(echo "$enc_pair" | cut -d'|' -f1)
+        opt_encryption=$(echo "$enc_pair" | cut -d'|' -f2)
+    fi
+
+    write_config "$CURRENT_INSTANCE" "$opt_port" "$opt_uuid" "$opt_decryption" "$opt_encryption" "$opt_remark"
+    write_template_service
+
+    echo -e "${YELLOW}[INFO]正在安全重载实例配置项并拉起: ${CURRENT_INSTANCE} ...${RESET}"
+    systemctl enable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+    systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+    
+    sleep 1.5
+    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+        echo -e "${GREEN}[OK]Xray Encryption 实例 [ ${CURRENT_INSTANCE} ] 部署/修改成功！${RESET}"
+        print_node_summary "$CURRENT_INSTANCE"
+    else
+        echo -e "${YELLOW}[WARN]实例重启成功，但检测到异常挂起，请按 [8] 抓取内核滚动日志排查。${RESET}"
+    fi
 }
 
-# =========================================================
-# 7. 面板交互菜单 
-# =========================================================
-menu() {
-    [[ $EUID -ne 0 ]] && echo -e "${RED}请切换至 root 用户运行此面板脚本。${RESET}" && exit 1
-    check_environment
+menu_uninstall() {
+    echo -e "${YELLOW}[WARN]该操作将彻底销毁当前聚焦选择的 Encryption 实例及其占用的端口通道。${RESET}"
+    local res=""
+    read -r -p "$(echo -e "${RED}确认抹除清理实例 [ ${CURRENT_INSTANCE} ] 吗？[y/N]: ${RESET}")" res || true
+    [[ "$res" =~ ^[Yy]$ ]] || return
+
+    systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+    systemctl disable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+    rm -f "${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
+    rm -f "${LINK_DIR}/xray_${CURRENT_INSTANCE}.txt"
+    unregister_instance "$CURRENT_INSTANCE"
+    echo -e "${GREEN}[OK]实例 [ ${CURRENT_INSTANCE} ] 已被纯净抹除。${RESET}"
+
+    if [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR" | grep 'config_')" ]; then
+        echo -e "${YELLOW}[INFO]检测到所有 Encryption 节点已排空，执行全局核心组件垃圾回收机制...${RESET}"
+        systemctl stop "${TEMPLATE_NAME}@*" >/dev/null 2>&1 || true
+        rm -f "$SERVICE_FILE" "$BIN_PATH" "$REGISTRY_FILE"
+        rm -rf "$CONFIG_DIR" "$LOG_DIR"
+        rm -f "${LINK_DIR}"/xray_*.txt 2>/dev/null || true
+        systemctl daemon-reload
+        echo -e "${GREEN}[OK]全系统已无常驻残留，基础依赖与内核解绑卸载完成！${RESET}"
+        CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "Xray")"
+    fi
+}
+
+configure_custom_socks5_outbound() {
+    local instance_config="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
+    if [[ ! -f "$instance_config" ]]; then 
+        echo -e "${RED}[ERROR]未安装，无法配置出口模式。${RESET}" >&2
+        return
+    fi
+
+    local mode current_protocol tmp_file
+    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$instance_config" 2>/dev/null || echo "freedom")
+
+    echo -e "${GREEN}-------------------------------------------${RESET}"
+    echo -e "${YELLOW}请选择出口模式：${RESET}"
+    if [[ "$current_protocol" == "socks" ]]; then
+        echo -e "${GREEN}当前模式:${RESET} ${YELLOW}Socks5${RESET}"
+    else
+        echo -e "${GREEN}当前模式:${RESET} ${YELLOW}直连${RESET}"
+    fi
+    echo -e "${GREEN}1) 直连出口${RESET}"
+    echo -e "${GREEN}2) Socks5出口${RESET}"
+    echo -e "${GREEN}0) 取消${RESET}"
+    echo -e "${GREEN}-------------------------------------------${RESET}"
+
+    echo -ne "${YELLOW}请输入选项: ${RESET}"
+    read -r mode || true
+    case "$mode" in
+        1)
+            tmp_file=$(mktemp)
+            jq '.outbounds = [{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]' "$instance_config" > "$tmp_file"
+            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+                rm -f "$tmp_file"
+                echo -e "${RED}[ERROR]生成的直连配置无效。${RESET}" >&2
+                return 1
+            fi
+            cp "$instance_config" "${instance_config}.bak.$(date +%s)"
+            mv "$tmp_file" "$instance_config"
+            chmod 644 "$instance_config" 2>/dev/null || true
+            
+            systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+            sleep 0.5
+            if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+                echo -e "${GREEN}[OK]已成功切换为直连出口！${RESET}"
+            else
+                echo -e "${RED}[ERROR]切换到直连失败。${RESET}" >&2
+                return 1
+            fi
+            return
+            ;;
+        2)
+            ;;
+        0|"")
+            echo -e "${YELLOW}[INFO]已取消配置。${RESET}"
+            return
+            ;;
+        *)
+            echo -e "${RED}[ERROR]无效选项，请输入 0-2 之间的数字。${RESET}" >&2
+            return 1
+            ;;
+    esac
+
+    echo -e "${YELLOW}[INFO]配置自定义 Socks5 出口代理...${RESET}"
+
+    local socks_host socks_port socks_user socks_pass
+
+    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
+    [[ -z "$socks_host" ]] && echo -e "${YELLOW}[INFO]已取消配置。${RESET}" && return
 
     while true; do
-        clear
-        local status=$(get_hy_status)
-        local version=$(get_installed_version)
-        local port_show=$(get_current_port_display)
-
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${GREEN}      ◈ sing-box Hy2 多实例面板 ◈          ${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-        echo -e "${GREEN}目标实例端口 :${RESET} ${YELLOW}${port_show}${RESET}"
-        echo -e "${GREEN}服务活跃状态 :${RESET} $status"
-        echo -e "${GREEN}共享内核版本 :${RESET} ${YELLOW}${version}${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-        echo -e "${GREEN} 1. 安装当前实例${RESET}"
-        echo -e "${GREEN} 2. 更新共享内核程序${RESET}"
-        echo -e "${GREEN} 3. 卸载当前实例${RESET}"
-        echo -e "${GREEN} 4. 修改当前实例配置${RESET}"
-        echo -e "${GREEN} 5. 启动当前实例${RESET}"
-        echo -e "${GREEN} 6. 停止当前实例${RESET}"
-        echo -e "${GREEN} 7. 重启当前实例${RESET}"
-        echo -e "${GREEN} 8. 查看当前实例日志${RESET}"
-        echo -e "${GREEN} 9. 查看当前实例配置${RESET}"
-        echo -e "${GREEN}10. 管理多开实例    ${YELLOW}← 添加/切换节点${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}===========================================${RESET}"
-
-        local choice=""
-        read -r -p $'\033[32m选择操作序号: \033[0m' choice || true
-        [[ -z "$choice" ]] && continue
-
-        case "$choice" in
-            1) insthysteria "new"; pause ;;
-            2) 
-                if download_core; then
-                    echo -e "${GREEN}[OK] 引擎内核覆盖升级完毕，各运行实例将在重启后生效。${RESET}"
-                fi
-                pause ;;
-            3) unsthysteria; pause ;;
-            4) insthysteria "edit"; pause ;;
-            5) rc-service "sing-box-hy2.${CURRENT_INSTANCE}" start && echo -e "${GREEN}[OK]启动成功${RESET}" ; pause ;;
-            6) rc-service "sing-box-hy2.${CURRENT_INSTANCE}" stop && echo -e "${GREEN}[OK]停止成功${RESET}" ; pause ;;
-            7) rc-service "sing-box-hy2.${CURRENT_INSTANCE}" restart && echo -e "${GREEN}[OK]重启完毕${RESET}" ; pause ;;
-            8) 
-                local log_f="/var/log/sing-box-hy2_${CURRENT_INSTANCE}.log"
-                if [[ -f "$log_f" ]]; then tail -n 50 "$log_f"; else warn "未发现实例运行日志。"; fi
-                pause ;;
-            9) showconf; pause ;;
-            10) menu_switch_matrix ;;
-            0) clear; exit 0 ;;
-            *) error "输入未知操作序号！"; sleep 0.5 ;;
-        esac
+        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
+        [[ -z "$socks_port" ]] && socks_port=1080
+        if is_valid_port "$socks_port"; then
+            break
+        else
+            echo -e "${RED}[ERROR]端口无效，请输入一个1-65535之间的数字。${RESET}" >&2
+        fi
     done
+
+    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
+    if [[ -n "$socks_user" ]]; then
+        read -rs -p "请输入 Socks5 密码: " socks_pass || true
+        echo
+    else
+        socks_pass=""
+    fi
+
+    tmp_file=$(mktemp)
+
+    if [[ -n "$socks_user" ]]; then
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            --arg user "$socks_user" \
+            --arg pass "$socks_pass" \
+            '
+            .outbounds = [
+              {
+                "protocol": "socks",
+                "tag": "custom-socks5-out",
+                "settings": {
+                  "servers": [
+                    {
+                      "address": $host,
+                      "port": $port,
+                      "users": [
+                        {
+                          "user": $user,
+                          "pass": $pass
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+            ' "$instance_config" > "$tmp_file"
+    else
+        jq \
+            --arg host "$socks_host" \
+            --argjson port "$socks_port" \
+            '
+            .outbounds = [
+              {
+                "protocol": "socks",
+                "tag": "custom-socks5-out",
+                "settings": {
+                  "servers": [
+                    {
+                      "address": $host,
+                      "port": $port
+                    }
+                  ]
+                }
+              }
+            ]
+            ' "$instance_config" > "$tmp_file"
+    fi
+
+    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        echo -e "${RED}[ERROR]生成的 Socks5 配置无效，请检查输入后重试。${RESET}" >&2
+        return 1
+    fi
+
+    cp "$instance_config" "${instance_config}.bak.$(date +%s)"
+    mv "$tmp_file" "$instance_config"
+    chmod 644 "$instance_config" 2>/dev/null || true
+
+    systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
+    sleep 0.5
+    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
+        echo -e "${GREEN}[OK]已成功切换为 Socks5 出口！${RESET}"
+    else
+        echo -e "${RED}[ERROR]重启服务失败，当前配置可能与 system 环境不兼容。${RESET}" >&2
+        return 1
+    fi
 }
 
-menu "$@"
+# ── 循环路由守护 ────────────────────────────────────────────────────────
+while true; do
+    get_status_info
+    clear
+    echo -e "${GREEN}===========================================${RESET}"
+    echo -e "${GREEN}    ◈ Xray VLESS-Encryption 多实例管理面板 ◈   ${RESET}"
+    echo -e "${GREEN}===========================================${RESET}"
+    echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
+    echo -e "${GREEN}目标实例绑定 :${RESET} ${YELLOW}${panel_port}${RESET}"
+    echo -e "${GREEN}服务活跃状态 :${RESET} $panel_status"
+    echo -e "${GREEN}核心沙箱引擎 :${RESET} ${YELLOW}${panel_version}${RESET}"
+    echo -e "${GREEN}链式分流代理 :${RESET} $panel_outbound"
+    echo -e "${GREEN}===========================================${RESET}"
+    echo -e "${GREEN} 1. 安装当前实例${RESET}"
+    echo -e "${GREEN} 2. 更新内核程序${RESET}"
+    echo -e "${GREEN} 3. 卸载当前实例${RESET}"
+    echo -e "${GREEN} 4. 修改当前实例${RESET}"
+    echo -e "${GREEN} 5. 启动当前实例${RESET}"
+    echo -e "${GREEN} 6. 停止当前实例${RESET}"
+    echo -e "${GREEN} 7. 重启当前实例${RESET}"
+    echo -e "${GREEN} 8. 当前实例日志${RESET}"
+    echo -e "${GREEN} 9. 当前实例配置${RESET}"
+    echo -e "${GREEN}10. Socks5出口${RESET}     ${YELLOW}← 链式分流代理${RESET}"
+    echo -e "${GREEN}11. 管理实例${RESET}       ${YELLOW}← 添加/切换节点${RESET}"
+    echo -e "${RED} 0. 退出${RESET}"
+    echo -e "${GREEN}===========================================${RESET}"
+    
+    choice=""
+    read -r -p "$(echo -e "${GREEN}选择操作序号: ${RESET}")" choice || true
+    case "$choice" in
+        1) menu_install "new" ;;
+        2) download_bin && install -m 0755 -o root -g root "$TMP_DIR/extracted/xray" "$BIN_PATH" && echo -e "${GREEN}[OK]Xray 核心更新成功${RESET}" ;;
+        3) menu_uninstall ;;
+        4) menu_install "edit" ;;
+        5) systemctl start "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]启动成功${RESET}" ;;
+        6) systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]停止成功${RESET}" ;;
+        7) systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && echo -e "${GREEN}[OK]重启完毕${RESET}" ;;
+        8) (trap 'echo -e "\n"' INT; journalctl -u "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" -n 50 -f) ;;
+        9) print_node_summary "$CURRENT_INSTANCE" ;;
+        10) configure_custom_socks5_outbound ;;
+        11) menu_switch_instance ;;
+        0) exit 0 ;;
+        *) echo -e "${YELLOW}[WARN]无效输入！${RESET}"; sleep 1 ;;
+    esac
+    read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制台面...${RESET}")" || true
+done

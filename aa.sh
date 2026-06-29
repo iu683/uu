@@ -1,355 +1,301 @@
-#!/bin/sh
+#!/bin/bash
 
-# =================================================================
-# 名称: 流量统计 & VPS/Docker 状态 TG日报管理工具 (Alpine 专属版)
-# =================================================================
+# MTPROTO TG代理 控制面板
 
+# ================== 颜色定义 ==================
 GREEN="\033[32m"
-YELLOW="\033[33m"
-NC="\033[0m" # 清除颜色
+RED="\033[31m"
+YELLOW="\033[33m" 
+PURPLE="\033[35m"
+SKYBLUE="\033[36m"
+RESET="\033[0m"
 
-CONFIG_FILE="/etc/vnstat_tg.conf"  # 配置文件路径
-BIN_PATH="/usr/local/bin/vnstat_tg_report.sh"  # 报告脚本路径
 
-# --- 1. 环境准备 ---
-prepare_env() {
-    echo "🔍 正在检查 Alpine 系统环境..."
+# ================== 基础环境变量 ==================
+HOSTNAME=$(hostname)
+USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
+export SECRET=${SECRET:-$(echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32)}
+WORKDIR="/root/proxynode/mtproto"
+# 【已修改】改为开机后等待 30 秒再执行重启脚本，防止网卡未准备就绪
+CRON_CMD="@reboot sleep 30 && /bin/bash $WORKDIR/restart.sh >/dev/null 2>&1"
+LOG_FILE="$WORKDIR/mtg.log"
 
-    # 1. 检查并安装 apk 基础依赖 (去掉了会冲突的 cronie)
-    local deps="vnstat bc curl sed awk coreutils procps"
-    
-    echo "📥 更新 apk 软件源并安装依赖..."
-    apk update
-    for dep in $deps; do
-        if ! command -v "$dep" >/dev/null 2>&1; then
-            echo "📥 安装依赖: $dep"
-            apk add "$dep"
-        fi
-    done
+# ================== 工具函数 ==================
+red_echo() { echo -e "${RED}$1${RESET}"; }
+green_echo() { echo -e "${GREEN}$1${RESET}"; }
+yellow_echo() { echo -e "${YELLOW}$1${RESET}"; }
+purple_echo() { echo -e "${PURPLE}$1${RESET}"; }
 
-    # 2. OpenRC 服务管理 (Alpine 专属优化)
-    # Alpine 默认自带 dcron (服务名为 crond)，直接检查并启动即可
-    if ! rc-service crond status >/dev/null 2>&1; then
-        echo "📥 启动 Cron 服务..."
-        rc-update add crond default >/dev/null 2>&1
-        rc-service crond start
-    fi
-
-    # 探测 vnstat 在 Alpine 里的真实服务名 (可能是 vnstat 或 vnstatd)
-    local vnstat_service="vnstat"
-    if [ ! -f "/etc/init.d/vnstat" ] && [ -f "/etc/init.d/vnstatd" ]; then
-        vnstat_service="vnstatd"
-    fi
-
-    # 启动并开机自启 vnstat 服务
-    if [ -f "/etc/init.d/$vnstat_service" ]; then
-        if ! rc-service "$vnstat_service" status >/dev/null 2>&1; then
-            echo "📥 启动 $vnstat_service 服务..."
-            rc-update add "$vnstat_service" default >/dev/null 2>&1
-            rc-service "$vnstat_service" start
-        fi
+# 获取正在运行的端口
+get_running_port() {
+    local pid=$(pgrep -x mtg)
+    if [[ -n "$pid" ]]; then
+        # 尝试从进程参数中抓取绑定的端口
+        local port=$(ps -p "$pid" -o args= | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d':' -f2)
+        # 如果找不到，尝试从预留文件读取
+        [[ -z "$port" && -f "$WORKDIR/port.txt" ]] && port=$(cat "$WORKDIR/port.txt")
+        echo "${port:-未知}"
     else
-        echo "⚠️ 未找到 vnstat 的系统服务脚本，尝试后台直接启动守护进程..."
-        if ! pgrep vnstatd >/dev/null 2>&1; then
-            vnstatd -d
+        echo "无"
+    fi
+}
+
+get_public_ip() {
+    local ip
+    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
+        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
+        for url in "https://ip6.n0at.com" "https://ip.sb"; do
+            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+        done
+    done
+    echo "无法获取公网 IP"
+}
+
+random_port() {
+    shuf -i 2000-65000 -n 1
+}
+
+check_vps_port() {
+    local port=$1
+    while [[ -n $(lsof -i :$port 2>/dev/null) ]]; do
+        red_echo "${port} 端口已经被其他程序占用，请更换端口重试。"
+        read -p "请输入新端口（回车使用随机端口）: " port
+        [[ -z $port ]] && port=$(random_port) && green_echo "使用随机端口: $port"
+    done
+    echo "$port"
+}
+
+check_devil_port () {
+    port_list=$(devil port list)
+    tcp_ports=$(echo "$port_list" | grep -c "tcp")
+    udp_ports=$(echo "$port_list" | grep -c "udp")
+
+    if [[ $tcp_ports -lt 1 ]]; then
+        yellow_echo "没有可用的 TCP 端口，正在尝试自动调整..."
+        if [[ $udp_ports -ge 3 ]]; then
+            udp_port_to_delete=$(echo "$port_list" | awk '/udp/ {print $1}' | head -n 1)
+            devil port del udp "$udp_port_to_delete" >/dev/null 2>&1
+        fi
+
+        while true; do
+            local rand_p=$(shuf -i 10000-65535 -n 1)
+            result=$(devil port add tcp "$rand_p" 2>&1)
+            if [[ $result == *"Ok"* ]]; then
+                MTP_PORT=$rand_p
+                break
+            fi
+        done
+    else
+        MTP_PORT=$(echo "$port_list" | awk '/tcp/ {print $1}' | sed -n '1p')
+    fi
+    devil binexec on >/dev/null 2>&1
+}
+
+install_lsof() {
+    if ! command -v lsof &>/dev/null; then
+        if [ -f "/etc/debian_version" ]; then
+            apt update && apt install -y lsof
+        elif [ -f "/etc/alpine-release" ]; then
+            apk add lsof
         fi
     fi
-    
-    # 初始化 vnstat 数据库
-    vnstat -u >/dev/null 2>&1  
-    echo "✅ 环境就绪。"
-}
-# --- 2. 核心报表逻辑生成 ---
-generate_report_logic() {
-    local BC_P=$(which bc)
-    local VN_P=$(which vnstat)
-    local CL_P=$(which curl)
-    local DATE_P=$(which date) # 确保使用的是 GNU date
-
-    # 动态写入逻辑脚本
-    cat <<EOF > $BIN_PATH
-#!/bin/sh
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-[ -f "/etc/vnstat_tg.conf" ] && . "/etc/vnstat_tg.conf" || exit 1
-
-BC="$BC_P"
-VN="$VN_P"
-CL="$CL_P"
-GDATE="$DATE_P"
-
-# 修复数字前面的零
-fix_zero() {
-    case "\$1" in
-        .*) echo "0\$1" ;;
-        *)  echo "\$1" ;;
-    esac
 }
 
-# 将流量值转化为 MB
-val_to_mb() {
-    local raw=\$(echo "\$1" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
-    local num=\$(echo "\$raw" | grep -oE '[0-9.]+' | head -n1)
-    [ -z "\$num" ] && num=0
-    case "\$raw" in
-        *T*) echo "scale=2; \$num * 1048576" | \$BC ;;
-        *G*) echo "scale=2; \$num * 1024" | \$BC ;;
-        *K*) echo "scale=2; \$num / 1024" | \$BC ;;
-        *)   echo "\$num" ;;
-    esac
+# ================== Crontab 管理 ==================
+check_cron_status() {
+    # 用更稳健的方式检查 restart.sh 是否已存在于 crontab 中
+    crontab -l 2>/dev/null | grep -q "restart.sh"
 }
 
-# 提取流量数据中的接收和发送流量
-get_traffic() {
-    echo "\$1" | cut -c13- | grep -oE '[0-9.]+[[:space:]]*[a-zA-Z/]+' | sed -n "\${2}p" | xargs
-}
-
-# 生成流量使用进度条
-gen_bar() {
-    local p=\$1; local b=""; [ "\$p" -gt 100 ] && p=100
-    local c="🟩"; [ "\$p" -ge 50 ] && c="🟧"; [ "\$p" -ge 80 ] && c="🟥"
-    
-    # 用 while 循环替代 bash 的 for (i=0; i<p/10; i++)
-    local i=0
-    local limit=\$((p / 10))
-    while [ \$i -lt \$limit ]; do
-        b="\$b\$c"
-        i=\$((i + 1))
-    done
-    while [ \$i -lt 10 ]; do
-        b="\$b⬜"
-        i=\$((i + 1))
-    done
-    echo "\$b"
-}
-
-# 1. 流量数据统计
-\$VN -i \$INTERFACE --update >/dev/null 2>&1
-
-# 获取公网 IP
-SERVER_IP=\$(\$CL -s --connect-timeout 5 https://ipinfo.io/ip || \$CL -s --connect-timeout 5 https://icanhazip.com || echo "获取失败")
-
-Y_D=\$(\$GDATE -d "yesterday" "+%Y-%m-%d")
-Y_A1=\$(\$GDATE -d "yesterday" "+%m/%d/%y")
-Y_A2=\$(\$GDATE -d "yesterday" "+%d.%m.%y")
-Y_A3=\$(\$GDATE -d "yesterday" "+%m/%d/%Y")
-RAW_LINE=\$(\$VN -d | grep -Ei "yesterday|\$Y_D|\$Y_A1|\$Y_A2|\$Y_A3")
-
-if [ -n "\$RAW_LINE" ]; then
-    RX_STR=\$(get_traffic "\$RAW_LINE" 1)
-    TX_STR=\$(get_traffic "\$RAW_LINE" 2)
-    RX_MB=\$(val_to_mb "\$RX_STR")
-    TX_MB=\$(val_to_mb "\$TX_STR")
-    TOTAL_YEST_GB=\$(fix_zero \$(echo "scale=2; (\$RX_MB + \$TX_MB) / 1024" | \$BC))
-    DISP_RX=\$(echo "\$RX_STR" | sed 's/GiB/GB/'); DISP_TX=\$(echo "\$TX_STR" | sed 's/GiB/GB/')
-else
-    DISP_RX="0.00 GB"; DISP_TX="0.00 GB"; TOTAL_YEST_GB="0.00"
-fi
-
-TODAY_D=\$(\$GDATE +%d | sed 's/^0//')
-THIS_Y=\$(\$GDATE +%Y); THIS_M=\$(\$GDATE +%m)
-if [ "\$TODAY_D" -lt "\$RESET_DAY" ]; then
-    START_DATE=\$(\$GDATE -d "\${THIS_Y}-\${THIS_M}-\${RESET_DAY} -1 month" +%Y-%m-%d)
-    END_DATE=\$(\$GDATE -d "\${THIS_Y}-\${THIS_M}-\${RESET_DAY} -1 day" +%Y-%m-%d)
-else
-    START_DATE=\$(\$GDATE -d "\${THIS_Y}-\${THIS_M}-\${RESET_DAY}" +%Y-%m-%d)
-    END_DATE=\$(\$GDATE -d "\${THIS_Y}-\${THIS_M}-\${RESET_DAY} +1 month -1 day" +%Y-%m-%d)
-fi
-
-TOTAL_PERIOD_MB=0
-CUR_TS=\$(\$GDATE -d "\$START_DATE" +%s)
-YEST_TS=\$(\$GDATE -d "yesterday" +%s)
-while [ "\$CUR_TS" -le "\$YEST_TS" ]; do
-    D_M1=\$(\$GDATE -d "@\$CUR_TS" "+%Y-%m-%d")
-    D_M2=\$(\$GDATE -d "@\$CUR_TS" "+%m/%d/%y")
-    D_M3=\$(\$GDATE -d "@\$CUR_TS" "+%d.%m.%y")
-    D_M4=\$(\$GDATE -d "@\$CUR_TS" "+%m/%d/%Y")
-    D_LINE=\$(\$VN -d | grep -E "\$D_M1|\$D_M2|\$D_M3|\$D_M4")
-    if [ -n "\$D_LINE" ]; then
-        D_RX_S=\$(get_traffic "\$D_LINE" 1)
-        D_TX_S=\$(get_traffic "\$D_LINE" 2)
-        TOTAL_PERIOD_MB=\$(echo "\$TOTAL_PERIOD_MB + \$(val_to_mb "\$D_RX_S") + \$(val_to_mb "\$D_TX_S")" | \$BC)
+set_cron() {
+    if ! check_cron_status; then
+        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
     fi
-    CUR_TS=\$((\$CUR_TS + 86400))
-done
+}
 
-USED_GB=\$(fix_zero \$(echo "scale=2; \$TOTAL_PERIOD_MB / 1024" | \$BC))
-PCT=\$(echo "scale=0; \$USED_GB * 100 / \$MAX_GB" | \$BC 2>/dev/null)
-[ -z "\$PCT" ] && PCT=0
-BAR=\$(gen_bar \$PCT)
-NOW=\$(\$GDATE "+%Y-%m-%d %H:%M")
-
-# 2. VPS 基础状态获取 & 运行时间汉化
-UPTIME_RAW=\$(uptime | awk -F'up ' '{print \$2}' | awk -F, '{print \$1}' | xargs)
-
-CPU_LOAD=\$(uptime | awk -F'load average:' '{print \$2}' | awk -F, '{print \$1}' | xargs)
-MEM_INFO=\$(free -m | awk '/Mem:/ {printf "%.1f/%.1f GB (%.0f%%)", \$3/1024, \$2/1024, \$3*100/\$2}')
-DISK_INFO=\$(df -h / | awk 'NR==2 {printf "%s/%s (%s)", \$3, \$2, \$5}')
-
-# 3. 网卡实时速率统计 (1秒采样)
-RX_BEFORE=\$(cat /sys/class/net/\$INTERFACE/statistics/rx_bytes)
-TX_BEFORE=\$(cat /sys/class/net/\$INTERFACE/statistics/tx_bytes)
-sleep 1
-RX_AFTER=\$(cat /sys/class/net/\$INTERFACE/statistics/rx_bytes)
-TX_AFTER=\$(cat /sys/class/net/\$INTERFACE/statistics/tx_bytes)
-SPEED_RX_KB=\$(echo "(\$RX_AFTER - \$RX_BEFORE) / 1024" | \$BC)
-SPEED_TX_KB=\$(echo "(\$TX_AFTER - \$TX_BEFORE) / 1024" | \$BC)
-
-if [ "\$SPEED_RX_KB" -gt 1024 ]; then
-    SPEED_RX="\$(echo "scale=1; \$SPEED_RX_KB / 1024" | \$BC) Mbps"
-else
-    SPEED_RX="\${SPEED_RX_KB} Kbps"
-fi
-if [ "$SPEED_TX_KB" -gt 1024 ]; then
-    SPEED_TX="\$(echo "scale=1; \$SPEED_TX_KB / 1024" | \$BC) Mbps"
-else
-    SPEED_TX="\${SPEED_TX_KB} Kbps"
-fi
-
-# 4. Docker 运行状态监控 (Alpine 兼容)
-DOCKER_BLOCK=""
-if command -v docker >/dev/null 2>&1 && rc-service docker status >/dev/null 2>&1; then
-    DOCKER_TOTAL=\$(docker ps -a --format '{{.Names}}' | wc -l)
-    DOCKER_RUNNING=\$(docker ps --format '{{.Names}}' | wc -l)
-    DOCKER_STATUS="🟢 运行中 (\$DOCKER_RUNNING/\$DOCKER_TOTAL)"
-    
-    DOCKER_EXC=\$(docker ps -a --filter "status=exited" --format '{{.Names}} ({{.Status}})' | grep -v 'Exited (0)' | head -n 3)
-    if [ -n "\$DOCKER_EXC" ]; then
-        DOCKER_STATUS="\$DOCKER_STATUS\n⚠️ *异常容器*:\n\\\`\$(echo "\$DOCKER_EXC" | sed 's/^/  • /')\\\`"
+remove_cron() {
+    # 【核心修改】去掉 if check 判断，直接强制过滤！
+    # 这样不管你的路径是 /root/proxynode/mtproto 还是 ~/mtp，只要有 restart.sh 统统杀掉
+    crontab -l 2>/dev/null | grep -v "restart.sh" | crontab -
+}
+# ================== 核心控制服务 ==================
+start_proxy() {
+    if pgrep -x mtg >/dev/null; then
+        yellow_echo "MTProto Proxy 已经在运行中。"
+        return 0
     fi
     
-    DOCKER_BLOCK="
-🐳 *Docker 运行状态*
-\$DOCKER_STATUS"
-fi
+    if [ ! -f "$WORKDIR/mtg" ]; then
+        red_echo "未检测到安装文件，请先选择 1 安装。"
+        return 1
+    fi
 
-# --- 报表样式定制 ---
-MSG="📊 *【\$HOST_ALIAS】服务器日报*
-🕙 时间: \\\`\$NOW\\\`
+    local port=$(cat "$WORKDIR/port.txt" 2>/dev/null)
+    if [[ -z "$port" || "$port" == "无" ]]; then
+        red_echo "未检测到配置端口，请重新安装或修改配置。"
+        return 1
+    fi
 
-🖥️ *VPS 基础性能监控*
-├─ 🌍 公网IP: \\\`\$SERVER_IP\\\`
-├─ ⚡ 负载 (1m): \\\`\$CPU_LOAD\\\`
-├─ 🧠 内存: \\\`\$MEM_INFO\\\`
-└─ 💾 硬盘: \\\`\$DISK_INFO\\\`
-
-🌐 *网卡实时与历史统计*
-├─ 🚀 实时下载: \\\`\$SPEED_RX\\\`
-├─ 🚀 实时上传: \\\`\$SPEED_TX\\\`
-├─ ⬇️ 昨日下载: \\\`\$DISP_RX\\\`
-├─ ⬆️ 昨日上传: \\\`\$DISP_TX\\\`
-└─ 🧮 昨日合计: \\\`\$TOTAL_YEST_GB GB\\\`
-
-📅 *流量周期统计*
-├─ 📅 周期开始: \\\`\$START_DATE\\\`
-├─ 📅 周期结束: \\\`\$END_DATE\\\`
-├─ 🔄 重置日: 每月 \\\`\$RESET_DAY\\\` 号
-├─ ⏳ 累计: \\\`\$USED_GB / \$MAX_GB GB\\\`
-└─ 🎯 进度: \$BAR \\\`\$PCT%\\\`\$DOCKER_BLOCK"
-
-# 发送到 Telegram
-\$CL --connect-timeout 10 --retry 3 -s -X POST "https://api.telegram.org/bot\$TG_TOKEN/sendMessage" \\
--d "chat_id=\$TG_CHAT_ID" \\
--d "text=\$MSG" \\
--d "parse_mode=Markdown" \\
--d "disable_notification=true" > /dev/null
-EOF
-
-    chmod +x $BIN_PATH  # 设置执行权限
+    cd "$WORKDIR" || return
+    nohup ./mtg run -b 0.0.0.0:$port "$SECRET" --stats-bind=127.0.0.1:$((port + 1)) >> "$LOG_FILE" 2>&1 &
+    green_echo "MTProto Proxy 启动成功！"
 }
 
-# --- 3. 配置与自定义通知时间录入 ---
-collect_config() {
-    [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
-    echo "--- 请输入配置参数 ---"
-    
-    printf "👤 主机别名 [%s]: " "${HOST_ALIAS:-My-VPS}"; read input_val; HOST_ALIAS=${input_val:-${HOST_ALIAS:-My-VPS}}
-    printf "🤖 Bot Token [%s]: " "${TG_TOKEN}"; read input_val; TG_TOKEN=${input_val:-$TG_TOKEN}
-    printf "🆔 Chat ID [%s]: " "${TG_CHAT_ID}"; read input_val; TG_CHAT_ID=${input_val:-$TG_CHAT_ID}
-    printf "📅 重置日 (1-31) [%s]: " "${RESET_DAY:-1}"; read input_val; RESET_DAY=${input_val:-${RESET_DAY:-1}}
-    printf "📊 限额 (GB) [%s]: " "${MAX_GB:-1000}"; read input_val; MAX_GB=${input_val:-${MAX_GB:-1000}}
-
-    # 自动获取默认网卡
-    IF_DEF=$(ip route | grep '^default' | awk '{print $5}' | head -n1)
-    printf "🌐 网卡 [%s]: " "${INTERFACE:-$IF_DEF}"; read input_val; INTERFACE=${input_val:-${INTERFACE:-$IF_DEF}}
-
-    # 自定义通知时间
-    printf "⏰ 通知时间 (HH:MM) [%s]: " "${RUN_TIME:-08:00}"; read input_val; RUN_TIME=${input_val:-${RUN_TIME:-08:00}}
-
-    # 保存配置到文件
-    cat <<EOF > "$CONFIG_FILE"
-HOST_ALIAS="$HOST_ALIAS"
-TG_TOKEN="$TG_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-RESET_DAY=$RESET_DAY
-MAX_GB=$MAX_GB
-INTERFACE="$INTERFACE"
-RUN_TIME="$RUN_TIME"
-EOF
-
-    # 生成报告脚本
-    generate_report_logic  
-    
-    # 巧妙转换 Cron 时间，过滤掉前导0
-    local H=$(echo $RUN_TIME | cut -d: -f1 | sed 's/^0//'); [ -z "$H" ] && H=0
-    local M=$(echo $RUN_TIME | cut -d: -f2 | sed 's/^0//'); [ -z "$M" ] && M=0
-    
-    # Alpine crontab 兼容写入
-    (crontab -l 2>/dev/null | grep -v "$BIN_PATH"; echo "$M $H * * * /bin/sh $BIN_PATH") | crontab -
-    echo "⏰ 定时发送任务已设定为每日 $RUN_TIME"
+stop_proxy() {
+    if pgrep -x mtg >/dev/null; then
+        pkill -9 mtg >/dev/null 2>&1
+        clear
+        green_echo "MTProto Proxy 已成功停止。"
+    else
+        yellow_echo "MTProto Proxy 本就处于停止状态。"
+    fi
 }
 
-# --- 4. 交互菜单 (绿色矩阵风) ---
+show_config() {
+    if [ ! -f "$WORKDIR/link.txt" ]; then
+        red_echo "未找到连接配置，请确保已成功安装。"
+    else
+        purple_echo "==== 当前 MTProto 连接配置 (V6VPS 替换IP地址为V6)===="
+        cat "$WORKDIR/link.txt"
+    fi
+}
+
+# ================== 安装与配置修改 ==================
+download_and_run_mtg() {
+    local arch="amd64"
+    cmd=$(uname -m)
+    if [ "$cmd" == "386" ]; then arch="386"; fi
+    if [ "$cmd" == "arm" ]; then arch="arm"; fi
+    if [ "$cmd" == "aarch64" ]; then arch="arm64"; fi
+
+    mkdir -p "$WORKDIR"
+    pkill -9 mtg >/dev/null 2>&1
+
+    yellow_echo "正在下载 mtg 核心组件..."
+    wget -q -O "${WORKDIR}/mtg" "https://github.com/whunt1/onekeymakemtg/raw/master/builds/ccbuilds/mtg-linux-$arch"
+    
+    if [ ! -s "${WORKDIR}/mtg" ]; then
+        red_echo "下载核心失败，请检查网络！"
+        return 1
+    fi
+    
+    chmod +x "${WORKDIR}/mtg"
+    echo "$MTP_PORT" > "$WORKDIR/port.txt"
+    cd "$WORKDIR" || return
+
+    # 运行服务并重定向日志
+    nohup ./mtg run -b 0.0.0.0:$MTP_PORT "$SECRET" --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> "$LOG_FILE" 2>&1 &
+    
+    # 创建守护/重启脚本
+    cat > "${WORKDIR}/restart.sh" <<EOF
+#!/bin/bash
+pkill -9 mtg >/dev/null 2>&1
+cd ${WORKDIR}
+nohup ./mtg run -b 0.0.0.0:$MTP_PORT $SECRET --stats-bind=127.0.0.1:$((MTP_PORT + 1)) >> ${LOG_FILE} 2>&1 &
+EOF
+    chmod +x "${WORKDIR}/restart.sh"
+    return 0
+}
+
+core_install() {
+    purple_echo "正在配置 MTProto 代理端口...\n"
+    
+    if [[ "$HOSTNAME" =~ mtp ]] || command -v devil &>/dev/null; then
+        check_devil_port
+        IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
+        IP1=${IP_LIST[0]:-$(get_public_ip)}
+    else
+        install_lsof
+        read -p "请输入 MTProto 代理端口 (回车使用随机端口): " user_port
+        [[ -z $user_port ]] && user_port=$(random_port)
+        MTP_PORT=$(check_vps_port "$user_port")
+        IP1=$(get_public_ip)
+    fi
+
+    if download_and_run_mtg; then
+        purple_echo "\n🎉 MTProto 安装/修改成功！"
+        LINKS="tg://proxy?server=$IP1&port=$MTP_PORT&secret=$SECRET"
+        green_echo "$LINKS\n"
+        echo -e "$LINKS" > "${WORKDIR}/link.txt"
+        
+        read -p "是否同时将MTProto加入开机自启（Crontab）？[回车默认加入,Y/n]: " choice_cron
+        case "$choice_cron" in
+            [nN][oO]|[nN]) remove_cron ;;
+            *) set_cron ;;
+        esac
+    fi
+}
+
+# ================== 主菜单循环 ==================
 while true; do
     clear
-    echo -e "${GREEN}=======================================${NC}"
-    echo -e "${GREEN}       流量日报 TG通知管理工具         ${NC}"
-    echo -e "${GREEN}=======================================${NC}"
-    
-    # --- 动态状态看板模块 ---
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-        echo -e "${GREEN} 👤 主机别名:${NC} ${YELLOW}$HOST_ALIAS${NC} ${GREEN}| 网卡:${NC} ${YELLOW}$INTERFACE${NC}"
-        echo -e "${GREEN} 📅 流量配置:${NC} ${YELLOW}每月 $RESET_DAY 号重置${NC} ${GREEN}| 限额:${NC} ${YELLOW}$MAX_GB GB${NC}"
-        
-        # 检查 crontab 中是否有该定时任务
-        if crontab -l 2>/dev/null | grep -Fq "$BIN_PATH"; then
-            echo -e "${GREEN} ⏰ 定时任务:${NC} ${YELLOW}已开启(每日$RUN_TIME)${NC}"
-        else
-            echo -e "${GREEN} ⏰ 定时任务:${NC} ${RED}未开启(无定时任务)${NC}"
-        fi
+    # 状态与端口动态获取
+    if pgrep -x mtg >/dev/null; then
+        status_display="${GREEN}●运行中${RESET}"
     else
-        echo -e "${GREEN} 📊 当前状态:${NC} ${YELLOW}未检测到有效配置文件${NC}"
+        status_display="${RED}●已停止${RESET}"
     fi
-    echo -e "${GREEN}=======================================${NC}"
+    
+    # 获取自启状态
+    if check_cron_status; then
+        cron_display="${GREEN}●已开启${RESET}"
+    else
+        cron_display="${RED}●已关闭${RESET}"
+    fi
 
-    # --- 菜单选项 ---
-    echo -e "${GREEN} 1. 安装${NC}"
-    echo -e "${GREEN} 2. 修改配置${NC}"
-    echo -e "${GREEN} 3. 手动触发测试 (发送日报)${NC}"
-    echo -e "${GREEN} 4. 更新${NC}"
-    echo -e "${GREEN} 5. 卸载${NC}"
-    echo -e "${GREEN} 0. 退出${NC}"
-    echo -e "${GREEN}=======================================${NC}"
+    port_display=$(get_running_port)
 
-    echo -ne "${GREEN} 请选择操作: ${NC}"
-    read choice
+    # 打印精美面板样式
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     MTProto Proxy 管理面板      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}状态     :${RESET} ${status_display}"
+    echo -e "${GREEN}端口     :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}开机自启 :${RESET} ${cron_display}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 安装 MTProto${RESET}"
+    echo -e "${GREEN}2. 修改配置${RESET}"
+    echo -e "${GREEN}3. 卸载 MTProto${RESET}"
+    echo -e "${GREEN}4. 启动 MTProto${RESET}"
+    echo -e "${GREEN}5. 停止 MTProto${RESET}"
+    echo -e "${GREEN}6. 重启 MTProto${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看连接配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    read -p "$(echo -e ${GREEN}请选择:${RESET} )" choice
+
     case $choice in
-        1) prepare_env; collect_config; echo "✅ 安装完成！"; sleep 2 ;;
-        2) collect_config; echo "✅ 配置与通知时间更新成功！"; sleep 2 ;;
-        3) 
-            if [ -f "$BIN_PATH" ]; then
-                /bin/sh "$BIN_PATH" && echo "✅ 日报已触发发送！" || echo "❌ 发送失败，请检查配置或网络。"; 
+        1|2)
+            clear; core_install; read -p "按回车返回菜单..." ;;
+        3)
+            clear
+            stop_proxy; remove_cron; rm -rf "$WORKDIR"
+            clear; red_echo "MTProto 已彻底从系统中卸载！"; read -p "按回车返回菜单..." ;;
+        4)
+            clear; start_proxy; read -p "按回车返回菜单..." ;;
+        5)
+            clear; stop_proxy; read -p "按回车返回菜单..." ;;
+        6)
+            clear; stop_proxy; sleep 1; start_proxy; read -p "按回车返回菜单..." ;;
+        7)
+            clear
+            if [ -f "$LOG_FILE" ]; then
+                purple_echo "=== 正在查看最新 50 行运行日志 ==="
+                tail -n 50 "$LOG_FILE"
             else
-                echo "❌ 报告尚未生成，请先执行全新安装或修改配置。";
+                yellow_echo "暂无日志文件。"
             fi
-            sleep 3 ;;
-        4) generate_report_logic; echo "✅ 已更新！"; sleep 1 ;;
-        5) 
-            (crontab -l 2>/dev/null | grep -v "$BIN_PATH") | crontab -; 
-            rm -f "$BIN_PATH" "$CONFIG_FILE"; 
-            echo "✅ 卸载成功，已清理配置文件及 Cron 定时任务。"; 
-            sleep 2 ;;
-        0) exit 0 ;;
-        *) echo "❌ 无效选项"; sleep 1 ;;
+            read -p "按回车返回菜单..." ;;
+        8)
+            clear; show_config; read -p "按回车返回菜单..." ;;
+        0)
+            exit 0 ;;
+        *)
+            red_echo "无效输入！" ; sleep 1 ;;
     esac
 done

@@ -1,192 +1,197 @@
 #!/bin/bash
-
-# 颜色定义
+# 网站一键部署
+WEB_ROOT="/var/www/clock_site"
+NGINX_CONF_DIR="/etc/nginx/sites-available"
+LOG_FILE="/var/log/nginx/clock_access.log"
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 RED='\033[0;31m'
-PLAIN='\033[0m'
+RESET='\033[0m'
 
-# 工作目录
-WORK_DIR="/opt/reality_checker"
 
-# 架构检测
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64)
-        SCANNER_ARCH="linux-amd64"
-        CHECKER_ARCH="linux-amd64"
-        ;;
-    aarch64)
-        SCANNER_ARCH="linux-arm64"
-        CHECKER_ARCH="linux-arm64"
-        ;;
-    *)
-        echo -e "${RED}暂不支持当前系统架构: ${ARCH}${PLAIN}"
-        exit 1
-        ;;
-esac
-
-# 检查根权限
-if [ "$EUID" -ne 0 ]; then
-   echo -e "${RED}错误: 请使用 root 用户或 sudo 运行此脚本！${PLAIN}"
-   exit 1
-fi
-
-# 状态检测函数
-check_status() {
-    if [ -f "$WORK_DIR/RealiTLScanner" ] && [ -f "$WORK_DIR/reality-checker-bin" ] && [ -f "$WORK_DIR/Country.mmdb" ]; then
-        STATUS_DEPLOY="环境部署: 已安装"
+get_public_ip() {
+    local mode=${1:-"v4"}
+    local ip=""
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
     else
-        STATUS_DEPLOY="环境部署: 未安装"
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
+    echo "127.0.0.1"
+}
 
-    if [ -f "$WORK_DIR/file.csv" ] && [ -s "$WORK_DIR/file.csv" ]; then
-        STATUS_SCAN="扫描数据: 已生成结果"
+install_site() {
+    read -p "请输入你的自定义域名： " DOMAIN
+
+    echo -e "${GREEN}正在检查并安装必要依赖(dnsutils/curl)...${RESET}"
+    apt update
+    apt install -y dnsutils curl
+
+    # 检查域名解析 (仅限 IPv4)
+    VPS_IPv4=$(get_public_ip)
+    DOMAIN_A=$(dig +short A "$DOMAIN" | tail -n1)
+
+    echo -e "${GREEN}VPS IPv4: $VPS_IPv4${RESET}"
+    echo -e "${GREEN}域名 A 记录: $DOMAIN_A${RESET}"
+
+    if [[ -n "$VPS_IPv4" && "$VPS_IPv4" != "$DOMAIN_A" ]]; then
+        echo -e "${RED}❌ A 记录未指向本机 IPv4${RESET}"
+    fi
+    
+    if [[ "$VPS_IPv4" == "$DOMAIN_A" ]]; then
+        echo -e "${GREEN}✅ IPv4 解析正确，继续配置${RESET}"
     else
-        STATUS_SCAN="扫描数据: 无扫描数据"
-    fi
-}
-
-# 菜单函数
-show_menu() {
-    clear
-    check_status
-    echo -e "${GREEN}=========================================${PLAIN}"
-    echo -e "${GREEN}         REALITY 扫描与检测菜单           ${PLAIN}"
-    echo -e "${GREEN}=========================================${PLAIN}"
-    echo -e "${GREEN} [状态] $STATUS_DEPLOY | $STATUS_SCAN${PLAIN}"
-    echo -e "${GREEN}=========================================${PLAIN}"
-    echo -e "${GREEN} 1. 一键部署环境${PLAIN}"
-    echo -e "${GREEN} 2. 启动本地扫描${PLAIN}"
-    echo -e "${GREEN} 3. 分析过滤数据${PLAIN}"
-    echo -e "${GREEN} 4. 卸载清理环境${PLAIN}"
-    echo -e "${GREEN} 0. 退出${PLAIN}"
-    echo -e "${GREEN}=========================================${PLAIN}"
-    echo -e -n "${GREEN}请选择操作: ${PLAIN}"
-}
-
-# 1. 部署函数
-deploy_env() {
-    echo -e "${GREEN}[*] 开始部署环境...${PLAIN}"
-    
-    # 安装必要工具
-    if ! command -v wget &> /dev/null || ! command -v unzip &> /dev/null; then
-        echo -e "${GREEN}[*] 正在安装依赖包 wget / unzip...${PLAIN}"
-        if command -v apt &> /dev/null; then
-            apt update && apt install -y wget unzip
-        elif command -v yum &> /dev/null; then
-            yum install -y wget unzip
-        fi
-    fi
-
-    mkdir -p "$WORK_DIR"
-    cd "$WORK_DIR" || exit
-
-    # 下载 reality-checker
-    echo -e "${GREEN}[*] 正在下载 reality-checker...${PLAIN}"
-    wget -q --show-progress "https://github.com/V2RaySSR/RealityChecker/releases/latest/download/reality-checker-${CHECKER_ARCH}.zip" -O checker.zip
-    unzip -q -o checker.zip
-    mv "reality-checker" "reality-checker-bin" 2>/dev/null || true
-    rm -f checker.zip
-
-    # 下载 RealiTLScanner
-    echo -e "${GREEN}[*] 正在下载 RealiTLScanner...${PLAIN}"
-    LATEST_SCANNER_VER=$(wget -qO- "https://api.github.com/repos/XTLS/RealiTLScanner/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -z "$LATEST_SCANNER_VER" ]; then LATEST_SCANNER_VER="v0.2.3"; fi
-    wget -q --show-progress "https://github.com/XTLS/RealiTLScanner/releases/download/${LATEST_SCANNER_VER}/RealiTLScanner-${SCANNER_ARCH}" -O RealiTLScanner
-    
-    # 下载 GeoIP 数据库
-    echo -e "${GREEN}[*] 正在下载 GeoIP 数据库...${PLAIN}"
-    wget -q --show-progress "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb" -O Country.mmdb
-
-    # 赋予权限
-    chmod +x reality-checker-bin RealiTLScanner 2>/dev/null
-
-    echo -e "${GREEN}[✓] 环境部署成功！所有程序已保存在: $WORK_DIR${PLAIN}"
-    echo -e -n "${GREEN}按任意键返回菜单...${PLAIN}"
-    read -n 1 -s -r
-}
-
-# 2. 扫描函数
-start_scan() {
-    if [ ! -f "$WORK_DIR/RealiTLScanner" ]; then
-        echo -e "${GREEN}[X] 错误: 未检测到运行环境，请先执行选项 1 进行部署。${PLAIN}"
-        echo -e -n "${GREEN}按任意键返回菜单...${PLAIN}"
-        read -n 1 -s -r
+        echo -e "${RED}❌ 域名未解析到本机，停止安装${RESET}"
         return
     fi
 
-    cd "$WORK_DIR" || exit
-    LOCAL_IP=$(wget -qO- -t 1 -T 2 ipinfo.io/ip || wget -qO- -t 1 -T 2 ifconfig.me)
-    
-    echo -e "${GREEN}--- 启动 RealiTLScanner 扫描 ---${PLAIN}"
-    echo -e -n "${GREEN}请输入目标 VPS IP (默认: $LOCAL_IP): ${PLAIN}"
-    read vpsip
-    vpsip=${vpsip:-$LOCAL_IP}
-    
-    echo -e -n "${GREEN}请输入扫描线程数 (默认 100): ${PLAIN}"
-    read thread
-    thread=${thread:-100}
-    
-    echo -e -n "${GREEN}请输入超时时间(秒) (默认 5): ${PLAIN}"
-    read timeout
-    timeout=${timeout:-5}
+    # --- 自定义证书路径逻辑 ---
+    DEFAULT_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    DEFAULT_KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
 
-    echo -e "${GREEN}[*] 开始扫描，请耐心等待进度条完成...${PLAIN}"
-    ./RealiTLScanner -addr "$vpsip" -port 443 -thread "$thread" -timeout "$timeout" -show -out file.csv
+    echo -e "\n${GREEN}--- 证书路径配置 ---${RESET}"
+    read -p "请输入证书路径 [默认: $DEFAULT_CERT]: " USER_CERT
+    read -p "请输入私钥路径 [默认: $DEFAULT_KEY]: " USER_KEY
 
-    if [ -f "file.csv" ] && [ -s "file.csv" ]; then
-        echo -e "${GREEN}[✓] 扫描完成！初始结果已保存至 $WORK_DIR/file.csv${PLAIN}"
+    # 如果用户直接回车，则使用默认预测路径
+    CERT_PATH=${USER_CERT:-$DEFAULT_CERT}
+    KEY_PATH=${USER_KEY:-$DEFAULT_KEY}
+    # --------------------------
+
+    mkdir -p "$WEB_ROOT"
+    chmod 755 "$WEB_ROOT"
+
+    # 默认 HTML 页面
+    cat > "$WEB_ROOT/index.html" <<'EOF'
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>时钟</title>
+<style>
+html, body { margin:0; padding:0; height:100%; display:flex; justify-content:center; align-items:center; background:#f0f0f0; font-family:Arial,sans-serif; flex-direction:column;}
+h1 { font-size:3rem; margin:0;}
+#time { font-size:5rem; font-weight:bold; margin-top:20px;}
+</style>
+</head>
+<body>
+<h1>🌍世界时间</h1>
+<div id="time"></div>
+<script>
+function updateTime() {
+    const now = new Date();
+    document.getElementById("time").innerText = now.toLocaleString();
+}
+setInterval(updateTime, 1000);
+updateTime();
+</script>
+</body>
+</html>
+EOF
+
+    # 写入 Nginx 配置
+    NGINX_CONF="$NGINX_CONF_DIR/$DOMAIN"
+    echo -e "${GREEN}正在写入/修改 Nginx 配置文件: $NGINX_CONF${RESET}"
+    cat > "$NGINX_CONF" <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+    
+    # 强制 HTTP 跳转 HTTPS
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name $DOMAIN;
+
+    root $WEB_ROOT;
+    index index.html;
+
+    # 采用确定的证书与私钥路径
+    ssl_certificate $CERT_PATH;
+    ssl_certificate_key $KEY_PATH;
+
+    # 基础 SSL 安全配置
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    access_log $LOG_FILE combined;
+}
+EOF
+
+    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
+    
+    # 检查并重载配置
+    echo -e "${GREEN}正在测试 Nginx 配置并平滑重载...${RESET}"
+    nginx -t && systemctl reload nginx
+
+    echo -e "${GREEN}✅ HTML 网站配置修改完成！${RESET}"
+    echo -e "${GREEN}页面路径：$WEB_ROOT/index.html${RESET}"
+    echo -e "${GREEN}当前生效的证书路径：${RESET}"
+    echo -e "   Certificate Path: $CERT_PATH"
+    echo -e "   Private Key Path: $KEY_PATH"
+    echo -e "${GREEN}访问：https://$DOMAIN${RESET}"
+}
+
+uninstall_site() {
+    read -p "请输入要卸载的域名： " DOMAIN
+    
+    echo -e "${GREEN}正在清理 $DOMAIN 的 Nginx 配置...${RESET}"
+    rm -f "$NGINX_CONF_DIR/$DOMAIN"
+    rm -f /etc/nginx/sites-enabled/$DOMAIN
+    rm -rf "$WEB_ROOT"
+    
+    # 仅仅重载 Nginx 使配置生效
+    systemctl reload nginx
+    echo -e "${GREEN}✅ HTML 时钟网站配置已卸载，Nginx 已平滑重载${RESET}"
+}
+
+edit_html() {
+    ${EDITOR:-nano} "$WEB_ROOT/index.html"
+    systemctl reload nginx
+}
+
+view_logs() {
+    if [ -f "$LOG_FILE" ]; then
+        tail -n 20 "$LOG_FILE"
+        echo -e "\n统计不同 IP 访问次数："
+        awk '{print $1}' "$LOG_FILE" | sort | uniq -c | sort -nr
     else
-        echo -e "${GREEN}[X] 扫描结束，但未成功生成有效数据。${PLAIN}"
-    fi
-    echo -e -n "${GREEN}按任意键返回菜单...${PLAIN}"
-    read -n 1 -s -r
-}
-
-# 3. 检查函数
-start_check() {
-    if [ ! -f "$WORK_DIR/reality-checker-bin" ] || [ ! -f "$WORK_DIR/file.csv" ]; then
-        echo -e "${GREEN}[X] 错误: 缺少必要组件或 file.csv 扫描文件，请先执行选项 1 和 2。${PLAIN}"
-        echo -e -n "${GREEN}按任意键返回菜单...${PLAIN}"
-        read -n 1 -s -r
-        return
-    fi
-
-    cd "$WORK_DIR" || exit
-    echo -e "${GREEN}--- 启动 reality-checker 过滤分析 ---${PLAIN}"
-    ./reality-checker-bin csv file.csv
-
-    echo -e "\n${GREEN}[✓] 分析完成。请从上方输出中挑选适合的 REALITY 域名！${PLAIN}"
-    echo -e -n "${GREEN}按任意键返回菜单...${PLAIN}"
-    read -n 1 -s -r
-}
-
-# 4. 卸载函数
-uninstall_all() {
-    echo -e -n "${RED}确定要彻底卸载并删除所有工具与数据吗？(y/n): ${PLAIN}"
-    read choice
-    if [ "$choice" = "y" ] || [ "$choice" = "Y" ]; then
-        rm -rf "$WORK_DIR"
-        rm -f "$0"
-        echo -e "${GREEN}[✓] 卸载完成！已彻底清理环境并退出。${PLAIN}"
-        exit 0
-    else
-        echo -e "${GREEN}已取消卸载。${PLAIN}"
-        echo -e -n "${GREEN}按任意键返回菜单...${PLAIN}"
-        read -n 1 -s -r
+        echo -e "${RED}日志文件不存在${RESET}"
     fi
 }
 
-# 主循环
 while true; do
-    show_menu
-    case "$REPLY" in
-        1) deploy_env ;;
-        2) start_scan ;;
-        3) start_check ;;
-        4) uninstall_all ;;
+    clear
+    echo -e "${GREEN}=========================${RESET}"
+    echo -e "${GREEN}    ◈  网站管理菜单  ◈   ${RESET}"
+    echo -e "${GREEN}=========================${RESET}"
+    echo -e "${GREEN}1) 部署网站${RESET}" 
+    echo -e "${GREEN}2) 卸载网站${RESET}"
+    echo -e "${GREEN}3) 编辑页面${RESET}"
+    echo -e "${GREEN}4) 访问日志${RESET}"
+    echo -e "${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}=========================${RESET}"
+    read -p "$(echo -e ${GREEN}请输入选项: ${RESET})" choice
+    case $choice in
+        1) install_site ;;
+        2) uninstall_site ;;
+        3) edit_html ;;
+        4) view_logs ;;
         0) exit 0 ;;
-        *) echo -e "${RED}请输入正确的选项 [0-4]${PLAIN}" && sleep 1 ;;
+        *) echo -e "${RED}请输入有效选项${RESET}" ;;
     esac
+    read -p "$(echo -e "${YELLOW}按回车返回菜单...${RESET}")"
 done

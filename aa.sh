@@ -30,7 +30,7 @@ info() { echo -e "${BLUE}[信息] $*${RESET}"; }
 warn() { echo -e "${YELLOW}[警告] $*${RESET}"; }
 error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 ok()   { echo -e "${GREEN}[成功] $*${RESET}"; }
-pause() { echo; echo -n "按任意键重新返回控制面板..."; read -r arg; echo; }
+pause() { echo; echo -ne "${GREEN}按任意键重新返回控制面板...${RESET}"; read -n 1 -s; echo; }
 
 create_user() {
     id -u "$SNELL_USER" >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin "$SNELL_USER" 2>/dev/null || true
@@ -116,8 +116,12 @@ download_and_extract_snell() {
     local RAW_VERSION=$1
     local ARCH=$(uname -m)
     
-    echo -e "${YELLOW}[INFO]检测到系统缺失必要组件，正在自动修复...${RESET}"
-    apk add --no-cache unzip curl gcompat >/dev/null 2>&1
+    echo -e "${YELLOW}[INFO] 正在检测并安装系统必要组件...${RESET}"
+    # 移除 >/dev/null 2>&1，让错误暴露出来，方便排查
+    if ! apk add --no-cache unzip curl libstdc++ libgcc; then
+        echo -e "${RED}[错误] 依赖安装失败！请检查系统 apk 包管理器状态。${RESET}" >&2
+        exit 1
+    fi
 
     local URL_ARCH
     case "$ARCH" in
@@ -183,11 +187,15 @@ write_config() {
     mkdir -p "$BASE_DIR"
 
     local real_listen=""
-    case "$listen_mode" in
-        *"0.0.0.0"*) real_listen="0.0.0.0:${port}" ;;
-        *"[::]"*)    real_listen="[::]:${port}" ;;
-        *)           real_listen="0.0.0.0:${port},[::]:${port}" ;; # 默认双栈
-    esac
+    # 彻底修复模糊匹配 Bug，改用精准关键字识别
+    if echo "$listen_mode" | grep -q "0.0.0.0" && echo "$listen_mode" | grep -q "\[::\]"; then
+        # 如果同时包含 IPv4 和 IPv6，下发官方标准双栈格式
+        real_listen="0.0.0.0:${port},[::]:${port}"
+    elif echo "$listen_mode" | grep -q "\[::\]"; then
+        real_listen="[::]:${port}"
+    else
+        real_listen="0.0.0.0:${port}"
+    fi
 
     cat > "$conf_file" <<EOF
 [snell-server]
@@ -506,7 +514,8 @@ get_panel_status_info() {
 
     local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.conf"
     if [ -f "$conf_file" ]; then
-        panel_port=$(grep '^listen' "$conf_file" | awk -F'= ' '{print $2}')
+        # 提取等号后面的完整字符串（保留逗号及后面的 IPv6），只去掉空格
+        panel_port=$(grep '^listen' "$conf_file" | awk -F'=[ ]*' '{print $2}' | tr -d '\r\n')
     else
         panel_port="未创建节点配置"
     fi

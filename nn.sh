@@ -32,21 +32,7 @@ get_public_ip() {
 }
 
 
-# 获取当前生效的配置信息
-get_current_status() {
-    # 查找 sites-enabled 中是否有软链接，以此获取当前域名
-    CURRENT_DOMAIN=$(ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "default" | head -n 1)
-    
-    if [ -n "$CURRENT_DOMAIN" ] && [ -f "$NGINX_CONF_DIR/$CURRENT_DOMAIN" ]; then
-        # 从 Nginx 配置中提取证书和私钥路径
-        CURRENT_CERT=$(grep -E '^\s*ssl_certificate\s' "$NGINX_CONF_DIR/$CURRENT_DOMAIN" | awk '{print $2}' | sed 's/;//')
-        CURRENT_KEY=$(grep -E '^\s*ssl_certificate_key\s' "$NGINX_CONF_DIR/$CURRENT_DOMAIN" | awk '{print $2}' | sed 's/;//')
-    else
-        CURRENT_DOMAIN="未检测到配置"
-        CURRENT_CERT="无"
-        CURRENT_KEY="无"
-    fi
-}
+
 
 install_site() {
     read -p "请输入你的自定义域名： " DOMAIN
@@ -190,11 +176,17 @@ view_logs() {
 
 while true; do
     clear
+    # 根据目录是否存在判断状态
+    if [ -d "$WEB_ROOT" ]; then
+        COLOR_STATUS="${GREEN}已安装${RESET}"
+    else
+        COLOR_STATUS="${RED}未安装${RESET}"
+    fi
     echo -e "${GREEN}=========================${RESET}"
     echo -e "${GREEN}    ◈  网站管理菜单  ◈   ${RESET}"
     echo -e "${GREEN}=========================${RESET}"
-    echo -e "${GREEN} 当前网站域名 : ${RESET}${CURRENT_DOMAIN}"
-    echo -e "${GREEN} 网页文件路径 : ${RESET}${WEB_ROOT}/index.html"
+    echo -e "${GREEN} 运行状态 : $COLOR_STATUS"
+    echo -e "${GREEN} 网页文件 : ${WEB_ROOT}/index.html${RESET}"
     echo -e "${GREEN}=========================${RESET}"
     echo -e "${GREEN}1) 部署网站${RESET}" 
     echo -e "${GREEN}2) 卸载网站${RESET}"

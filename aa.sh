@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# 哆啦A梦转发面板 Docker Compose 管理面板
+# BBS1ORG 论坛原生环境自建安装管理面板 (解耦目录版)
 # =================================================================
 
 # 颜色
@@ -10,77 +10,16 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="flux-panel"
-BASE_DIR="/opt/$APP_NAME"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
-GOST_SQL_URL="https://github.com/bqlpfy/flux-panel/releases/download/1.4.3/gost.sql"
-NODE_SCRIPT_URL="https://github.com/bqlpfy/flux-panel/raw/main/install.sh"
+TARGET_DIR="/var/www/bbs1org"
+# 统一管理 Nginx 配置目录路径
+NGINX_CONF_DIR="/etc/nginx/sites-available"
+NGINX_ENABLED_DIR="/etc/nginx/sites-enabled"
 
-DOCKER_CMD="docker compose"
-
-# 代理前缀列表（第一个留空代表直连尝试）
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
-
-# 检测依赖
+# 检测基础依赖
 check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+    if ! command -v git &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 git，请先安装 git！(apt install git 或 yum install git)${RESET}"
         exit 1
-    fi
-    if ! $DOCKER_CMD version &>/dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker Compose v2，请升级 Docker！${RESET}"
-        exit 1
-    fi
-}
-
-# 代理轮询下载通用函数
-download_file() {
-    local url="$1" local output="$2" local success=false
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local target_url="${proxy}${url}"
-        echo -e "${YELLOW}📡 正在尝试通过 [${proxy:-直连}] 下载...${RESET}"
-        curl -L -k --max-time 15 -o "$output" "$target_url"
-        if [ -s "$output" ]; then success=true; break; else rm -f "$output"; fi
-    done
-    [[ "$success" = true ]] && return 0 || return 1
-}
-
-# 动态获取容器状态、映射端口
-get_status_info() {
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/vite-frontend$)" ]; then
-        status_front="${GREEN}运行中${RESET}"
-    else
-        status_front="${RED}已停止/未创建${RESET}"
-    fi
-
-    if [ "$(docker ps -q -f name=^/springboot-backend$)" ]; then
-        status_back="${GREEN}运行中${RESET}"
-    else
-        status_back="${RED}已停止/未创建${RESET}"
-    fi
-
-    if [ "$(docker ps -q -f name=^/gost-mysql$)" ]; then
-        status_mysql="${GREEN}运行中${RESET}"
-    else
-        status_mysql="${YELLOW}未创建或外部数据库${RESET}"
-    fi
-
-    # 2. 从环境变量或容器中提取端口
-    if [ -f "$ENV_FILE" ]; then
-        web_front=$(grep 'FRONTEND_PORT=' "$ENV_FILE" | cut -d= -f2)
-        web_back=$(grep 'BACKEND_PORT=' "$ENV_FILE" | cut -d= -f2)
-    else
-        web_front="-"
-        web_back="-"
     fi
 }
 
@@ -106,279 +45,177 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 检测本地 IPv6 支持
-check_ipv6_support() {
-    ping6 -c 1 ::1 &>/dev/null && return 0 || return 1
+# 动态获取本地运行状态
+get_status_info() {
+    if [ -d "$TARGET_DIR" ]; then
+        status_dir="${GREEN}已创建 (${TARGET_DIR})${RESET}"
+    else
+        status_dir="${RED}未创建${RESET}"
+    fi
+
+    if command -v nginx &> /dev/null && systemctl is-active --quiet nginx; then
+        status_nginx="${GREEN}运行中${RESET}"
+    else
+        status_nginx="${RED}未运行/未安装${RESET}"
+    fi
 }
 
-# 部署 哆啦A梦转发面板
+# 执行自建安装
 install_app() {
     check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 数据库模式配置 ======${RESET}"
-    echo -e "${GREEN}1) 使用本地 Docker 自动安装 MySQL${RESET}"
-    echo -e "${GREEN}2) 连接已有的远程外部 MySQL 数据库 (自动导入结构)${RESET}"
-    echo -ne "${YELLOW}请选择数据库部署模式 [默认 1]: ${RESET}"
-    read -r db_mode
-    db_mode=${db_mode:-1}
-
-    echo -e "${YELLOW}📡 准备下载数据库初始化文件...${RESET}"
-    if [ ! -f "$BASE_DIR/gost.sql" ] || [ ! -s "$BASE_DIR/gost.sql" ]; then
-        if ! download_file "$GOST_SQL_URL" "$BASE_DIR/gost.sql"; then
-            echo -e "${RED}❌ 数据库文件下载失败，请检查网络通道${RESET}"
-            return 1
-        fi
-    fi
-
-    if [ "$db_mode" == "2" ]; then
-        echo -ne "${YELLOW}请输入远程数据库 IP/域名: ${RESET}"
-        read -r DB_HOST
-        echo -ne "${YELLOW}请输入远程数据库端口 [默认: 3306]: ${RESET}"
-        read -r DB_PORT
-        DB_PORT=${DB_PORT:-3306}
+    
+    echo -e "${CYAN}====== 开始自建环境安装 ======${RESET}"
+    
+    # 1. 克隆源码
+    if [ ! -d "$TARGET_DIR" ]; then
+        echo -e "${YELLOW}📡 正在克隆源码到 ${TARGET_DIR} ...${RESET}"
+        mkdir -p /var/www
+        git clone https://github.com/bbs1org/bbs1org.git "$TARGET_DIR"
     else
-        DB_HOST="mysql"
-        DB_PORT="3306"
+        echo -e "${GREEN}✅ 目标目录已存在，跳过克隆。${RESET}"
     fi
 
-    echo -ne "${YELLOW}请输入前端访问端口 [默认: 6366]: ${RESET}"
-    read -r FRONTEND_PORT
-    FRONTEND_PORT=${FRONTEND_PORT:-6366}
+    # 2. 创建目录并赋予权限
+    echo -e "${YELLOW}🔧 正在创建 data 和 cache 目录并设置 www-data 权限...${RESET}"
+    cd "$TARGET_DIR" || exit
+    mkdir -p data cache
+    
+    # 自动识别系统 Web 用户（Debian/Ubuntu 通常是 www-data，CentOS 通常是 nginx）
+    local web_user="www-data"
+    if id "nginx" &>/dev/null; then web_user="nginx"; fi
+    
+    chown -R "$web_user:$web_user" data cache
+    chmod -R 755 data cache
+    echo -e "${GREEN}✅ 权限归属已设置为: ${web_user}${RESET}"
 
-    echo -ne "${YELLOW}请输入后端访问端口 [默认: 6365]: ${RESET}"
-    read -r BACKEND_PORT
-    BACKEND_PORT=${BACKEND_PORT:-6365}
+    # 3. 域名核心输入逻辑
+    read -p "$(echo -e "${GREEN}请输入你的自定义域名：${RESET}")" DOMAIN
+    
+    # 确保存储配置文件的目录存在
+    mkdir -p "$NGINX_CONF_DIR" "$NGINX_ENABLED_DIR"
 
-    echo -ne "${YELLOW}请输入数据库用户名 [默认: gost]: ${RESET}"
-    read -r DB_USER
-    DB_USER=${DB_USER:-gost}
+    # --- 自定义证书路径逻辑 ---
+    DEFAULT_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    DEFAULT_KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
 
-    echo -ne "${YELLOW}请输入数据库名称 [默认: gost]: ${RESET}"
-    read -r DB_NAME
-    DB_NAME=${DB_NAME:-gost}
+    echo -e "\n${GREEN}--- 证书路径配置 ---${RESET}"
+    read -p "$(echo -e "${GREEN}请输入证书路径 [默认: $DEFAULT_CERT]: ${RESET}")" USER_CERT
+    read -p "$(echo -e "${GREEN}请输入私钥路径 [默认: $DEFAULT_KEY]: ${RESET}")" USER_KEY
 
-    echo -ne "${YELLOW}请输入数据库密码 [默认: 123456]: ${RESET}"
-    read -r DB_PASSWORD
-    DB_PASSWORD=${DB_PASSWORD:-123456}
+    # 如果用户直接回车，则使用默认预测路径
+    CERT_PATH=${USER_CERT:-$DEFAULT_CERT}
+    KEY_PATH=${USER_KEY:-$DEFAULT_KEY}
+    # --------------------------
 
-    if [ "$db_mode" == "2" ]; then
-        echo -e "${YELLOW}🔄 正在尝试连接远程数据库并自动导入结构...${RESET}"
-        docker run --rm -i --net=host mysql:5.7 mysql -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" < "$BASE_DIR/gost.sql" 2>/tmp/gost_db_err.log
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}❌ 远程数据库导入失败！错误信息如下：${RESET}"
-            cat /tmp/gost_db_err.log
-            return 1
-        fi
-    fi
-
-    JWT_SECRET=$(openssl rand -hex 16 2>/dev/null || echo "gost_jwt_secret_$(date +%s)")
-
-    ENABLE_IPV6=false
-    if check_ipv6_support; then
-        echo -e "${GREEN}🚀 系统支持 IPv6，默认开启 Docker IPv6 支持${RESET}"
-        ENABLE_IPV6=true
-    fi
-
-    # 生成 .env
-    cat <<EOF > "$ENV_FILE"
-DB_HOST=$DB_HOST
-DB_PORT=$DB_PORT
-DB_NAME=$DB_NAME
-DB_USER=$DB_USER
-DB_PASSWORD=$DB_PASSWORD
-JWT_SECRET=$JWT_SECRET
-FRONTEND_PORT=$FRONTEND_PORT
-BACKEND_PORT=$BACKEND_PORT
-EOF
-
-    # 生成 docker-compose.yml
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-EOF
-
-    if [ "$db_mode" == "1" ]; then
-    cat <<EOF >> "$COMPOSE_FILE"
-  mysql:
-    image: mysql:5.7
-    container_name: gost-mysql
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_USER: ${DB_USER}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
-      TZ: Asia/Shanghai
-    volumes:
-      - mysql_data:/var/lib/mysql
-      - ./gost.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    command: >
-      --default-authentication-plugin=mysql_native_password
-      --character-set-server=utf8mb4
-      --collation-server=utf8mb4_unicode_ci
-      --max_connections=1000
-    networks:
-      - gost-network
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      timeout: 10s
-      retries: 10
-EOF
-    fi
-
-    cat <<EOF >> "$COMPOSE_FILE"
-  backend:
-    image: bqlpfy/springboot-backend:1.4.3
-    container_name: springboot-backend
-    restart: unless-stopped
-    environment:
-      DB_HOST: ${DB_HOST}
-      DB_PORT: ${DB_PORT}
-      DB_NAME: ${DB_NAME}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      JWT_SECRET: ${JWT_SECRET}
-      LOG_DIR: /app/logs
-      JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
-    ports:
-      - "${BACKEND_PORT}:6365"
-    volumes:
-      - backend_logs:/app/logs
-$( [ "$db_mode" == "1" ] && echo "    depends_on:
-      mysql:
-        condition: service_healthy" )
-    networks:
-      - gost-network
-    healthcheck:
-      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 90s
-
-  frontend:
-    image: bqlpfy/vite-frontend:1.4.3
-    container_name: vite-frontend
-    restart: unless-stopped
-    ports:
-      - "${FRONTEND_PORT}:80"
-$( [ "$db_mode" == "1" ] && echo "    depends_on:
-      backend:
-        condition: service_healthy" )
-    networks:
-      - gost-network
-
-volumes:
-$( [ "$db_mode" == "1" ] && echo "  mysql_data:
-    name: mysql_data
-    driver: local" )
-  backend_logs:
-    name: backend_logs
-    driver: local
-
-networks:
-  gost-network:
-    name: gost-network
-    driver: bridge
-$( [ "$ENABLE_IPV6" = true ] && echo "    enable_ipv6: true
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
-        - subnet: fd00:dead:beef::/48" )
-EOF
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动面板...${RESET}"
-    cd "$BASE_DIR" && $DOCKER_CMD up -d --force-recreate
-
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    哆啦A梦转发面板 部署成功！  ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}前端访问: http://${DETECT_IP}:${FRONTEND_PORT}${RESET}"
-    echo -e "${YELLOW}后端访问: http://${DETECT_IP}:${BACKEND_PORT}${RESET}"
-    echo -e "${YELLOW}默认账号: admin_user / 密码: admin_user${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    # 4. 动态写入 Nginx 站点配置文件
+    echo -e "${YELLOW}📝 正在生成 Nginx 站点配置文件...${RESET}"
+    
+    cat <<EOF > "${NGINX_CONF_DIR}/${DOMAIN}"
+server {
+    listen 80;
+    server_name ${DOMAIN};
+    # 强制将所有 HTTP 请求重定向到 HTTPS
+    return 301 https://\$host\$request_uri;
 }
 
-update_app() { [[ -f "$COMPOSE_FILE" ]] && cd "$BASE_DIR" && $DOCKER_CMD pull && $DOCKER_CMD up -d && echo -e "${GREEN}更新完成！${RESET}" || echo -e "${RED}错误: 未部署！${RESET}"; }
-uninstall_app() {
-    echo -ne "${YELLOW}确定要卸载并删除容器吗？(y/n): ${RESET}"
-    read -r confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && $DOCKER_CMD down
-            echo -ne "${YELLOW}是否同时删除本地所有挂载数据及目录？(y/n): ${RESET}"
-            read -r clean_data
-            [[ "$clean_data" == "y" || "$clean_data" == "Y" ]] && rm -rf "$BASE_DIR" && echo -e "${GREEN}本地数据已彻底清理。${RESET}"
-        else
-            docker rm -f vite-frontend springboot-backend gost-mysql 2>/dev/null
-        fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+server {
+    listen 443 ssl;
+    server_name ${DOMAIN};
+    root ${TARGET_DIR};
+    index index.php;
+
+    # SSL 证书配置
+    ssl_certificate ${CERT_PATH};
+    ssl_certificate_key ${KEY_PATH};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    # 安全拦截规则：禁止公网访问 SQLite 数据库
+    location ^~ /data/ {
+        deny all;
+    }
+
+    # 安全拦截规则：禁止公网访问缓存目录
+    location ^~ /cache/ {
+        deny all;
+    }
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+        include fastcgi_params;
+        # 默认使用 unix 套接字（主流系统如 Ubuntu/Debian 默认配置）
+        fastcgi_pass unix:/run/php/php8.1-fpm.sock; 
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+}
+EOF
+
+    # 创建 Nginx 启用软链接 (使用解耦后的变量写法)
+    ln -sf "${NGINX_CONF_DIR}/${DOMAIN}" "${NGINX_ENABLED_DIR}/"
+    
+    # 5. 检查并重载配置
+    echo -e "${GREEN}正在测试 Nginx 配置并平滑重载...${RESET}"
+    if nginx -t; then
+        systemctl reload nginx
+        echo -e "${GREEN}✅ Nginx 配置加载成功并已成功重载服务！${RESET}"
+    else
+        echo -e "${RED}❌ Nginx 配置测试失败，请检查上面输出的错误原因或确保证书路径正确！${RESET}"
+    fi
+
+    # 6. 完成提示
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${GREEN}        BBS1ORG 论坛站点配置完成！                ${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${YELLOW}🌐 访问以下链接开始安装并在后台绑定域名:${RESET}"
+    echo -e "${GREEN}👉 https://${DOMAIN}/install.php${RESET}"
+    echo -e "${RED}🔒 安全生效: data/ 和 cache/ 在 Nginx 规则中已被拒绝访问。${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
+}
+
+# 更新源码
+update_app() {
+    if [ -d "$TARGET_DIR/.git" ]; then
+        echo -e "${YELLOW}🔄 正在同步 GitHub 最新源码...${RESET}"
+        cd "$TARGET_DIR" && git pull
+        echo -e "${GREEN}✅ 源码更新成功！${RESET}"
+    else
+        echo -e "${RED}错误: 未检测到 Git 仓库项目，请先执行选项 1 部署！${RESET}"
     fi
 }
 
-check_compose_exist() { [[ -f "$COMPOSE_FILE" ]] && return 0 || { echo -e "${RED}错误: 未检测到配置文件！${RESET}"; return 1; }; }
-start_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD start && echo -e "${GREEN}服务已启动${RESET}"; }
-stop_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD stop && echo -e "${YELLOW}服务已停止${RESET}"; }
-restart_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD restart && echo -e "${GREEN}服务已重启${RESET}"; }
-
+# 查看本地日志
 view_logs() {
-    echo -e "${GREEN}选择容器查看日志:${RESET}"
-    echo "1) MySQL"
-    echo "2) Backend (后端)"
-    echo "3) Frontend (前端)"
-    read -p "选择: " c
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}选择查看本地服务日志:${RESET}"
+    echo -e "${GREEN}1) Nginx 错误日志 (Error Log)${RESET}"
+    echo -e "${GREEN}2) Nginx 访问日志 (Access Log)${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请选择 [1-2]: ${RESET}"
+    read -r c
     case $c in
-        1) docker logs -f gost-mysql 2>/dev/null || echo -e "${RED}容器未创建${RESET}" ;;
-        2) docker logs -f springboot-backend 2>/dev/null || echo -e "${RED}容器未创建${RESET}" ;;
-        3) docker logs -f vite-frontend 2>/dev/null || echo -e "${RED}容器未创建${RESET}" ;;
+        1) tail -n 100 -f /var/log/nginx/error.log 2>/dev/null || echo -e "${RED}日志文件不存在${RESET}" ;;
+        2) tail -n 100 -f /var/log/nginx/access.log 2>/dev/null || echo -e "${RED}日志文件不存在${RESET}" ;;
         *) echo -e "${RED}无效选择${RESET}" ;;
     esac
 }
 
-manage_nodes() {
-    echo "📡 正在获取节点管理..."
-    if download_file "$NODE_SCRIPT_URL" "$BASE_DIR/node_install.sh"; then
-        chmod +x "$BASE_DIR/node_install.sh"
-        "$BASE_DIR/node_install.sh"
-        rm -f "$BASE_DIR/node_install.sh"
-    else
-        echo -e "${RED}❌ 无法下载节点管理，请检查网络！${RESET}"
-    fi
-}
-
-show_info() {
-    get_status_info
-    local DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}前端状态 : $status_front"
-    echo -e "${YELLOW}后端状态 : $status_back"
-    echo -e "${YELLOW}数据状态 : $status_mysql"
-    echo -e "${YELLOW}前端地址 : http://${DETECT_IP}:${web_front}${RESET}"
-    echo -e "${YELLOW}后端地址 : http://${DETECT_IP}:${web_back}${RESET}"
-    echo -e "${YELLOW}配置目录 : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
+# 主菜单交互
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈    哆啦A梦转发面板管理    ◈   ${RESET}"
+    echo -e "${GREEN} ◈     BBS1ORG 原生自建管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}前端状态 :${RESET} $status_front ${GREEN}端口 :${RESET} ${YELLOW}${web_front}${RESET}"
-    echo -e "${GREEN}后端状态 :${RESET} $status_back  ${GREEN}端口 :${RESET} ${YELLOW}${web_back}${RESET}"
-    echo -e "${GREEN}数据状态 :${RESET} $status_mysql"
+    echo -e "${GREEN}源码目录 :${RESET} $status_dir"
+    echo -e "${GREEN}环境状态 : Nginx -> $status_nginx"
+    echo -e "${GREEN}配置目录 :${RESET} ${CYAN}${NGINX_CONF_DIR}${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}9. 节点管理${RESET}  ${YELLOW}← 添加节点${RESET}"
+    echo -e "${GREEN}1. 部署源码与配置站点 (含 HTTPS)${RESET}"
+    echo -e "${GREEN}2. 更新论坛源码 (Git Pull)${RESET}"
+    echo -e "${GREEN}7. 查看本地 Nginx 日志${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
@@ -386,13 +223,7 @@ menu() {
     case "$choice" in
         1) install_app ;;
         2) update_app ;;
-        3) uninstall_app ;;
-        4) start_app ;;
-        5) stop_app ;;
-        6) restart_app ;;
         7) view_logs ;;
-        8) show_info ;;
-        9) manage_nodes ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

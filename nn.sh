@@ -1,230 +1,412 @@
 #!/bin/bash
+# =================================================================
+# 哆啦A梦转发面板 Docker Compose 管理面板
+# =================================================================
 
-# 标准 ANSI 颜色定义
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-RESET='\033[0m'
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# 载入环境变量并增强 PATH 搜索
-[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
-[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null
-export PATH="/usr/local/bin:$HOME/.local/bin:/root/.local/bin:$PATH"
+APP_NAME="flvx-panel"
+BASE_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
+NODE_SCRIPT_URL="https://raw.githubusercontent.com/Sagit-chu/flvx/main/install.sh"
 
-# 动态定位 Quick-SSH 实际安装与数据路径
-get_paths() {
-    SSH_CONFIG="$HOME/.ssh/config"
-    QSSHRC_FILE="$HOME/.qsshrc"
-    REAL_EXEC_PATH=$(command -v qssh 2>/dev/null)
-    if [ -z "$REAL_EXEC_PATH" ] && [ -f "$HOME/.local/bin/qssh" ]; then
-        REAL_EXEC_PATH="$HOME/.local/bin/qssh"
+DOCKER_CMD="docker compose"
+
+# 代理前缀列表
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://ghfast.top/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+)
+
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
+    fi
+    if ! $DOCKER_CMD version &>/dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker Compose v2，请升级 Docker！${RESET}"
+        exit 1
     fi
 }
 
-# 获取状态与版本信息
-get_status() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        status="${GREEN}已安装${RESET}"
-        version_info=$($REAL_EXEC_PATH help 2>/dev/null | grep -i "qssh" | head -n 1 | awk '{print $2}')
-        [ -z "$version_info" ] && version_info="1.1.11"
-        qssh_version="${YELLOW}${version_info}${RESET}"
+# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
+format_ip_for_url() {
+    local ip="$1"
+    if [[ "$ip" == *":"* ]]; then
+        echo "[$ip]"
     else
-        status="${RED}未安装${RESET}"
-        qssh_version="${RED}-${RESET}"
-    fi
-
-    if [ -f "$SSH_CONFIG" ] && grep -q -i "Host " "$SSH_CONFIG" 2>/dev/null; then
-        config_status="${GREEN}已有连接${RESET}"
-    else
-        config_status="${YELLOW}暂无连接${RESET}"
+        echo "$ip"
     fi
 }
 
-# 菜单面板
-show_menu() {
+download_file() {
+    local url="$1" local output="$2" local success=false
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local target_url="${proxy}${url}"
+        echo -e "${YELLOW}📡 正在尝试通过 [${proxy:-直连}]...${RESET}"
+        curl -L -k --max-time 15 -o "$output" "$target_url"
+        if [ -s "$output" ]; then success=true; break; else rm -f "$output"; fi
+    done
+    [[ "$success" = true ]] && return 0 || return 1
+}
+
+get_status_info() {
+    [ "$(docker ps -q -f name=^/vite-frontend$)" ] && status_front="${GREEN}运行中${RESET}" || status_front="${RED}已停止/未创建${RESET}"
+    [ "$(docker ps -q -f name=^/flux-panel-backend$)" ] && status_back="${GREEN}运行中${RESET}" || status_back="${RED}已停止/未创建${RESET}"
+    
+    if [ -f "$ENV_FILE" ]; then
+        db_type_curr=$(grep 'DB_TYPE=' "$ENV_FILE" | cut -d= -f2)
+        db_type_curr=${db_type_curr:-sqlite}
+        if [ "$db_type_curr" == "postgres" ]; then
+            [ "$(docker ps -q -f name=^/flux-panel-postgres$)" ] && status_db="${GREEN}PostgreSQL 运行中${RESET}" || status_db="${RED}PostgreSQL 已停止${RESET}"
+        else
+            status_db="${GREEN}SQLite (内置模式)${RESET}"
+        fi
+        web_front=$(grep 'FRONTEND_PORT=' "$ENV_FILE" | cut -d= -f2)
+        web_back=$(grep 'BACKEND_PORT=' "$ENV_FILE" | cut -d= -f2)
+    else
+        status_db="${YELLOW}未配置${RESET}"
+        web_front="-"
+        web_back="-"
+    fi
+}
+
+# 获取公网 IP (兼容双栈环境)
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
+}
+
+check_ipv6_support() {
+    ping6 -c 1 ::1 &>/dev/null && return 0 || return 1
+}
+
+install_app() {
+    check_dependencies
+    mkdir -p "$BASE_DIR"
+
+    echo -e "${CYAN}====== 数据库类型选择 ======${RESET}"
+    echo -e "${GREEN}1) 使用内置轻量级 SQLite (推荐，免维护，占用小)${RESET}"
+    echo -e "${GREEN}2) 使用独立 PostgreSQL 16 容器 (适合高并发/多节点数据同步)${RESET}"
+    echo -ne "${YELLOW}请选择数据库类型 [默认 1]: ${RESET}"
+    read -r db_select
+    db_select=${db_select:-1}
+
+    # 远程数据库支持扩展
+    local remote_db_port_section=""
+    if [ "$db_select" == "2" ]; then
+        echo -ne "${YELLOW}是否允许 PostgreSQL 数据库支持远程连接？(y/n) [默认 n]: ${RESET}"
+        read -r allow_remote
+        if [[ "$allow_remote" == "y" || "$allow_remote" == "Y" ]]; then
+            echo -ne "${YELLOW}请输入 PostgreSQL 远程访问端口 [默认 5432]: ${RESET}"
+            read -r db_port
+            db_port=${db_port:-5432}
+            remote_db_port_section="ports:\n      - \"${db_port}:5432\""
+            echo -e "${GREEN}已配置数据库远程映射端口: ${db_port}${RESET}"
+        fi
+    fi
+
+    echo -ne "${YELLOW}请输入前端访问端口 [默认: 6366]: ${RESET}"
+    read -r FRONTEND_PORT
+    FRONTEND_PORT=${FRONTEND_PORT:-6366}
+
+    echo -ne "${YELLOW}请输入后端访问端口 [默认: 6365]: ${RESET}"
+    read -r BACKEND_PORT
+    BACKEND_PORT=${BACKEND_PORT:-6365}
+
+    JWT_SECRET=$(openssl rand -hex 16 2>/dev/null || echo "flux_jwt_secret_$(date +%s)")
+    ENABLE_IPV6=false
+    check_ipv6_support && ENABLE_IPV6=true
+
+    # 根据选择初始化环境变量
+    if [ "$db_select" == "2" ]; then
+        DB_TYPE="postgres"
+        PG_PASS=$(openssl rand -hex 12 2>/dev/null || echo "flux_pwd_$(date +%s)")
+        DATABASE_URL="postgres://flux_panel:${PG_PASS}@postgres:5432/flux_panel?sslmode=disable"
+        
+        cat <<EOF > "$ENV_FILE"
+JWT_SECRET=$JWT_SECRET
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+DB_TYPE=postgres
+DATABASE_URL=$DATABASE_URL
+POSTGRES_DB=flux_panel
+POSTGRES_USER=flux_panel
+POSTGRES_PASSWORD=$PG_PASS
+FLUX_VERSION=latest
+EOF
+    else
+        cat <<EOF > "$ENV_FILE"
+JWT_SECRET=$JWT_SECRET
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+DB_TYPE=sqlite
+FLUX_VERSION=latest
+EOF
+    fi
+
+    # 动态写入全新的 docker-compose.yml
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  backend:
+    image: ghcr.io/sagit-chu/flux-panel-backend:\${FLUX_VERSION:-latest}
+    container_name: flux-panel-backend
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    environment:
+      DB_TYPE: \${DB_TYPE:-sqlite}
+      DB_PATH: /app/data/gost.db
+      DATABASE_URL: \${DATABASE_URL:-}
+      JWT_SECRET: \${JWT_SECRET}
+      SERVER_ADDR: :6365
+      TZ: Asia/Shanghai
+      FLUX_VERSION: \${FLUX_VERSION:-dev}
+      PANEL_DEPLOY_DIR: /opt/flux-panel
+      PANEL_BACKEND_CONTAINER: flux-panel-backend
+    ports:
+      - "\${BACKEND_PORT}:6365"
+    volumes:
+      - sqlite_data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/opt/flux-panel
+    networks:
+      - gost-network
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+EOF
+
+    # 如果选择 PostgreSQL，则注入 postgres 服务段
+    if [ "$db_select" == "2" ]; then
+    cat <<EOF >> "$COMPOSE_FILE"
+  postgres:
+    image: postgres:16-alpine
+    container_name: flux-panel-postgres
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+    environment:
+      POSTGRES_DB: \${POSTGRES_DB:-flux_panel}
+      POSTGRES_USER: \${POSTGRES_USER:-flux_panel}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-flux_panel_change_me}
+      TZ: Asia/Shanghai
+$( [ -n "$remote_db_port_section" ] && echo -e "    $remote_db_port_section" )
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER:-flux_panel} -d \${POSTGRES_DB:-flux_panel}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+EOF
+    fi
+
+    # 注入前端
+    cat <<EOF >> "$COMPOSE_FILE"
+  frontend:
+    image: ghcr.io/sagit-chu/vite-frontend:\${FLUX_VERSION:-latest}
+    container_name: vite-frontend
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    ports:
+      - "\${FRONTEND_PORT}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - gost-network
+
+volumes:
+  sqlite_data:
+    name: sqlite_data
+    driver: local
+$( [ "$db_select" == "2" ] && echo "  postgres_data:
+    name: postgres_data
+    driver: local" )
+
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+$( if [ "$ENABLE_IPV6" = true ]; then echo "    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.80.0.0/16
+        - subnet: fd00:dead:beef::/48"
+   else echo "    ipam:
+      config:
+        - subnet: 172.80.0.0/16"
+   fi )
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动面板...${RESET}"
+    cd "$BASE_DIR" && $DOCKER_CMD up -d --force-recreate
+
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}      Flvx-Panel 部署成功！  ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}前端访问: http://${DETECT_IP}:${FRONTEND_PORT}${RESET}"
+    echo -e "${YELLOW}后端访问: http://${DETECT_IP}:${BACKEND_PORT}${RESET}"
+    echo -e "${YELLOW}默认账号: admin_user / 密码: admin_user${RESET}"
+    if [ -n "$remote_db_port_section" ]; then
+        echo -e "${CYAN}数据库远程连接: ${RAW_IP}:${db_port} (用户: flux_panel)${RESET}"
+    fi
+    echo -e "${GREEN}================================${RESET}"
+}
+
+update_app() { [[ -f "$COMPOSE_FILE" ]] && cd "$BASE_DIR" && $DOCKER_CMD pull && $DOCKER_CMD up -d && echo -e "${GREEN}更新完成！${RESET}" || echo -e "${RED}错误: 未部署！${RESET}"; }
+uninstall_app() {
+    echo -ne "${YELLOW}确定要卸载吗？(y/n): ${RESET}"
+    read -r confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && $DOCKER_CMD down
+            echo -ne "${YELLOW}是否完全清理挂载数据？(y/n): ${RESET}"
+            read -r clean_data
+            [[ "$clean_data" == "y" || "$clean_data" == "Y" ]] && rm -rf "$BASE_DIR" && echo -e "${GREEN}数据已彻底清理。${RESET}"
+        else
+            docker rm -f vite-frontend flux-panel-backend flux-panel-postgres 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
+}
+
+check_compose_exist() { [[ -f "$COMPOSE_FILE" ]] && return 0 || { echo -e "${RED}错误: 未检测到配置文件！${RESET}"; return 1; }; }
+start_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD restart && echo -e "${GREEN}服务已重启${RESET}"; }
+
+view_logs() {
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}选择容器查看日志:${RESET}"
+    echo -e "${YELLOW}1) Backend (后端)${RESET}"
+    echo -e "${YELLOW}2) Frontend (前端)${RESET}"
+    echo -e "${YELLOW}3) PostgreSQL (数据库)${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请选择 [1-3]: ${RESET}"
+    read -r c
+    case $c in
+        1) docker logs -f flux-panel-backend ;;
+        2) docker logs -f vite-frontend ;;
+        3) docker logs -f flux-panel-postgres 2>/dev/null || echo -e "${RED}未处于 PostgreSQL 模式或容器未创建${RESET}" ;;
+        *) echo -e "${RED}无效选择${RESET}" ;;
+    esac
+}
+
+manage_nodes() {
+    echo -e "${YELLOW}📡 正在获取节点管理管理...${RESET}"
+    if download_file "$NODE_SCRIPT_URL" "$BASE_DIR/node_install.sh"; then
+        chmod +x "$BASE_DIR/node_install.sh" && "$BASE_DIR/node_install.sh"
+        rm -f "$BASE_DIR/node_install.sh"
+    else
+        echo -e "${RED}❌ 无法下载节点管理，请检查网络！${RESET}"
+    fi
+}
+
+show_info() {
+    get_status_info
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}前端状态 : $status_front"
+    echo -e "${YELLOW}后端状态 : $status_back"
+    echo -e "${YELLOW}数据存储 : $status_db"
+    echo -e "${YELLOW}前端地址 : http://${DETECT_IP}:${web_front}${RESET}"
+    echo -e "${YELLOW}后端地址 : http://${DETECT_IP}:${web_back}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+menu() {
     clear
-    get_status
+    get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈  Quick-SSH 终端连接管理面板 ◈ ${RESET}"
+    echo -e "${GREEN}   ◈  Flvx-Panel 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} $qssh_version"
-    echo -e "${GREEN}连接 :${RESET} $config_status"
+    echo -e "${GREEN}前端状态 :${RESET} $status_front  ${GREEN}端口 :${RESET} ${YELLOW}${web_front}${RESET}"
+    echo -e "${GREEN}后端状态 :${RESET} $status_back  ${GREEN}端口 :${RESET} ${YELLOW}${web_back}${RESET}"
+    echo -e "${GREEN}数据环境 :${RESET} $status_db"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 自动安装/更新 (Linux x64)${RESET}"
-    echo -e "${GREEN}2. 启动 TUI 交互界面${RESET}"
-    echo -e "${GREEN}3. 快捷添加 SSH 连接${RESET}"
-    echo -e "${GREEN}4. TUI 常用快捷键速查${RESET}"
-    echo -e "${YELLOW}5. 🛠️ 一键修复 ~/.ssh 密钥权限${RESET}"
-    echo -e "${GREEN}6. 彻底卸载与净化${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 节点管理${RESET}  ${YELLOW}← 添加节点${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
-}
-
-# 1. 安装
-install_qssh() {
-    echo -e "\n${YELLOW}正在从 GitHub 检索 Quick-SSH 最新版本信息...${RESET}"
-    LATEST_TAG=$(curl -s https://api.github.com/repos/CCE-Li/Quick-SSH/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -z "$LATEST_TAG" ]; then
-        echo -e "${RED}❌ 无法获取最新版本信息，请检查网络。${RESET}"
-        return 1
-    fi
-    echo -e "${GREEN}发现最新版本: ${LATEST_TAG}${RESET}"
-    DOWNLOAD_URL="https://github.com/CCE-Li/Quick-SSH/releases/download/${LATEST_TAG}/qssh-linux-x64"
-    TMP_DIR=$(mktemp -d)
-    if curl -L "$DOWNLOAD_URL" -o "${TMP_DIR}/qssh"; then
-        mkdir -p "$HOME/.local/bin"
-        mv "${TMP_DIR}/qssh" "$HOME/.local/bin/qssh"
-        chmod +x "$HOME/.local/bin/qssh"
-        if [ -w "/usr/local/bin" ]; then
-            rm -f /usr/local/bin/qssh
-            ln -s "$HOME/.local/bin/qssh" /usr/local/bin/qssh
-        else
-            sudo rm -f /usr/local/bin/qssh
-            sudo ln -s "$HOME/.local/bin/qssh" /usr/local/bin/qssh
-        fi
-        echo -e "${GREEN}✔ 最新版 Quick-SSH 成功安装！${RESET}"
-    else
-        echo -e "${RED}❌ 下载失败。${RESET}"
-    fi
-    rm -rf "$TMP_DIR"
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
-
-# 2. 启动 TUI 界面
-start_tui() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        "$REAL_EXEC_PATH"
-    else
-        echo -e "\n${RED}未检测到 qssh 命令，请先执行选项 1！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-    fi
-}
-
-# 3. 快捷添加连接 (拆分输入项版)
-add_ssh_connection() {
-    get_paths
-    if [ -z "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${RED}未检测到已安装的 Quick-SSH。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-        return
-    fi
-    echo -e "\n${GREEN}[快捷添加 SSH 连接]${RESET}"
-    
-    # 1. 别名
-    echo -ne "${YELLOW}1. 请输入连接别名 (例如 my-server): ${RESET}"
-    read -r alias_name
-    [ -z "$alias_name" ] && echo -e "${RED}❌ 别名不能为空！${RESET}" && sleep 1 && return
-
-    # 2. 用户名
-    echo -ne "${YELLOW}2. 请输入用户名 (例如 root): ${RESET}"
-    read -r ssh_user
-    [ -z "$ssh_user" ] && echo -e "${RED}❌ 用户名不能为空！${RESET}" && sleep 1 && return
-
-    # 3. 连接地址
-    echo -ne "${YELLOW}3. 请输入连接地址/IP (例如 192.168.1.100): ${RESET}"
-    read -r ssh_host
-    [ -z "$ssh_host" ] && echo -e "${RED}❌ 连接地址不能为空！${RESET}" && sleep 1 && return
-
-    # 4. 端口（带默认值 22）
-    echo -ne "${YELLOW}4. 请输入端口号 (回车默认 22): ${RESET}"
-    read -r ssh_port
-    [ -z "$ssh_port" ] && ssh_port="22"
-
-    # 5. 私钥路径（带默认值 ~/.ssh/id_rsa）
-    echo -ne "${YELLOW}5. 请输入私钥路径 (回车默认 ~/.ssh/id_rsa): ${RESET}"
-    read -r key_path
-    [ -z "$key_path" ] && key_path="$HOME/.ssh/id_rsa"
-
-    # 拼接为 qssh 所需的标准格式: user@host:port
-    login_info="${ssh_user}@${ssh_host}:${ssh_port}"
-
-    echo -e "\n${GREEN}正在将 [${alias_name}] (${login_info}) 写入连接配置...${RESET}"
-    "$REAL_EXEC_PATH" add "$alias_name" "$login_info" --key "$key_path"
-    
-    echo -ne "\n${GREEN}添加成功！按回车键返回主菜单...${RESET}" && read -r
-}
-
-# 4. 快捷键指南面板
-show_shortcuts() {
-    clear
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -e "${YELLOW}               Quick-SSH TUI 常用键位速查             ${RESET}"
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -e "  ↑ / ↓          : 移动光标选择服务器连接"
-    echo -e "  Enter          : 一键发起 SSH 会话连入服务器"
-    echo -e "  Space (空格)   : 选择/取消选择（用于批量操作）"
-    echo -e "  d              : 删除当前/批量删除连接"
-    echo -e "  P              : 批量检测连接延迟状态"
-    echo -e "  q              : 退出当前界面"
-    echo -e "\n${GREEN}[🔥 特色闪光点：高级拖拽上传]${RESET}"
-    echo -e "  * 会话连接中，直接把本地文件/目录拖进当前终端窗口。"
-    echo -e "  * 软件自动打开新本地窗口利用 SFTP 后台并发上传。"
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -ne "${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
-
-# 5. 🔥 一键修复权限功能
-fix_ssh_permissions() {
-    echo -e "\n${YELLOW}正在检查并严格标准化修复本地 SSH 目录及文件的权限...${RESET}"
-    
-    if [ -d "$HOME/.ssh" ]; then
-        # 1. 修复目录
-        chmod 700 "$HOME/.ssh"
-        echo -e "${GREEN}✔ 已将 ~/.ssh 目录权限修正为 700 (drwx------)${RESET}"
-        
-        # 2. 修复常见私钥文件
-        for keyfile in id_rsa id_ecdsa id_ed25519 id_dsa; do
-            if [ -f "$HOME/.ssh/$keyfile" ]; then
-                chmod 600 "$HOME/.ssh/$keyfile"
-                echo -e "${GREEN}✔ 已将私钥 $keyfile 权限修正为 600 (-rw-------)${RESET}"
-            fi
-        done
-        
-        # 3. 修复常见公钥及配置文件
-        [ -f "$HOME/.ssh/id_rsa.pub" ] && chmod 644 "$HOME/.ssh/id_rsa.pub" && echo -e "${GREEN}✔ 已将公钥 id_rsa.pub 权限修正为 644${RESET}"
-        [ -f "$HOME/.ssh/authorized_keys" ] && chmod 600 "$HOME/.ssh/authorized_keys" && echo -e "${GREEN}✔ 已将授权列表 authorized_keys 权限修正为 600${RESET}"
-        [ -f "$HOME/.ssh/config" ] && chmod 644 "$HOME/.ssh/config" && echo -e "${GREEN}✔ 已将配置文件 config 权限修正为 644${RESET}"
-        
-        echo -e "\n${GREEN}🎉 权限修复成功！现已满足 OpenSSH 严格安全指标，可正常使用密匙连入。${RESET}"
-    else
-        echo -e "${RED}❌ 未在当前用户家目录下找到 .ssh 文件夹，无需修复。${RESET}"
-    fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
-
-# 6. 清理与卸载
-uninstall_qssh() {
-    get_paths
-    echo -e "\n${RED}警告：准备进入 Quick-SSH 卸载流程... (保留 ~/.ssh/config 数据)${RESET}"
-    echo -ne "${RED}确定要清除 qssh 二进制程序和全局调用配置吗？(y/n): ${RESET}"
-    read -r ans
-    if [[ "$ans" =~ ^[Yy]$ ]]; then
-        if [ -w "/usr/local/bin" ]; then rm -f /usr/local/bin/qssh; else sudo rm -f /usr/local/bin/qssh; fi
-        [ -n "$REAL_EXEC_PATH" ] && [ "$REAL_EXEC_PATH" != "/usr/local/bin/qssh" ] && rm -f "$REAL_EXEC_PATH"
-        rm -f "$HOME/.local/bin/qssh" "$QSSHRC_FILE"
-        echo -e "${GREEN}✔ 全局清理完成！${RESET}"
-    else
-        echo "已取消卸载。"
-    fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
-
-# 主循环
-while true; do
-    show_menu
     read -r choice
-    case $choice in
-        1) install_qssh ;;
-        2) start_tui ;;
-        3) add_ssh_connection ;;
-        4) show_shortcuts ;;
-        5) fix_ssh_permissions ;;
-        6) uninstall_qssh ;;
-        0) clear; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
+    case "$choice" in
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) start_app ;;
+        5) stop_app ;;
+        6) restart_app ;;
+        7) view_logs ;;
+        8) show_info ;;
+        9) manage_nodes ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+}
+
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
 done

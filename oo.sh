@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# BBS1ORG 论坛原生环境自建安装管理面板
+# flvx-panel Docker Compose 管理面板 (已修正 DB 依赖与 Volume 警告)
 # =================================================================
 
 # 颜色
@@ -10,40 +10,81 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-TARGET_DIR="/var/www/bbs1org"
-NGINX_CONF_DIR="/etc/nginx/sites-available"
-NGINX_ENABLED_DIR="/etc/nginx/sites-enabled"
+APP_NAME="flvx-panel"
+BASE_DIR="/opt/$APP_NAME"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
+NODE_SCRIPT_URL="https://raw.githubusercontent.com/Sagit-chu/flvx/main/install.sh"
 
-# 检测基础依赖并自动安装 PHP 核心扩展
+DOCKER_CMD="docker compose"
+
+# 代理前缀列表
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://ghfast.top/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+)
+
 check_dependencies() {
-    if ! command -v git &> /dev/null; then
-        echo -e "${YELLOW}📡 未检测到 git，正在自动安装...${RESET}"
-        apt update && apt install -y git
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
     fi
-
-    # 自动检测当前系统的 PHP 版本并补全组件（防止 500 报错）
-    if command -v php &> /dev/null; then
-        local php_ver
-        php_ver=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
-        echo -e "${YELLOW}📦 检测到系统 PHP 版本为: ${php_ver}，正在检查/补全必备扩展(SQLite3/XML/Curl/Mbstring)...${RESET}"
-        
-        if command -v apt &> /dev/null; then
-            apt update && apt install -y php${php_ver}-sqlite3 php${php_ver}-xml php${php_ver}-curl php${php_ver}-mbstring
-            echo -e "${GREEN}🔄 正在重启 php${php_ver}-fpm 以加载新扩展...${RESET}"
-            systemctl restart php${php_ver}-fpm 2>/dev/null || systemctl restart php-fpm 2>/dev/null
-        elif command -v yum &> /dev/null; then
-            yum install -y php-sqlite3 php-xml php-curl php-mbstring
-            systemctl restart php-fpm 2>/dev/null
-        fi
-        echo -e "${GREEN}✅ PHP 环境依赖补全成功！${RESET}"
-    else
-        echo -e "${RED}⚠️ 警告: 未在系统层面检测到原生 PHP 命令行程序，请确保您已手动安装 PHP-FPM！${RESET}"
+    if ! $DOCKER_CMD version &>/dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker Compose v2，请升级 Docker！${RESET}"
+        exit 1
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
+# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
+format_ip_for_url() {
+    local ip="$1"
+    if [[ "$ip" == *":"* ]]; then
+        echo "[$ip]"
+    else
+        echo "$ip"
+    fi
+}
+
+download_file() {
+    local url="$1" local output="$2" local success=false
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local target_url="${proxy}${url}"
+        echo -e "${YELLOW}📡 正在尝试通过 [${proxy:-直连}]...${RESET}"
+        curl -L -k --max-time 15 -o "$output" "$target_url"
+        if [ -s "$output" ]; then success=true; break; else rm -f "$output"; fi
+    done
+    [[ "$success" = true ]] && return 0 || return 1
+}
+
+get_status_info() {
+    [ "$(docker ps -q -f name=^/vite-frontend$)" ] && status_front="${GREEN}运行中${RESET}" || status_front="${RED}已停止/未创建${RESET}"
+    [ "$(docker ps -q -f name=^/flux-panel-backend$)" ] && status_back="${GREEN}运行中${RESET}" || status_back="${RED}已停止/未创建${RESET}"
+    
+    if [ -f "$ENV_FILE" ]; then
+        db_type_curr=$(grep 'DB_TYPE=' "$ENV_FILE" | cut -d= -f2)
+        db_type_curr=${db_type_curr:-sqlite}
+        if [ "$db_type_curr" == "postgres" ]; then
+            [ "$(docker ps -q -f name=^/flux-panel-postgres$)" ] && status_db="${GREEN}PostgreSQL 运行中${RESET}" || status_db="${RED}PostgreSQL 已停止${RESET}"
+        else
+            status_db="${GREEN}SQLite (内置模式)${RESET}"
+        fi
+        web_front=$(grep 'FRONTEND_PORT=' "$ENV_FILE" | cut -d= -f2)
+        web_back=$(grep 'BACKEND_PORT=' "$ENV_FILE" | cut -d= -f2)
+    else
+        status_db="${YELLOW}未配置${RESET}"
+        web_front="-"
+        web_back="-"
+    fi
+}
+
 get_public_ip() {
-    local mode=${1:-"auto"} local ip=""
+    local mode=${1:-"auto"}
+    local ip=""
+    
     if [[ "$mode" == "v4" ]]; then
         for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
@@ -63,215 +104,285 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 智能探测本地 PHP-FPM 的监听位置
-detect_php_fpm() {
-    echo -e "${YELLOW}🔍 正在智能探测系统 PHP-FPM 监听配置...${RESET}"
-    local grep_listen=""
-    grep_listen=$(grep -R "listen =" /etc/php* 2>/dev/null | grep -v ";" | head -n 1)
-    
-    if [[ "$grep_listen" =~ /run/.*\.sock ]]; then
-        PHP_PASS="unix:$(echo "$grep_listen" | awk -F'= ' '{print $2}')"
-    elif [[ "$grep_listen" =~ [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+ ]]; then
-        PHP_PASS="$(echo "$grep_listen" | awk -F'= ' '{print $2}')"
-    else
-        local find_sock=""
-        find_sock=$(find /run/php/ -name "php*-fpm.sock" 2>/dev/null | head -n 1)
-        if [[ -n "$find_sock" ]]; then
-            PHP_PASS="unix:$find_sock"
-        else
-            PHP_PASS="127.0.0.1:9000"
+check_ipv6_support() {
+    ping6 -c 1 ::1 &>/dev/null && return 0 || return 1
+}
+
+install_app() {
+    check_dependencies
+    mkdir -p "$BASE_DIR"
+
+    echo -e "${CYAN}====== 数据库类型选择 ======${RESET}"
+    echo -e "${GREEN}1) 使用内置轻量级 SQLite (推荐，免维护，占用小)${RESET}"
+    echo -e "${GREEN}2) 使用独立 PostgreSQL 16 容器 (适合高并发/多节点数据同步)${RESET}"
+    echo -ne "${YELLOW}请选择数据库类型 [默认 1]: ${RESET}"
+    read -r db_select
+    db_select=${db_select:-1}
+
+    local remote_db_port_section=""
+    if [ "$db_select" == "2" ]; then
+        echo -ne "${YELLOW}是否允许 PostgreSQL 数据库支持远程连接？(y/n) [默认 n]: ${RESET}"
+        read -r allow_remote
+        if [[ "$allow_remote" == "y" || "$allow_remote" == "Y" ]]; then
+            echo -ne "${YELLOW}请输入 PostgreSQL 远程访问端口 [默认 5432]: ${RESET}"
+            read -r db_port
+            db_port=${db_port:-5432}
+            remote_db_port_section="ports:\n      - \"${db_port}:5432\""
+            echo -e "${GREEN}已配置数据库远程映射端口: ${db_port}${RESET}"
         fi
     fi
-    echo -e "${GREEN}✅ 成功捕获 PHP 后端转发目标: ${PHP_PASS}${RESET}"
-}
 
-# 动态获取本地运行状态
-get_status_info() {
-    if [ -d "$TARGET_DIR" ]; then
-        status_dir="${GREEN}已创建 (${TARGET_DIR})${RESET}"
+    echo -ne "${YELLOW}请输入前端访问端口 [默认: 6366]: ${RESET}"
+    read -r FRONTEND_PORT
+    FRONTEND_PORT=${FRONTEND_PORT:-6366}
+
+    echo -ne "${YELLOW}请输入后端访问端口 [默认: 6365]: ${RESET}"
+    read -r BACKEND_PORT
+    BACKEND_PORT=${BACKEND_PORT:-6365}
+
+    JWT_SECRET=$(openssl rand -hex 16 2>/dev/null || echo "flux_jwt_secret_$(date +%s)")
+    ENABLE_IPV6=false
+    check_ipv6_support && ENABLE_IPV6=true
+
+    # 根据选择初始化环境变量
+    if [ "$db_select" == "2" ]; then
+        DB_TYPE="postgres"
+        PG_PASS=$(openssl rand -hex 12 2>/dev/null || echo "flux_pwd_$(date +%s)")
+        DATABASE_URL="postgres://flux_panel:${PG_PASS}@postgres:5432/flux_panel?sslmode=disable"
+        
+        cat <<EOF > "$ENV_FILE"
+JWT_SECRET=$JWT_SECRET
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+DB_TYPE=postgres
+DATABASE_URL=$DATABASE_URL
+POSTGRES_DB=flux_panel
+POSTGRES_USER=flux_panel
+POSTGRES_PASSWORD=$PG_PASS
+FLUX_VERSION=latest
+EOF
     else
-        status_dir="${RED}未创建${RESET}"
+        cat <<EOF > "$ENV_FILE"
+JWT_SECRET=$JWT_SECRET
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+DB_TYPE=sqlite
+FLUX_VERSION=latest
+EOF
     fi
 
-    if command -v nginx &> /dev/null && systemctl is-active --quiet nginx; then
-        status_nginx="${GREEN}运行中${RESET}"
-    else
-        status_nginx="${RED}未运行/未安装${RESET}"
-    fi
-}
+    # 动态写入全新的 docker-compose.yml
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  backend:
+    image: ghcr.io/sagit-chu/flux-panel-backend:\${FLUX_VERSION:-latest}
+    container_name: flux-panel-backend
+    restart: unless-stopped
+$( [ "$db_select" == "2" ] && echo -e "    depends_on:\n      postgres:\n        condition: service_healthy" )
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    environment:
+      DB_TYPE: \${DB_TYPE:-sqlite}
+      DB_PATH: /app/data/gost.db
+      DATABASE_URL: \${DATABASE_URL:-}
+      JWT_SECRET: \${JWT_SECRET}
+      SERVER_ADDR: :6365
+      TZ: Asia/Shanghai
+      FLUX_VERSION: \${FLUX_VERSION:-dev}
+      PANEL_DEPLOY_DIR: /opt/flux-panel
+      PANEL_BACKEND_CONTAINER: flux-panel-backend
+    ports:
+      - "\${BACKEND_PORT}:6365"
+    volumes:
+$( [ "$db_select" == "2" ] && echo "      - /var/run/docker.sock:/var/run/docker.sock" || echo "      - sqlite_data:/app/data\n      - /var/run/docker.sock:/var/run/docker.sock" )
+      - ./:/opt/flux-panel
+    networks:
+      - gost-network
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
-# 执行自建安装
-install_app() {
-    # 1. 运行依赖检测并自动补全 PHP-SQLite 组件
-    check_dependencies
-    
-    echo -e "${CYAN}====== 开始自建环境安装 ======${RESET}"
-    
-    # 2. 克隆源码
-    if [ ! -d "$TARGET_DIR" ]; then
-        echo -e "${YELLOW}📡 正在克隆源码到 ${TARGET_DIR} ...${RESET}"
-        mkdir -p /var/www
-        git clone https://github.com/bbs1org/bbs1org.git "$TARGET_DIR"
-    else
-        echo -e "${GREEN}✅ 目标目录已存在，跳过克隆。${RESET}"
-    fi
-
-    # 3. 创建目录并赋予绝对安全的 777 读写权限防止 SQLite 锁死导致 500
-    echo -e "${YELLOW}🔧 正在创建 data 和 cache 目录并设置高权限...${RESET}"
-    cd "$TARGET_DIR" || exit
-    mkdir -p data cache
-    
-    local web_user="www-data"
-    if id "nginx" &>/dev/null; then web_user="nginx"; fi
-    
-    chown -R "$web_user:$web_user" data cache
-    chmod -R 777 data cache
-    echo -e "${GREEN}✅ 目录权限与归属优化完成。${RESET}"
-
-    # 4. 智能探测 PHP
-    detect_php_fpm
-
-    # 5. 域名核心输入逻辑
-    read -p "$(echo -e "${GREEN}请输入你的自定义域名：${RESET}")" DOMAIN
-    
-    mkdir -p "$NGINX_CONF_DIR" "$NGINX_ENABLED_DIR"
-
-    # --- 自定义证书路径逻辑 ---
-    DEFAULT_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-    DEFAULT_KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-
-    echo -e "\n${GREEN}--- 证书路径配置 ---${RESET}"
-    read -p "$(echo -e "${GREEN}请输入证书路径 [默认: $DEFAULT_CERT]: ${RESET}")" USER_CERT
-    read -p "$(echo -e "${GREEN}请输入私钥路径 [默认: $DEFAULT_KEY]: ${RESET}")" USER_KEY
-
-    # 如果用户直接回车，则使用默认预测路径
-    CERT_PATH=${USER_CERT:-$DEFAULT_CERT}
-    KEY_PATH=${USER_KEY:-$DEFAULT_KEY}
-    # --------------------------
-
-    # 6. 动态写入 Nginx 站点配置文件
-    echo -e "${YELLOW}📝 正在生成 Nginx 站点配置文件...${RESET}"
-    
-    cat <<EOF > "${NGINX_CONF_DIR}/${DOMAIN}"
-server {
-    listen 80;
-    server_name ${DOMAIN};
-    # 强制将所有 HTTP 请求重定向到 HTTPS
-    return 301 https://\$host\$request_uri;
-}
-
-server {
-    listen 443 ssl;
-    server_name ${DOMAIN};
-    root ${TARGET_DIR};
-    index index.php;
-
-    # SSL 证书配置
-    ssl_certificate ${CERT_PATH};
-    ssl_certificate_key ${KEY_PATH};
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    # 安全拦截规则：禁止公网访问 SQLite 数据库
-    location ^~ /data/ {
-        deny all;
-    }
-
-    # 安全拦截规则：禁止公网访问缓存目录
-    location ^~ /cache/ {
-        deny all;
-    }
-
-    location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
-    }
-
-    location ~ \.php\$ {
-        include fastcgi_params;
-        fastcgi_pass ${PHP_PASS}; 
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-    }
-}
 EOF
 
-    # 创建 Nginx 启用软链接
-    ln -sf "${NGINX_CONF_DIR}/${DOMAIN}" "${NGINX_ENABLED_DIR}/"
-    
-    # 7. 检查并重载配置
-    echo -e "${GREEN}正在测试 Nginx 配置并平滑重载...${RESET}"
-    if nginx -t; then
-        systemctl reload nginx
-        echo -e "${GREEN}✅ Nginx 配置加载成功并已成功重载服务！${RESET}"
-    else
-        echo -e "${RED}❌ Nginx 配置测试失败，请检查上面输出的错误原因或确保证书路径正确！${RESET}"
+    # 如果选择 PostgreSQL，则注入 postgres 服务段
+    if [ "$db_select" == "2" ]; then
+    cat <<EOF >> "$COMPOSE_FILE"
+  postgres:
+    image: postgres:16-alpine
+    container_name: flux-panel-postgres
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+    environment:
+      POSTGRES_DB: \${POSTGRES_DB:-flux_panel}
+      POSTGRES_USER: \${POSTGRES_USER:-flux_panel}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-flux_panel_change_me}
+      TZ: Asia/Shanghai
+$( [ -n "$remote_db_port_section" ] && echo -e "    $remote_db_port_section" )
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER:-flux_panel} -d \${POSTGRES_DB:-flux_panel}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+EOF
     fi
 
-    # 8. 完成提示
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN}        BBS1ORG 论坛站点配置完成！                ${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${YELLOW}🌐 访问以下链接开始安装并在后台绑定域名:${RESET}"
-    echo -e "${GREEN}👉 https://${DOMAIN}/install.php${RESET}"
-    echo -e "${RED}🔒 安全生效: data/ 和 cache/ 在 Nginx 规则中已被拒绝访问。${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-}
+    # 注入前端
+    cat <<EOF >> "$COMPOSE_FILE"
+  frontend:
+    image: ghcr.io/sagit-chu/vite-frontend:\${FLUX_VERSION:-latest}
+    container_name: vite-frontend
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    ports:
+      - "\${FRONTEND_PORT}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - gost-network
 
-# 更新源码
-update_app() {
-    if [ -d "$TARGET_DIR/.git" ]; then
-        echo -e "${YELLOW}🔄 正在同步 GitHub 最新源码...${RESET}"
-        cd "$TARGET_DIR" && git pull
-        echo -e "${GREEN}✅ 源码更新成功！${RESET}"
-    else
-        echo -e "${RED}错误: 未检测到 Git 仓库项目，请先执行选项 1 部署！${RESET}"
+volumes:
+$( [ "$db_select" == "2" ] && echo "  postgres_data:
+    name: postgres_data
+    driver: local" || echo "  sqlite_data:
+    name: sqlite_data
+    driver: local" )
+
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+$( if [ "$ENABLE_IPV6" = true ]; then echo "    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.80.0.0/16
+        - subnet: fd00:dead:beef::/48"
+   else echo "    ipam:
+      config:
+        - subnet: 172.80.0.0/16"
+   fi )
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动面板...${RESET}"
+    cd "$BASE_DIR" && $DOCKER_CMD up -d --force-recreate
+
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}      Flvx-Panel 部署成功！  ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}前端访问: http://${DETECT_IP}:${FRONTEND_PORT}${RESET}"
+    echo -e "${YELLOW}后端访问: http://${DETECT_IP}:${BACKEND_PORT}${RESET}"
+    echo -e "${YELLOW}默认账号: admin_user / 密码: admin_user${RESET}"
+    if [ -n "$remote_db_port_section" ]; then
+        echo -e "${CYAN}数据库远程连接: ${RAW_IP}:${db_port} (用户: flux_panel)${RESET}"
     fi
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 卸载功能
-# 卸载功能
+update_app() { [[ -f "$COMPOSE_FILE" ]] && cd "$BASE_DIR" && $DOCKER_CMD pull && $DOCKER_CMD up -d && echo -e "${GREEN}更新完成！${RESET}" || echo -e "${RED}错误: 未部署！${RESET}"; }
 uninstall_app() {
-    echo -e "${RED}警告：正在执行卸载流程！${RESET}"
-    echo -ne "${YELLOW}是否同时彻底删除论坛源码和全部数据库数据 (${TARGET_DIR})？(y/n): ${RESET}"
-    read -r clean_data
-    if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
-        rm -rf "$TARGET_DIR"
-        echo -e "${GREEN}✅ 论坛所有本地网页和数据库文件已彻底清理。${RESET}"
+    echo -ne "${YELLOW}确定要卸载吗？(y/n): ${RESET}"
+    read -r confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && $DOCKER_CMD down
+            echo -ne "${YELLOW}是否完全清理挂载数据？(y/n): ${RESET}"
+            read -r clean_data
+            [[ "$clean_data" == "y" || "$clean_data" == "Y" ]] && rm -rf "$BASE_DIR" && echo -e "${GREEN}数据已彻底清理。${RESET}"
+        else
+            docker rm -f vite-frontend flux-panel-backend flux-panel-postgres 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
-
-    echo -e "${GREEN}🎉 域名为 ${UNINSTALL_DOMAIN} 的站点卸载完成！${RESET}"
 }
 
-# 查看本地日志
+check_compose_exist() { [[ -f "$COMPOSE_FILE" ]] && return 0 || { echo -e "${RED}错误: 未检测到配置文件！${RESET}"; return 1; }; }
+start_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD restart && echo -e "${GREEN}服务已重启${RESET}"; }
+
 view_logs() {
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}选择查看本地服务日志:${RESET}"
-    echo -e "${GREEN}1) Nginx 错误日志 (Error Log)${RESET}"
-    echo -e "${GREEN}2) Nginx 访问日志 (Access Log)${RESET}"
+    echo -e "${GREEN}选择容器查看日志:${RESET}"
+    echo -e "${YELLOW}1) Backend (后端)${RESET}"
+    echo -e "${YELLOW}2) Frontend (前端)${RESET}"
+    echo -e "${YELLOW}3) PostgreSQL (数据库)${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请选择 [1-2]: ${RESET}"
+    echo -ne "${GREEN}请选择 [1-3]: ${RESET}"
     read -r c
     case $c in
-        1) tail -n 100 -f /var/log/nginx/error.log 2>/dev/null || echo -e "${RED}日志文件不存在${RESET}" ;;
-        2) tail -n 100 -f /var/log/nginx/access.log 2>/dev/null || echo -e "${RED}日志文件不存在${RESET}" ;;
+        1) docker logs -f flux-panel-backend ;;
+        2) docker logs -f vite-frontend ;;
+        3) docker logs -f flux-panel-postgres 2>/dev/null || echo -e "${RED}未处于 PostgreSQL 模式或容器未创建${RESET}" ;;
         *) echo -e "${RED}无效选择${RESET}" ;;
     esac
 }
 
-# 主菜单交互
+manage_nodes() {
+    echo -e "${YELLOW}📡 正在获取节点管理管理...${RESET}"
+    if download_file "$NODE_SCRIPT_URL" "$BASE_DIR/node_install.sh"; then
+        chmod +x "$BASE_DIR/node_install.sh" && "$BASE_DIR/node_install.sh"
+        rm -f "$BASE_DIR/node_install.sh"
+    else
+        echo -e "${RED}❌ 无法下载节点管理，请检查网络！${RESET}"
+    fi
+}
+
+show_info() {
+    get_status_info
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}前端状态 : $status_front"
+    echo -e "${YELLOW}后端状态 : $status_back"
+    echo -e "${YELLOW}数据存储 : $status_db"
+    echo -e "${YELLOW}前端地址 : http://${DETECT_IP}:${web_front}${RESET}"
+    echo -e "${YELLOW}后端地址 : http://${DETECT_IP}:${web_back}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
 menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈  BBS1ORG 原生自建管理面板  ◈ ${RESET}"
+    echo -e "${GREEN}   ◈  Flvx-Panel 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}源码目录 :${RESET} $status_dir"
-    echo -e "${GREEN}环境状态 : Nginx -> $status_nginx"
-    echo -e "${GREEN}配置目录 :${RESET} ${CYAN}${NGINX_CONF_DIR}${RESET}"
+    echo -e "${GREEN}前端状态 :${RESET} $status_front  ${GREEN}端口 :${RESET} ${YELLOW}${web_front}${RESET}"
+    echo -e "${GREEN}后端状态 :${RESET} $status_back  ${GREEN}端口 :${RESET} ${YELLOW}${web_back}${RESET}"
+    echo -e "${GREEN}数据环境 :${RESET} $status_db"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署论坛站点${RESET}"
-    echo -e "${GREEN}2. 更新论坛源码${RESET}"
-    echo -e "${GREEN}3. 卸载论坛站点${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 节点管理${RESET}  ${YELLOW}← 添加节点${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
@@ -280,7 +391,12 @@ menu() {
         1) install_app ;;
         2) update_app ;;
         3) uninstall_app ;;
+        4) start_app ;;
+        5) stop_app ;;
+        6) restart_app ;;
         7) view_logs ;;
+        8) show_info ;;
+        9) manage_nodes ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

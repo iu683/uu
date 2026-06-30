@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# 哆啦A梦转发面板 Docker Compose 管理面板
+# flvx-panel Docker Compose 管理面板 (已修正 DB 依赖与 Volume 警告)
 # =================================================================
 
 # 颜色
@@ -10,11 +10,11 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="flux-panel"
+APP_NAME="flvx-panel"
 BASE_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
-NODE_SCRIPT_URL="https://raw.githubusercontent.com/Sagit-chu/flux-panel/main/install.sh"
+NODE_SCRIPT_URL="https://raw.githubusercontent.com/Sagit-chu/flvx/main/install.sh"
 
 DOCKER_CMD="docker compose"
 
@@ -81,7 +81,6 @@ get_status_info() {
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
     local mode=${1:-"auto"}
     local ip=""
@@ -111,18 +110,25 @@ check_ipv6_support() {
 
 install_app() {
     check_dependencies
-    mkdir -p "$BASE_DIR"
+    # 统一在本地提前创建好数据挂载目录
+    mkdir -p "$BASE_DIR/data"
 
     echo -e "${CYAN}====== 数据库类型选择 ======${RESET}"
-    echo -e "${GREEN}1) 使用内置轻量级 SQLite (推荐，免维护，占用小)${RESET}"
-    echo -e "${GREEN}2) 使用独立 PostgreSQL 16 容器 (适合高并发/多节点数据同步)${RESET}"
+    echo -e "${GREEN}1) 使用内置轻量级 SQLite (推荐，免维护)${RESET}"
+    echo -e "${GREEN}2) 使用独立 PostgreSQL 16 容器 (适合单机高并发)${RESET}"
+    echo -e "${GREEN}3) 使用自建/第三方远程 PostgreSQL 数据库 (适合多机集群同步)${RESET}"
     echo -ne "${YELLOW}请选择数据库类型 [默认 1]: ${RESET}"
     read -r db_select
     db_select=${db_select:-1}
 
-    # 远程数据库支持扩展
+    # 变量初始化
     local remote_db_port_section=""
+    local DB_TYPE="sqlite"
+    local DATABASE_URL=""
+
     if [ "$db_select" == "2" ]; then
+        # ====== 2. 本地 PostgreSQL 容器配置 ======
+        DB_TYPE="postgres"
         echo -ne "${YELLOW}是否允许 PostgreSQL 数据库支持远程连接？(y/n) [默认 n]: ${RESET}"
         read -r allow_remote
         if [[ "$allow_remote" == "y" || "$allow_remote" == "Y" ]]; then
@@ -132,8 +138,36 @@ install_app() {
             remote_db_port_section="ports:\n      - \"${db_port}:5432\""
             echo -e "${GREEN}已配置数据库远程映射端口: ${db_port}${RESET}"
         fi
+        
+        PG_PASS=$(openssl rand -hex 12 2>/dev/null || echo "flux_pwd_$(date +%s)")
+        DATABASE_URL="postgres://flux_panel:${PG_PASS}@postgres:5432/flux_panel?sslmode=disable"
+
+    elif [ "$db_select" == "3" ]; then
+        # ====== 3. 远程 PostgreSQL 配置 ======
+        DB_TYPE="postgres"
+        echo -e "${CYAN}====== 远程 PostgreSQL 配置 ======${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库 IP/域名: ${RESET}"
+        read -r r_host
+        echo -ne "${YELLOW}请输入远程数据库 端口 [默认: 5432]: ${RESET}"
+        read -r r_port
+        r_port=${r_port:-5432}
+        echo -ne "${YELLOW}请输入远程数据库 用户名 [默认: postgres]: ${RESET}"
+        read -r r_user
+        r_user=${r_user:-postgres}
+        echo -ne "${YELLOW}请输入远程数据库 密码: ${RESET}"
+        read -r r_pass
+        echo -ne "${YELLOW}请输入远程数据库 数据库名 [默认: postgres]: ${RESET}"
+        read -r r_name
+        r_name=${r_name:-postgres}
+
+        if [[ -z "$r_host" || -z "$r_pass" ]]; then
+            echo -e "${RED}错误: 远程数据库地址和密码不能为空！${RESET}"
+            return 1
+        fi
+        DATABASE_URL="postgres://${r_user}:${r_pass}@${r_host}:${r_port}/${r_name}?sslmode=disable"
     fi
 
+    # ====== 公共端口配置 ======
     echo -ne "${YELLOW}请输入前端访问端口 [默认: 6366]: ${RESET}"
     read -r FRONTEND_PORT
     FRONTEND_PORT=${FRONTEND_PORT:-6366}
@@ -146,12 +180,8 @@ install_app() {
     ENABLE_IPV6=false
     check_ipv6_support && ENABLE_IPV6=true
 
-    # 根据选择初始化环境变量
+    # ====== 生成环境文件 .env ======
     if [ "$db_select" == "2" ]; then
-        DB_TYPE="postgres"
-        PG_PASS=$(openssl rand -hex 12 2>/dev/null || echo "flux_pwd_$(date +%s)")
-        DATABASE_URL="postgres://flux_panel:${PG_PASS}@postgres:5432/flux_panel?sslmode=disable"
-        
         cat <<EOF > "$ENV_FILE"
 JWT_SECRET=$JWT_SECRET
 BACKEND_PORT=$BACKEND_PORT
@@ -163,6 +193,15 @@ POSTGRES_USER=flux_panel
 POSTGRES_PASSWORD=$PG_PASS
 FLUX_VERSION=latest
 EOF
+    elif [ "$db_select" == "3" ]; then
+        cat <<EOF > "$ENV_FILE"
+JWT_SECRET=$JWT_SECRET
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+DB_TYPE=postgres
+DATABASE_URL=$DATABASE_URL
+FLUX_VERSION=latest
+EOF
     else
         cat <<EOF > "$ENV_FILE"
 JWT_SECRET=$JWT_SECRET
@@ -171,15 +210,16 @@ FRONTEND_PORT=$FRONTEND_PORT
 DB_TYPE=sqlite
 FLUX_VERSION=latest
 EOF
-    fi
+fi
 
-    # 动态写入全新的 docker-compose.yml
+    # ====== 动态写入全新的 docker-compose.yml ======
     cat <<EOF > "$COMPOSE_FILE"
 services:
   backend:
     image: ghcr.io/sagit-chu/flux-panel-backend:\${FLUX_VERSION:-latest}
     container_name: flux-panel-backend
     restart: unless-stopped
+$( [ "$db_select" == "2" ] && echo -e "    depends_on:\n      postgres:\n        condition: service_healthy" )
     logging:
       driver: json-file
       options:
@@ -198,7 +238,7 @@ services:
     ports:
       - "\${BACKEND_PORT}:6365"
     volumes:
-      - sqlite_data:/app/data
+      - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
       - ./:/opt/flux-panel
     networks:
@@ -214,7 +254,7 @@ services:
 
 EOF
 
-    # 如果选择 PostgreSQL，则注入 postgres 服务段
+    # 如果选择本地 PostgreSQL 容器(2)，则注入 postgres 编排段
     if [ "$db_select" == "2" ]; then
     cat <<EOF >> "$COMPOSE_FILE"
   postgres:
@@ -245,7 +285,7 @@ $( [ -n "$remote_db_port_section" ] && echo -e "    $remote_db_port_section" )
 EOF
     fi
 
-    # 注入前端
+    # 注入前端服务
     cat <<EOF >> "$COMPOSE_FILE"
   frontend:
     image: ghcr.io/sagit-chu/vite-frontend:\${FLUX_VERSION:-latest}
@@ -264,14 +304,21 @@ EOF
     networks:
       - gost-network
 
-volumes:
-  sqlite_data:
-    name: sqlite_data
-    driver: local
-$( [ "$db_select" == "2" ] && echo "  postgres_data:
-    name: postgres_data
-    driver: local" )
+EOF
 
+    # ====== 动态追加 volumes 声明 (只有选择本地容器PG时才写顶级 volumes) ======
+    if [ "$db_select" == "2" ]; then
+    cat <<EOF >> "$COMPOSE_FILE"
+volumes:
+  postgres_data:
+    name: postgres_data
+    driver: local
+
+EOF
+    fi
+
+    # ====== 动态追加 networks 声明 ======
+    cat <<EOF >> "$COMPOSE_FILE"
 networks:
   gost-network:
     name: gost-network
@@ -294,13 +341,17 @@ EOF
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Flux-Panel 部署成功！  ${RESET}"
+    echo -e "${GREEN}      Flvx-Panel 部署成功！  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}前端访问: http://${DETECT_IP}:${FRONTEND_PORT}${RESET}"
-    echo -e "${YELLOW}后端访问: http://${DETECT_IP}:${BACKEND_PORT}${RESET}"
+    echo -ne "${YELLOW}后端访问: http://${DETECT_IP}:${BACKEND_PORT}\n${RESET}"
     echo -e "${YELLOW}默认账号: admin_user / 密码: admin_user${RESET}"
-    if [ -n "$remote_db_port_section" ]; then
+    if [ "$db_select" == "2" ] && [ -n "$remote_db_port_section" ]; then
         echo -e "${CYAN}数据库远程连接: ${RAW_IP}:${db_port} (用户: flux_panel)${RESET}"
+    fi
+    echo -e "${CYAN}本地持久化目录: $BASE_DIR/data ➔ 映射至容器: /app/data${RESET}"
+    if [ "$db_select" == "1" ]; then
+        echo -e "${CYAN}数据环境: 内置 SQLite 数据库文件已存放在: $BASE_DIR/data/gost.db${RESET}"
     fi
     echo -e "${GREEN}================================${RESET}"
 }
@@ -311,11 +362,20 @@ uninstall_app() {
     read -r confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         if [ -f "$COMPOSE_FILE" ]; then
+            echo -e "${YELLOW}正在停止并删除容器...${RESET}"
             cd "$BASE_DIR" && $DOCKER_CMD down
-            echo -ne "${YELLOW}是否完全清理挂载数据？(y/n): ${RESET}"
+
+            echo -ne "${YELLOW}是否完全清理挂载的本地本地数据和配置文件？(y/n): ${RESET}"
             read -r clean_data
-            [[ "$clean_data" == "y" || "$clean_data" == "Y" ]] && rm -rf "$BASE_DIR" && echo -e "${GREEN}数据已彻底清理。${RESET}"
+            if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
+                echo -e "${YELLOW}正在清理本地数据...${RESET}"
+                # 精准清理本地挂载的 data 目录、环境文件和编排文件，不直接轰掉父目录，防止脚本自身闪退
+                rm -rf "$BASE_DIR"
+                rm -f "$COMPOSE_FILE" "$ENV_FILE"
+                echo -e "${GREEN}本地数据目录 (data) 及配置文件已彻底清理。${RESET}"
+            fi
         else
+            # 兜底清理：如果找不到 compose 文件，尝试强制强制删除可能残留的容器
             docker rm -f vite-frontend flux-panel-backend flux-panel-postgres 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
@@ -371,7 +431,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Flux-Panel 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}   ◈  Flvx-Panel 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}前端状态 :${RESET} $status_front  ${GREEN}端口 :${RESET} ${YELLOW}${web_front}${RESET}"
     echo -e "${GREEN}后端状态 :${RESET} $status_back  ${GREEN}端口 :${RESET} ${YELLOW}${web_back}${RESET}"

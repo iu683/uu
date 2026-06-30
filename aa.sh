@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# GPT Image Playground Docker Compose 管理面板 
+# 哆啦A梦转发面板 Docker Compose 管理面板
 # =================================================================
 
 # 颜色
@@ -10,14 +10,31 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="gpt-image-playground"
-BASE_DIR="/opt/gpt-image-playground"
+APP_NAME="flux-panel"
+BASE_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
+NODE_SCRIPT_URL="https://raw.githubusercontent.com/Sagit-chu/flux-panel/main/install.sh"
 
-# 检测依赖
+DOCKER_CMD="docker compose"
+
+# 代理前缀列表
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://ghfast.top/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+)
+
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
+    fi
+    if ! $DOCKER_CMD version &>/dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker Compose v2，请升级 Docker！${RESET}"
         exit 1
     fi
 }
@@ -32,37 +49,35 @@ format_ip_for_url() {
     fi
 }
 
-# 动态获取容器状态、映射端口和环境变量配置
+download_file() {
+    local url="$1" local output="$2" local success=false
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local target_url="${proxy}${url}"
+        echo -e "${YELLOW}📡 正在尝试通过 [${proxy:-直连}]...${RESET}"
+        curl -L -k --max-time 15 -o "$output" "$target_url"
+        if [ -s "$output" ]; then success=true; break; else rm -f "$output"; fi
+    done
+    [[ "$success" = true ]] && return 0 || return 1
+}
+
 get_status_info() {
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
+    [ "$(docker ps -q -f name=^/vite-frontend$)" ] && status_front="${GREEN}运行中${RESET}" || status_front="${RED}已停止/未创建${RESET}"
+    [ "$(docker ps -q -f name=^/flux-panel-backend$)" ] && status_back="${GREEN}运行中${RESET}" || status_back="${RED}已停止/未创建${RESET}"
+    
+    if [ -f "$ENV_FILE" ]; then
+        db_type_curr=$(grep 'DB_TYPE=' "$ENV_FILE" | cut -d= -f2)
+        db_type_curr=${db_type_curr:-sqlite}
+        if [ "$db_type_curr" == "postgres" ]; then
+            [ "$(docker ps -q -f name=^/flux-panel-postgres$)" ] && status_db="${GREEN}PostgreSQL 运行中${RESET}" || status_db="${RED}PostgreSQL 已停止${RESET}"
+        else
+            status_db="${GREEN}SQLite (内置模式)${RESET}"
+        fi
+        web_front=$(grep 'FRONTEND_PORT=' "$ENV_FILE" | cut -d= -f2)
+        web_back=$(grep 'BACKEND_PORT=' "$ENV_FILE" | cut -d= -f2)
     else
-        status="${RED}未部署${RESET}"
-    fi
-
-    # 2. 如果容器存在，从容器状态中提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 从容器状态提取 WebUI 端口（容器内部监听的是 80 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 兜底获取第一个绑定的端口
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8080"
-
-        # 从容器状态提取 API URL
-        api_url=$(docker inspect -f '{{range .Config.Env}}{{if breakout "DEFAULT_API_URL=" .}}{{.}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | sed 's/DEFAULT_API_URL=//')
-        [[ -z "$api_url" ]] && api_url="https://api.openai.com/v1"
-    else
-        # 容器未安装/未部署时的返回值
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-        api_url="N/A"
+        status_db="${YELLOW}未配置${RESET}"
+        web_front="-"
+        web_back="-"
     fi
 }
 
@@ -90,120 +105,278 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 GPT Image Playground
-install_playground() {
+check_ipv6_support() {
+    ping6 -c 1 ::1 &>/dev/null && return 0 || return 1
+}
+
+install_app() {
     check_dependencies
-    
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
+    echo -e "${CYAN}====== 数据库类型选择 ======${RESET}"
+    echo -e "${GREEN}1) 使用内置轻量级 SQLite (推荐，免维护，占用小)${RESET}"
+    echo -e "${GREEN}2) 使用独立 PostgreSQL 16 容器 (适合高并发/多节点数据同步)${RESET}"
+    echo -ne "${YELLOW}请选择数据库类型 [默认 1]: ${RESET}"
+    read -r db_select
+    db_select=${db_select:-1}
+
+    # 远程数据库支持扩展
+    local remote_db_port_section=""
+    if [ "$db_select" == "2" ]; then
+        echo -ne "${YELLOW}是否允许 PostgreSQL 数据库支持远程连接？(y/n) [默认 n]: ${RESET}"
+        read -r allow_remote
+        if [[ "$allow_remote" == "y" || "$allow_remote" == "Y" ]]; then
+            echo -ne "${YELLOW}请输入 PostgreSQL 远程访问端口 [默认 5432]: ${RESET}"
+            read -r db_port
+            db_port=${db_port:-5432}
+            remote_db_port_section="ports:\n      - \"${db_port}:5432\""
+            echo -e "${GREEN}已配置数据库远程映射端口: ${db_port}${RESET}"
+        fi
     fi
 
-    echo -ne "${YELLOW}请输入 OpenAI API 接口地址 [默认: https://api.openai.com/v1]: ${RESET}"
-    read -r custom_api
-    [[ -z "$custom_api" ]] && custom_api="https://api.openai.com/v1"
+    echo -ne "${YELLOW}请输入前端访问端口 [默认: 6366]: ${RESET}"
+    read -r FRONTEND_PORT
+    FRONTEND_PORT=${FRONTEND_PORT:-6366}
 
-    # 修改目录权限
-    chmod -R 777 "$BASE_DIR"
+    echo -ne "${YELLOW}请输入后端访问端口 [默认: 6365]: ${RESET}"
+    read -r BACKEND_PORT
+    BACKEND_PORT=${BACKEND_PORT:-6365}
 
-    # 生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    JWT_SECRET=$(openssl rand -hex 16 2>/dev/null || echo "flux_jwt_secret_$(date +%s)")
+    ENABLE_IPV6=false
+    check_ipv6_support && ENABLE_IPV6=true
+
+    # 根据选择初始化环境变量
+    if [ "$db_select" == "2" ]; then
+        DB_TYPE="postgres"
+        PG_PASS=$(openssl rand -hex 12 2>/dev/null || echo "flux_pwd_$(date +%s)")
+        DATABASE_URL="postgres://flux_panel:${PG_PASS}@postgres:5432/flux_panel?sslmode=disable"
+        
+        cat <<EOF > "$ENV_FILE"
+JWT_SECRET=$JWT_SECRET
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+DB_TYPE=postgres
+DATABASE_URL=$DATABASE_URL
+POSTGRES_DB=flux_panel
+POSTGRES_USER=flux_panel
+POSTGRES_PASSWORD=$PG_PASS
+FLUX_VERSION=latest
+EOF
+    else
+        cat <<EOF > "$ENV_FILE"
+JWT_SECRET=$JWT_SECRET
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+DB_TYPE=sqlite
+FLUX_VERSION=latest
+EOF
+    fi
+
+    # 动态写入全新的 docker-compose.yml
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  gpt-image-playground:
-    container_name: ${CONTAINER_NAME}
-    image: ghcr.io/cooksleep/gpt_image_playground:latest
-    environment:
-      - DEFAULT_API_URL=${custom_api}
-    ports:
-      - "${custom_port}:80"
+  backend:
+    image: ghcr.io/sagit-chu/flux-panel-backend:\${FLUX_VERSION:-latest}
+    container_name: flux-panel-backend
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    environment:
+      DB_TYPE: \${DB_TYPE:-sqlite}
+      DB_PATH: /app/data/gost.db
+      DATABASE_URL: \${DATABASE_URL:-}
+      JWT_SECRET: \${JWT_SECRET}
+      SERVER_ADDR: :6365
+      TZ: Asia/Shanghai
+      FLUX_VERSION: \${FLUX_VERSION:-dev}
+      PANEL_DEPLOY_DIR: /opt/flux-panel
+      PANEL_BACKEND_CONTAINER: flux-panel-backend
+    ports:
+      - "\${BACKEND_PORT}:6365"
+    volumes:
+      - sqlite_data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/opt/flux-panel
+    networks:
+      - gost-network
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 GPT Image Playground 服务...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    # 如果选择 PostgreSQL，则注入 postgres 服务段
+    if [ "$db_select" == "2" ]; then
+    cat <<EOF >> "$COMPOSE_FILE"
+  postgres:
+    image: postgres:16-alpine
+    container_name: flux-panel-postgres
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+    environment:
+      POSTGRES_DB: \${POSTGRES_DB:-flux_panel}
+      POSTGRES_USER: \${POSTGRES_USER:-flux_panel}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-flux_panel_change_me}
+      TZ: Asia/Shanghai
+$( [ -n "$remote_db_port_section" ] && echo -e "    $remote_db_port_section" )
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER:-flux_panel} -d \${POSTGRES_DB:-flux_panel}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+EOF
+    fi
+
+    # 注入前端
+    cat <<EOF >> "$COMPOSE_FILE"
+  frontend:
+    image: ghcr.io/sagit-chu/vite-frontend:\${FLUX_VERSION:-latest}
+    container_name: vite-frontend
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    ports:
+      - "\${FRONTEND_PORT}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - gost-network
+
+volumes:
+  sqlite_data:
+    name: sqlite_data
+    driver: local
+$( [ "$db_select" == "2" ] && echo "  postgres_data:
+    name: postgres_data
+    driver: local" )
+
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+$( if [ "$ENABLE_IPV6" = true ]; then echo "    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.80.0.0/16
+        - subnet: fd00:dead:beef::/48"
+   else echo "    ipam:
+      config:
+        - subnet: 172.80.0.0/16"
+   fi )
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动面板...${RESET}"
+    cd "$BASE_DIR" && $DOCKER_CMD up -d --force-recreate
 
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
 
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}     GPT Image Playground 部署成功！    ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}API 接口地址 : $custom_api${RESET}"
-    echo -e "${YELLOW}提示: 打开浏览器访问上方地址即可开始进行图像生成与游玩。${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-}
-
-# 更新镜像
-update_playground() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}      Flux-Panel 部署成功！  ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}前端访问: http://${DETECT_IP}:${FRONTEND_PORT}${RESET}"
+    echo -e "${YELLOW}后端访问: http://${DETECT_IP}:${BACKEND_PORT}${RESET}"
+    echo -e "${YELLOW}默认账号: admin_user / 密码: admin_user${RESET}"
+    if [ -n "$remote_db_port_section" ]; then
+        echo -e "${CYAN}数据库远程连接: ${RAW_IP}:${db_port} (用户: flux_panel)${RESET}"
     fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 卸载服务
-uninstall_playground() {
-    echo -ne "${YELLOW}确定要卸载并删除 GPT Image Playground 容器吗？(y/n): ${RESET}"
+update_app() { [[ -f "$COMPOSE_FILE" ]] && cd "$BASE_DIR" && $DOCKER_CMD pull && $DOCKER_CMD up -d && echo -e "${GREEN}更新完成！${RESET}" || echo -e "${RED}错误: 未部署！${RESET}"; }
+uninstall_app() {
+    echo -ne "${YELLOW}确定要卸载吗？(y/n): ${RESET}"
     read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件？(y/n): ${RESET}"
+            cd "$BASE_DIR" && $DOCKER_CMD down
+            echo -ne "${YELLOW}是否完全清理挂载数据？(y/n): ${RESET}"
             read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}配置目录已彻底清理。${RESET}"
-            fi
+            [[ "$clean_data" == "y" || "$clean_data" == "Y" ]] && rm -rf "$BASE_DIR" && echo -e "${GREEN}数据已彻底清理。${RESET}"
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            docker rm -f vite-frontend flux-panel-backend flux-panel-postgres 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_playground() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_playground() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_playground() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_playground() { docker logs -f "$CONTAINER_NAME"; }
+check_compose_exist() { [[ -f "$COMPOSE_FILE" ]] && return 0 || { echo -e "${RED}错误: 未检测到配置文件！${RESET}"; return 1; }; }
+start_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD restart && echo -e "${GREEN}服务已重启${RESET}"; }
+
+view_logs() {
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}选择容器查看日志:${RESET}"
+    echo -e "${YELLOW}1) Backend (后端)${RESET}"
+    echo -e "${YELLOW}2) Frontend (前端)${RESET}"
+    echo -e "${YELLOW}3) PostgreSQL (数据库)${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请选择 [1-3]: ${RESET}"
+    read -r c
+    case $c in
+        1) docker logs -f flux-panel-backend ;;
+        2) docker logs -f vite-frontend ;;
+        3) docker logs -f flux-panel-postgres 2>/dev/null || echo -e "${RED}未处于 PostgreSQL 模式或容器未创建${RESET}" ;;
+        *) echo -e "${RED}无效选择${RESET}" ;;
+    esac
+}
+
+manage_nodes() {
+    echo -e "${YELLOW}📡 正在获取节点管理管理...${RESET}"
+    if download_file "$NODE_SCRIPT_URL" "$BASE_DIR/node_install.sh"; then
+        chmod +x "$BASE_DIR/node_install.sh" && "$BASE_DIR/node_install.sh"
+        rm -f "$BASE_DIR/node_install.sh"
+    else
+        echo -e "${RED}❌ 无法下载节点管理，请检查网络！${RESET}"
+    fi
+}
 
 show_info() {
     get_status_info
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${YELLOW}当前状态     : $status"
-    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}API 接口地址 : ${api_url}${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}前端状态 : $status_front"
+    echo -e "${YELLOW}后端状态 : $status_back"
+    echo -e "${YELLOW}数据存储 : $status_db"
+    echo -e "${YELLOW}前端地址 : http://${DETECT_IP}:${web_front}${RESET}"
+    echo -e "${YELLOW}后端地址 : http://${DETECT_IP}:${web_back}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}   ◈  GPT Image Playground 管理面板  ◈   ${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈  Flux-Panel 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}前端状态 :${RESET} $status_front  ${GREEN}端口 :${RESET} ${YELLOW}${web_front}${RESET}"
+    echo -e "${GREEN}后端状态 :${RESET} $status_back  ${GREEN}端口 :${RESET} ${YELLOW}${web_back}${RESET}"
+    echo -e "${GREEN}数据环境 :${RESET} $status_db"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -212,19 +385,21 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 节点管理${RESET}  ${YELLOW}← 添加节点${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_playground ;;
-        2) update_playground ;;
-        3) uninstall_playground ;;
-        4) start_playground ;;
-        5) stop_playground ;;
-        6) restart_playground ;;
-        7) logs_playground ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) start_app ;;
+        5) stop_app ;;
+        6) restart_app ;;
+        7) view_logs ;;
         8) show_info ;;
+        9) manage_nodes ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

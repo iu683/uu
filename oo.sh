@@ -1,102 +1,31 @@
 #!/bin/bash
 # =================================================================
-# 哆啦A梦转发面板 Docker Compose 管理面板
+# MailGo - 面板
 # =================================================================
 
-# 颜色
+# 颜色定义
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
-RESET="\0 atmosphere [0m"
+MAGENTA="\033[35m"
 RESET="\033[0m"
 
-APP_NAME="flux-panel"
-BASE_DIR="/opt/$APP_NAME"
+BASE_DIR="/opt/mailgo"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
-GOST_SQL_URL="https://github.com/bqlpfy/flux-panel/releases/download/1.4.3/gost.sql"
-NODE_SCRIPT_URL="https://github.com/bqlpfy/flux-panel/raw/main/install.sh"
+DEFAULT_BACKUP_DIR="$BASE_DIR/backups"
 
-DOCKER_CMD="docker compose"
-
-# 代理前缀列表（第一个留空代表直连尝试）
-GITHUB_PROXY=(
-    ''
-    'https://v6.gh-proxy.org/'
-    'https://ghfast.top/'
-    'https://gh-proxy.com/'
-    'https://hub.glowp.xyz/'
-    'https://proxy.vvvv.ee/'
-    'https://ghproxy.lvedong.eu.org/'
-)
-
-# 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
-    fi
-    if ! $DOCKER_CMD version &>/dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker Compose v2，请升级 Docker！${RESET}"
-        exit 1
+        echo -e "${RED}错误: 未检测到 Docker！${RESET}"; exit 1
     fi
 }
 
-# 代理轮询下载通用函数
-download_file() {
-    local url="$1" local output="$2" local success=false
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local target_url="${proxy}${url}"
-        echo -e "${YELLOW}📡 正在尝试通过 [${proxy:-直连}]...${RESET}"
-        curl -L -k --max-time 15 -o "$output" "$target_url"
-        if [ -s "$output" ]; then success=true; break; else rm -f "$output"; fi
-    done
-    [[ "$success" = true ]] && return 0 || return 1
-}
-
-# 动态获取容器状态、映射端口
-get_status_info() {
-    if ! command -v docker &> /dev/null; then
-        status="${RED}未安装 Docker${RESET}"
-        img_version="${RED}未安装${RESET}"
-        status_front="${RED}已停止/未创建${RESET}"
-        status_back="${RED}已停止/未创建${RESET}"
-        status_mysql="${YELLOW}未创建或外部数据库${RESET}"
-        web_front="-"
-        web_back="-"
-        return 0
-    fi
-    if [ "$(docker ps -q -f name=^/vite-frontend$)" ]; then
-        status_front="${GREEN}运行中${RESET}"
-    else
-        status_front="${RED}已停止/未创建${RESET}"
-    fi
-
-    if [ "$(docker ps -q -f name=^/springboot-backend$)" ]; then
-        status_back="${GREEN}运行中${RESET}"
-    else
-        status_back="${RED}已停止/未创建${RESET}"
-    fi
-
-    if [ "$(docker ps -q -f name=^/gost-mysql$)" ]; then
-        status_mysql="${GREEN}运行中${RESET}"
-    else
-        status_mysql="${YELLOW}未创建或外部数据库${RESET}"
-    fi
-
-    if [ -f "$ENV_FILE" ]; then
-        web_front=$(grep 'FRONTEND_PORT=' "$ENV_FILE" | cut -d= -f2)
-        web_back=$(grep 'BACKEND_PORT=' "$ENV_FILE" | cut -d= -f2)
-    else
-        web_front="-"
-        web_back="-"
-    fi
-}
-
-# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"} local ip=""
+    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local ip=""
+    
     if [[ "$mode" == "v4" ]]; then
         for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
@@ -116,309 +45,433 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-
-# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
-format_ip_for_url() {
-    local ip="$1"
-    if [[ "$ip" == *":"* ]]; then
-        echo "[$ip]"
-    else
-        echo "$ip"
+# 动态获取容器整体状态和端口 (采用原生 Docker Inspect 终极技术 - MailGo 专属版)
+get_status_info() {
+    if ! command -v docker &> /dev/null; then
+        status="${RED}未安装 Docker${RESET}"
+        img_version="${RED}未安装${RESET}"
+        web_port="N/A"
+        data_dir="N/A"
+        return 0
     fi
+    if [ -f "$COMPOSE_FILE" ]; then
+        # 1. 检测 MailGo 容器是否正在运行
+        if [ "$(docker ps -q -f name=mailgo)" ]; then
+            status="${GREEN}运行中${RESET}"
+            # 终极技术：精准提取宿主机映射到容器内部 5547/tcp 的真实端口
+            web_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5547/tcp") 0).HostPort}}' mailgo 2>/dev/null)
+        # 2. 检测 MailGo 容器是否存在但处于停止状态
+        elif [ "$(docker ps -aq -f name=mailgo)" ]; then
+            status="${YELLOW}已停止${RESET}"
+            web_port=""
+        else
+            status="${RED}未部署${RESET}"
+            web_port=""
+        fi
+        
+        # 3. 兜底策略：如果容器未运行或未映射成功，从 docker-compose.yml 静态提取端口
+        if [ -z "$web_port" ]; then
+            # 智能提取 mailgo 块下的第一个端口映射的左侧（宿主机端口）
+            web_port=$(sed -n '/mailgo:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9]+:' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-')
+            
+            # 如果是环境变量引用的形式（如 ${SERVER_PORT:-8080}），则尝试读取 .env 文件
+            if [[ "$web_port" == *"\$"* || "$web_port" == *"SERVER_PORT"* ]]; then
+                if [ -f "$ENV_FILE" ]; then
+                    web_port=$(grep -E "^SERVER_PORT=" "$ENV_FILE" | cut -d'=' -f2 | tr -d '[:space:]')
+                fi
+            fi
+            
+            # 绝对兜底：如果以上都获取失败，使用 MailGo 默认外部端口 8080
+            [[ -z "$web_port" ]] && web_port="8080"
+        fi
+    else
+        status="${RED}未初始化${RESET}"
+        web_port="N/A"
+    fi
+    
+    # 统一转换显示格式，防止主菜单调用时出现空白
+    port_display="$web_port"
 }
 
 
-# 检测本地 IPv6 支持
-check_ipv6_support() {
-    ping6 -c 1 ::1 &>/dev/null && return 0 || return 1
-}
-
-# 部署 哆啦A梦转发面板
-install_app() {
+install_utils() {
     check_dependencies
     mkdir -p "$BASE_DIR"
+    
+    echo -e "${CYAN}====== 1. 数据库与缓存部署模式选择 ======${RESET}"
+    echo -e "${GREEN}1) 内置常规模式 (本地跑 MySQL 和 Redis 容器)${RESET}"
+    echo -e "${GREEN}2) 远程数据模式 (连接外部已有的 MySQL/Redis，跳过本地库)${RESET}"
+    echo -ne "${YELLOW}请选择模式 [默认 1]: ${RESET}"; read -r db_mode
+    [[ -z "$db_mode" ]] && db_mode="1"
 
-    echo -e "${CYAN}====== 数据库模式配置 ======${RESET}"
-    echo -e "${GREEN}1) 使用本地 Docker 自动安装 MySQL (数据挂载至本地目录)${RESET}"
-    echo -e "${GREEN}2) 连接已有的远程外部 MySQL 数据库 (自动导入结构)${RESET}"
-    echo -ne "${YELLOW}请选择数据库部署模式 [默认 1]: ${RESET}"
-    read -r db_mode
-    db_mode=${db_mode:-1}
+    local db_host="mysql" local redis_host="redis" local db_user="mailgo" local db_pass="mailgo_secret"
+    local db_name="mailgo" local db_port="3306" local redis_pass="" local redis_port="6379" local redis_db="0"
+    local db_root_pass="root_secret"
 
-    echo -e "${YELLOW}📡 准备下载数据库初始化文件...${RESET}"
-    if [ ! -f "$BASE_DIR/gost.sql" ] || [ ! -s "$BASE_DIR/gost.sql" ]; then
-        if ! download_file "$GOST_SQL_URL" "$BASE_DIR/gost.sql"; then
-            echo -e "${RED}❌ 数据库文件下载失败，请检查网络通道${RESET}"
-            return 1
-        fi
+    if [ "$db_mode" = "2" ]; then
+        echo -e "\n${CYAN}➜ 请输入远程 MySQL 配置:${RESET}"
+        echo -ne "${YELLOW}远程 MySQL 地址 (Host): ${RESET}"; read -r db_host
+        echo -ne "${YELLOW}远程 MySQL 端口 (Port) [默认 3306]: ${RESET}"; read -r tmp_port; [[ -n "$tmp_port" ]] && db_port="$tmp_port"
+        echo -ne "${YELLOW}远程 MySQL 用户 (User) [默认 mailgo]: ${RESET}"; read -r tmp_user; [[ -n "$tmp_user" ]] && db_user="$tmp_user"
+        echo -ne "${YELLOW}远程 MySQL 密码: ${RESET}"; read -r db_pass
+        echo -ne "${YELLOW}远程 MySQL 数据库名 (DB Name) [默认 mailgo]: ${RESET}"; read -r tmp_db; [[ -n "$tmp_db" ]] && db_name="$tmp_db"
+
+        echo -e "\n${CYAN}➜ 请输入远程 Redis 配置:${RESET}"
+        echo -ne "${YELLOW}远程 Redis 地址 (Host): ${RESET}"; read -r redis_host
+        echo -ne "${YELLOW}远程 Redis 端口 (Port) [默认 6379]: ${RESET}"; read -r tmp_rport; [[ -n "$tmp_rport" ]] && redis_port="$tmp_rport"
+        echo -ne "${YELLOW}远程 Redis 分区/库编号 (DB Index) [默认 0]: ${RESET}"; read -r tmp_rdb; [[ -n "$tmp_rdb" ]] && redis_db="$tmp_rdb"
+        echo -ne "${YELLOW}远程 Redis 密码 (无密码直接回车): ${RESET}"; read -r redis_pass
     fi
 
-    if [ "$db_mode" == "2" ]; then
-        echo -ne "${YELLOW}请输入远程数据库 IP/域名: ${RESET}"
-        read -r DB_HOST
-        echo -ne "${YELLOW}请输入远程数据库端口 [默认: 3306]: ${RESET}"
-        read -r DB_PORT
-        DB_PORT=${DB_PORT:-3306}
-    else
-        DB_HOST="mysql"
-        DB_PORT="3306"
-    fi
+    echo -e "\n${CYAN}====== 2. 安全与基础密钥配置 ======${RESET}"
+    local rand_key=$(date +%s | sha256sum | head -c 32)
+    echo -ne "${YELLOW}请输入 MailGo 访问端口 [默认 8080]: ${RESET}"; read -r custom_port; [[ -z "$custom_port" ]] && custom_port="8080"
+    echo -ne "${YELLOW}请输入镜像版本标签 (Image Tag) [默认 latest]: ${RESET}"; read -r image_tag; [[ -z "$image_tag" ]] && image_tag="latest"
 
-    echo -ne "${YELLOW}请输入前端访问端口 [默认: 6366]: ${RESET}"
-    read -r FRONTEND_PORT
-    FRONTEND_PORT=${FRONTEND_PORT:-6366}
-
-    echo -ne "${YELLOW}请输入后端访问端口 [默认: 6365]: ${RESET}"
-    read -r BACKEND_PORT
-    BACKEND_PORT=${BACKEND_PORT:-6365}
-
-    echo -ne "${YELLOW}请输入数据库用户名 [默认: gost]: ${RESET}"
-    read -r DB_USER
-    DB_USER=${DB_USER:-gost}
-
-    echo -ne "${YELLOW}请输入数据库名称 [默认: gost]: ${RESET}"
-    read -r DB_NAME
-    DB_NAME=${DB_NAME:-gost}
-
-    echo -ne "${YELLOW}请输入数据库密码 [默认: 123456]: ${RESET}"
-    read -r DB_PASSWORD
-    DB_PASSWORD=${DB_PASSWORD:-123456}
-
-    if [ "$db_mode" == "2" ]; then
-        echo -e "${YELLOW}🔄 正在尝试连接远程数据库并自动导入结构...${RESET}"
-        docker run --rm -i --net=host mysql:5.7 mysql -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" < "$BASE_DIR/gost.sql" 2>/tmp/gost_db_err.log
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}❌ 远程数据库导入失败！错误信息如下：${RESET}"
-            cat /tmp/gost_db_err.log
-            return 1
-        fi
-    fi
-
-    JWT_SECRET=$(openssl rand -hex 16 2>/dev/null || echo "gost_jwt_secret_$(date +%s)")
-
-    ENABLE_IPV6=false
-    if check_ipv6_support; then
-        echo -e "${GREEN}🚀 系统支持 IPv6，默认开启 Docker IPv6 支持${RESET}"
-        ENABLE_IPV6=true
-    fi
-
-    # 生成 .env
+    # 写入 .env 文件
     cat <<EOF > "$ENV_FILE"
-DB_HOST=$DB_HOST
-DB_PORT=$DB_PORT
-DB_NAME=$DB_NAME
-DB_USER=$DB_USER
-DB_PASSWORD=$DB_PASSWORD
-JWT_SECRET=$JWT_SECRET
-FRONTEND_PORT=$FRONTEND_PORT
-BACKEND_PORT=$BACKEND_PORT
+# ═══════════════════════════════════════════════════════════════
+#  MailGo Environment Configuration
+# ═══════════════════════════════════════════════════════════════
+
+ENCRYPTION_KEY=${rand_key}
+SERVER_PORT=${custom_port}
+MAILGO_IMAGE_TAG=${image_tag}
+TRUSTED_PROXIES=
+
+# ── MySQL 配置 ──
+MYSQL_USER=${db_user}
+MYSQL_PASSWORD=${db_pass}
+MYSQL_HOST=${db_host}
+MYSQL_PORT=${db_port}
+MYSQL_DATABASE=${db_name}
+MYSQL_ROOT_PASSWORD=${db_root_pass}
+
+# ── Redis 配置 ──
+REDIS_HOST=${redis_host}
+REDIS_PORT=${redis_port}
+REDIS_PASSWORD=${redis_pass}
+REDIS_DB=${redis_db}
 EOF
 
-    # 生成 docker-compose.yml
+    # 根据部署模式，智能生成内部依赖块
+    local server_depends=""
+    if [ "$db_mode" = "1" ]; then
+        server_depends=$(cat <<EOF
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+EOF
+)
+    fi
+
+    # 构造核心 docker-compose.yml 拓扑
     cat <<EOF > "$COMPOSE_FILE"
 services:
+  mailgo:
+    image: ghcr.io/mengmengcode/mailgo:\${MAILGO_IMAGE_TAG:-latest}
+    container_name: mailgo
+    restart: unless-stopped
+    ports:
+      - "\${SERVER_PORT:-8080}:\${SERVER_PORT:-8080}"
+    env_file: .env
+${server_depends}
+
 EOF
 
-    if [ "$db_mode" == "1" ]; then
-    # 创建本地数据挂载目录
-    mkdir -p "$BASE_DIR/mysql_data"
-    cat <<EOF >> "$COMPOSE_FILE"
+    # 只有常规模式下，才会追加本地数据基础设施
+    if [ "$db_mode" = "1" ]; then
+        cat <<EOF >> "$COMPOSE_FILE"
   mysql:
-    image: mysql:5.7
-    container_name: gost-mysql
+    image: mysql:8.0
+    container_name: mailgo-mysql
     restart: unless-stopped
+    command:
+      - --innodb-buffer-pool-size=\${MYSQL_INNODB_BUFFER_POOL_SIZE:-256M}
+      - --innodb-log-file-size=\${MYSQL_INNODB_LOG_FILE_SIZE:-128M}
+      - --innodb-flush-log-at-trx-commit=\${MYSQL_INNODB_FLUSH_LOG_AT_TRX_COMMIT:-2}
+      - --innodb-flush-method=O_DIRECT
+      - --max-connections=\${MYSQL_MAX_CONNECTIONS:-50}
+      - --performance-schema=OFF
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_USER: ${DB_USER}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
-      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: \${MYSQL_ROOT_PASSWORD:-root_secret}
+      MYSQL_DATABASE: mailgo
+      MYSQL_USER: mailgo
+      MYSQL_PASSWORD: \${MYSQL_PASSWORD:-mailgo_secret}
     volumes:
-      - ./mysql_data:/var/lib/mysql
-      - ./gost.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    command: >
-      --default-authentication-plugin=mysql_native_password
-      --character-set-server=utf8mb4
-      --collation-server=utf8mb4_unicode_ci
-      --max_connections=1000
-    networks:
-      - gost-network
+      - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      timeout: 10s
-      retries: 10
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p\${MYSQL_ROOT_PASSWORD:-root_secret}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: mailgo-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mysql-data:
+  redis-data:
 EOF
     fi
 
-    cat <<EOF >> "$COMPOSE_FILE"
-  backend:
-    image: bqlpfy/springboot-backend:1.4.3
-    container_name: springboot-backend
-    restart: unless-stopped
-    environment:
-      DB_HOST: ${DB_HOST}
-      DB_PORT: ${DB_PORT}
-      DB_NAME: ${DB_NAME}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      JWT_SECRET: ${JWT_SECRET}
-      LOG_DIR: /app/logs
-      JAVA_OPTS: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
-    ports:
-      - "${BACKEND_PORT}:6365"
-    volumes:
-      - backend_logs:/app/logs
-$( [ "$db_mode" == "1" ] && echo "    depends_on:
-      mysql:
-        condition: service_healthy" )
-    networks:
-      - gost-network
-    healthcheck:
-      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 90s
-
-  frontend:
-    image: bqlpfy/vite-frontend:1.4.3
-    container_name: vite-frontend
-    restart: unless-stopped
-    ports:
-      - "${FRONTEND_PORT}:80"
-$( [ "$db_mode" == "1" ] && echo "    depends_on:
-      backend:
-        condition: service_healthy" )
-    networks:
-      - gost-network
-
-volumes:
-  backend_logs:
-    name: backend_logs
-    driver: local
-
-networks:
-  gost-network:
-    name: gost-network
-    driver: bridge
-$( [ "$ENABLE_IPV6" = true ] && echo "    enable_ipv6: true
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
-        - subnet: fd00:dead:beef::/48" )
-EOF
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动面板...${RESET}"
-    cd "$BASE_DIR" && $DOCKER_CMD up -d --force-recreate
+    echo -e "${YELLOW}正在通过 Docker Compose 部署并拉起集群...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d
+    echo -e "${GREEN}MailGo 容器集群正在初始化...${RESET}"
+    sleep 5
 
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    哆啦A梦转发面板 部署成功！  ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}前端访问: http://${DETECT_IP}:${FRONTEND_PORT}${RESET}"
-    echo -e "${YELLOW}后端访问: http://${DETECT_IP}:${BACKEND_PORT}${RESET}"
-    echo -e "${YELLOW}默认账号: admin_user / 密码: admin_user${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}             MailGo 部署成功！                      ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: ${BASE_DIR}${RESET}"
+    echo -e "${MAGENTA}🔑 首次安装 - 正在尝试抓取控制台初始密码:${RESET}"
+    echo -e "----------------------------------------------------"
+    docker logs mailgo 2>&1 | grep -E "Password|password|密码" || echo -e "${YELLOW}未在日志中匹配到初始密码，可稍后前往日志审计功能查看。${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-update_app() { [[ -f "$COMPOSE_FILE" ]] && cd "$BASE_DIR" && $DOCKER_CMD pull && $DOCKER_CMD up -d && echo -e "${GREEN}更新完成！${RESET}" || echo -e "${RED}错误: 未部署！${RESET}"; }
-uninstall_app() {
-    echo -ne "${YELLOW}确定要卸载并删除吗？(y/n): ${RESET}"
+trigger_backup() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then echo -e "${RED}错误: 未部署系统！${RESET}"; return; fi
+    
+    echo -ne "${YELLOW}请输入备份保存的绝对路径 [默认: $DEFAULT_BACKUP_DIR]: ${RESET}"
+    read -r backup_dir
+    [[ -z "$backup_dir" ]] && backup_dir="$DEFAULT_BACKUP_DIR"
+    mkdir -p "$backup_dir" && chmod -R 777 "$backup_dir"
+    
+    cd "$BASE_DIR"
+    local timestamp=$(date +%Y%m%d-%H%M%S)
+
+    # 1. 智能判定 MySQL 是否属于远程模式
+    if grep -q "mailgo-mysql" "$COMPOSE_FILE"; then
+        echo -e "${CYAN}[数据库备份] 内置模式：正在热导出本地 MySQL 数据快照...${RESET}"
+        local db_user=$(grep -E "^MYSQL_USER=" "$ENV_FILE" | cut -d'=' -f2)
+        local db_pass=$(grep -E "^MYSQL_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2)
+        local db_name=$(grep -E "^MYSQL_DATABASE=" "$ENV_FILE" | cut -d'=' -f2)
+        docker exec -e MYSQL_PWD="${db_pass}" mailgo-mysql mysqldump -u "${db_user}" "${db_name}" > "${backup_dir}/mailgo-${timestamp}.sql" 2>/dev/null
+    else
+        echo -e "${CYAN}[数据库备份] ${YELLOW}检测到远程 MySQL 环境，自动跳过本地数据备份。${RESET}"
+    fi
+
+    # 2. 智能判定 Redis 是否属于远程模式
+    if grep -q "mailgo-redis" "$COMPOSE_FILE"; then
+        echo -e "${CYAN}[缓存备份] 内置模式：正在同步本地 Redis 缓存盘...${RESET}"
+        docker exec mailgo-redis redis-cli save 2>/dev/null
+    else
+        echo -e "${CYAN}[缓存备份] ${YELLOW}检测到远程 Redis 环境，自动跳过本地缓存备份。${RESET}"
+    fi
+    
+    echo -e "${CYAN}[物理打包] 正在打包核心环境配置文件资产...${RESET}"
+    tar -czf "${backup_dir}/mailgo-files-${timestamp}.tar.gz" .env docker-compose.yml 2>/dev/null
+    echo -e "${GREEN}备份打包成功！保存在: $backup_dir${RESET}"
+}
+
+restore_utils() {
+    echo -ne "${YELLOW}请输入你的备份文件存放绝对路径 [默认: $DEFAULT_BACKUP_DIR]: ${RESET}"
+    read -r backup_dir
+    [[ -z "$backup_dir" ]] && backup_dir="$DEFAULT_BACKUP_DIR"
+
+    if [[ ! -d "$backup_dir" ]]; then echo -e "${RED}错误: 未检测到备份路径 $backup_dir${RESET}"; return; fi
+    clear
+    echo -e "${CYAN}====== 📥 MailGo 智能全自动恢复面板 ======${RESET}"
+    echo -e "读取路径: $backup_dir"
+    echo -e "----------------------------------------------------"
+    
+    local tar_files=($(ls "$backup_dir" 2>/dev/null | grep -E "mailgo-files-.*\.tar\.gz"))
+    if [ ${#tar_files[@]} -eq 0 ]; then echo -e "${RED}未找到符合条件的 mailgo-files-*.tar.gz 压缩包！${RESET}"; return; fi
+    
+    for i in "${!tar_files[@]}"; do echo -e "${GREEN}[$i]${RESET} 压缩包: ${tar_files[$i]}"; done
+    echo -e "----------------------------------------------------"
+    echo -ne "${YELLOW}请选择要恢复的物理资产包(tar.gz)编号: ${RESET}"
+    read -r tar_idx
+    if [[ -z "$tar_idx" || ! "$tar_idx" =~ ^[0-9]+$ || $tar_idx -ge ${#tar_files[@]} ]]; then return; fi
+    local selected_tar="${backup_dir}/${tar_files[$tar_idx]}"
+
+    echo -ne "\n${RED}警告: 本操作会强行覆盖现有环境配置！确认回灌部署吗？(y/n): ${RESET}"
     read -r confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && $DOCKER_CMD down
-            echo -ne "${YELLOW}是否同时删除本地所有挂载数据及目录？(y/n): ${RESET}"
-            read -r clean_data
-            [[ "$clean_data" == "y" || "$clean_data" == "Y" ]] && rm -rf "$BASE_DIR" && echo -e "${GREEN}本地数据已彻底清理。${RESET}"
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then return; fi
+
+    echo -e "${YELLOW}正在安全停止本地主服务及集群容器...${RESET}"
+    if [ -d "$BASE_DIR" ]; then
+        cd "$BASE_DIR" && docker compose down 2>/dev/null
+    fi
+
+    echo -e "${YELLOW}[智能基建] 检测并全自动创建系统主目录: $BASE_DIR ...${RESET}"
+    mkdir -p "$BASE_DIR"
+
+    echo -e "${YELLOW}[物理释放] 正在释放回填物理配置文件资产...${RESET}"
+    tar -xzf "$selected_tar" -C "$BASE_DIR/"
+    cd "$BASE_DIR"
+
+    # 3. 智能联动：MySQL 远程环境检测与直跳
+    if ! grep -q "mailgo-mysql" "$COMPOSE_FILE"; then
+        echo -e "${CYAN}[智能判定] MySQL 属于【远程数据库模式】，直接跳过本地 MySQL 库灌录。${RESET}"
+    else
+        echo -e "${YELLOW}[库灌录] 检测到内置 MySQL，正在单独拉起本地数据节点准备回灌...${RESET}"
+        local sql_files=($(ls "$backup_dir" 2>/dev/null | grep -E "mailgo-.*\.sql"))
+        if [ ${#sql_files[@]} -gt 0 ]; then
+            docker compose up -d mysql
+            echo -e "${YELLOW}等待本地 MySQL 响应初始化中 (15s)...${RESET}"
+            sleep 15
+            
+            local db_user=$(grep -E "^MYSQL_USER=" "$ENV_FILE" | cut -d'=' -f2)
+            local db_pass=$(grep -E "^MYSQL_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2)
+            local db_name=$(grep -E "^MYSQL_DATABASE=" "$ENV_FILE" | cut -d'=' -f2)
+            
+            docker cp "${backup_dir}/${sql_files[0]}" mailgo-mysql:/tmp/restore.sql 2>/dev/null
+            docker exec -i mailgo-mysql sh -c "export MYSQL_PWD='${db_pass}'; mysql -u ${db_user} ${db_name} < /tmp/restore.sql" 2>/dev/null
+            docker exec mailgo-mysql rm -f /tmp/restore.sql 2>/dev/null
         else
-            docker rm -f vite-frontend springboot-backend gost-mysql 2>/dev/null
+            echo -e "${YELLOW}未检测到对应数据库 .sql 文件，跳过库回灌。${RESET}"
+        fi
+    fi
+
+    # 4. 智能联动：Redis 远程环境检测与直跳
+    if ! grep -q "mailgo-redis" "$COMPOSE_FILE"; then
+        echo -e "${CYAN}[智能判定] Redis 属于【远程缓存模式】，无需本地容器，直接跳过。${RESET}"
+    else
+        echo -e "${YELLOW}[缓存拉起] 检测到内置缓存拓扑，正在拉起本地 Redis 节点...${RESET}"
+        docker compose up -d redis
+    fi
+
+    echo -e "${YELLOW}正在全量复活 MailGo 业务主节点...${RESET}"
+    docker compose up -d --force-recreate
+    echo -e "${GREEN}🌟 快照数据灾备恢复成功！请刷新页面进行业务验证！${RESET}"
+}
+
+logs_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}===================================${RESET}"
+        echo -e "${GREEN}     📋 MailGo 实时运行日志审计    ${RESET}"
+        echo -e "${GREEN}===================================${RESET}"
+        echo -e "${GREEN}1. 查看 MailGo 主业务运行日志${RESET}"
+        echo -e "${GREEN}2. 查看 MySQL (本地数据持久化层日志)${RESET}"
+        echo -e "${GREEN}3. 查看 Redis (本地高频缓存层日志)${RESET}"
+        echo -e "${GREEN}0. 返回主菜单${RESET}"
+        echo -e "${GREEN}===================================${RESET}"
+        echo -ne "${GREEN}请选择要审计的容器日志编号: ${RESET}"
+        get_status_info
+        if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR"; fi
+        read -r log_choice
+        case "$log_choice" in
+            1) docker compose logs -f --tail=100 mailgo ;;
+            2) docker compose logs -f --tail=100 mysql 2>/dev/null || echo -e "${RED}远程模式未启用内置数据库。${RESET}" ;;
+            3) docker compose logs -f --tail=100 redis 2>/dev/null || echo -e "${RED}远程模式未启用内置缓存。${RESET}" ;;
+            0) break ;;
+            *) echo -e "${RED}选择无效！${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+uninstall_utils() {
+    echo -ne "${YELLOW}确定要彻底卸载并删除 MailGo 吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down -v
+            echo -e "${GREEN}容器集群与相关挂载卷已安全解除并释放。${RESET}"
+            echo -ne "${YELLOW}是否同时彻底清除宿主机物理配置和核心缓存卷？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}已彻底清除宿主机系统主目录。${RESET}"
+            fi
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-check_compose_exist() { [[ -f "$COMPOSE_FILE" ]] && return 0 || { echo -e "${RED}错误: 未检测到配置文件！${RESET}"; return 1; }; }
-start_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD start && echo -e "${GREEN}服务已启动${RESET}"; }
-stop_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD stop && echo -e "${YELLOW}服务已停止${RESET}"; }
-restart_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD restart && echo -e "${GREEN}服务已重启${RESET}"; }
-
-view_logs() {
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}选择容器查看日志:${RESET}"
-    echo -e "${YELLOW}1) MySQL (数据)${RESET}"
-    echo -e "${YELLOW}2) Backend (后端)${RESET}"
-    echo -e "${YELLOW}3) Frontend (前端)${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请选择 [1-3]: ${RESET}"
-    read -r c
-    case $c in
-        1) docker logs -f gost-mysql 2>/dev/null || echo -e "${RED}容器未创建${RESET}" ;;
-        2) docker logs -f springboot-backend 2>/dev/null || echo -e "${RED}容器未创建${RESET}" ;;
-        3) docker logs -f vite-frontend 2>/dev/null || echo -e "${RED}容器未创建${RESET}" ;;
-        *) echo -e "${RED}无效选择${RESET}" ;;
-    esac
-}
-
-manage_nodes() {
-    echo -e "${YELLOW}📡 正在获取节点管理...${RESET}"
-    if download_file "$NODE_SCRIPT_URL" "$BASE_DIR/node_install.sh"; then
-        chmod +x "$BASE_DIR/node_install.sh"
-        "$BASE_DIR/node_install.sh"
-        rm -f "$BASE_DIR/node_install.sh"
-    else
-        echo -e "${RED}❌ 无法下载节点管理，请检查网络！${RESET}"
-    fi
-}
+start_utils() { if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}已启动${RESET}"; fi; }
+stop_utils() { if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}已停止${RESET}"; fi; }
+restart_utils() { if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}已重启${RESET}"; fi; }
 
 show_info() {
     get_status_info
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}前端状态 : $status_front"
-    echo -e "${YELLOW}后端状态 : $status_back"
-    echo -e "${YELLOW}数据状态 : $status_mysql"
-    echo -e "${YELLOW}前端地址 : http://${DETECT_IP}:${web_front}${RESET}"
-    echo -e "${YELLOW}后端地址 : http://${DETECT_IP}:${web_back}${RESET}"
-    echo -e "${YELLOW}配置目录 : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}MailGo 服务状态 : $status"
+    echo -e "${YELLOW}当前宿主机映射端口: ${port_display}${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: ${BASE_DIR}${RESET}"
     echo -e "${GREEN}================================${RESET}"
+}
+
+update_utils() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到集群编排文件 ($COMPOSE_FILE)！${RESET}"
+        echo -e "${YELLOW}请先执行选项 1 部署/启动新实例。${RESET}"
+        return 1
+    fi
+
+    echo -e "${CYAN}===================================${RESET}"
+    echo -e "${CYAN}     🔄 正在拉取并同步最新镜像       ${RESET}"
+    echo -e "${CYAN}===================================${RESET}"
+    
+    cd "$BASE_DIR" || exit 1
+
+    echo -e "${YELLOW}➜ 正在连接远程仓库拉取最新 MailGo 镜像...${RESET}"
+    if docker compose pull; then
+        echo -e "${GREEN}✔ 镜像下载/更新完成。${RESET}"
+        
+        echo -e "${YELLOW}➜ 正在应用热重载应用镜像变更...${RESET}"
+        docker compose up -d --remove-orphans
+        echo -e "${GREEN}🌟 MailGo 已成功更新！${RESET}"
+    else
+        echo -e "${RED}❌ 镜像拉取失败！请检查网络连接或镜像源连通性。${RESET}"
+    fi
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈    哆啦A梦 转发面板管理    ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}前端状态 :${RESET} $status_front ${GREEN}端口 :${RESET} ${YELLOW}${web_front}${RESET}"
-    echo -e "${GREEN}后端状态 :${RESET} $status_back ${GREEN}端口 :${RESET} ${YELLOW}${web_back}${RESET}"
-    echo -e "${GREEN}数据状态 :${RESET} $status_mysql"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}9. 节点管理${RESET}  ${YELLOW}← 添加节点${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}      ◈   MailGo 管理面板   ◈     ${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN} 1. 部署启动${RESET}"
+    echo -e "${GREEN} 2. 更新容器${RESET}"
+    echo -e "${GREEN} 3. 卸载容器${RESET}"
+    echo -e "${GREEN} 4. 启动容器${RESET}"
+    echo -e "${GREEN} 5. 停止容器${RESET}"
+    echo -e "${GREEN} 6. 重启容器${RESET}"
+    echo -e "${GREEN} 7. 查看日志${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
+    echo -e "${GREEN} 9. 快照备份${RESET}"
+    echo -e "${GREEN}10. 快照恢复${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_app ;;
-        2) update_app ;;
-        3) uninstall_app ;;
-        4) start_app ;;
-        5) stop_app ;;
-        6) restart_app ;;
-        7) view_logs ;;
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_menu ;;
         8) show_info ;;
-        9) manage_nodes ;;
+        9) trigger_backup ;;
+        10) restore_utils ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

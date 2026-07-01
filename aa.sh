@@ -1,47 +1,29 @@
 #!/bin/bash
 
-# 确保脚本以 root 权限运行
-if [ "$EUID" -ne 0 ]; then
-  echo "错误：请以 root 用户运行此脚本！"
-  exit 1
+# 颜色定义
+G='\033[0;32m' # 绿
+B='\033[0;34m' # 蓝
+Y='\033[1;33m' # 黄
+R='\033[0;31m' # 红
+NC='\033[0m'   # 无色
+
+# 1. 严格的环境检查
+if ! command -v docker &> /dev/null; then
+    echo -e "${R}❌ 错误: 未检测到 Docker，请先安装！${NC}"
+    exit 1
 fi
 
-echo "开始清理指定的脚本文件..."
+if ! docker info &> /dev/null; then
+    echo -e "${R}❌ 错误: Docker 服务未启动或无权限！${NC}"
+    exit 1
+fi
 
-# 1. 定义需要删除的文件列表
-FILES=(
-    "/root/vps-toolbox.sh"
-    "/root/toolboxupdate.sh"
-    "/root/proxy.sh"
-    "/root/Alpine.sh"
-    "/root/oracle.sh"
-    "/root/panel.sh"
-    "/root/dockerupdate.sh"
-    "/usr/local/bin/clean-server"
-)
+# 2. 静默执行清理并判断结果
+echo -e "${Y}⏳ 正在一键清理未使用的 Docker 镜像与数据卷...${NC}"
 
-# 循环删除文件
-for FILE in "${FILES[@]}"; do
-    if [ -f "$FILE" ]; then
-        rm -f "$FILE"
-        echo "已删除: $FILE"
-    else
-        echo "未找到文件（跳过）: $FILE"
-    fi
-done
-
-echo "--------------------------------"
-echo "开始清理相关的 crontab 定时任务..."
-
-# 2. 备份当前的 crontab 以防万一
-crontab -l > /tmp/cron_backup_$(date +%F).txt 2>/dev/null
-
-# 导出当前任务，过滤掉包含特定脚本的行，然后重新写入
-crontab -l 2>/dev/null | grep -v -E "toolboxupdate.sh|clean-server|dockerupdate.sh" | crontab -
-
-echo "定时任务清理完成！"
-echo "--------------------------------"
-echo "所有清理工作已完成。旧的定时任务已备份在 /tmp/ 目录下。"
-
-# 自残：删除本卸载脚本自身
-rm -- "$0"
+if docker image prune -a -f && docker volume prune -f; then
+    echo -e "${G}✅ 清理完成！系统空间已释放。${NC}"
+else
+    echo -e "${R}❌ 清理失败，请检查 Docker 状态或权限！${NC}"
+    exit 1
+fi

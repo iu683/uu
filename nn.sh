@@ -1,44 +1,51 @@
 #!/bin/bash
 
-# 确保脚本以 root 权限运行
-if [ "$EUID" -ne 0 ]; then
-  echo "错误：请以 root 用户运行此脚本！"
-  exit 1
+# 颜色定义
+G='\033[0;32m' # 绿
+Y='\033[1;33m' # 黄
+R='\033[0;31m' # 红
+NC='\033[0m'   # 无色
+
+CONFIG_PATH="/opt/nezha/agent/config.yml"
+
+# 1. 检查配置文件是否存在
+if [ ! -f "$CONFIG_PATH" ]; then
+    echo -e "${R}❌ 错误: 未找到哪吒 Agent 配置文件 ($CONFIG_PATH)${NC}"
+    exit 1
 fi
 
-echo "开始清理指定的脚本文件..."
+# 2. 修改配置（禁用命令执行）
+echo -e "${Y}⏳ 正在修改配置文件，禁用哪吒 Agent 远程命令执行...${NC}"
+sed -i 's/disable_command_execute: false/disable_command_execute: true/' "$CONFIG_PATH"
 
-# 1. 定义需要删除的文件列表
-FILES=(
-    "/root/vps-toolbox.sh"
-    "/root/toolboxupdate.sh"
-    "/root/proxy.sh"
-    "/root/Alpine.sh"
-    "/root/oracle.sh"
-    "/root/panel.sh"
-    "/root/dockerupdate.sh"
-    "/usr/local/bin/clean-server"
-)
-
-# 循环删除文件
-for FILE in "${FILES[@]}"; do
-    if [ -f "$FILE" ]; then
-        rm -f "$FILE"
-        echo "已删除: $FILE"
+# 3. 智能判断系统环境并重启服务
+if command -v systemctl &>/dev/null; then
+    # 标准 Linux (Systemd)
+    echo -e "${Y}⚙️ 检测到 Systemd 环境，正在重启哪吒服务...${NC}"
+    if systemctl restart nezha-agent; then
+        echo -e "${G}✅ 成功：配置已生效并已通过 systemctl 重启服务！${NC}"
     else
-        echo "未找到文件（跳过）: $FILE"
+        echo -e "${R}❌ 失败：systemctl 重启哪吒服务失败。${NC}"
     fi
-done
 
-echo "--------------------------------"
-echo "开始清理相关的 crontab 定时任务..."
+elif command -v rc-service &>/dev/null; then
+    # Alpine Linux (OpenRC)
+    echo -e "${Y}⚙️ 检测到 Alpine (OpenRC) 环境，正在重启哪吒服务...${NC}"
+    if rc-service nezha-agent restart; then
+        echo -e "${G}✅ 成功：配置已生效并已通过 OpenRC 重启服务！${NC}"
+    else
+        echo -e "${R}❌ 失败：OpenRC 重启哪吒服务失败。${NC}"
+    fi
 
-# 2. 备份当前的 crontab 以防万一
-crontab -l > /tmp/cron_backup_$(date +%F).txt 2>/dev/null
-
-# 导出当前任务，过滤掉包含特定脚本的行，然后重新写入
-crontab -l 2>/dev/null | grep -v -E "toolboxupdate.sh|clean-server|dockerupdate.sh" | crontab -
-
-echo "定时任务清理完成！"
-echo "--------------------------------"
-echo "所有清理工作已完成。"
+else
+    # 兜底方案：无服务管理器时直接重载进程
+    echo -e "${Y}⚠️ 未检测到标准服务管理器，正在尝试通过强制重启进程激活配置...${NC}"
+    killall nezha-agent 2>/dev/null
+    sleep 1
+    if [ -x "/opt/nezha/agent/nezha-agent" ]; then
+        /opt/nezha/agent/nezha-agent &>/dev/null &
+        echo -e "${G}✅ 成功：哪吒 Agent 进程已重新拉起！${NC}"
+    else
+        echo -e "${R}❌ 失败：找不到哪吒 Agent 可执行程序，请手动重启。${NC}"
+    fi
+fi

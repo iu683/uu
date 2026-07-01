@@ -22,6 +22,18 @@ check_dependencies() {
     fi
 }
 
+
+# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
+format_ip_for_url() {
+    local ip="$1"
+    if [[ "$ip" == *":"* ]]; then
+        echo "[$ip]"
+    else
+        echo "$ip"
+    fi
+}
+
+
 get_public_ip() {
     local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
     local ip=""
@@ -45,26 +57,61 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
+# 动态获取容器整体状态和端口
 get_status_info() {
-    local active_id=$(docker ps -q --filter "name=mailgo" --filter "status=running" | head -n 1)
-    if [ -n "$active_id" ]; then
-        status="${GREEN}运行中${RESET}"
-        port_display=$(docker port mailgo 8080 2>/dev/null | cut -d':' -f2)
-        [[ -z "$port_display" ]] && port_display="8080"
-    else
-        local dead_id=$(docker ps -aq --filter "name=mailgo" | head -n 1)
-        if [ -n "$dead_id" ]; then status="${RED}已停止${RESET}"; else status="${RED}未部署${RESET}"; fi
-        port_display="N/A"
+    if ! command -v docker &> /dev/null; then
+        status="${RED}未安装 Docker${RESET}"
+        img_version="${RED}未安装${RESET}"
+        web_port="N/A"
+        data_dir="N/A"
+        return 0
     fi
+    if [ -f "$COMPOSE_FILE" ]; then
+        # 1. 尝试动态获取运行状态
+        if [ "$(docker ps -q -f name=mailgo)" ]; then
+            status="${GREEN}运行中${RESET}"
+            web_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5547/tcp") 0).HostPort}}' mailgo 2>/dev/null)
+        elif [ "$(docker ps -aq -f name=mailgo)" ]; then
+            status="${YELLOW}已停止${RESET}"
+            web_port=""
+        else
+            status="${RED}未部署${RESET}"
+            web_port=""
+        fi
+        
+        # 2. 如果 Inspect 读取为空（或容器未运行），触发智能静态解包
+        if [ -z "$web_port" ]; then
+            # 改进点：放宽匹配规则，允许提取包含 $SERVER_PORT 变量的行
+            web_port=$(sed -n '/mailgo:/,/^[[:space:]]*[a-zA-Z]/p' "$COMPOSE_FILE" | grep -E '\-[[:space:]]*["'\'']?[0-9$]+' | head -n 1 | awk -F ':' '{print $1}' | tr -d '[:space:]"''-${}')
+            
+            # 3. 判定提取出来的是否是环境变量占位符
+            if [[ -z "$web_port" || "$web_port" == *"SERVER_PORT"* || ! "$web_port" =~ ^[0-9]+$ ]]; then
+                if [ -f "$ENV_FILE" ]; then
+                    # 精准从 .env 中抓取 SERVER_PORT
+                    web_port=$(grep -E "^SERVER_PORT=" "$ENV_FILE" | cut -d'=' -f2 | tr -d '[:space:]')
+                fi
+            fi
+            
+            # 4. 终极防空兜底
+            [[ -z "$web_port" ]] && web_port="8080"
+        fi
+    else
+        status="${RED}未初始化${RESET}"
+        web_port="N/A"
+    fi
+    
+    # 传递给面板打印变量
+    port_display="$web_port"
 }
+
 
 install_utils() {
     check_dependencies
     mkdir -p "$BASE_DIR"
     
     echo -e "${CYAN}====== 1. 数据库与缓存部署模式选择 ======${RESET}"
-    echo -e "${GREEN}1) 内置常规模式${RESET} (本地跑 MySQL 和 Redis 容器)"
-    echo -e "${GREEN}2) 远程数据模式${RESET} (连接外部已有的 MySQL/Redis，跳过本地库)"
+    echo -e "${GREEN}1) 内置常规模式 (本地跑 MySQL 和 Redis 容器)${RESET}"
+    echo -e "${GREEN}2) 远程数据模式 (连接外部已有的 MySQL/Redis，跳过本地库)${RESET}"
     echo -ne "${YELLOW}请选择模式 [默认 1]: ${RESET}"; read -r db_mode
     [[ -z "$db_mode" ]] && db_mode="1"
 
@@ -139,7 +186,7 @@ services:
     container_name: mailgo
     restart: unless-stopped
     ports:
-      - "\${SERVER_PORT:-8080}:8080"
+      - "\${SERVER_PORT:-8080}:\${SERVER_PORT:-8080}"
     env_file: .env
 ${server_depends}
 
@@ -196,18 +243,13 @@ EOF
     echo -e "${GREEN}MailGo 容器集群正在初始化...${RESET}"
     sleep 5
 
-    # 智能防护获取公网 IP
-    local SERVER_IP
-    if command -v get_public_ip &> /dev/null; then
-        SERVER_IP=$(get_public_ip)
-    else
-        SERVER_IP=$(hostname -I | awk '{print $1}')
-    fi
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
 
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${GREEN}             MailGo 部署成功！                      ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}🌐 访问地址: http://${SERVER_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}🌐 访问地址: http://${DETECT_IP}:${port_display}${RESET}"
     echo -e "${YELLOW}📂 数据目录: ${BASE_DIR}${RESET}"
     echo -e "${MAGENTA}🔑 首次安装 - 正在尝试抓取控制台初始密码:${RESET}"
     echo -e "----------------------------------------------------"
@@ -372,11 +414,13 @@ restart_utils() { if [ -d "$BASE_DIR" ]; then cd "$BASE_DIR" && docker compose r
 
 show_info() {
     get_status_info
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}MailGo 服务状态 : $status"
     echo -e "${YELLOW}当前宿主机映射端口: ${port_display}${RESET}"
-    echo -e "--------------------------------"
-    docker ps --format "table {{.Names}}\t{{.Status}}" | grep -E "mailgo"
+    echo -e "${YELLOW}🌐 访问地址: http://${DETECT_IP}:${port_display}${RESET}"
+    echo -e "${YELLOW}📂 数据目录: ${BASE_DIR}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -411,8 +455,8 @@ menu() {
     echo -e "${GREEN}===================================${RESET}"
     echo -e "${GREEN}      ◈   MailGo 管理面板   ◈     ${RESET}"
     echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}服务状态 :${RESET} $status"
-    echo -e "${GREEN}活动端口 :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
     echo -e "${GREEN}===================================${RESET}"
     echo -e "${GREEN} 1. 部署启动${RESET}"
     echo -e "${GREEN} 2. 更新容器${RESET}"
@@ -421,12 +465,12 @@ menu() {
     echo -e "${GREEN} 5. 停止容器${RESET}"
     echo -e "${GREEN} 6. 重启容器${RESET}"
     echo -e "${GREEN} 7. 查看日志${RESET}"
-    echo -e "${GREEN} 8. 状态报告${RESET}"
+    echo -e "${GREEN} 8. 查看配置${RESET}"
     echo -e "${GREEN} 9. 快照备份${RESET}"
     echo -e "${GREEN}10. 快照恢复${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}===================================${RESET}"
-    echo -ne "${GREEN}请输入操作代号: ${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
         1) install_utils ;;
@@ -440,7 +484,7 @@ menu() {
         9) trigger_backup ;;
         10) restore_utils ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效代号！${RESET}" ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 

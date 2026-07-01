@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Lucky 网络工具箱 Docker Compose 管理面板 
+# flvx-panel Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,63 +10,85 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="lucky"
-BASE_DIR="/opt/lucky"
+APP_NAME="flvx-panel"
+BASE_DIR="/opt/$APP_NAME"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
+NODE_SCRIPT_URL="https://raw.githubusercontent.com/Sagit-chu/flvx/main/install.sh"
 
-# 检测依赖
+DOCKER_CMD="docker compose"
+
+# 代理前缀列表
+GITHUB_PROXY=(
+    ''
+    'https://v6.gh-proxy.org/'
+    'https://ghfast.top/'
+    'https://gh-proxy.com/'
+    'https://hub.glowp.xyz/'
+    'https://proxy.vvvv.ee/'
+)
+
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
+    if ! $DOCKER_CMD version &>/dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker Compose v2，请升级 Docker！${RESET}"
+        exit 1
+    fi
 }
 
-# 动态获取容器状态、网络模式和映射端口
+# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
+format_ip_for_url() {
+    local ip="$1"
+    if [[ "$ip" == *":"* ]]; then
+        echo "[$ip]"
+    else
+        echo "$ip"
+    fi
+}
+
+download_file() {
+    local url="$1" local output="$2" local success=false
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local target_url="${proxy}${url}"
+        echo -e "${YELLOW}📡 正在尝试通过 [${proxy:-直连}]...${RESET}"
+        curl -L -k --max-time 15 -o "$output" "$target_url"
+        if [ -s "$output" ]; then success=true; break; else rm -f "$output"; fi
+    done
+    [[ "$success" = true ]] && return 0 || return 1
+}
+
 get_status_info() {
     if ! command -v docker &> /dev/null; then
-        status="${RED}未安装 Docker${RESET}"
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-        data_dir="N/A"
+        status_front="${RED}未安装 Docker${RESET}"
+        status_back="${RED}未安装${RESET}"
+        status_db="${RED}未配置${RESET}"
+        web_front="-"
+        web_back="-"
         return 0
     fi
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
-
-    # 2. 如果容器存在，从容器状态中提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 检查是否为 Host 网络模式
-        net_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CONTAINER_NAME" 2>/dev/null)
-        if [[ "$net_mode" == "host" ]]; then
-            webui_port="16601 (Host模式)"
+    [ "$(docker ps -q -f name=^/vite-frontend$)" ] && status_front="${GREEN}运行中${RESET}" || status_front="${RED}已停止/未创建${RESET}"
+    [ "$(docker ps -q -f name=^/flux-panel-backend$)" ] && status_back="${GREEN}运行中${RESET}" || status_back="${RED}已停止/未创建${RESET}"
+    
+    if [ -f "$ENV_FILE" ]; then
+        db_type_curr=$(grep 'DB_TYPE=' "$ENV_FILE" | cut -d= -f2)
+        db_type_curr=${db_type_curr:-sqlite}
+        if [ "$db_type_curr" == "postgres" ]; then
+            [ "$(docker ps -q -f name=^/flux-panel-postgres$)" ] && status_db="${GREEN}PostgreSQL 运行中${RESET}" || status_db="${RED}PostgreSQL 已停止${RESET}"
         else
-            # 提取映射端口（默认 16601）
-            webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "16601/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-            [[ -z "$webui_port" ]] && webui_port="16601"
+            status_db="${GREEN}SQLite (内置模式)${RESET}"
         fi
-
-        # 提取数据挂载路径
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/conf"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/conf"
+        web_front=$(grep 'FRONTEND_PORT=' "$ENV_FILE" | cut -d= -f2)
+        web_back=$(grep 'BACKEND_PORT=' "$ENV_FILE" | cut -d= -f2)
     else
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-        data_dir="N/A"
+        status_db="${YELLOW}未配置${RESET}"
+        web_front="-"
+        web_back="-"
     fi
 }
 
-# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
     local mode=${1:-"auto"}
     local ip=""
@@ -90,157 +112,306 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Lucky
-install_lucky() {
+check_ipv6_support() {
+    ping6 -c 1 ::1 &>/dev/null && return 0 || return 1
+}
+
+install_app() {
     check_dependencies
-    
-    mkdir -p "$BASE_DIR"
+    # 提前创建本地挂载目录及PG专用子目录
+    mkdir -p "$BASE_DIR/data/pg_data"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -e "${YELLOW}请选择 Lucky 的网络运行模式:${RESET}"
-    echo -e "  ${GREEN}1. Host 模式${RESET} (推荐，拥有最佳的 IPv6 及网络管理兼容性)"
-    echo -e "  ${GREEN}2. Port 映射模式${RESET} (传统端口映射，安全性好)"
-    echo -ne "${YELLOW}请输入选项 [默认: 1]: ${RESET}"
-    read -r net_choice
-    [[ -z "$net_choice" ]] && net_choice="1"
+    echo -e "${CYAN}====== 数据库类型选择 ======${RESET}"
+    echo -e "${GREEN}1) 使用内置轻量级 SQLite (推荐，免维护)${RESET}"
+    echo -e "${GREEN}2) 使用独立 PostgreSQL 16 容器 (适合单机高并发)${RESET}"
+    echo -e "${GREEN}3) 使用自建/第三方远程 PostgreSQL 数据库 (适合多机集群同步)${RESET}"
+    echo -ne "${YELLOW}请选择数据库类型 [默认 1]: ${RESET}"
+    read -r db_select
+    db_select=${db_select:-1}
 
-    echo -ne "${YELLOW}请输入配置挂载绝对路径 [默认: $BASE_DIR/conf]: ${RESET}"
-    read -r custom_data
-    [[ -z "$custom_data" ]] && custom_data="$BASE_DIR/conf"
+    # 变量初始化
+    local DB_TYPE="sqlite"
+    local DATABASE_URL=""
 
-    # 创建目录并赋权
-    mkdir -p "$custom_data"
-    chmod -R 777 "$BASE_DIR" "$custom_data"
+    if [ "$db_select" == "2" ]; then
+        # ====== 2. 本地 PostgreSQL 容器配置 ======
+        DB_TYPE="postgres"
+        PG_PASS=$(openssl rand -hex 12 2>/dev/null || echo "flux_pwd_$(date +%s)")
+        DATABASE_URL="postgres://flux_panel:${PG_PASS}@postgres:5432/flux_panel?sslmode=disable"
 
-    # 根据选择生成不同的 Compose 配置
-    if [[ "$net_choice" == "2" ]]; then
-        echo -ne "${YELLOW}请输入 Lucky 访问端口 (宿主机端口) [默认: 16601]: ${RESET}"
-        read -r custom_port
-        [[ -z "$custom_port" ]] && custom_port="16601"
-        if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-            return
+    elif [ "$db_select" == "3" ]; then
+        # ====== 3. 远程 PostgreSQL 配置 ======
+        DB_TYPE="postgres"
+        echo -e "${CYAN}====== 远程 PostgreSQL 配置 ======${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库 IP/域名: ${RESET}"
+        read -r r_host
+        echo -ne "${YELLOW}请输入远程数据库 端口 [默认: 5432]: ${RESET}"
+        read -r r_port
+        r_port=${r_port:-5432}
+        echo -ne "${YELLOW}请输入远程数据库 用户名 [默认: postgres]: ${RESET}"
+        read -r r_user
+        r_user=${r_user:-postgres}
+        echo -ne "${YELLOW}请输入远程数据库 密码: ${RESET}"
+        read -r r_pass
+        echo -ne "${YELLOW}请输入远程数据库 数据库名 [默认: postgres]: ${RESET}"
+        read -r r_name
+        r_name=${r_name:-postgres}
+
+        if [[ -z "$r_host" || -z "$r_pass" ]]; then
+            echo -e "${RED}错误: 远程数据库地址和密码不能为空！${RESET}"
+            return 1
         fi
-        
-        display_port="$custom_port"
-        
-        echo -e "${YELLOW}正在生成 [Port映射模式] 的 docker-compose.yml 配置文件...${RESET}"
-        cat <<EOF > "$COMPOSE_FILE"
-services:
-  lucky:
-    image: gdy666/lucky:v2
-    container_name: ${CONTAINER_NAME}
-    restart: always
-    ports:
-      - "${custom_port}:16601"
-    volumes:
-      - ${custom_data}:/app/conf
-      - /var/run/docker.sock:/var/run/docker.sock
+        DATABASE_URL="postgres://${r_user}:${r_pass}@${r_host}:${r_port}/${r_name}?sslmode=disable"
+    fi
+
+    # ====== 公共端口配置 ======
+    echo -ne "${YELLOW}请输入前端访问端口 [默认: 6366]: ${RESET}"
+    read -r FRONTEND_PORT
+    FRONTEND_PORT=${FRONTEND_PORT:-6366}
+
+    echo -ne "${YELLOW}请输入后端访问端口 [默认: 6365]: ${RESET}"
+    read -r BACKEND_PORT
+    BACKEND_PORT=${BACKEND_PORT:-6365}
+
+    JWT_SECRET=$(openssl rand -hex 16 2>/dev/null || echo "flux_jwt_secret_$(date +%s)")
+    ENABLE_IPV6=false
+    if check_ipv6_support; then
+        echo -e "${GREEN}🚀 系统支持 IPv6，默认开启 Docker IPv6 支持${RESET}"
+        ENABLE_IPV6=true
+    fi
+
+    # ====== 生成环境文件 .env ======
+    if [ "$db_select" == "2" ]; then
+        cat <<EOF > "$ENV_FILE"
+JWT_SECRET=$JWT_SECRET
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+DB_TYPE=postgres
+DATABASE_URL=$DATABASE_URL
+POSTGRES_DB=flux_panel
+POSTGRES_USER=flux_panel
+POSTGRES_PASSWORD=$PG_PASS
+FLUX_VERSION=latest
+EOF
+    elif [ "$db_select" == "3" ]; then
+        cat <<EOF > "$ENV_FILE"
+JWT_SECRET=$JWT_SECRET
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+DB_TYPE=postgres
+DATABASE_URL=$DATABASE_URL
+FLUX_VERSION=latest
 EOF
     else
-        display_port="16601"
-        echo -e "${YELLOW}正在生成 [Host网络模式] 的 docker-compose.yml 配置文件...${RESET}"
-        cat <<EOF > "$COMPOSE_FILE"
+        cat <<EOF > "$ENV_FILE"
+JWT_SECRET=$JWT_SECRET
+BACKEND_PORT=$BACKEND_PORT
+FRONTEND_PORT=$FRONTEND_PORT
+DB_TYPE=sqlite
+FLUX_VERSION=latest
+EOF
+fi
+
+    # ====== 动态写入全新的 docker-compose.yml ======
+    cat <<EOF > "$COMPOSE_FILE"
 services:
-  lucky:
-    image: gdy666/lucky:v2
-    container_name: ${CONTAINER_NAME}
-    restart: always
-    network_mode: host
+  backend:
+    image: ghcr.io/sagit-chu/flux-panel-backend:\${FLUX_VERSION:-latest}
+    container_name: flux-panel-backend
+    restart: unless-stopped
+$( [ "$db_select" == "2" ] && echo -e "    depends_on:\n      postgres:\n        condition: service_healthy" )
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    environment:
+      DB_TYPE: \${DB_TYPE:-sqlite}
+      DB_PATH: /app/data/gost.db
+      DATABASE_URL: \${DATABASE_URL:-}
+      JWT_SECRET: \${JWT_SECRET}
+      SERVER_ADDR: :6365
+      TZ: Asia/Shanghai
+      FLUX_VERSION: \--\${FLUX_VERSION:-dev}
+      PANEL_DEPLOY_DIR: /opt/flux-panel
+      PANEL_BACKEND_CONTAINER: flux-panel-backend
+    ports:
+      - "\${BACKEND_PORT}:6365"
     volumes:
-      - ${custom_data}:/app/conf
+      - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/opt/flux-panel
+    networks:
+      - gost-network
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+EOF
+
+    # 如果选择本地 PostgreSQL 容器(2)，则注入 postgres 编排段
+    if [ "$db_select" == "2" ]; then
+    cat <<EOF >> "$COMPOSE_FILE"
+  postgres:
+    image: postgres:16-alpine
+    container_name: flux-panel-postgres
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+    environment:
+      POSTGRES_DB: \${POSTGRES_DB:-flux_panel}
+      POSTGRES_USER: \${POSTGRES_USER:-flux_panel}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-flux_panel_change_me}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/pg_data:/var/lib/postgresql/data
+    networks:
+      - gost-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER:-flux_panel} -d \${POSTGRES_DB:-flux_panel}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
 EOF
     fi
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Lucky 服务...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
+    # 注入前端服务
+    cat <<EOF >> "$COMPOSE_FILE"
+  frontend:
+    image: ghcr.io/sagit-chu/vite-frontend:\${FLUX_VERSION:-latest}
+    container_name: vite-frontend
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    ports:
+      - "\${FRONTEND_PORT}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - gost-network
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+EOF
 
-    DETECT_IP=$(get_public_ip)
+    # ====== 动态追加 networks 声明 ======
+    cat <<EOF >> "$COMPOSE_FILE"
+networks:
+  gost-network:
+    name: gost-network
+    driver: bridge
+$( if [ "$ENABLE_IPV6" = true ]; then echo "    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.80.0.0/16
+        - subnet: fd00:dead:beef::/48"
+   else echo "    ipam:
+      config:
+        - subnet: 172.80.0.0/16"
+   fi )
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动面板...${RESET}"
+    cd "$BASE_DIR" && $DOCKER_CMD up -d --force-recreate
+
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Lucky 部署成功！        ${RESET}"
+    echo -e "${GREEN}      Flvx-Panel 部署成功！  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${display_port}${RESET}"
-    echo -e "${YELLOW}宿主机配置路径 : $custom_data${RESET}"
-    echo -e "${RED}提示: 默认初始登录用户名: 666  初始密码: 666${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-}
-
-# 更新 Lucky 镜像
-update_lucky() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return
+    echo -e "${YELLOW}前端访问: http://${DETECT_IP}:${FRONTEND_PORT}${RESET}"
+    echo -e "${YELLOW}后端访问: http://${DETECT_IP}:${BACKEND_PORT}${RESET}"
+    echo -e "${YELLOW}默认账号: admin_user / 密码: admin_user${RESET}"
+    echo -e "${CYAN}本地持久化目录: $BASE_DIR/data ➔ 映射至容器: /app/data${RESET}"
+    if [ "$db_select" == "1" ]; then
+        echo -e "${CYAN}数据环境: 内置 SQLite 数据库文件已存放在: $BASE_DIR/data/gost.db${RESET}"
+    elif [ "$db_select" == "2" ]; then
+        echo -e "${CYAN}数据环境: 本地 PostgreSQL 数据已存放在: $BASE_DIR/data/pg_data${RESET}"
     fi
-    echo -e "${YELLOW}正在从远端拉取 Lucky 最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 卸载 Lucky
-uninstall_lucky() {
-    echo -ne "${YELLOW}确定要卸载并删除 Lucky 容器吗？(y/n): ${RESET}"
+update_app() { [[ -f "$COMPOSE_FILE" ]] && cd "$BASE_DIR" && $DOCKER_CMD pull && $DOCKER_CMD up -d && echo -e "${GREEN}更新完成！${RESET}" || echo -e "${RED}错误: 未部署！${RESET}"; }
+
+uninstall_app() {
+    echo -ne "${YELLOW}确定要卸载吗？(y/n): ${RESET}"
     read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有配置文件和缓存数据？(y/n): ${RESET}"
+            echo -e "${YELLOW}正在停止并删除容器...${RESET}"
+            cd "$BASE_DIR" && $DOCKER_CMD down
+
+            echo -ne "${YELLOW}是否完全清理挂载的本地数据和配置文件？(y/n): ${RESET}"
             read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+            if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
+                echo -e "${YELLOW}正在清理本地数据...${RESET}"
+                # 调整删除顺序，防止父目录先消失
+                rm -f "$COMPOSE_FILE" "$ENV_FILE"
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}本地数据目录及配置文件已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            # 兜底清理：如果找不到 compose 文件，尝试强制删除可能残留的容器
+            docker rm -f vite-frontend flux-panel-backend flux-panel-postgres 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 容器开关管理控制（增加文件校验）
-check_compose_exist() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return 1
-    fi
-    return 0
+check_compose_exist() { [[ -f "$COMPOSE_FILE" ]] && return 0 || { echo -e "${RED}错误: 未检测到配置文件！${RESET}"; return 1; }; }
+start_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD start && echo -e "${GREEN}服务已启动${RESET}"; }
+stop_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_app() { check_compose_exist && cd "$BASE_DIR" && $DOCKER_CMD restart && echo -e "${GREEN}服务已重启${RESET}"; }
+
+view_logs() {
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}选择容器查看日志:${RESET}"
+    echo -e "${YELLOW}1) Backend (后端)${RESET}"
+    echo -e "${YELLOW}2) Frontend (前端)${RESET}"
+    echo -e "${YELLOW}3) PostgreSQL (数据库)${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请选择 [1-3]: ${RESET}"
+    read -r c
+    case $c in
+        1) docker logs -f flux-panel-backend ;;
+        2) docker logs -f vite-frontend ;;
+        3) docker logs -f flux-panel-postgres 2>/dev/null || echo -e "${RED}未处于 PostgreSQL 模式或容器未创建${RESET}" ;;
+        *) echo -e "${RED}无效选择${RESET}" ;;
+    esac
 }
 
-start_lucky() { 
-    check_compose_exist && cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"
-}
-
-stop_lucky() { 
-    check_compose_exist && cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"
-}
-
-restart_lucky() { 
-    check_compose_exist && cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"
-}
-
-logs_lucky() { 
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        docker logs -f "$CONTAINER_NAME"
+manage_nodes() {
+    echo -e "${YELLOW}📡 正在获取节点管理...${RESET}"
+    if download_file "$NODE_SCRIPT_URL" "$BASE_DIR/node_install.sh"; then
+        chmod +x "$BASE_DIR/node_install.sh" && "$BASE_DIR/node_install.sh"
+        rm -f "$BASE_DIR/node_install.sh"
     else
-        echo -e "${RED}错误: 容器未创建，无法查看日志！${RESET}"
+        echo -e "${RED}❌ 无法下载节点管理，请检查网络！${RESET}"
     fi
 }
 
 show_info() {
     get_status_info
-    local DETECT_IP=$(get_public_ip)
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}宿主机配置路径 : ${data_dir}${RESET}"
+    echo -e "${YELLOW}前端状态 : $status_front"
+    echo -e "${YELLOW}后端状态 : $status_back"
+    echo -e "${YELLOW}数据存储 : $status_db"
+    echo -e "${YELLOW}前端地址 : http://${DETECT_IP}:${web_front}${RESET}"
+    echo -e "${YELLOW}后端地址 : http://${DETECT_IP}:${web_back}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -248,10 +419,11 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈    Lucky   反向代理   ◈   ${RESET}"
+    echo -e "${GREEN}   ◈  FlVX-Panel 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}前端状态 :${RESET} $status_front  ${GREEN}端口 :${RESET} ${YELLOW}${web_front}${RESET}"
+    echo -e "${GREEN}后端状态 :${RESET} $status_back  ${GREEN}端口 :${RESET} ${YELLOW}${web_back}${RESET}"
+    echo -e "${GREEN}数据环境 :${RESET} $status_db"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -261,19 +433,21 @@ menu() {
     echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 节点管理${RESET}  ${YELLOW}← 添加节点${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_lucky ;;
-        2) update_lucky ;;
-        3) uninstall_lucky ;;
-        4) start_lucky ;;
-        5) stop_lucky ;;
-        6) restart_lucky ;;
-        7) logs_lucky ;;
+        1) install_app ;;
+        2) update_app ;;
+        3) uninstall_app ;;
+        4) start_app ;;
+        5) stop_app ;;
+        6) restart_app ;;
+        7) view_logs ;;
         8) show_info ;;
+        9) manage_nodes ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

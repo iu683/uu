@@ -1,317 +1,347 @@
 #!/bin/bash
+# =================================================================
+# Komari Traffic Hub Docker Compose 管理面板 
+# =================================================================
 
-# 标准 ANSI 颜色定义
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-RESET='\033[0m'
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-# 载入环境变量并增强 PATH 搜索
-[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
-[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null
-export PATH="/usr/local/bin:$HOME/.local/bin:/root/.local/bin:$PATH"
+BASE_DIR="/opt/komari-traffic"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
+DATA_DIR="$BASE_DIR/data"
 
-# 基础配置
-GITEA_API="https://gitea.bytevibe.dev/api/v1/repos/gary/ktui/releases/latest"
-GITEA_DOWNLOAD_BASE="https://gitea.bytevibe.dev/gary/ktui/releases/download"
+# 双容器名称定义
+CONTAINER_BOT="komari-traffic-bot"
+CONTAINER_WEB="komari-traffic-web"
 
-# 动态定位 KTUI 实际安装路径
-get_paths() {
-    REAL_EXEC_PATH=$(command -v ktui 2>/dev/null)
-    if [ -z "$REAL_EXEC_PATH" ] && [ -f "$HOME/.local/bin/ktui" ]; then
-        REAL_EXEC_PATH="$HOME/.local/bin/ktui"
+# 检测依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
     fi
 }
 
-# 获取状态、版本及当前配置信息
-get_status() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        status="${GREEN}已安装${RESET}"
-        # 💡 优化点：使用 head -n 1 只精准抓取第一行的版本号，防止 Hash 和时间刷屏
-        version_info=$($REAL_EXEC_PATH version 2>/dev/null | head -n 1 | awk '{print $2}')
-        [ -z "$version_info" ] && version_info="0.1.1"
-        ktui_version="${YELLOW}${version_info}${RESET}"
+# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
+format_ip_for_url() {
+    local ip="$1"
+    if [[ "$ip" == *":"* ]]; then
+        echo "[$ip]"
     else
-        status="${RED}未安装${RESET}"
-        ktui_version="${RED}-${RESET}"
+        echo "$ip"
+    fi
+}
+
+# 动态获取双容器状态、映射端口和环境变量配置
+get_status_info() {
+    if ! command -v docker &> /dev/null; then
+        status="${RED}未安装 Docker${RESET}"
+        webui_port="N/A"
+        return 0
     fi
 
-    # 获取当前配置的 URL
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        current_url=$($REAL_EXEC_PATH config show 2>/dev/null | grep -i "url" | awk -F'"' '{print $4}')
-        if [ -z "$current_url" ] || [ "$current_url" == "null" ]; then
-            config_status="${YELLOW}未配置 URL${RESET}"
-        else
-            config_status="${GREEN}${current_url}${RESET}"
-        fi
+    # 1. 检查两个容器的状态
+    local bot_run=$(docker ps -q -f name=^/${CONTAINER_BOT}$)
+    local web_run=$(docker ps -q -f name=^/${CONTAINER_WEB}$)
+    local bot_exist=$(docker ps -aq -f name=^/${CONTAINER_BOT}$)
+    local web_exist=$(docker ps -aq -f name=^/${CONTAINER_WEB}$)
+
+    if [[ -n "$bot_run" && -n "$web_run" ]]; then
+        status="${GREEN}运行中 (双服务正常)${RESET}"
+    elif [[ -n "$bot_run" || -n "$web_run" ]]; then
+        status="${YELLOW}部分运行 (请检查日志)${RESET}"
+    elif [[ -n "$bot_exist" || -n "$web_exist" ]]; then
+        status="${RED}已停止${RESET}"
     else
-        config_status="${RED}-${RESET}"
+        status="${RED}未部署${RESET}"
     fi
+
+    # 2. 从环境或容器提取 Web 端口
+    if [[ -f "$ENV_FILE" ]]; then
+        webui_port=$(grep -E "^WEB_PORT=" "$ENV_FILE" | cut -d'=' -f2)
+    fi
+    [[ -z "$webui_port" ]] && webui_port="8080"
 }
 
-# 菜单面板
-show_menu() {
-    clear
-    get_status
-    echo -e "${GREEN}============================${RESET}"
-    echo -e "${GREEN}     ◈ KTUI 监控管理 ◈     ${RESET}"
-    echo -e "${GREEN}============================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} $ktui_version"
-    echo -e "${GREEN}后端 :${RESET} $config_status"
-    echo -e "${GREEN}============================${RESET}"
-    echo -e "${GREEN} 1. 安装${RESET}"
-    echo -e "${GREEN} 2. 更新${RESET}"
-    echo -e "${GREEN} 3. 卡片视图${RESET}"
-    echo -e "${GREEN} 4. 列表视图${RESET}"
-    echo -e "${GREEN} 5. 配置后端${RESET}"
-    echo -e "${GREEN} 6. 设置APIKey${RESET}"
-    echo -e "${GREEN} 7. 查看配置与路${RESET}"
-    echo -e "${GREEN} 8. 启动ASCII${RESET}"
-    echo -e "${GREEN} 9. 快捷键指南${RESET}"
-    echo -e "${GREEN}10. 卸载${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}============================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-}
-
-# 1. 动态获取最新版并下载安装
-download_and_install() {
-    echo -e "\n${YELLOW}[正在从 Gitea 检索 KTUI 最新版本信息...]${RESET}"
+# 获取公网 IP (兼容双栈环境)
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
     
-    # 1. 自动请求 Gitea API 获取最新的 tag_name
-    LATEST_TAG=$(curl -s "$GITEA_API" | grep -o '"tag_name":"[^"]*' | grep -o '[^"]*$')
-    
-    if [ -z "$LATEST_TAG" ]; then
-        # 备用方案：如果 API 限制或失效，尝试从网页流抓取
-        LATEST_TAG=$(curl -sL "https://gitea.bytevibe.dev/gary/ktui/releases" | grep -o 'releases/tag/v[0-9.]*' | head -n 1 | awk -F'/' '{print $3}')
-    fi
-
-    if [ -z "$LATEST_TAG" ]; then
-        echo -e "${RED}❌ 错误：无法获取最新版本号，请检查网络是否能够访问 gitea.bytevibe.dev。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-        return 1
-    fi
-
-    # 去掉 tag 里面的 'v' 方便纯版本号拼接（如 v0.1.1 -> 0.1.1）
-    PURE_VER=$(echo "$LATEST_TAG" | sed 's/^v//')
-    echo -e "${GREEN}发现最新版本: ${LATEST_TAG}${RESET}"
-
-    # 2. 识别系统架构
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64)
-            FILENAME="ktui_${PURE_VER}_linux_amd64.tar.gz"
-            ;;
-        aarch64|arm64)
-            FILENAME="ktui_${PURE_VER}_linux_arm64.tar.gz"
-            ;;
-        *)
-            echo -e "${RED}❌ 抱歉，暂不支持当前系统架构: $ARCH${RESET}"
-            echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-            return 1
-            ;;
-    esac
-
-    # 3. 拼接动态下载链接
-    DOWNLOAD_URL="${GITEA_DOWNLOAD_BASE}/${LATEST_TAG}/${FILENAME}"
-    echo -e "${GREEN}准备下载: ${FILENAME}${RESET}"
-    
-    TMP_DIR=$(mktemp -d)
-    if curl -L "$DOWNLOAD_URL" -o "${TMP_DIR}/${FILENAME}"; then
-        echo -e "${YELLOW}下载成功，正在解压并配置路径...${RESET}"
-        
-        # 解压 tar.gz
-        tar -xzf "${TMP_DIR}/${FILENAME}" -C "$TMP_DIR"
-        
-        if [ -f "${TMP_DIR}/ktui" ]; then
-            mkdir -p "$HOME/.local/bin"
-            mv "${TMP_DIR}/ktui" "$HOME/.local/bin/ktui"
-            chmod +x "$HOME/.local/bin/ktui"
-            
-            # 创建全局软链接
-            if [ -w "/usr/local/bin" ]; then
-                rm -f /usr/local/bin/ktui
-                ln -s "$HOME/.local/bin/ktui" /usr/local/bin/ktui
-            else
-                sudo rm -f /usr/local/bin/ktui
-                sudo ln -s "$HOME/.local/bin/ktui" /usr/local/bin/ktui
-            fi
-            echo -e "${GREEN}✔ KTUI (${LATEST_TAG}) 成功安装到系统路径！快捷指令: ktui${RESET}"
-        else
-            echo -e "${RED}❌ 解压文件中未找到可执行文件 ktui。${RESET}"
-        fi
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
     else
-        echo -e "${RED}❌ 下载失败，请检查下载地址是否正确或 Gitea 仓储中是否有对应的架构包。${RESET}"
-        echo -e "${RED}失败链接: ${DOWNLOAD_URL}${RESET}"
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
-    rm -rf "$TMP_DIR"
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+    echo "127.0.0.1" && return 0
 }
 
-# 2. 纯粹的自更新逻辑
-check_and_update() {
-    get_paths
-    if [ -z "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${RED}❌ 未检测到已安装的 KTUI，无法执行更新流，请先选择选项 1 安装。${RESET}"
-    else
-        echo -e "\n${YELLOW}[触发官方内置自更新流程]${RESET}"
-        "$REAL_EXEC_PATH" update --check
-        echo -ne "${YELLOW}是否执行更新替换？(y/n): ${RESET}"
-        read -r ans
-        if [[ "$ans" =~ ^[Yy]$ ]]; then
-            "$REAL_EXEC_PATH" update
-            echo -e "${GREEN}✔ 更新指令执行完毕。${RESET}"
-        else
-            echo -e "${GREEN}已取消更新。${RESET}"
-        fi
-    fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
-
-# 3 & 4. 启动 TUI
-start_tui() {
-    get_paths
-    if [ -z "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${RED}未检测到 ktui 命令，请先执行选项 1 进行安装！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-        return
-    fi
-    if [ "$1" == "sheet" ]; then
-        "$REAL_EXEC_PATH" --sheet
-    else
-        "$REAL_EXEC_PATH" --line
-    fi
-}
-
-# 5. 初始化与设置 URL
-init_config_url() {
-    get_paths
-    if [ -z "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${RED}未检测到已安装的 KTUI。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-        return
-    fi
-    echo -e "\n${GREEN}[初始化与设置后端 URL]${RESET}"
-    "$REAL_EXEC_PATH" config init 2>/dev/null
+# 部署 Komari Traffic Hub
+install_hub() {
+    check_dependencies
     
-    echo -ne "${YELLOW}请输入 Komari 后端地址 (例如 https://komari.example.com): ${RESET}"
+    mkdir -p "$BASE_DIR"
+    mkdir -p "$DATA_DIR"
+
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    echo -ne "${YELLOW}1. 请输入 Komari 后端基础 URL (例如 https://komari.example.com): ${RESET}"
     read -r komari_url
-    if [ -n "$komari_url" ]; then
-        "$REAL_EXEC_PATH" config set url "$komari_url"
-        echo -e "${GREEN}✔ URL 设置成功！${RESET}"
-    else
-        echo -e "${RED}❌ 输入不能为空。${RESET}"
-    fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
+    [[ -z "$komari_url" ]] && komari_url="https://your-komari.example"
 
-# 6. 快捷设置其他常用项
-set_extra_config() {
-    get_paths
-    if [ -z "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${RED}未检测到已安装的 KTUI。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+    echo -ne "${YELLOW}2. 请输入 Telegram Bot Token: ${RESET}"
+    read -r tg_token
+    
+    echo -ne "${YELLOW}3. 请输入 Telegram 主接收 Chat ID: ${RESET}"
+    read -r tg_chat_id
+
+    echo -ne "${YELLOW}4. 请输入网页登录密码 (WEB_PASSWORD): ${RESET}"
+    read -r web_password
+    [[ -z "$web_password" ]] && web_password="SecurePassword123"
+
+    echo -ne "${YELLOW}5. 请输入服务访问端口 (宿主机端口) [默认: 8080]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8080"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
-    echo -e "\n${GREEN}[快捷设置核心配置]${RESET}"
-    
-    echo -ne "${YELLOW}1. 请输入 API Key (留空跳过): ${RESET}"
-    read -r api_key
-    [ -n "$api_key" ] && "$REAL_EXEC_PATH" config set api-key "$api_key"
 
-    echo -ne "${YELLOW}2. 请输入默认视图模式 (sheet/line, 回车跳过): ${RESET}"
-    read -r view_mode
-    [[ "$view_mode" == "sheet" || "$view_mode" == "line" ]] && "$REAL_EXEC_PATH" config set mode "$view_mode"
+    # 修改目录权限（容器内部为非 root 用户 10001 运行）
+    echo -e "${YELLOW}正在配置本地数据目录权限(UID 10001)...${RESET}"
+    sudo chown -R 10001:10001 "$DATA_DIR"
+    sudo chmod -R u+rwX,go+rX "$DATA_DIR"
 
-    echo -e "${GREEN}✔ 配置项更新完成！${RESET}"
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+    # 生成符合要求的 .env 配置文件
+    echo -e "${YELLOW}正在生成 .env 配置文件...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+KOMARI_BASE_URL=${komari_url}
+TELEGRAM_BOT_TOKEN=${tg_token}
+TELEGRAM_CHAT_ID=${tg_chat_id}
+TELEGRAM_ALLOWED_CHAT_IDS=
+TELEGRAM_ADMIN_CHAT_IDS=
+AI_API_BASE=
+AI_API_KEY=
+AI_MODEL=
+AI_PACK_CACHE_TTL_SECONDS=3600
+WEB_USERNAME=admin
+WEB_PASSWORD=${web_password}
+WEB_SESSION_SECRET=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
+WEB_PORT=${custom_port}
+BOT_START_NOTIFY=1
+BOT_INSTANCE_NAME=Komari-Traffic-Hub
+KOMARI_TIMEOUT_SECONDS=15
+KOMARI_API_TOKEN=
+KOMARI_API_TOKEN_HEADER=Authorization
+KOMARI_API_TOKEN_PREFIX=Bearer
+KOMARI_FETCH_WORKERS=6
+DATA_DIR=/data
+STAT_TZ=Asia/Shanghai
+TOP_N=3
+SAMPLE_INTERVAL_SECONDS=300
+SAMPLE_RETENTION_HOURS=2
+TRAFFIC_SNAPSHOT_RETENTION_DAYS=45
+HISTORY_HOT_DAYS=60
+HISTORY_RETENTION_DAYS=365
+TASK_RUN_RETENTION_DAYS=7
+NODE_DAILY_USAGE_RETENTION_DAYS=365
+ALERTS_ENABLED=1
+TELEGRAM_ALERT_CHAT_ID=
+ALERT_COOLDOWN_SECONDS=1800
+ALERT_SILENCE_WINDOWS=
+ALERT_NODE_MISSING_SAMPLES=2
+ALERT_WINDOW_MINUTES=60
+ALERT_TOTAL_WINDOW_BYTES=
+ALERT_NODE_WINDOW_BYTES=
+ALERT_DAILY_TOTAL_BYTES=
+ALERT_DAILY_NODE_BYTES=
+ALERT_RECOVERY_NOTIFY=1
+LOG_LEVEL=INFO
+LOG_FILE=
+EOF
+
+    # 生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  bot:
+    image: ghcr.io/wirelouis/komari-traffic-hub:latest
+    container_name: ${CONTAINER_BOT}
+    env_file: .env
+    environment:
+      - TZ=Asia/Shanghai
+      - STAT_TZ=Asia/Shanghai
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "/app/komari_traffic_report.py", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command: ["python", "/app/komari_traffic_report.py", "listen"]
+
+  web:
+    image: ghcr.io/wirelouis/komari-traffic-hub:latest
+    container_name: ${CONTAINER_WEB}
+    env_file: .env
+    environment:
+      - TZ=Asia/Shanghai
+      - STAT_TZ=Asia/Shanghai
+    volumes:
+      - ./data:/data
+    ports:
+      - "\${WEB_PORT:-8080}:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command: ["uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8080"]
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}        Komari Traffic Hub 部署及初始化成功！        ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}Web 面板地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}网页登录用户 : admin${RESET}"
+    echo -e "${YELLOW}网页登录密码 : ${web_password}${RESET}"
+    echo -e "${YELLOW}数据挂载路径 : $DATA_DIR${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    echo -e "${CYAN}提示: 更多高级告警及AI配置参数可随时选择选项 8 重新编辑 .env 文件。${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 7. 查看配置与实际路径
-show_config_details() {
-    get_paths
-    if [ -z "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${RED}未检测到已安装的 KTUI。${RESET}"
-    else
-        echo -e "\n${YELLOW}--------------------------------------${RESET}"
-        echo -e "${GREEN}【配置文件当前实际绝对路径】:${RESET}"
-        "$REAL_EXEC_PATH" config path
-        echo -e "${GREEN}【配置文件当前内容展示】:${RESET}"
-        "$REAL_EXEC_PATH" config show
-        echo -e "${YELLOW}--------------------------------------${RESET}"
+# 更新镜像
+update_hub() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
     fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+    echo -e "${YELLOW}正在拉取最新镜像并平滑重启服务...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 8. 启动 ASCII 兼容模式
-start_ascii_mode() {
-    get_paths
-    if [ -n "$REAL_EXEC_PATH" ]; then
-        echo -e "\n${YELLOW}正在使用 ASCII 兼容无色模式启动，解决乱码问题...${RESET}"
-        "$REAL_EXEC_PATH" --ascii --no-color
-    else
-        echo -e "\n${RED}未检测到已安装的 KTUI。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+# 卸载服务
+uninstall_hub() {
+    echo -ne "${YELLOW}确定要卸载并删除 Komari Traffic Hub 容器吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有本地配置文件及历史数据？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}配置及本地数据目录已彻底清理。${RESET}"
+            fi
+        else
+            docker rm -f "$CONTAINER_BOT" "$CONTAINER_WEB" 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 9. 快捷键面板
-show_shortcuts() {
+start_hub() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}双容器服务已启动${RESET}"; }
+stop_hub() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}双容器服务已停止${RESET}"; }
+restart_hub() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}双容器服务已重启${RESET}"; }
+
+logs_hub() { 
+    echo -e "${CYAN}--- 容器当前聚合运行日志 (按 Ctrl+C 退出) ---${RESET}"
+    cd "$BASE_DIR" && docker compose logs -f --tail=100
+}
+
+# 新增编辑配置功能
+edit_config() {
+    if [[ ! -f "$ENV_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在打开配置文件，修改完毕后保存退出，系统将自动使配置生效...${RESET}"
+    sleep 1
+    nano "$ENV_FILE"
+    echo -e "${YELLOW}正在应用新配置重启容器...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --remove-orphans
+    echo -e "${GREEN}配置已成功热重载生效！${RESET}"
+}
+
+show_info() {
+    get_status_info
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}Web面板地址  : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}网页登录密码 : ${web_password}${RESET}"
+    echo -e "${YELLOW}数据挂载路径 : ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+}
+
+menu() {
     clear
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -e "${YELLOW}               KTUI TUI 界面快捷键交互速查             ${RESET}"
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -e "  ↑ / k          : 列表页选择上一个节点；详情页向上滚动"
-    echo -e "  ↓ / j          : 列表页选择下一个节点；详情页向下滚动"
-    echo -e "  PgUp / PgDn    : 快速向上 / 向下翻页滚动"
-    echo -e "  Enter / o      : 打开选中节点的【详情页】"
-    echo -e "  Esc / b / q    : 从详情页【返回】列表页"
-    echo -e "  h / l、1-5、Tab : 切换详情页内部的【标签页(Tabs)】"
-    echo -e "  [ / ]          : 切换详情页的【时间窗口范围】"
-    echo -e "  m              : 在列表页无缝切换 sheet / line 模式"
-    echo -e "  r              : 立即强制刷新当前数据"
-    echo -e "  d              : 打开或重新加载选中节点的详情数据"
-    echo -e "  a              : 实时切换 ASCII 兼容模式"
-    echo -e "  q / Ctrl-C     : 在列表页退出程序"
-    echo -e "${YELLOW}======================================================${RESET}"
-    echo -ne "${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
-
-# 10. 卸载功能
-uninstall_ktui() {
-    get_paths
-    echo -e "\n${RED}警告：准备进入 KTUI 卸载流程... (保留用户配置文件)${RESET}"
-    echo -ne "${RED}确定要清除 ktui 二进制程序和全局调用配置吗？(y/n): ${RESET}"
-    read -r ans
-    if [[ "$ans" =~ ^[Yy]$ ]]; then
-        if [ -w "/usr/local/bin" ]; then rm -f /usr/local/bin/ktui; else sudo rm -f /usr/local/bin/ktui; fi
-        [ -n "$REAL_EXEC_PATH" ] && [ "$REAL_EXEC_PATH" != "/usr/local/bin/ktui" ] && rm -f "$REAL_EXEC_PATH"
-        rm -f "$HOME/.local/bin/ktui"
-        echo -e "${GREEN}✔ 全局清理完成！配置保留在系统 XDG 目录中。${RESET}"
-    else
-        echo -e "${GREEN}已取消卸载。${RESET}"
-    fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
-}
-
-# 主循环
-while true; do
-    show_menu
+    get_status_info
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN} ◈ Komari Traffic Hub 面板 ◈ ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新服务${RESET}"
+    echo -e "${GREEN}3. 卸载服务${RESET}"
+    echo -e "${GREEN}4. 启动服务${RESET}"
+    echo -e "${GREEN}5. 停止服务${RESET}"
+    echo -e "${GREEN}6. 重启服务${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 修改配置${RESET}"
+    echo -e "${GREEN}9. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
-    case $choice in
-        1) download_and_install ;;
-        2) check_and_update ;;
-        3) start_tui "sheet" ;;
-        4) start_tui "line" ;;
-        5) init_config_url ;;
-        6) set_extra_config ;;
-        7) show_config_details ;;
-        8) start_ascii_mode ;;
-        9) show_shortcuts ;;
-        10) uninstall_ktui ;;
-        0) clear; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
+    case "$choice" in
+        1) install_hub ;;
+        2) update_hub ;;
+        3) uninstall_hub ;;
+        4) start_hub ;;
+        5) stop_hub ;;
+        6) restart_hub ;;
+        7) logs_hub ;;
+        8) edit_config ;;
+        9) show_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+}
+
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
 done

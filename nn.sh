@@ -69,11 +69,18 @@ get_status_info() {
         ssh_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "22/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$ssh_port" ]] && ssh_port="222"
 
-        # 探测当前数据库类型
-        if docker inspect -f '{{range .Config.Env}}{{if breakout "GITEA__database__DB_TYPE=" .}}{{.}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep -q "postgres"; then
+        # 探测当前数据库类型 (修复高级语法失效的Bug，用标准 printf 处理环境变量)
+        local env_db_type=$(docker inspect -f '{{range .Config.Env}}{{printf "%s\n" .}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep "GITEA__database__DB_TYPE=")
+        local env_db_host=$(docker inspect -f '{{range .Config.Env}}{{printf "%s\n" .}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep "GITEA__database__HOST=")
+        
+        if [[ "$env_db_type" == *"postgres"* ]]; then
             db_type="PostgreSQL"
-        elif docker inspect -f '{{range .Config.Env}}{{if breakout "GITEA__database__DB_TYPE=" .}}{{.}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep -q "mysql"; then
-            db_type="MySQL"
+        elif [[ "$env_db_type" == *"mysql"* ]]; then
+            if [[ "$env_db_host" == *"db:3306"* ]]; then
+                db_type="MySQL (容器内联)"
+            else
+                db_type="MySQL (远程外部)"
+            fi
         else
             db_type="SQLite (内置)"
         fi

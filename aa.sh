@@ -42,6 +42,7 @@ get_status_info() {
         status="${RED}未安装 Docker${RESET}"
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
+        ssh_port="N/A"
         db_type="N/A"
         return 0
     fi
@@ -64,10 +65,16 @@ get_status_info() {
         webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port="3000"
 
-        # 探测当前数据库类型
-        if docker inspect -f '{{range .Config.Env}}{{if breakout "GITEA__database__DB_TYPE=" .}}{{.}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep -q "postgres"; then
+        # 从容器状态提取 SSH 映射端口（容器内部监听的是 22 端口）
+        ssh_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "22/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$ssh_port" ]] && ssh_port="222"
+
+        # 探测当前数据库类型（改为用标准的 grep 匹配环境变量，100% 精准）
+        local env_db_type=$(docker inspect -f '{{range .Config.Env}}{{2026_LOG=.}}{{printf "%s\n" .}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep "GITEA__database__DB_TYPE=")
+        
+        if [[ "$env_db_type" == *"postgres"* ]]; then
             db_type="PostgreSQL"
-        elif docker inspect -f '{{range .Config.Env}}{{if breakout "GITEA__database__DB_TYPE=" .}}{{.}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep -q "mysql"; then
+        elif [[ "$env_db_type" == *"mysql"* ]]; then
             db_type="MySQL"
         else
             db_type="SQLite (内置)"
@@ -75,9 +82,11 @@ get_status_info() {
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
+        ssh_port="N/A"
         db_type="N/A"
     fi
 }
+
 
 # 获取公网 IP (兼容双栈环境)
 get_public_ip() {
@@ -304,7 +313,6 @@ EOF
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-
 # 更新镜像
 update_gitea() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
@@ -325,7 +333,7 @@ uninstall_gitea() {
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器及网络已移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有本地的代码数据和数据库？(数据无价，请谨慎！)(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有本地的代码数据和数据库？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
@@ -355,7 +363,8 @@ show_info() {
     echo -e "${YELLOW}当前状态     : $status"
     echo -e "${YELLOW}数据库架构   : $db_type"
     echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}网页访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}SSH 映射端口 : ${ssh_port}${RESET}"
     echo -e "${YELLOW}数据挂载路径 : ${GITEA_DATA_DIR}${RESET}"
     echo -e "${GREEN}========================================${RESET}"
 }
@@ -363,13 +372,13 @@ show_info() {
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}==================================${RESET}"
-    echo -e "${GREEN}   ◈  Gitea 代码托管管理面板  ◈   ${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}      ◈  Gitea 代码托管管理面板  ◈      ${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}网页 :${RESET} ${YELLOW}${webui_port}${RESET}   ${GREEN}SSH端口 :${RESET} ${YELLOW}${ssh_port}${RESET}"
     echo -e "${GREEN}架构 :${RESET} ${CYAN}${db_type}${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -379,7 +388,7 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in

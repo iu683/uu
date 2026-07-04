@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Ice Climber Arena Docker Compose 管理面板 
+# Bumper Cars Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="ice-climber-arena"
-BASE_DIR="/opt/ice-climber-arena"
+CONTAINER_NAME="bumper-cars"
+BASE_DIR="/opt/bumper-cars"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 数据挂载本地的宿主机路径
@@ -44,9 +44,8 @@ get_status_info() {
         return 0
     fi
     
-    # 1. 检查容器状态
+    # 1. 检查容器状态并联动健康检查
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 增加健康检查状态展示
         local health_status=$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER_NAME" 2>/dev/null)
         if [[ "$health_status" == "healthy" ]]; then
             status="${GREEN}运行中 (健康)${RESET}"
@@ -105,8 +104,8 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Ice Climber Arena
-install_arena() {
+# 部署 Bumper Cars
+install_cars() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
@@ -129,8 +128,8 @@ install_arena() {
     echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  ice-climber-arena:
-    image: kjlion/ice-climber-arena:latest
+  bomb-party:
+    image: kjlion/bumper-cars:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     ports:
@@ -139,7 +138,7 @@ services:
       - PORT=3000
       - TZ=Asia/Shanghai
     volumes:
-      - ${DATA_DIR}:/app/server/data
+      - ${DATA_DIR}:/app/data
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health || exit 1"]
       interval: 30s
@@ -148,24 +147,24 @@ services:
       start_period: 10s
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Ice Climber Arena 服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Bumper Cars 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
 
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}        Ice Climber Arena 部署及启动成功！          ${RESET}"
+    echo -e "${GREEN}          Bumper Cars 部署及启动成功！              ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
     echo -e "${YELLOW}数据挂载路径 : $DATA_DIR${RESET}"
     echo -e "${GREEN}----------------------------------------------------${RESET}"
-    echo -e "${CYAN}提示: 容器包含 10 秒的启动等待期 (start_period)，请稍后查看健康状态。${RESET}"
+    echo -e "${CYAN}提示: 容器包含 10 秒启动等待期 (start_period)，请稍后刷新查看健康状态。${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 # 更新镜像
-update_arena() {
+update_cars() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
@@ -177,8 +176,8 @@ update_arena() {
 }
 
 # 卸载服务
-uninstall_arena() {
-    echo -ne "${YELLOW}确定要卸载并删除 Ice Climber Arena 容器吗？(y/n): ${RESET}"
+uninstall_cars() {
+    echo -ne "${YELLOW}确定要卸载并删除 Bumper Cars 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
@@ -197,10 +196,10 @@ uninstall_arena() {
     fi
 }
 
-start_arena() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_arena() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_arena() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_arena() { 
+start_cars() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_cars() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_cars() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_cars() { 
     echo -e "${CYAN}--- 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
     docker logs -f "$CONTAINER_NAME"; 
 }
@@ -221,7 +220,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}◈  Ice Climber Arena  面板  ◈${RESET}"
+    echo -e "${GREEN}   ◈  Bumper Cars  面板  ◈    ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -239,13 +238,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_arena ;;
-        2) update_arena ;;
-        3) uninstall_arena ;;
-        4) start_arena ;;
-        5) stop_arena ;;
-        6) restart_arena ;;
-        7) logs_arena ;;
+        1) install_cars ;;
+        2) update_cars ;;
+        3) uninstall_cars ;;
+        4) start_cars ;;
+        5) stop_cars ;;
+        6) restart_cars ;;
+        7) logs_cars ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

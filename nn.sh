@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Arena Brawl Docker Compose 管理面板 
+# CookieCloud Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="arena-brawl"
-BASE_DIR="/opt/arena-brawl"
+CONTAINER_NAME="cookiecloud-app"
+BASE_DIR="/opt/cookiecloud"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 数据挂载本地的宿主机路径
@@ -44,9 +44,9 @@ get_status_info() {
         return 0
     fi
     
-    # 1. 检查容器状态并联动健康检查
+    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        local health_status=$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER_NAME" 2>/dev/null)
+        local health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null)
         if [[ "$health_status" == "healthy" ]]; then
             status="${GREEN}运行中 (健康)${RESET}"
         elif [[ "$health_status" == "unhealthy" ]]; then
@@ -54,7 +54,7 @@ get_status_info() {
         elif [[ "$health_status" == "starting" ]]; then
             status="${YELLOW}运行中 (启动中)${RESET}"
         else
-            status="${YELLOW}运行中${RESET}"
+            status="${GREEN}运行中${RESET}"
         fi
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
@@ -68,11 +68,11 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取端口（容器内部监听的是 3000 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 从容器状态提取端口（容器内部监听的是 8088 端口）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8088/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
         # 兜底获取第一个绑定的端口
         [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3000"
+        [[ -z "$webui_port" ]] && webui_port="8088"
     else
         # 容器未安装/未部署时的返回值
         img_version="${RED}未安装${RESET}"
@@ -104,8 +104,8 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Arena Brawl
-install_brawl() {
+# 部署 CookieCloud
+install_cookiecloud() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
@@ -113,9 +113,9 @@ install_brawl() {
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 3000]: ${RESET}"
+    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 8088]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
+    [[ -z "$custom_port" ]] && custom_port="8088"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
@@ -128,43 +128,32 @@ install_brawl() {
     echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  arena-brawl:
-    image: kjlion/arena-brawl:latest
+  cookiecloud:
+    image: easychen/cookiecloud:latest
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:3000"
-    environment:
-      - PORT=3000
-      - TZ=Asia/Shanghai
+    restart: always
     volumes:
-      - ${DATA_DIR}:/app/data
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      - ${DATA_DIR}:/data/api/data
+    ports:
+      - "${custom_port}:8088"
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Arena Brawl 服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 CookieCloud 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
 
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}          Arena Brawl 部署及启动成功！              ${RESET}"
+    echo -e "${GREEN}           CookieCloud 部署及启动成功！             ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
     echo -e "${YELLOW}数据挂载路径 : $DATA_DIR${RESET}"
     echo -e "${GREEN}----------------------------------------------------${RESET}"
-    echo -e "${CYAN}提示: 容器包含 10 秒启动等待期 (start_period)，请稍后刷新查看健康状态。${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
 }
 
 # 更新镜像
-update_brawl() {
+update_cookiecloud() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
@@ -176,8 +165,8 @@ update_brawl() {
 }
 
 # 卸载服务
-uninstall_brawl() {
-    echo -ne "${YELLOW}确定要卸载并删除 Arena Brawl 容器吗？(y/n): ${RESET}"
+uninstall_cookiecloud() {
+    echo -ne "${YELLOW}确定要卸载并删除 CookieCloud 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
@@ -196,10 +185,10 @@ uninstall_brawl() {
     fi
 }
 
-start_brawl() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_brawl() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_brawl() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_brawl() { 
+start_cookiecloud() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_cookiecloud() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_cookiecloud() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_cookiecloud() { 
     echo -e "${CYAN}--- 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
     docker logs -f "$CONTAINER_NAME"; 
 }
@@ -220,7 +209,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}   ◈  Arena Brawl  面板  ◈    ${RESET}"
+    echo -e "${GREEN}   ◈  CookieCloud  面板  ◈    ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -238,13 +227,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_brawl ;;
-        2) update_brawl ;;
-        3) uninstall_brawl ;;
-        4) start_brawl ;;
-        5) stop_brawl ;;
-        6) restart_brawl ;;
-        7) logs_brawl ;;
+        1) install_cookiecloud ;;
+        2) update_cookiecloud ;;
+        3) uninstall_cookiecloud ;;
+        4) start_cookiecloud ;;
+        5) stop_cookiecloud ;;
+        6) restart_cookiecloud ;;
+        7) logs_cookiecloud ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

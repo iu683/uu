@@ -1,247 +1,419 @@
 #!/bin/bash
 # =================================================================
-# CookieCloud Docker Compose 管理面板 
+# 名称: 全能网络工具箱 
+# 适配: Debian / Ubuntu / CentOS / Rocky Linux / Alpine Linux
 # =================================================================
 
-# 颜色
-RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
-CYAN="\033[36m"
+RED="\033[31m"
+BLUE="\033[36m"
 RESET="\033[0m"
+ORANGE='\033[38;5;208m'
 
-CONTAINER_NAME="cookiecloud-app"
-BASE_DIR="/opt/cookiecloud"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+# 默认配置参数
+IPERF_PORT=5201
+IPERF_TIME=30
+IPERF_PARALLEL=1
+IPERF_UDP_BW="1G"
+MTR_PROTO="ICMP"
+MTR_SHOW_AS="true"
 
-# 数据挂载本地的宿主机路径
-DATA_DIR="$BASE_DIR/data"
+# 全局安全退出捕获
+trap "echo -e '${RESET}'; exit" INT TERM
 
-# 检测依赖
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
-    fi
-}
-
-# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
-format_ip_for_url() {
-    local ip="$1"
-    if [[ "$ip" == *":"* ]]; then
-        echo "[$ip]"
+# ==========================================
+# 工具状态动态探测
+# ==========================================
+get_status() {
+    if command -v "$1" >/dev/null 2>&1; then
+        echo -e "${YELLOW}已安装${RESET}"
     else
-        echo "$ip"
+        echo -e "${RED}未安装${RESET}"
     fi
 }
 
-# 动态获取容器状态、映射端口和环境变量配置
-get_status_info() {
-    if ! command -v docker &> /dev/null; then
-        status="${RED}未安装 Docker${RESET}"
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-        return 0
-    fi
+# ==========================================
+# 自动化安装引擎
+# ==========================================
+check_and_install() {
+    local tool=$1
+    if command -v "$tool" >/dev/null 2>&1; then return; fi
+
+    echo -e "${YELLOW}📦 正在安装必要依赖与工具: $tool ...${RESET}"
     
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        local health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        if [[ "$health_status" == "healthy" ]]; then
-            status="${GREEN}运行中 (健康)${RESET}"
-        elif [[ "$health_status" == "unhealthy" ]]; then
-            status="${RED}运行中 (不健康)${RESET}"
-        elif [[ "$health_status" == "starting" ]]; then
-            status="${YELLOW}运行中 (启动中)${RESET}"
-        else
-            status="${GREEN}运行中${RESET}"
+    # 基础依赖环境前置检查与修复
+    if [ -f /etc/alpine-release ]; then
+        apk add --no-cache curl wget tar bash grep gawk openssl
+    elif ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y curl wget tar grep gawk
+        elif command -v dnf >/dev/null 2>&1; then dnf install -y curl wget tar grep gawk
+        elif command -v yum >/dev/null 2>&1; then yum install -y curl wget tar grep gawk
         fi
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 从容器状态提取端口（容器内部监听的是 8088 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8088/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 兜底获取第一个绑定的端口
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8088"
-    else
-        # 容器未安装/未部署时的返回值
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-    fi
-}
-
-# 获取公网 IP (兼容双栈环境)
-get_public_ip() {
-    local mode=${1:-"auto"}
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
-}
-
-# 部署 CookieCloud
-install_cookiecloud() {
-    check_dependencies
-    
-    mkdir -p "$BASE_DIR"
-    mkdir -p "$DATA_DIR"
-
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 8088]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8088"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
-
-    # 修改目录权限
-    chmod -R 777 "$BASE_DIR"
-
-    # 生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  cookiecloud:
-    image: easychen/cookiecloud:latest
-    container_name: ${CONTAINER_NAME}
-    restart: always
-    volumes:
-      - ${DATA_DIR}:/data/api/data
-    ports:
-      - "${custom_port}:8088"
-EOF
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 CookieCloud 服务...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-    RAW_IP=$(get_public_ip)
-    DETECT_IP=$(format_ip_for_url "$RAW_IP")
-
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}           CookieCloud 部署及启动成功！             ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}数据挂载路径 : $DATA_DIR${RESET}"
-    echo -e "${GREEN}----------------------------------------------------${RESET}"
-}
-
-# 更新镜像
-update_cookiecloud() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return
-    fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
-}
-
-# 卸载服务
-uninstall_cookiecloud() {
-    echo -ne "${YELLOW}确定要卸载并删除 CookieCloud 容器吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有本地配置文件及挂载数据？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}配置及本地数据目录已彻底清理。${RESET}"
+    case "$tool" in
+        speedtest)
+            if [ -f /etc/alpine-release ]; then
+                echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
+                apk add --no-cache speedtest-cli
+                if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
+                    ln -sf "$(command -v speedtest-cli)" /usr/bin/speedtest
+                fi
+            else
+                echo -e "${YELLOW}📦 正在通过二进制包快速安装 Ookla Speedtest...${RESET}"
+                local cpu_arch=$(uname -m)
+                local download_url=""
+                case "$cpu_arch" in
+                    x86_64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
+                    aarch64|arm64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
+                    *) echo -e "${RED}❌ 错误: 不支持的架构 ${cpu_arch}${RESET}" >&2; exit 1 ;;
+                esac
+                cd /tmp
+                wget -q "$download_url" -O speedtest.tgz && \
+                tar -xzf speedtest.tgz && \
+                mv -f speedtest /usr/local/bin/ && \
+                rm -f speedtest.tgz speedtest.5 speedtest.md LICENSE.md
             fi
-        else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
-        fi
-        echo -e "${GREEN}卸载完成！${RESET}"
-    fi
-}
+            mkdir -p "$HOME/.ookla"
+            echo '{"license_accepted": true, "gdpr_accepted": true}' > "$HOME/.ookla/speedtest-cli.json" 2>/dev/null || true
+            ;;
+        nexttrace)
+            curl -fsSL nxtrace.org/nt | bash || true
+            ;;
+        iperf3)
+            if [ -f /etc/alpine-release ]; then apk add --no-cache iperf3
+            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y iperf3
+            elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release 2>/dev/null || true; dnf install -y iperf3
+            elif command -v yum >/dev/null 2>&1; then yum install -y epel-release 2>/dev/null || true; yum install -y iperf3
+            fi
+            ;;
+        mtr)
+            if [ -f /etc/alpine-release ]; then apk add --no-cache mtr
+            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y mtr-tiny || apt-get install -y mtr
+            elif command -v dnf >/dev/null 2>&1; then dnf install -y mtr
+            elif command -v yum >/dev/null 2>&1; then yum install -y mtr
+            fi
+            ;;
+        inetspeed)
+            echo -e "${YELLOW}📦 正在安装 iNetSpeed-CLI (Apple CDN 测速)...${RESET}"
+            # 使用 echo "inetspeed" 管道输入，自动回应安装器的命令名询问
+            echo "2" | curl -fsSL https://raw.githubusercontent.com/tsosunchia/iNetSpeed-CLI/main/scripts/install.sh | bash || true
+            ;;
+        speed-cloudflare-cli)
+            echo -e "${YELLOW}🔍 正在通过 GitHub API 获取 Cloudflare-CLI Rust 最新版本信息...${RESET}"
+            
+            # 1. 抓取 API 数据
+            local api_response=$(curl -fsSL "https://api.github.com/repos/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/latest" 2>/dev/null)
+            if [ -z "$api_response" ]; then
+                echo -e "${RED}❌ 无法获取 GitHub 最新发布版本信息，请检查网络或 API 速率限制。${RESET}"
+                sleep 2
+                return 1
+            fi
 
-start_cookiecloud() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_cookiecloud() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_cookiecloud() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_cookiecloud() { 
-    echo -e "${CYAN}--- 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
-    docker logs -f "$CONTAINER_NAME"; 
-}
+            local latest_tag=$(echo "$api_response" | jq -r '.tag_name')
+            echo -e "${GREEN}✨ 发现最新版本: ${latest_tag}${RESET}"
 
-show_info() {
-    get_status_info
-    RAW_IP=$(get_public_ip)
-    DETECT_IP=$(format_ip_for_url "$RAW_IP")
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${YELLOW}当前状态     : $status"
-    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}数据挂载路径 : ${DATA_DIR}${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-}
+            # 2. 识别架构并检索对应的下载 URL
+            local cpu_arch=$(uname -m)
+            local cf_url=""
+            
+            case "$cpu_arch" in
+                x86_64) 
+                    # 在最新的 Release 资源列表中搜索匹配含 'ubuntu' 且不含 'arm' 且不含 '.deb' 的裸文件下载链接
+                    cf_url=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("ubuntu") and (contains("arm") | not) and (contains(".deb") | not)) | .browser_download_url' | head -n 1)
+                    ;;
+                aarch64|arm64) 
+                    # 匹配含 'ubuntu' 且含 'arm' 且不含 '.deb' 的链接
+                    cf_url=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("ubuntu") and contains("arm") and (contains(".deb") | not)) | .browser_download_url' | head -n 1)
+                    ;;
+                *) 
+                    echo -e "${RED}❌ 错误: 不支持的系统架构 ${cpu_arch}${RESET}" >&2
+                    exit 1 
+                    ;;
+            esac
 
-menu() {
-    clear
-    get_status_info
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}   ◈  CookieCloud  面板  ◈    ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_cookiecloud ;;
-        2) update_cookiecloud ;;
-        3) uninstall_cookiecloud ;;
-        4) start_cookiecloud ;;
-        5) stop_cookiecloud ;;
-        6) restart_cookiecloud ;;
-        7) logs_cookiecloud ;;
-        8) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
+            # 3. 容错拦截：若未能提取到 URL，使用固定的稳妥降级方案
+            if [ -z "$cf_url" ] || [ "$cf_url" = "null" ]; then
+                echo -e "${YELLOW}⚠️ 提取最新下载链接失败，启用稳定版规则匹配下载...${RESET}"
+                if [ "$cpu_arch" = "x86_64" ]; then
+                    cf_url="https://github.com/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/download/v0.1.0/speed-cloudflare-cli-ubuntu-22.04"
+                else
+                    cf_url="https://github.com/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/download/v0.1.0/speed-cloudflare-cli-ubuntu-22.04-arm"
+                fi
+            fi
+
+            # 4. 下载裸文件并赋权
+            echo -e "${YELLOW}📥 正在下载二进制资产...${RESET}"
+            wget -q "$cf_url" -O /usr/local/bin/speed-cloudflare-cli
+            if [ $? -eq 0 ]; then
+                chmod +x /usr/local/bin/speed-cloudflare-cli
+                echo -e "${GREEN}✅ speed-cloudflare-cli 部署成功！${RESET}"
+                sleep 1
+            else
+                echo -e "${RED}❌ 下载失败，请检查网络或 GitHub 连通性。${RESET}"
+                sleep 2
+            fi
+            ;;
     esac
+    hash -r 2>/dev/null
 }
 
+# ==========================================
+# 1) Speedtest 模块 (双保险免提示版)
+# ==========================================
+run_speedtest() {
+    clear
+    check_and_install speedtest
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈   Speedtest 网速测试   ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}🚀 开始测速...${RESET}"
+    echo "-------------------------------------"
+    if speedtest --help 2>&1 | grep -q "accept-license"; then
+        echo "YES" | speedtest --accept-license --accept-gdpr --force || true
+    else
+        speedtest || speedtest-cli || true
+    fi
+    echo "-------------------------------------"
+    read -p "测试完成，按回车返回面板..." dummy
+}
+
+# ==========================================
+# 2) NextTrace 模块
+# ==========================================
+run_nexttrace() {
+    clear
+    check_and_install nexttrace
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈   NextTrace 路由追踪   ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    read -p "请输入目标IP或域名: " target
+    if [ -z "$target" ]; then return; fi
+    echo -e "--------------------------------"
+    nexttrace "$target" || true
+    echo -e "${GREEN}================================${RESET}"
+    read -p "追踪完成，按回车返回面板..." dummy
+}
+
+# ==========================================
+# 3) iperf3 
+# ==========================================
+get_iperf_ip() {
+    read -p "请输入远端服务器 IP/域名: " SERVER_IP
+    if [ -z "$SERVER_IP" ]; then
+        echo -e "${RED}❌ 未输入有效 IP，操作取消。${RESET}"
+        sleep 1.5
+        return 1
+    fi
+    return 0
+}
+
+run_iperf3() {
+    check_and_install iperf3
+    while true; do
+        clear
+        echo -e "${GREEN}===================================${RESET}"
+        echo -e "${GREEN}     ◈   iperf3 测速管理   ◈      ${RESET}"
+        echo -e "${GREEN}===================================${RESET}"
+        echo -e "${YELLOW}端口 = $IPERF_PORT  | 时长    = ${IPERF_TIME}s ${RESET}"
+        echo -e "${YELLOW}线程 = $IPERF_PARALLEL     | UDP带宽 = $IPERF_UDP_BW${RESET}"
+        echo -e "${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}1) 启动 iperf3 本地服务端"
+        echo -e "${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}2) 发起 TCP 下载 (↓) 测试${RESET}"
+        echo -e " ${GREEN}3) 发起 TCP 上传 (↑) 测试${RESET}"
+        echo -e " ${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}4) 发起 UDP 下载 (↓) 测试${RESET}"
+        echo -e " ${GREEN}5) 发起 UDP 上传 (↑) 测试${RESET}"
+        echo -e "${GREEN}-----------------------------------${RESET}"
+        echo -e " ${GREEN}6) 修改测试参数${RESET}"
+        echo -e " ${GREEN}0) 退出${RESET}"
+        echo -e "${GREEN}===================================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        read -r choice
+        
+        case "$choice" in
+            1)
+                clear
+                echo -e "${ORANGE}===================================${RESET}"
+                echo -e "${GREEN}  iperf3 服务器已启动 (监听端口: $IPERF_PORT)${RESET}"
+                echo -e "${YELLOW}  👉 提示: 测速完毕后，按 Ctrl+C 可安全返回菜单${RESET}"
+                echo -e "${ORANGE}===================================${RESET}\n"
+                (trap 'echo -e "${YELLOW}服务端已安全关闭。${RESET}"; exit 0' INT; iperf3 -s -i 10 -p "$IPERF_PORT")
+                echo "-----------------------------------"
+                read -p "按回车继续..." dummy
+                ;;
+            2)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 TCP 下载 (↓) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -R -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            3)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 TCP 上传 (↑) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            4)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 UDP 下载 (↓) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -R -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            5)
+                clear; get_iperf_ip || continue
+                echo -e "\n${GREEN}🚀 UDP 上传 (↑) 测试中...${RESET}"
+                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
+                read -p "测试完成，按回车继续..." dummy
+                ;;
+            6)
+                echo -e "${YELLOW}>>> 修改 iperf3 临时参数 <<<${RESET}"
+                read -p "修改端口 (当前 $IPERF_PORT): " in_p; IPERF_PORT=${in_p:-$IPERF_PORT}
+                read -p "修改时长 (当前 $IPERF_TIME): " in_t; IPERF_TIME=${in_t:-$IPERF_TIME}
+                read -p "修改线程 (当前 $IPERF_PARALLEL): " in_pa; IPERF_PARALLEL=${in_pa:-$IPERF_PARALLEL}
+                read -p "修改UDP带宽 (当前 $IPERF_UDP_BW): " in_b; IPERF_UDP_BW=${in_b:-$IPERF_UDP_BW}
+                ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ==========================================
+# 4) MTR 面板模块
+# ==========================================
+run_mtr() {
+    check_and_install mtr
+    while true; do
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}    ◈   MTR 链路诊断面板   ◈    ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN}探测协议 :${RESET} ${YELLOW}$(echo "$MTR_PROTO" | tr 'a-z' 'A-Z')${RESET}"
+        echo -e "${GREEN}AS号展示 :${RESET} ${YELLOW}$([ "$MTR_SHOW_AS" = "true" ] && echo "开启" || echo "关闭")${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1) 实时动态检测${RESET}"
+        echo -e "${GREEN} 2) 静态报告模式${RESET}"
+        echo -e "${GREEN} 0) 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -ne "${GREEN} 请选择: ${RESET}"
+        read -r choice
+        
+        local args=""
+        [ "$MTR_SHOW_AS" = "true" ] && args="$args -z"
+
+        case "$choice" in
+            1)
+                read -p "请输入目标IP/域名: " target
+                if [ -z "$target" ]; then continue; fi
+                echo -e "--------------------------------"
+                mtr $args "$target" || true
+                echo -e "--------------------------------"
+                read -p "检测结束，按回车返回..." dummy
+                ;;
+            2)
+                read -p "请输入目标IP/域名: " target
+                if [ -z "$target" ]; then continue; fi
+                clear
+                echo -e "${GREEN}报告生成中(发送100个包)...${RESET}\n"
+                mtr -r -c 100 $args "$target" || true
+                echo -e "--------------------------------"
+                read -p "分析结束，按回车返回..." dummy
+                ;;
+            0) exit 0 ;;
+        esac
+    done
+}
+
+
+# ==========================================
+# 5) TcpQuality 模块
+# ==========================================
+run_nping() {
+    clear
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈ TcpQuality TCP重传探测 ◈  ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo "-------------------------------------"
+    bash <(curl -sL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh)
+    echo "-------------------------------------"
+    read -p "测试完成，按回车返回面板..." dummy
+}
+
+
+# ==========================================
+# 6) iNetSpeed-CLI 模块 
+# ==========================================
+run_inetspeed() {
+    clear
+    check_and_install inetspeed
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈  iNetSpeed Apple CDN测速  ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}🚀 开始连接 Apple CDN 节点进行测试...${RESET}"
+    echo "-------------------------------------"
+    inetspeed || true
+    echo "-------------------------------------"
+    read -p "测试完成，按回车返回面板..." dummy
+}
+
+# ==========================================
+# 7) Cloudflare Speedtest Rust 模块
+# ==========================================
+run_cloudflare_cli() {
+    clear
+    check_and_install speed-cloudflare-cli
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} ◈ Cloudflare Speedtest (Rust) ◈ ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}🚀 开始连接 Cloudflare Anycast 边缘网络...${RESET}"
+    echo "-------------------------------------"
+    speed-cloudflare-cli || true
+    echo "-------------------------------------"
+    read -p "测试完成，按回车返回面板..." dummy
+}
+
+
+
+# ==========================================
+# 工具箱主面板循环
+# ==========================================
 while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
+    clear
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}   ◈   网络管理 综合面板   ◈    ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}Speedtest :${RESET} $(get_status speedtest)"
+    echo -e "${GREEN}iNetSpeed :${RESET} $(get_status inetspeed)"
+    echo -e "${GREEN}Cloudflare:${RESET} $(get_status speed-cloudflare-cli)"
+    echo -e "${GREEN}NextTrace :${RESET} $(get_status nexttrace)"
+    echo -e "${GREEN}iperf3    :${RESET} $(get_status iperf3)"
+    echo -e "${GREEN}MTR       :${RESET} $(get_status mtr)"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e " ${GREEN}1) 运行 Speedtest  网速测试${RESET}"
+    echo -e " ${GREEN}2) 运行 NextTrace  路由追踪${RESET}"
+    echo -e " ${GREEN}3) 运行 iperf3     测速${RESET}"
+    echo -e " ${GREEN}4) 运行 MTR        链路诊断${RESET}"
+    echo -e " ${GREEN}5) 运行 nping      重传探测${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e " ${GREEN}6) 运行 iNetSpeed  测速 (Apple CDN)${RESET}"
+    echo -e " ${GREEN}7) 运行 Cloudflare 测速${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e " ${GREEN}0) 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    read -p $'\033[32m 请选择: \033[0m' choice
+
+    case "$choice" in
+        1) run_speedtest ;;
+        2) run_nexttrace ;;
+        3) run_iperf3 ;;
+        4) run_mtr ;;
+        5) run_nping ;;
+        6) run_inetspeed ;;
+        7) run_cloudflare_cli ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入错误,重新输入${RESET}"; sleep 1 ;;
+    esac
 done

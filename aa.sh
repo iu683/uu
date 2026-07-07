@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# TOTP-Share-Dashboard (持久化本地挂载 + 自动安全 Build) 自动化管理面板
+# Hubproxy Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,23 +10,17 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="totp-share-dashboard"
-BASE_DIR="/opt/totp-dashboard"
-SRC_DIR="$BASE_DIR" 
-REPO_URL="https://github.com/Time999-1/totp-share-dashboard.git"
+CONTAINER_NAME="hubproxy"
+BASE_DIR="/opt/hubproxy"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+
+# 数据与配置文件路径
+CONFIG_FILE="$BASE_DIR/src/config.toml"
 
 # 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
-    fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
-    if ! command -v openssl &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 OpenSSL，请先安装 OpenSSL 用于生成加密密钥！${RESET}"
         exit 1
     fi
 }
@@ -41,7 +35,7 @@ format_ip_for_url() {
     fi
 }
 
-# 动态获取服务端口与运行状态
+# 动态获取容器状态并联动健康检查
 get_status_info() {
     if ! command -v docker &> /dev/null; then
         status="${RED}未安装 Docker${RESET}"
@@ -49,18 +43,35 @@ get_status_info() {
         webui_port="N/A"
         return 0
     fi
-    local container_id=$(docker ps -q -f "name=$APP_NAME" -f "status=running" 2>/dev/null)
-
-    if [[ -n "$container_id" ]]; then
-        status="${GREEN}运行中${RESET}"
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8787"
-    else
-        if [ -d "$SRC_DIR/.git" ]; then
-            status="${RED}已停止${RESET}"
+    
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        local health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        if [[ "$health_status" == "healthy" ]]; then
+            status="${GREEN}运行中 (健康)${RESET}"
+        elif [[ "$health_status" == "unhealthy" ]]; then
+            status="${RED}运行中 (不健康)${RESET}"
+        elif [[ "$health_status" == "starting" ]]; then
+            status="${YELLOW}运行中 (启动中)${RESET}"
         else
-            status="${RED}未部署${RESET}"
+            status="${GREEN}运行中${RESET}"
         fi
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="5000"
+    else
+        img_version="${RED}未安装${RESET}"
         webui_port="N/A"
     fi
 }
@@ -89,185 +100,199 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署核心逻辑
-install_translate() {
+# 部署 Hubproxy 并初始化默认配置
+install_hubproxy() {
     check_dependencies
+    
+    mkdir -p "$BASE_DIR"
+    mkdir -p "$(dirname "$CONFIG_FILE")"
 
-    echo -e "${CYAN}====== 1. 端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入本地映射端口 (127.0.0.1:端口) [默认: 8787]: ${RESET}"
+    # 如果配置文件不存在，自动写入用户提供的默认模板
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${YELLOW}正在初始化默认的 config.toml 配置文件...${RESET}"
+        cat <<'EOF' > "$CONFIG_FILE"
+# 可通过 CONFIG_PATH 环境变量指定配置文件路径，默认读取当前工作目录下的 config.toml
+
+[server]
+# 监听地址
+addr = "0.0.0.0:5000"
+# GitHub 文件大小限制（字节），默认 1GB
+fileSize = 1073741824
+# HTTP/2 cleartext
+enableH2C = true
+# 启用前端页面
+enableFrontend = true
+
+# 限速规则，格式 "ip periodHours requestLimit"
+# "*" 为全局，其他为按 IP/CIDR 覆盖，requestLimit=0 表示阻断
+ipLimits = ["* 3 500"]
+
+[access]
+# 仓库白名单（支持 GitHub 仓库和 Docker 镜像，支持通配符）
+whiteList = []
+
+# 仓库黑名单（支持 GitHub 仓库和 Docker 镜像，支持通配符）
+blackList = []
+
+# 上游代理 (例如 socks5://127.0.0.1:1080)
+proxy = ""
+
+[download]
+# 批量下载离线镜像数量限制
+maxImages = 10
+
+# Registry 映射配置，支持多种镜像仓库上游
+[registries]
+
+# GitHub Container Registry
+[registries."ghcr.io"]
+upstream = "ghcr.io"
+authHost = "ghcr.io/token"
+authType = "github"
+enabled = true
+
+# Google Container Registry
+[registries."gcr.io"]
+upstream = "gcr.io"
+authHost = "gcr.io/v2/token"
+authType = "google"
+enabled = true
+
+# Quay.io Container Registry
+[registries."quay.io"]
+upstream = "quay.io"
+authHost = "quay.io/v2/auth"
+authType = "quay"
+enabled = true
+
+# Kubernetes Container Registry
+[registries."registry.k8s.io"]
+upstream = "registry.k8s.io"
+authHost = "registry.k8s.io"
+authType = "anonymous"
+enabled = true
+
+[tokenCache]
+# 启用缓存（同时控制 Token 和 Manifest 缓存）
+enabled = true
+# 缓存时间，Go duration 格式（如 20m、1h、30s）
+defaultTTL = "20m"
+
+# 日志等级：debug/info/warn/error
+logLevel = "info"
+EOF
+    fi
+
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 5000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8787"
-
-    # 创建并克隆仓库
-    mkdir -p "$SRC_DIR"
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "\n${YELLOW}正在克隆 TOTP Dashboard 官方 GitHub 仓库...${RESET}"
-        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
-        if [ $? -eq 0 ]; then
-            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
-            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
-            rm -rf "$SRC_DIR/tmp_repo"
-        else
-            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
-            exit 1
-        fi
-    else
-        echo -e "\n${GREEN}检测到本地已存在仓库，正在同步最新代码...${RESET}"
-        cd "$SRC_DIR" && git pull
+    [[ -z "$custom_port" ]] && custom_port="5000"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
     fi
 
-    cd "$SRC_DIR"
+    # 修改目录及文件权限，避免容器无权读取
+    chmod -R 777 "$BASE_DIR"
 
-    # 自动化处理环境变量
-    if [ ! -f ".env" ]; then
-        echo -e "\n${YELLOW}正在自动为您生成高强度安全凭证并配置 .env ...${RESET}"
-        cp .env.example .env 2>/dev/null
-        
-        AUTO_PASS=$(openssl rand -base64 12)
-        AUTO_SECRET_1=$(openssl rand -hex 16)
-        AUTO_SECRET_2=$(openssl rand -hex 16)
-
-        sed -i "s/ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$AUTO_PASS/g" .env
-        sed -i "s/SESSION_SECRET=.*/SESSION_SECRET=$AUTO_SECRET_1/g" .env
-        sed -i "s/APP_ENCRYPTION_KEY=.*/APP_ENCRYPTION_KEY=$AUTO_SECRET_2/g" .env
-        
-        sed -i "s/TRUST_PROXY=.*/TRUST_PROXY=true/g" .env
-        sed -i "s/COOKIE_SECURE=.*/COOKIE_SECURE=true/g" .env
-        
-        if ! grep -q "TZ=" .env; then
-            echo "TZ=Asia/Shanghai" >> .env
-        fi
-    else
-        echo -e "\n${GREEN}已检测到现有的 .env 配置文件，跳过覆盖以保护您的凭证。${RESET}"
-    fi
-
-    # 预先在宿主机创建 data 目录，并赋予权限（防止挂载后因容器内非 root 用户导致权限拒绝）
-    echo -e "${YELLOW}正在预热创建本地挂载数据目录并配置权限...${RESET}"
-    mkdir -p "$SRC_DIR/data"
-    chmod -R 777 "$SRC_DIR/data"
-
-    # 动态写入【本地绝对路径挂载】的 docker-compose.yml 
-    echo -e "${YELLOW}正在动态构建 docker-compose.yml 文件...${RESET}"
-    cat <<EOF > docker-compose.yml
+    # 生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
 services:
-  totp-dashboard:
-    build: .
-    container_name: $APP_NAME
-    restart: unless-stopped
-    env_file:
-      - .env
+  hubproxy:
+    image: ghcr.io/787a68/hubproxy:latest
+    container_name: ${CONTAINER_NAME}
+    restart: always
     ports:
-      - "127.0.0.1:$custom_port:8000"
+      - "${custom_port}:5000"
+    environment:
+      - CONFIG_PATH=/app/config.toml
     volumes:
-      - ./data:/app/data
-    security_opt:
-      - no-new-privileges:true
+      - ${CONFIG_FILE}:/app/config.toml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 EOF
 
-    # 完美对齐官方启动命令并热重编
-    echo -e "\n${YELLOW}正在执行容器集群 Build 编译并启动...${RESET}"
-    docker compose up -d --build
-
-    echo -e "${YELLOW}正在等待容器集群初始化拉起服务 (约 5 秒)...${RESET}"
-    sleep 5
-
-    # 补充跑一次本地挂载目录权限，确保万无一失
-    chmod -R 777 "$SRC_DIR/data" 2>/dev/null
-
-    get_status_info
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Hubproxy 服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
-    
-    CURRENT_PASS=$(grep "ADMIN_PASSWORD=" .env | cut -d'=' -f2)
-    CURRENT_USER=$(grep "ADMIN_USERNAME=" .env | cut -d'=' -f2)
-    [[ -z "$CURRENT_USER" ]] && CURRENT_USER="admin"
 
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}    TOTP-Share-Dashboard 本地挂载编译启动成功！    ${RESET}"
+    echo -e "${GREEN}           Hubproxy 部署及启动成功！                ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}面板本地代理监听 : 127.0.0.1:${custom_port}${RESET}"
-    echo -e "${YELLOW}1Panel反代建议   : 将反代后端指向 127.0.0.1:${custom_port}${RESET}"
-    echo -e "${YELLOW}宿主数据挂载路径 : ${SRC_DIR}/data （可直接在此备份db）${RESET}"
-    echo -e "${GREEN}----------------------------------------------------${RESET}"
-    echo -e "${CYAN}🔐 系统自动为您分配的初始化凭证：${RESET}"
-    echo -e "   - 管理员账号 : ${GREEN}${CURRENT_USER}${RESET}"
-    echo -e "   - 管理员密码 : ${GREEN}${CURRENT_PASS}${RESET}"
-    echo -e "${RED}⚠️  注意：因开启了 COOKIE_SECURE，1Panel 反代必须配置 SSL(HTTPS) 才能正常登录！${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}配置文件路径 : $CONFIG_FILE (只读挂载)${RESET}"
+    echo -e "${CYAN}提示: 如需修改代理白名单或限速规则，请编辑上述 config.toml 后重启容器。${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新：拉取最新源码 + 重新 Build
-update_translate() {
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
+# 更新镜像
+update_hubproxy() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    get_status_info
-    local current_port=$webui_port
-    [[ "$current_port" == "N/A" ]] && current_port="8787"
-
-    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
-    cd "$SRC_DIR" && git pull
-    
-    echo -e "${YELLOW}正在重新编译镜像并进行平滑热更新...${RESET}"
-    docker compose up -d --build --remove-orphans
-    # 保持本地挂载目录权限
-    chmod -R 777 "$SRC_DIR/data" 2>/dev/null
-    echo -e "${GREEN}容器更新并重编完成！${RESET}"
+    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载
-uninstall_translate() {
-    echo -ne "${RED}确定要停止并卸载 TOTP Dashboard 容器集群吗？(y/n): ${RESET}"
+# 卸载服务
+uninstall_hubproxy() {
+    echo -ne "${YELLOW}确定要卸载并删除 Hubproxy 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -d "$SRC_DIR/.git" ]; then
-            cd "$SRC_DIR" && docker compose down
-            echo -e "${GREEN}容器与网络已被安全停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同步连根拔除本地【所有加密密钥、代码以及挂载的数据库TOTP数据】？(y/n): ${RESET}"
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有本地配置文件及挂载数据？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}宿主机本地所有源码与挂载数据已被彻底清除！${RESET}"
+                echo -e "${GREEN}配置及本地数据目录已彻底清理。${RESET}"
             fi
         else
-            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 基于 Compose 生命周期的联动控制
-start_translate() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}容器已全面启动${RESET}"; }
-stop_translate() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}容器已安全停止${RESET}"; }
-restart_translate() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}容器已平滑重启${RESET}"; }
-logs_translate() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
+start_hubproxy() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_hubproxy() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_hubproxy() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_hubproxy() { 
+    echo -e "${CYAN}--- 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
+    docker logs -f "$CONTAINER_NAME"; 
+}
 
 show_info() {
     get_status_info
-    if [ -f "$SRC_DIR/.env" ]; then
-        CURRENT_USER=$(grep "ADMIN_USERNAME=" "$SRC_DIR/.env" | cut -d'=' -f2)
-        CURRENT_PASS=$(grep "ADMIN_PASSWORD=" "$SRC_DIR/.env" | cut -d'=' -f2)
-    fi
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}运行状态         : $status"
-    echo -e "${YELLOW}监听端口         : ${webui_port}"
-    echo -e "${YELLOW}面板本地代理监听 : 127.0.0.1:${webui_port}${RESET}"
-    echo -e "${YELLOW}宿主数据挂载路径 : ${SRC_DIR}/data"
-    echo -e "${YELLOW}管理员账号       : ${CURRENT_USER:-admin}"
-    echo -e "${YELLOW}管理员密码       : ${CURRENT_PASS:-未生成}"
-    echo -e "${GREEN}====================================================${RESET}"
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}配置文件路径 : ${CONFIG_FILE}${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}   ◈ TOTP-Share-Dashboard 面板 ◈   ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}集群状态 :${RESET} $status"
-    echo -e "${GREEN}内部端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}   ◈  Hubproxy 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -277,17 +302,17 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
+        1) install_hubproxy ;;
+        2) update_hubproxy ;;
+        3) uninstall_hubproxy ;;
+        4) start_hubproxy ;;
+        5) stop_hubproxy ;;
+        6) restart_hubproxy ;;
+        7) logs_hubproxy ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

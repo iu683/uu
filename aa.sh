@@ -1,288 +1,357 @@
 #!/bin/bash
 
-# 颜色定义
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-RESET='\033[0m'
+# 基础路径设定
+CFT_INSTALL_DIR="/opt/cloudflared"
+CFT_BIN="/usr/local/bin/cloudflared"
+TOKEN_FILE="$CFT_INSTALL_DIR/.token"
+IS_OPENWRT=0
+IS_ALPINE=0
 
-# 自定义配置文件路径
-ENV_FILE="$HOME/.claude_custom_env"
+G_STATUS=""
+G_VERSION=""
 
-# 临时和永久确保当前脚本进程能找到最新的 PATH
-export PATH="$HOME/.local/bin:$PATH"
+# GitHub 轮询节点列表
+GITHUB_PROXY=(
+    'https://gh-proxy.com/'
+    'https://v6.gh-proxy.org/'
+    'https://ghproxy.lvedong.eu.org/'
+    'https://proxy.vvvv.ee/'
+    'https://hub.glowp.xyz/'
+    '' 
+)
+DEFAULT_BACKUP_VER="2026.6.0"
 
-# 自动刷新和导出自定义 API 环境配置
-refresh_env() {
-    # 优先从本地 settings.json 中解析当前状态，保证主面板状态 100% 同步
-    local SETTINGS_JSON="$HOME/.claude/settings.json"
-    if [ -f "$SETTINGS_JSON" ]; then
-        # 简单通过 grep 判定是否配置了自定义中转（免去安装 jq 的依赖）
-        if grep -q '"ANTHROPIC_BASE_URL"' "$SETTINGS_JSON" 2>/dev/null; then
-            IS_CUSTOM_API=true
-            # 从 JSON 中提取当前的 Base URL 和 Model（用于主面板展示）
-            CURRENT_URL=$(grep '"ANTHROPIC_BASE_URL"' "$SETTINGS_JSON" | sed -E 's/.*"ANTHROPIC_BASE_URL": ?"([^"]+)".*/\1/')
-            CURRENT_MODEL=$(grep '"ANTHROPIC_MODEL"' "$SETTINGS_JSON" | sed -E 's/.*"ANTHROPIC_MODEL": ?"([^"]+)".*/\1/')
+# 标准颜色
+CYAN="\e[36m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+RED="\e[31m"
+RESET="\e[0m"
+
+# 检查运行环境与架构
+check_env() {
+    if [ -f /etc/openwrt_release ]; then
+        IS_OPENWRT=1
+    elif [ -f /etc/alpine-release ]; then
+        IS_ALPINE=1
+    fi
+}
+check_env
+
+get_arch() {
+    # Cloudflare 官方发布包命名中，linux-amd64 已经默认兼容了 Alpine musl 环境
+    # 因此不需要在文件名末尾拼接 "-musl" 字符串
+    case "$(uname -m)" in
+        x86_64) echo "amd64";;
+        aarch64) echo "arm64";;
+        armv7*|armv6*) echo "arm";;
+        *) echo "amd64";;
+    esac
+}
+
+# 自动获取 GitHub 最新版本号
+get_auto_version() {
+    local fetched_ver=""
+    echo -e "${YELLOW}正在尝试获取 GitHub 远端最新 cloudflared 版本号...${RESET}" >&2
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        fetched_ver=$(curl -sL -m 4 "${proxy}https://api.github.com/repos/cloudflare/cloudflared/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *//;s/"//g')
+        if [ -n "$fetched_ver" ]; then
+            echo "$fetched_ver"
+            return 0
+        fi
+    done
+    echo "$DEFAULT_BACKUP_VER"
+}
+
+# 下载组件核心逻辑
+download_package_loop() {
+    local version=$1
+    local arch=$2
+    local remote_filename="cloudflared-linux-${arch}"
+    local success=0
+
+    echo -e "${YELLOW}开始下载 cloudflared 二进制文件 ${version} (${arch})...${RESET}"
+    for proxy in "${GITHUB_PROXY[@]}"; do
+        local url="${proxy}https://github.com/cloudflare/cloudflared/releases/download/${version}/${remote_filename}"
+        if wget -T 10 -O "cloudflared_tmp" "$url"; then
+            echo -e "${GREEN}[成功] 下载完成！${RESET}"
+            success=1
+            break
         else
-            IS_CUSTOM_API=false
-            CURRENT_URL=""
-            CURRENT_MODEL=""
+            rm -f "cloudflared_tmp"
+        fi
+    done
+    [ $success -eq 1 ] && return 0 || return 1
+}
+
+# 安装/更新主程序功能
+install_or_update_bin() {
+    local CFT_VER=$(get_auto_version)
+    local ARCH=$(get_arch)
+    
+    mkdir -p "$CFT_INSTALL_DIR"
+    cd "$CFT_INSTALL_DIR" || exit 1
+
+    if download_package_loop "$CFT_VER" "$ARCH"; then
+        stop_service 2>/dev/null || true
+        mv -f "cloudflared_tmp" "$CFT_BIN"
+        chmod +x "$CFT_BIN"
+        echo -e "${GREEN}[成功] cloudflared 主程序已就位/更新成功！${RESET}"
+        [ -f "$TOKEN_FILE" ] && restart_service
+    else
+        echo -e "${RED}[严重错误] 下载失败，请检查网络或重试！${RESET}"
+    fi
+    read -p "按回车返回菜单..." </dev/tty
+}
+
+# 更新隧道运行状态
+update_status_variables() {
+    G_VERSION="未检测到组件"
+    G_STATUS="${RED}已停止${RESET}"
+
+    if [ -f "$CFT_BIN" ]; then
+        G_VERSION=$($CFT_BIN --version 2>/dev/null | awk '{print $3}' || echo "未知")
+        if [ "$IS_OPENWRT" = "1" ]; then
+            (ps | grep -v grep | grep -q "[c]loudflared") && G_STATUS="${GREEN}已启动${RESET}"
+        elif [ "$IS_ALPINE" = "1" ]; then
+            (rc-service cloudflared status 2>/dev/null | grep -q "started") && G_STATUS="${GREEN}已启动${RESET}"
+        else
+            (systemctl is-active --quiet cloudflared 2>/dev/null) && G_STATUS="${GREEN}已启动${RESET}"
         fi
     fi
 }
 
-# 获取状态与版本信息
-get_status() {
-    if command -v claude &> /dev/null; then
-        status="${GREEN}已安装${RESET}"
-        version_info=$(claude -v 2>/dev/null | head -n 1)
-        [ -z "$version_info" ] && version_info="未知版本"
-        claude_version="${YELLOW}${version_info}${RESET}"
-    else
-        status="${RED}未安装${RESET}"
-        version_info_err="-"
-        claude_version="${RED}-${RESET}"
-    fi
-
-    # 刷新并检查是否配置了自定义 API
-    refresh_env
-    if [ "$IS_CUSTOM_API" = true ]; then
-        api_status="${YELLOW}自定义中转 (${CURRENT_MODEL:-中转})${RESET}"
-    else
-        api_status="${GREEN}官方默认${RESET}"
-    fi
-}
-
-# 菜单面板
-show_menu() {
-    clear
-    get_status
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Claude Code 管理面板   ◈    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}版本 :${RESET} $claude_version"
-    echo -e "${GREEN}API  :${RESET} $api_status"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Claude Code${RESET}"
-    echo -e "${GREEN}2. 在当前目录启动${RESET}"
-    echo -e "${GREEN}3. 指定项目路径启动${RESET}"
-    echo -e "${GREEN}4. 登录/切换账户 (官方模式)${RESET}"
-    echo -e "${GREEN}5. 设置自定义 API 模型/中转网关${RESET}"
-    echo -e "${GREEN}6. 更新${RESET}"
-    echo -e "${GREEN}7. 卸载${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-}
-
-# 1. 安装
-install_claude() {
-    echo -e "\n${YELLOW}正在通过官方安装 Claude Code...${RESET}"
-    curl -fsSL https://claude.ai/install.sh | bash
+# 写入 OpenWrt 守护服务（已加入 --protocol http2）
+write_initd_service() {
+    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    [ -z "$token" ] && return 1
     
-    echo -e "\n${YELLOW}正在检查环境并自动修复 PATH...${RESET}"
-    local shell_config=""
-    if [ -n "$ZSH_VERSION" ] || [ -f "$HOME/.zshrc" ]; then
-        shell_config="$HOME/.zshrc"
-    else
-        shell_config="$HOME/.bashrc"
-    fi
-
-    if ! grep -q '\.local/bin' "$shell_config" 2>/dev/null; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$shell_config"
-        echo -e "${GREEN}✔ 已自动将 ~/.local/bin 写入 $shell_config${RESET}"
-    else
-        echo -e "${GREEN}✔ 配置文件中已存在 PATH 记录，无需重复添加。${RESET}"
-    fi
-
-    export PATH="$HOME/.local/bin:$PATH"
-    echo -e "${GREEN}安装与修复完成！${RESET}"
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-}
-
-# 2. 当前目录启动
-start_current() {
-    if command -v claude &> /dev/null; then
-        echo -e "\n${GREEN}正在当前目录启动 Claude Code...${RESET}"
-        clear
-        claude
-    else
-        echo -e "\n${RED}未检测到 claude 命令，请先执行安装！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 3. 指定路径启动
-start_path() {
-    echo -e "\n"
-    echo -ne "${GREEN}请输入你的项目绝对路径: ${RESET}"
-    read target_path
-    # 替换可能存在的 ~ 为全局家目录路径
-    target_path="${target_path/#\~/$HOME}"
-    
-    if [ -d "$target_path" ]; then
-        echo -e "${GREEN}正在切换到 $target_path 并启动 Claude Code...${RESET}"
-        clear
-        cd "$target_path" && claude
-    else
-        echo -e "${RED}路径不存在或无效，请检查后重试！${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 4. 登录
-login_claude() {
-    if command -v claude &> /dev/null; then
-        echo -e "\n${YELLOW}正在启动登录程序...${RESET}"
-        echo -e "提示：如果已经在会话中，直接输入 /login 即可"
-        claude -c "/login" 2>/dev/null || claude
-    else
-        echo -e "\n${RED}未检测到已安装的 Claude Code。${RESET}"
-        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
-    fi
-}
-
-# 5. 配置高级自定义 API 模型与路径
-config_custom_api() {
-    local SETTINGS_JSON="$HOME/.claude/settings.json"
-    local ONBOARDING_JSON="$HOME/.claude.json"
-    mkdir -p "$HOME/.claude"
-    
-    refresh_env
-    echo -e "\n${GREEN}================================${RESET}"
-    echo -e "${GREEN}      自定义 API 配置管理       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}当前 Base URL:${RESET} ${YELLOW}${CURRENT_URL:-官方默认}${RESET}"
-    echo -e "${GREEN}当前主核心模型:${RESET} ${YELLOW}${CURRENT_MODEL:-官方默认}${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${GREEN}1. 快捷设置代理模型配置${RESET}"
-    echo -e "${GREEN}2. 清除自定义配置（恢复官方默认）${RESET}"
-    echo -e "${GREEN}0. 返回主菜单${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read api_choice
-
-    case $api_choice in
-        1)
-            echo -e "\n${YELLOW}1/4. 请输入自定义 API 中转地址/网关 (例如: https://api.yourproxy.com/v1):${RESET}"
-            echo -ne "   地址: " && read input_url
-            
-            echo -e "\n${YELLOW}2/4. 请输入你的 API Key / 密钥 Token:${RESET}"
-            echo -ne "   秘钥: " && read input_key
-
-            echo -e "\n${YELLOW}3/4. 请输入主核心自定义模型 ID:${RESET}"
-            echo -ne "   (例如: claude-3-5-sonnet-20241022 或 deepseek-chat)\n   模型名: " && read input_model
-
-            echo -e "\n${YELLOW}4/4. 请输入子代理自定义模型 ID (TTP/工具执行模型):${RESET}"
-            echo -ne "   (例如: claude-3-5-haiku-20241022 或 deepseek-coder)\n   模型名: " && read input_submodel
-
-            if [ -n "$input_url" ] && [ -n "$input_key" ] && [ -n "$input_model" ] && [ -n "$input_submodel" ]; then
-                
-                # 1. 强行注入官方免登补丁
-                cat << EOF > "$ONBOARDING_JSON"
-{
-  "hasCompletedOnboarding": true
+    cat > /etc/init.d/cloudflared <<EOF
+#!/bin/sh /etc/rc.common
+START=99
+USE_PROCD=1
+PROG=$CFT_BIN
+start_service() {
+    procd_open_instance
+    procd_set_param command \$PROG tunnel run --protocol http2 --token "$token"
+    procd_set_param respawn
+    procd_close_instance
 }
 EOF
+    chmod +x /etc/init.d/cloudflared
+    /etc/init.d/cloudflared enable
+}
 
-                # 2. 严格按照全新的标准格式写入本地 settings.json
-                cat << EOF > "$SETTINGS_JSON"
-{
-  "\$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "env": {
-    "ANTHROPIC_BASE_URL": "$input_url",
-    "ANTHROPIC_API_KEY": "$input_key",
-    "ANTHROPIC_MODEL": "$input_model",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$input_submodel"
-  }
+# 写入 Alpine (OpenRC) 守护服务（已加入 --protocol http2）
+write_openrc_service() {
+    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    [ -z "$token" ] && return 1
+
+    cat > /etc/init.d/cloudflared <<EOF
+#!/sbin/openrc-run
+description="Cloudflare Tunnel (Token Mode)"
+supervisor="supervise-daemon"
+command="$CFT_BIN"
+command_args="tunnel run --protocol http2 --token $token"
+command_background="yes"
+pidfile="/run/\${RC_SVCNAME}.pid"
+
+depend() {
+    need net
+    after firewall
 }
 EOF
-                # 运行时环境变量同步清理，防止混淆环境
-                unset CLAUDE_BASE_URL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-
-                echo -e "\n${GREEN}========================================${RESET}"
-                echo -e "${GREEN}✔ 配置成功！${RESET}"
-                echo -e "${GREEN}✔ 已写入全新的 schema 校验标准配置！${RESET}"
-                echo -e "${GREEN}========================================${RESET}"
-            else
-                echo -e "${RED}所有输入均不能为空，取消设置。${RESET}"
-            fi
-            ;;
-        2)
-            # 恢复默认空设置格式
-            cat << EOF > "$SETTINGS_JSON"
-{
-  "\$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "env": {}
+    chmod +x /etc/init.d/cloudflared
+    rc-update add cloudflared default >/dev/null 2>&1
 }
+
+# 写入标准 Linux Systemd 守护服务（已加入 --protocol http2）
+write_systemd_service() {
+    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    [ -z "$token" ] && return 1
+
+    cat > /etc/systemd/system/cloudflared.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel (Token Mode)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$CFT_BIN tunnel run --protocol http2 --token $token
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
 EOF
-            rm -f "$ONBOARDING_JSON"
-            echo -e "${GREEN}✔ 已彻底清除自定义配置，成功恢复官方初始状态。${RESET}"
-            ;;
-        *)
-            return
-            ;;
-    esac
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    systemctl daemon-reload
 }
 
-# 6. 更新
-update_claude() {
-    echo -e "\n${YELLOW}正在尝试更新 Claude Code...${RESET}"
-    if command -v claude &> /dev/null; then
-        claude update || npm update -g @anthropic-ai/claude-code
+# 统合写入守护服务路由
+deploy_service_config() {
+    if [ "$IS_OPENWRT" = "1" ]; then
+        write_initd_service
+    elif [ "$IS_ALPINE" = "1" ]; then
+        write_openrc_service
     else
-        echo -e "${RED}未检测到已安装的 Claude Code，无法更新。${RESET}"
+        write_systemd_service
     fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
 }
 
-# 7. 整合卸载
-uninstall_claude_flow() {
-    echo -e "\n${RED}准备进入卸载流程...${RESET}"
-    echo -ne "${RED}确定要卸载 Claude Code 主程序吗？(y/n): ${RESET}"
-    read ans
-    if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
-        echo -e "${YELLOW}[步骤 1/2] 正在删除主程序可执行文件及全局依赖...${RESET}"
-        rm -f ~/.local/bin/claude
-        rm -rf ~/.local/share/claude
-        echo -e "${GREEN}✔ 主程序卸载成功。${RESET}"
-        
-        echo -e "\n${RED}[步骤 2/2] 是否需要连同配置文件、历史记录、自定义API及MCP设置一起清除？${RESET}"
-        echo -e "${RED}注意：此操作不可逆，清除后所有本地历史将永久丢失！${RESET}"
-        echo -ne "${RED}是否清除配置文件？(y/n): ${RESET}"
-        read ans_config
-        if [ "$ans_config" = "y" ] || [ "$ans_config" = "Y" ]; then
-            echo -e "${YELLOW}正在清除全局、本地及API配置文件...${RESET}"
-            rm -rf ~/.claude
-            rm -f ~/.claude.json
-            rm -rf .claude
-            rm -f .mcp.json
-            rm -f "$ENV_FILE"
-            echo -e "${GREEN}✔ 配置文件清除完毕，所有数据已彻底干净！${RESET}"
+# 绑定 Token
+bind_token() {
+    if [ ! -f "$CFT_BIN" ]; then
+        echo -e "${RED}错误：本地没有主程序，请先执行选项 1 安装主程序！${RESET}"
+        sleep 2
+        return
+    fi
+
+    echo "=== 绑定 Cloudflare Tunnel Token ==="
+    echo -e "${YELLOW}请输入你在 Cloudflare 网页端获取的官方一键 Token (eyJhIjoi...):${RESET}"
+    read -p "Token: " input_token </dev/tty
+    
+    if [ -z "$input_token" ]; then
+        echo -e "${RED}Token 不能为空，放弃操作。${RESET}"
+        sleep 1.5
+        return
+    fi
+
+    mkdir -p "$CFT_INSTALL_DIR"
+    rm -f "$CFT_INSTALL_DIR/config.yml" "$CFT_INSTALL_DIR/tunnel_cred.json" "$CFT_INSTALL_DIR/.cft_inited"
+    
+    echo "$input_token" | tr -d '\r\n ' > "$TOKEN_FILE"
+    echo -e "${GREEN}Token 记录成功！正在配置并尝试拉起服务...${RESET}"
+    
+    deploy_service_config
+    start_service
+    sleep 1.5
+}
+
+# 启动服务
+start_service() {
+    if [ ! -f "$CFT_BIN" ] || [ ! -f "$TOKEN_FILE" ]; then
+        echo -e "${RED}错误：未安装主程序或未绑定 Token！${RESET}"; sleep 2; return
+    fi
+
+    deploy_service_config
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/cloudflared start
+    elif [ "$IS_ALPINE" = "1" ]; then
+        rc-service cloudflared start
+    else
+        systemctl start cloudflared
+        systemctl enable cloudflared 2>/dev/null || true
+    fi
+    echo "隧道服务已启动"; sleep 1;
+}
+
+# 停止服务
+stop_service() {
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/cloudflared stop
+    elif [ "$IS_ALPINE" = "1" ]; then
+        rc-service cloudflared stop 2>/dev/null || true
+    else
+        systemctl stop cloudflared
+    fi
+    echo "隧道服务已停止"; sleep 1;
+}
+
+# 重启服务
+restart_service() {
+    if [ ! -f "$CFT_BIN" ] || [ ! -f "$TOKEN_FILE" ]; then
+        echo -e "${RED}错误：未安装主程序或未绑定 Token！${RESET}"; sleep 2; return
+    fi
+
+    deploy_service_config
+    if [ "$IS_OPENWRT" = "1" ]; then
+        /etc/init.d/cloudflared restart
+    elif [ "$IS_ALPINE" = "1" ]; then
+        rc-service cloudflared restart
+    else
+        systemctl restart cloudflared
+    fi
+    echo "隧道服务已重启"; sleep 1;
+}
+
+# 查看运行日志
+log_service() {
+    echo -e "${CYAN}=== 正在获取最近的 30 行隧道运行日志 ===${RESET}"
+    if [ "$IS_OPENWRT" = "1" ]; then 
+        logread | grep cloudflared | tail -n 30 || echo "暂无日志"
+    elif [ "$IS_ALPINE" = "1" ]; then
+        if [ -f /var/log/messages ]; then
+            tail -n 100 /var/log/messages | grep cloudflared | tail -n 30
         else
-            echo -e "${YELLOW}已保留配置文件。你可以随时重新安装并恢复使用。${RESET}"
+            echo -e "${YELLOW}Alpine 默认输出至 syslog，请确保已安装 busybox-initscripts 或 syslog-ng${RESET}"
+            rc-service cloudflared status
         fi
-    else
-        echo "已取消卸载操作。"
+    else 
+        journalctl -u cloudflared -n 30 --no-pager 2>/dev/null || tail -n 30 /var/log/messages 2>/dev/null
     fi
-    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read
+    read -p "按回车返回菜单..." </dev/tty
 }
 
-# 主循环
-while true; do
-    show_menu
-    read choice
-    case $choice in
-        1) install_claude ;;
-        2) start_current ;;
-        3) start_path ;;
-        4) login_claude ;;
-        5) config_custom_api ;;
-        6) update_claude ;;
-        7) uninstall_claude_flow ;;
-        0) clear; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
-    esac
-done
+# 彻底卸载
+uninstall_service() {
+    echo -e "${RED}确定要彻底卸载本地服务及清除所有配置吗？(y/n)${RESET}"
+    read -p "请输入: " confirm </dev/tty
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        stop_service 2>/dev/null || true
+        if [ "$IS_OPENWRT" = "1" ]; then
+            /etc/init.d/cloudflared disable 2>/dev/null || true
+            rm -f /etc/init.d/cloudflared
+        elif [ "$IS_ALPINE" = "1" ]; then
+            rc-update del cloudflared default >/dev/null 2>&1 || true
+            rm -f /etc/init.d/cloudflared
+        else
+            systemctl disable cloudflared 2>/dev/null || true
+            rm -f /etc/systemd/system/cloudflared.service
+            systemctl daemon-reload
+        fi
+        rm -rf "$CFT_INSTALL_DIR" "$CFT_BIN"
+        echo -e "${GREEN}Cloudflare Tunnel 已完全卸载干净。${RESET}"
+        sleep 2
+    fi
+}
+
+# ---------- 主菜单界面 ----------
+main_menu() {
+    while true; do
+        update_status_variables
+        clear
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} ◈Cloudflare  远端控制管理面板◈ ${RESET}"
+        echo -e "${GREEN}  (Dashboard 模式/无需本地配置)  ${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        [ ! -f "$CFT_BIN" ] && echo -e "${RED}[警告] 未找到执行文件，请先执行选项 1 安装！${RESET}"
+        echo -e "${GREEN}当前状态 :${RESET} $G_STATUS"
+        echo -e "${GREEN}主程序版 :${RESET} ${YELLOW}${G_VERSION}${RESET}"
+        echo -e "${GREEN}管理提示 : 规则增删请直接在网页面板操作${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -e "${GREEN} 1. 安装/更新cloudflared${RESET}"
+        echo -e "${GREEN} 2. 绑定/修改Token${RESET}"
+        echo -e "${GREEN} 3. 启动隧道服务${RESET}"
+        echo -e "${GREEN} 4. 停止隧道服务${RESET}"
+        echo -e "${GREEN} 5. 重启隧道服务${RESET}"
+        echo -e "${GREEN} 6. 查看运行日志${RESET}"
+        echo -e "${GREEN} 7. 卸载服务${RESET}"
+        echo -e "${GREEN} 0. 退出${RESET}"
+        echo -e "${GREEN}================================${RESET}"
+        echo -ne "${GREEN}请输入选项: ${RESET}"
+        read choice </dev/tty
+        case $choice in
+            1) install_or_update_bin ;;
+            2) bind_token ;;
+            3) start_service ;;
+            4) stop_service ;;
+            5) restart_service ;;
+            6) log_service ;;
+            7) uninstall_service ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选项！${RESET}" && sleep 1 ;;
+        esac
+    done
+}
+
+main_menu

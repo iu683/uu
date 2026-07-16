@@ -1,357 +1,297 @@
 #!/bin/bash
+# =================================================================
+# Private Rules Docker Compose 管理面板
+# =================================================================
 
-# 基础路径设定
-CFT_INSTALL_DIR="/opt/cloudflared"
-CFT_BIN="/usr/local/bin/cloudflared"
-TOKEN_FILE="$CFT_INSTALL_DIR/.token"
-IS_OPENWRT=0
-IS_ALPINE=0
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-G_STATUS=""
-G_VERSION=""
+CONTAINER_NAME="private-rules"
+BASE_DIR="/opt/private-rules"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
-# GitHub 轮询节点列表
-GITHUB_PROXY=(
-    'https://gh-proxy.com/'
-    'https://v6.gh-proxy.org/'
-    'https://ghproxy.lvedong.eu.org/'
-    'https://proxy.vvvv.ee/'
-    'https://hub.glowp.xyz/'
-    '' 
-)
-DEFAULT_BACKUP_VER="2026.6.0"
+# 数据挂载本地的宿主机路径
+DATA_DIR="$BASE_DIR/data"
 
-# 标准颜色
-CYAN="\e[36m"
-GREEN="\e[32m"
-YELLOW="\e[33m"
-RED="\e[31m"
-RESET="\e[0m"
-
-# 检查运行环境与架构
-check_env() {
-    if [ -f /etc/openwrt_release ]; then
-        IS_OPENWRT=1
-    elif [ -f /etc/alpine-release ]; then
-        IS_ALPINE=1
+# 检测依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
     fi
 }
-check_env
 
-get_arch() {
-    # Cloudflare 官方发布包命名中，linux-amd64 已经默认兼容了 Alpine musl 环境
-    # 因此不需要在文件名末尾拼接 "-musl" 字符串
-    case "$(uname -m)" in
-        x86_64) echo "amd64";;
-        aarch64) echo "arm64";;
-        armv7*|armv6*) echo "arm";;
-        *) echo "amd64";;
+# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
+format_ip_for_url() {
+    local ip="$1"
+    if [[ "$ip" == *":"* ]]; then
+        echo "[$ip]"
+    else
+        echo "$ip"
+    fi
+}
+
+# 动态获取容器状态、映射端口和环境变量配置
+get_status_info() {
+    if ! command -v docker &> /dev/null; then
+        status="${RED}未安装 Docker${RESET}"
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        return 0
+    fi
+    
+    # 1. 检查容器状态并联动健康检查
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        local health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        if [[ "$health_status" == "healthy" ]]; then
+            status="${GREEN}运行中 (健康)${RESET}"
+        elif [[ "$health_status" == "unhealthy" ]]; then
+            status="${RED}运行中 (不健康)${RESET}"
+        elif [[ "$health_status" == "starting" ]]; then
+            status="${YELLOW}运行中 (启动中)${RESET}"
+        else
+            status="${GREEN}运行中${RESET}"
+        fi
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        # 从容器状态提取端口（容器内部监听的是 5173 端口）
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5173/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        # 兜底获取第一个绑定的端口
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="5173"
+    else
+        # 容器未安装/未部署时的返回值
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+    fi
+}
+
+# 获取公网 IP (兼容双栈环境)
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
+}
+
+# 生成随机密钥
+generate_random_secret() {
+    if command -v openssl &> /dev/null; then
+        openssl rand -hex 16
+    else
+        echo "secret-$(date +%s%N | cut -c 1-12)"
+    fi
+}
+
+# 部署 Private Rules
+install_rules() {
+    check_dependencies
+    
+    mkdir -p "$BASE_DIR"
+    mkdir -p "$DATA_DIR"
+
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    
+    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 5173]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="5173"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
+
+    echo -ne "${YELLOW}请输入后台管理员密码 (ADMIN_PASSWORD): ${RESET}"
+    read -r admin_password
+    while [[ -z "$admin_password" ]]; do
+        echo -e "${RED}密码不能为空！${RESET}"
+        echo -ne "${YELLOW}请再次输入后台管理员密码 (ADMIN_PASSWORD): ${RESET}"
+        read -r admin_password
+    done
+
+    echo -ne "${YELLOW}请输入 SESSION_SECRET [留空自动生成随机密钥]: ${RESET}"
+    read -r session_secret
+    [[ -z "$session_secret" ]] && session_secret=$(generate_random_secret)
+
+    echo -ne "${YELLOW}请输入 RULE_TOKEN [留空自动生成随机密钥]: ${RESET}"
+    read -r rule_token
+    [[ -z "$rule_token" ]] && rule_token=$(generate_random_secret)
+
+    # 写入 .env 文件
+    cat <<EOF > "$ENV_FILE"
+ADMIN_PASSWORD=${admin_password}
+SESSION_SECRET=${session_secret}
+RULE_TOKEN=${rule_token}
+EOF
+
+    # 修改目录及文件权限
+    chmod -R 777 "$BASE_DIR"
+
+    # 生成符合要求的 docker-compose.yml 配置文件 (已将 volume 命名卷转换为目录挂载，便于管理)
+    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  private-rules:
+    image: cyclince/private-rules:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:5173"
+    environment:
+      - ADMIN_PASSWORD=\${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      - SESSION_SECRET=\${SESSION_SECRET:?Set SESSION_SECRET in .env}
+      - RULE_TOKEN=\${RULE_TOKEN:?Set RULE_TOKEN in .env}
+      - TRUST_PROXY=true
+    volumes:
+      - ${DATA_DIR}:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Private Rules 服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}          Private Rules 部署及启动成功！            ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}/admin/login${RESET}"
+    echo -e "${YELLOW}服务管理密码 : $admin_password${RESET}"
+    echo -e "${YELLOW}数据挂载路径 : $DATA_DIR${RESET}"
+    echo -e "${YELLOW}环境变量配置 : $ENV_FILE${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    echo -e "${CYAN}提示: 容器包含 20 秒启动等待期 (start_period)，请稍后刷新查看健康状态。${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+}
+
+# 更新镜像
+update_rules() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+}
+
+# 卸载服务
+uninstall_rules() {
+    echo -ne "${YELLOW}确定要卸载并删除 Private Rules 容器吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有本地配置文件及挂载数据？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}配置及本地数据目录已彻底清理。${RESET}"
+            fi
+        else
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
+}
+
+start_rules() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_rules() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_rules() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_rules() { 
+    echo -e "${CYAN}--- 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
+    docker logs -f "$CONTAINER_NAME"; 
+}
+
+show_info() {
+    get_status_info
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}/admin/login${RESET}"
+    echo -e "${YELLOW}服务管理密码 : $admin_password${RESET}"
+    echo -e "${YELLOW}数据挂载路径 : ${DATA_DIR}${RESET}"
+    echo -e "${YELLOW}配置文件路径 : ${ENV_FILE}${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+}
+
+menu() {
+    clear
+    get_status_info
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}  ◈  Private Rules  面板  ◈  ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_rules ;;
+        2) update_rules ;;
+        3) uninstall_rules ;;
+        4) start_rules ;;
+        5) stop_rules ;;
+        6) restart_rules ;;
+        7) logs_rules ;;
+        8) show_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
 }
 
-# 自动获取 GitHub 最新版本号
-get_auto_version() {
-    local fetched_ver=""
-    echo -e "${YELLOW}正在尝试获取 GitHub 远端最新 cloudflared 版本号...${RESET}" >&2
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        fetched_ver=$(curl -sL -m 4 "${proxy}https://api.github.com/repos/cloudflare/cloudflared/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *//;s/"//g')
-        if [ -n "$fetched_ver" ]; then
-            echo "$fetched_ver"
-            return 0
-        fi
-    done
-    echo "$DEFAULT_BACKUP_VER"
-}
-
-# 下载组件核心逻辑
-download_package_loop() {
-    local version=$1
-    local arch=$2
-    local remote_filename="cloudflared-linux-${arch}"
-    local success=0
-
-    echo -e "${YELLOW}开始下载 cloudflared 二进制文件 ${version} (${arch})...${RESET}"
-    for proxy in "${GITHUB_PROXY[@]}"; do
-        local url="${proxy}https://github.com/cloudflare/cloudflared/releases/download/${version}/${remote_filename}"
-        if wget -T 10 -O "cloudflared_tmp" "$url"; then
-            echo -e "${GREEN}[成功] 下载完成！${RESET}"
-            success=1
-            break
-        else
-            rm -f "cloudflared_tmp"
-        fi
-    done
-    [ $success -eq 1 ] && return 0 || return 1
-}
-
-# 安装/更新主程序功能
-install_or_update_bin() {
-    local CFT_VER=$(get_auto_version)
-    local ARCH=$(get_arch)
-    
-    mkdir -p "$CFT_INSTALL_DIR"
-    cd "$CFT_INSTALL_DIR" || exit 1
-
-    if download_package_loop "$CFT_VER" "$ARCH"; then
-        stop_service 2>/dev/null || true
-        mv -f "cloudflared_tmp" "$CFT_BIN"
-        chmod +x "$CFT_BIN"
-        echo -e "${GREEN}[成功] cloudflared 主程序已就位/更新成功！${RESET}"
-        [ -f "$TOKEN_FILE" ] && restart_service
-    else
-        echo -e "${RED}[严重错误] 下载失败，请检查网络或重试！${RESET}"
-    fi
-    read -p "按回车返回菜单..." </dev/tty
-}
-
-# 更新隧道运行状态
-update_status_variables() {
-    G_VERSION="未检测到组件"
-    G_STATUS="${RED}已停止${RESET}"
-
-    if [ -f "$CFT_BIN" ]; then
-        G_VERSION=$($CFT_BIN --version 2>/dev/null | awk '{print $3}' || echo "未知")
-        if [ "$IS_OPENWRT" = "1" ]; then
-            (ps | grep -v grep | grep -q "[c]loudflared") && G_STATUS="${GREEN}已启动${RESET}"
-        elif [ "$IS_ALPINE" = "1" ]; then
-            (rc-service cloudflared status 2>/dev/null | grep -q "started") && G_STATUS="${GREEN}已启动${RESET}"
-        else
-            (systemctl is-active --quiet cloudflared 2>/dev/null) && G_STATUS="${GREEN}已启动${RESET}"
-        fi
-    fi
-}
-
-# 写入 OpenWrt 守护服务（已加入 --protocol http2）
-write_initd_service() {
-    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
-    [ -z "$token" ] && return 1
-    
-    cat > /etc/init.d/cloudflared <<EOF
-#!/bin/sh /etc/rc.common
-START=99
-USE_PROCD=1
-PROG=$CFT_BIN
-start_service() {
-    procd_open_instance
-    procd_set_param command \$PROG tunnel run --protocol http2 --token "$token"
-    procd_set_param respawn
-    procd_close_instance
-}
-EOF
-    chmod +x /etc/init.d/cloudflared
-    /etc/init.d/cloudflared enable
-}
-
-# 写入 Alpine (OpenRC) 守护服务（已加入 --protocol http2）
-write_openrc_service() {
-    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
-    [ -z "$token" ] && return 1
-
-    cat > /etc/init.d/cloudflared <<EOF
-#!/sbin/openrc-run
-description="Cloudflare Tunnel (Token Mode)"
-supervisor="supervise-daemon"
-command="$CFT_BIN"
-command_args="tunnel run --protocol http2 --token $token"
-command_background="yes"
-pidfile="/run/\${RC_SVCNAME}.pid"
-
-depend() {
-    need net
-    after firewall
-}
-EOF
-    chmod +x /etc/init.d/cloudflared
-    rc-update add cloudflared default >/dev/null 2>&1
-}
-
-# 写入标准 Linux Systemd 守护服务（已加入 --protocol http2）
-write_systemd_service() {
-    local token=$(cat "$TOKEN_FILE" 2>/dev/null)
-    [ -z "$token" ] && return 1
-
-    cat > /etc/systemd/system/cloudflared.service <<EOF
-[Unit]
-Description=Cloudflare Tunnel (Token Mode)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$CFT_BIN tunnel run --protocol http2 --token $token
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-}
-
-# 统合写入守护服务路由
-deploy_service_config() {
-    if [ "$IS_OPENWRT" = "1" ]; then
-        write_initd_service
-    elif [ "$IS_ALPINE" = "1" ]; then
-        write_openrc_service
-    else
-        write_systemd_service
-    fi
-}
-
-# 绑定 Token
-bind_token() {
-    if [ ! -f "$CFT_BIN" ]; then
-        echo -e "${RED}错误：本地没有主程序，请先执行选项 1 安装主程序！${RESET}"
-        sleep 2
-        return
-    fi
-
-    echo "=== 绑定 Cloudflare Tunnel Token ==="
-    echo -e "${YELLOW}请输入你在 Cloudflare 网页端获取的官方一键 Token (eyJhIjoi...):${RESET}"
-    read -p "Token: " input_token </dev/tty
-    
-    if [ -z "$input_token" ]; then
-        echo -e "${RED}Token 不能为空，放弃操作。${RESET}"
-        sleep 1.5
-        return
-    fi
-
-    mkdir -p "$CFT_INSTALL_DIR"
-    rm -f "$CFT_INSTALL_DIR/config.yml" "$CFT_INSTALL_DIR/tunnel_cred.json" "$CFT_INSTALL_DIR/.cft_inited"
-    
-    echo "$input_token" | tr -d '\r\n ' > "$TOKEN_FILE"
-    echo -e "${GREEN}Token 记录成功！正在配置并尝试拉起服务...${RESET}"
-    
-    deploy_service_config
-    start_service
-    sleep 1.5
-}
-
-# 启动服务
-start_service() {
-    if [ ! -f "$CFT_BIN" ] || [ ! -f "$TOKEN_FILE" ]; then
-        echo -e "${RED}错误：未安装主程序或未绑定 Token！${RESET}"; sleep 2; return
-    fi
-
-    deploy_service_config
-    if [ "$IS_OPENWRT" = "1" ]; then
-        /etc/init.d/cloudflared start
-    elif [ "$IS_ALPINE" = "1" ]; then
-        rc-service cloudflared start
-    else
-        systemctl start cloudflared
-        systemctl enable cloudflared 2>/dev/null || true
-    fi
-    echo "隧道服务已启动"; sleep 1;
-}
-
-# 停止服务
-stop_service() {
-    if [ "$IS_OPENWRT" = "1" ]; then
-        /etc/init.d/cloudflared stop
-    elif [ "$IS_ALPINE" = "1" ]; then
-        rc-service cloudflared stop 2>/dev/null || true
-    else
-        systemctl stop cloudflared
-    fi
-    echo "隧道服务已停止"; sleep 1;
-}
-
-# 重启服务
-restart_service() {
-    if [ ! -f "$CFT_BIN" ] || [ ! -f "$TOKEN_FILE" ]; then
-        echo -e "${RED}错误：未安装主程序或未绑定 Token！${RESET}"; sleep 2; return
-    fi
-
-    deploy_service_config
-    if [ "$IS_OPENWRT" = "1" ]; then
-        /etc/init.d/cloudflared restart
-    elif [ "$IS_ALPINE" = "1" ]; then
-        rc-service cloudflared restart
-    else
-        systemctl restart cloudflared
-    fi
-    echo "隧道服务已重启"; sleep 1;
-}
-
-# 查看运行日志
-log_service() {
-    echo -e "${CYAN}=== 正在获取最近的 30 行隧道运行日志 ===${RESET}"
-    if [ "$IS_OPENWRT" = "1" ]; then 
-        logread | grep cloudflared | tail -n 30 || echo "暂无日志"
-    elif [ "$IS_ALPINE" = "1" ]; then
-        if [ -f /var/log/messages ]; then
-            tail -n 100 /var/log/messages | grep cloudflared | tail -n 30
-        else
-            echo -e "${YELLOW}Alpine 默认输出至 syslog，请确保已安装 busybox-initscripts 或 syslog-ng${RESET}"
-            rc-service cloudflared status
-        fi
-    else 
-        journalctl -u cloudflared -n 30 --no-pager 2>/dev/null || tail -n 30 /var/log/messages 2>/dev/null
-    fi
-    read -p "按回车返回菜单..." </dev/tty
-}
-
-# 彻底卸载
-uninstall_service() {
-    echo -e "${RED}确定要彻底卸载本地服务及清除所有配置吗？(y/n)${RESET}"
-    read -p "请输入: " confirm </dev/tty
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        stop_service 2>/dev/null || true
-        if [ "$IS_OPENWRT" = "1" ]; then
-            /etc/init.d/cloudflared disable 2>/dev/null || true
-            rm -f /etc/init.d/cloudflared
-        elif [ "$IS_ALPINE" = "1" ]; then
-            rc-update del cloudflared default >/dev/null 2>&1 || true
-            rm -f /etc/init.d/cloudflared
-        else
-            systemctl disable cloudflared 2>/dev/null || true
-            rm -f /etc/systemd/system/cloudflared.service
-            systemctl daemon-reload
-        fi
-        rm -rf "$CFT_INSTALL_DIR" "$CFT_BIN"
-        echo -e "${GREEN}Cloudflare Tunnel 已完全卸载干净。${RESET}"
-        sleep 2
-    fi
-}
-
-# ---------- 主菜单界面 ----------
-main_menu() {
-    while true; do
-        update_status_variables
-        clear
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} ◈Cloudflare  远端控制管理面板◈ ${RESET}"
-        echo -e "${GREEN}  (Dashboard 模式/无需本地配置)  ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        [ ! -f "$CFT_BIN" ] && echo -e "${RED}[警告] 未找到执行文件，请先执行选项 1 安装！${RESET}"
-        echo -e "${GREEN}当前状态 :${RESET} $G_STATUS"
-        echo -e "${GREEN}主程序版 :${RESET} ${YELLOW}${G_VERSION}${RESET}"
-        echo -e "${GREEN}管理提示 : 规则增删请直接在网页面板操作${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1. 安装/更新cloudflared${RESET}"
-        echo -e "${GREEN} 2. 绑定/修改Token${RESET}"
-        echo -e "${GREEN} 3. 启动隧道服务${RESET}"
-        echo -e "${GREEN} 4. 停止隧道服务${RESET}"
-        echo -e "${GREEN} 5. 重启隧道服务${RESET}"
-        echo -e "${GREEN} 6. 查看运行日志${RESET}"
-        echo -e "${GREEN} 7. 卸载服务${RESET}"
-        echo -e "${GREEN} 0. 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -ne "${GREEN}请输入选项: ${RESET}"
-        read choice </dev/tty
-        case $choice in
-            1) install_or_update_bin ;;
-            2) bind_token ;;
-            3) start_service ;;
-            4) stop_service ;;
-            5) restart_service ;;
-            6) log_service ;;
-            7) uninstall_service ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项！${RESET}" && sleep 1 ;;
-        esac
-    done
-}
-
-main_menu
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

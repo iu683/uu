@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Private Rules Docker Compose 管理面板
+# Mosdns Docker Compose 管理面板
 # =================================================================
 
 # 颜色
@@ -10,13 +10,13 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="private-rules"
-BASE_DIR="/opt/private-rules"
+CONTAINER_NAME="mosdns"
+BASE_DIR="/opt/mosdns"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
 # 数据挂载本地的宿主机路径
-DATA_DIR="$BASE_DIR/data"
+DATA_DIR="$BASE_DIR"
 
 # 检测依赖
 check_dependencies() {
@@ -36,27 +36,19 @@ format_ip_for_url() {
     fi
 }
 
-# 动态获取容器状态、映射端口和环境变量配置
+# 动态获取容器状态、映射端口和网络配置
 get_status_info() {
     if ! command -v docker &> /dev/null; then
         status="${RED}未安装 Docker${RESET}"
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
+        net_mode="Unknown"
         return 0
     fi
     
-    # 1. 检查容器状态并联动健康检查
+    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        local health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        if [[ "$health_status" == "healthy" ]]; then
-            status="${GREEN}运行中 (健康)${RESET}"
-        elif [[ "$health_status" == "unhealthy" ]]; then
-            status="${RED}运行中 (不健康)${RESET}"
-        elif [[ "$health_status" == "starting" ]]; then
-            status="${YELLOW}运行中 (启动中)${RESET}"
-        else
-            status="${GREEN}运行中${RESET}"
-        fi
+        status="${GREEN}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
@@ -69,15 +61,20 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取端口（容器内部监听的是 5173 端口）
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5173/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        # 兜底获取第一个绑定的端口
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="5173"
+        # 提取网络模式
+        net_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CONTAINER_NAME" 2>/dev/null)
+
+        if [[ "$net_mode" == "host" ]]; then
+            webui_port="9099 (Host 模式)"
+        else
+            # 从容器状态提取端口（容器内部监听的是 9099 端口）
+            webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9099/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+            [[ -z "$webui_port" ]] && webui_port="9099"
+        fi
     else
-        # 容器未安装/未部署时的返回值
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
+        net_mode="N/A"
     fi
 }
 
@@ -105,98 +102,92 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 生成随机密钥
-generate_random_secret() {
-    if command -v openssl &> /dev/null; then
-        openssl rand -hex 16
-    else
-        echo "secret-$(date +%s%N | cut -c 1-12)"
-    fi
-}
-
-# 部署 Private Rules
+# 部署 Mosdns
 install_rules() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
-    mkdir -p "$DATA_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 5173]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="5173"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
+    echo -e "${YELLOW}请选择网络模式:${RESET}"
+    echo -e " 1. ${GREEN}Host 模式${RESET} (高性能，推荐，免配置支持 IPv6，直接占用宿主机 53 和 9099 端口)"
+    echo -e " 2. ${GREEN}Bridge 模式${RESET} (桥接网络端口映射，可自定义外部端口)"
+    echo -ne "${YELLOW}请输入选项 [默认: 1]: ${RESET}"
+    read -r net_choice
+    [[ -z "$net_choice" ]] && net_choice="1"
 
-    echo -ne "${YELLOW}请输入后台管理员密码 (ADMIN_PASSWORD): ${RESET}"
-    read -r admin_password
-    while [[ -z "$admin_password" ]]; do
-        echo -e "${RED}密码不能为空！${RESET}"
-        echo -ne "${YELLOW}请再次输入后台管理员密码 (ADMIN_PASSWORD): ${RESET}"
-        read -r admin_password
-    done
+    if [[ "$net_choice" == "2" ]]; then
+        # 桥接模式自定义端口
+        echo -ne "${YELLOW}请输入 DNS 服务访问端口 (UDP/TCP 宿主机端口) [默认: 53]: ${RESET}"
+        read -r custom_dns_port
+        [[ -z "$custom_dns_port" ]] && custom_dns_port="53"
 
-    echo -ne "${YELLOW}请输入 SESSION_SECRET [留空自动生成随机密钥]: ${RESET}"
-    read -r session_secret
-    [[ -z "$session_secret" ]] && session_secret=$(generate_random_secret)
+        echo -ne "${YELLOW}请输入 HTTP API 控制台访问端口 (TCP 宿主机端口) [默认: 9099]: ${RESET}"
+        read -r custom_http_port
+        [[ -z "$custom_http_port" ]] && custom_http_port="9099"
 
-    echo -ne "${YELLOW}请输入 RULE_TOKEN [留空自动生成随机密钥]: ${RESET}"
-    read -r rule_token
-    [[ -z "$rule_token" ]] && rule_token=$(generate_random_secret)
-
-    # 写入 .env 文件
-    cat <<EOF > "$ENV_FILE"
-ADMIN_PASSWORD=${admin_password}
-SESSION_SECRET=${session_secret}
-RULE_TOKEN=${rule_token}
+        # 写入环境配置
+        cat <<EOF > "$ENV_FILE"
+MOSDNS_NET_MODE=bridge
+DNS_PORT=${custom_dns_port}
+HTTP_PORT=${custom_http_port}
 EOF
 
-    # 修改目录及文件权限
-    chmod -R 777 "$BASE_DIR"
-
-    # 生成符合要求的 docker-compose.yml 配置文件 (已将 volume 命名卷转换为目录挂载，便于管理)
-    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
+        # 生成 Bridge 模式的 Compose 文件
+        echo -e "${YELLOW}正在生成 Bridge 模式的 docker-compose.yml 配置文件...${RESET}"
+        cat <<EOF > "$COMPOSE_FILE"
 services:
-  private-rules:
-    image: cyclince/private-rules:latest
+  mosdns:
+    image: jasonxtt/mosdns-t:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     ports:
-      - "${custom_port}:5173"
-    environment:
-      - ADMIN_PASSWORD=\${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
-      - SESSION_SECRET=\${SESSION_SECRET:?Set SESSION_SECRET in .env}
-      - RULE_TOKEN=\${RULE_TOKEN:?Set RULE_TOKEN in .env}
-      - TRUST_PROXY=true
+      - "\${DNS_PORT}:53/tcp"
+      - "\${DNS_PORT}:53/udp"
+      - "\${HTTP_PORT}:9099/tcp"
     volumes:
-      - ${DATA_DIR}:/app/data
-    healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+      - "${DATA_DIR}:/cus/mosdns"
 EOF
+        display_port=$custom_http_port
+    else
+        # Host 模式配置
+        cat <<EOF > "$ENV_FILE"
+MOSDNS_NET_MODE=host
+EOF
+        echo -e "${YELLOW}正在生成 Host 模式的 docker-compose.yml 配置文件...${RESET}"
+        cat <<EOF > "$COMPOSE_FILE"
+services:
+  mosdns:
+    image: jasonxtt/mosdns-t:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MOSDNS_CONTAINER_NETWORK_MODE: host
+    volumes:
+      - "${DATA_DIR}:/cus/mosdns"
+EOF
+        display_port="9099"
+    fi
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Private Rules 服务...${RESET}"
+    # 修改目录权限保证容器读写正常
+    chmod -R 777 "$BASE_DIR"
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Mosdns 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
 
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}          Private Rules 部署及启动成功！            ${RESET}"
+    echo -e "${GREEN}          Mosdns 部署及启动成功！                  ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}/admin/login${RESET}"
-    echo -e "${YELLOW}服务管理密码 : $admin_password${RESET}"
-    echo -e "${YELLOW}数据挂载路径 : $DATA_DIR${RESET}"
-    echo -e "${YELLOW}环境变量配置 : $ENV_FILE${RESET}"
+    echo -e "${YELLOW}网络运行模式 : $([[ "$net_choice" == "2" ]] && echo "Bridge 桥接" || echo "Host 直连")${RESET}"
+    echo -e "${YELLOW}API 控制台   : http://${DETECT_IP}:${display_port}/  (需视配置文件开放情况)${RESET}"
+    echo -e "${YELLOW}数据配置路径 : $DATA_DIR${RESET}"
+    echo -e "${YELLOW}配置环境文件 : $ENV_FILE${RESET}"
     echo -e "${GREEN}----------------------------------------------------${RESET}"
-    echo -e "${CYAN}提示: 容器包含 20 秒启动等待期 (start_period)，请稍后刷新查看健康状态。${RESET}"
+    echo -e "${CYAN}提示: 请确保已将自定义的 config.yaml 放置于 $DATA_DIR 目录下，否则容器可能无法正常工作。${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
@@ -206,7 +197,7 @@ update_rules() {
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取最新 mosdns 镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
@@ -214,13 +205,13 @@ update_rules() {
 
 # 卸载服务
 uninstall_rules() {
-    echo -ne "${YELLOW}确定要卸载并删除 Private Rules 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Mosdns 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有本地配置文件及挂载数据？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有本地配置文件及数据挂载？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
@@ -247,9 +238,9 @@ show_info() {
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
     echo -e "${GREEN}========================================${RESET}"
     echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}网络模式     : $net_mode"
     echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}/admin/login${RESET}"
-    echo -e "${YELLOW}服务管理密码 : $admin_password${RESET}"
+    echo -e "${YELLOW}控制台端口   : ${webui_port}${RESET}"
     echo -e "${YELLOW}数据挂载路径 : ${DATA_DIR}${RESET}"
     echo -e "${YELLOW}配置文件路径 : ${ENV_FILE}${RESET}"
     echo -e "${GREEN}========================================${RESET}"
@@ -259,9 +250,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}  ◈  Private Rules  面板  ◈  ${RESET}"
+    echo -e "${GREEN}    ◈   Mosdns 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}模式 :${RESET} ${YELLOW}${net_mode}${RESET}"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"

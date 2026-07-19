@@ -1,463 +1,266 @@
 #!/bin/bash
-# =================================================================
-# 名称: 全能网络工具箱 
-# 适配: Debian / Ubuntu / CentOS / Rocky Linux / Alpine Linux
-# =================================================================
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-BLUE="\033[36m"
-RESET="\033[0m"
-ORANGE='\033[38;5;208m'
+# 标准 ANSI 颜色定义
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
 
-# 默认配置参数
-IPERF_PORT=5201
-IPERF_TIME=30
-IPERF_PARALLEL=1
-IPERF_UDP_BW="1G"
-MTR_PROTO="ICMP"
-MTR_SHOW_AS="true"
+# 载入环境变量并增强 PATH 搜索
+[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
+[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null
+export PATH="/usr/local/bin:$HOME/.local/bin:/root/.local/bin:$PATH"
 
-# 全局安全退出捕获
-trap "echo -e '${RESET}'; exit" INT TERM
+# 基础配置
+GITHUB_API="https://api.github.com/repos/Foxemsx/riptide/releases/latest"
+DB_PATH="$HOME/.config/riptide/riptide.db"
 
-# ==========================================
-# 工具状态动态探测
-# ==========================================
-get_status() {
-    if command -v "$1" >/dev/null 2>&1; then
-        echo -e "${YELLOW}已安装${RESET}"
-    else
-        echo -e "${RED}未安装${RESET}"
+# 动态定位 Riptide 实际安装路径
+get_paths() {
+    REAL_EXEC_PATH=$(command -v riptide 2>/dev/null)
+    if [ -z "$REAL_EXEC_PATH" ] && [ -f "$HOME/.local/bin/riptide" ]; then
+        REAL_EXEC_PATH="$HOME/.local/bin/riptide"
     fi
 }
 
-# ==========================================
-# 自动化安装引擎
-# ==========================================
-check_and_install() {
-    local tool=$1
-    if command -v "$tool" >/dev/null 2>&1; then return; fi
-
-    echo -e "${YELLOW}📦 正在安装必要依赖与工具: $tool ...${RESET}"
-    
-    # 基础依赖环境前置检查与修复
-    if [ -f /etc/alpine-release ]; then
-        apk add --no-cache curl wget tar bash grep gawk openssl
-    elif ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y curl wget tar grep gawk
-        elif command -v dnf >/dev/null 2>&1; then dnf install -y curl wget tar grep gawk
-        elif command -v yum >/dev/null 2>&1; then yum install -y curl wget tar grep gawk
-        fi
+# 获取状态、版本及数据库信息
+get_status() {
+    get_paths
+    if [ -n "$REAL_EXEC_PATH" ]; then
+        status="${GREEN}已安装${RESET}"
+        # 获取当前版本信息
+        version_info="v1.4.0" # 默认为当前版本，若程序支持 --version 可在此解析
+        riptide_version="${YELLOW}${version_info}${RESET}"
+    else
+        status="${RED}未安装${RESET}"
+        riptide_version="${RED}-${RESET}"
     fi
 
-    case "$tool" in
-        speedtest)
-            if [ -f /etc/alpine-release ]; then
-                echo -e "${YELLOW}📦 检测到 Alpine 系统，正在通过 apk 官方源安装...${RESET}"
-                apk add --no-cache speedtest-cli
-                if [ ! -f /usr/local/bin/speedtest ] && [ ! -f /usr/bin/speedtest ]; then
-                    ln -sf "$(command -v speedtest-cli)" /usr/bin/speedtest
-                fi
-            else
-                echo -e "${YELLOW}📦 正在通过二进制包快速安装 Ookla Speedtest...${RESET}"
-                local cpu_arch=$(uname -m)
-                local download_url=""
-                case "$cpu_arch" in
-                    x86_64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
-                    aarch64|arm64) download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
-                    *) echo -e "${RED}❌ 错误: 不支持的架构 ${cpu_arch}${RESET}" >&2; exit 1 ;;
-                esac
-                cd /tmp
-                wget -q "$download_url" -O speedtest.tgz && \
-                tar -xzf speedtest.tgz && \
-                mv -f speedtest /usr/local/bin/ && \
-                rm -f speedtest.tgz speedtest.5 speedtest.md LICENSE.md
-            fi
-            mkdir -p "$HOME/.ookla"
-            echo '{"license_accepted": true, "gdpr_accepted": true}' > "$HOME/.ookla/speedtest-cli.json" 2>/dev/null || true
-            ;;
-        nexttrace)
-            curl -fsSL nxtrace.org/nt | bash || true
-            ;;
-        iperf3)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache iperf3
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y iperf3
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release 2>/dev/null || true; dnf install -y iperf3
-            elif command -v yum >/dev/null 2>&1; then yum install -y epel-release 2>/dev/null || true; yum install -y iperf3
-            fi
-            ;;
-        mtr)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache mtr
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y mtr-tiny || apt-get install -y mtr
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y mtr
-            elif command -v yum >/dev/null 2>&1; then yum install -y mtr
-            fi
-            ;;
-        nping)
-            if [ -f /etc/alpine-release ]; then apk add --no-cache nmap-nping || apk add --no-cache nmap
-            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y nmap
-            elif command -v dnf >/dev/null 2>&1; then dnf install -y nmap
-            elif command -v yum >/dev/null 2>&1; then yum install -y nmap
-            fi
-            ;;
-        inetspeed)
-            echo -e "${YELLOW}📦 正在安装 iNetSpeed-CLI (Apple CDN 测速)...${RESET}"
-            # 使用 echo "inetspeed" 管道输入，自动回应安装器的命令名询问
-            echo "2" | curl -fsSL https://raw.githubusercontent.com/tsosunchia/iNetSpeed-CLI/main/scripts/install.sh | bash || true
-            ;;
-        speed-cloudflare-cli)
-            echo -e "${YELLOW}🔍 正在通过 GitHub API 获取 Cloudflare-CLI Rust 最新版本信息...${RESET}"
-            
-            # 1. 抓取 API 数据
-            local api_response=$(curl -fsSL "https://api.github.com/repos/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/latest" 2>/dev/null)
-            if [ -z "$api_response" ]; then
-                echo -e "${RED}❌ 无法获取 GitHub 最新发布版本信息，请检查网络或 API 速率限制。${RESET}"
-                sleep 2
-                return 1
-            fi
+    # 检测本地数据库状态
+    if [ -f "$DB_PATH" ]; then
+        db_status="${GREEN}已建立 (已记录历史数据)${RESET}"
+    else
+        db_status="${YELLOW}未初始化 (首次运行测速后生成)${RESET}"
+    fi
+}
 
-            local latest_tag=$(echo "$api_response" | jq -r '.tag_name')
-            echo -e "${GREEN}✨ 发现最新版本: ${latest_tag}${RESET}"
+# 菜单面板
+show_menu() {
+    clear
+    get_status
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}      ◈ Riptide 网络监控管理 ◈       ${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}版本 :${RESET} $riptide_version"
+    echo -e "${GREEN}数据 :${RESET} $db_status"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -e "${GREEN} 1. 安装 / 更新 Riptide${RESET}"
+    echo -e "${GREEN} 2. 标准模式启动 (主菜单)${RESET}"
+    echo -e "${GREEN} 3. 紧凑模式启动 (跳过大Logo)${RESET}"
+    echo -e "${GREEN} 4. 自定义色彩主题启动${RESET}"
+    echo -e "${GREEN} 5. 测速历史数据库路径查看${RESET}"
+    echo -e "${GREEN} 6. 重置本地数据库 (清空历史)${RESET}"
+    echo -e "${GREEN} 7. TUI 界面快捷键指南${RESET}"
+    echo -e "${GREEN} 8. 卸载 Riptide${RESET}"
+    echo -e "${GREEN} 0. 退出${RESET}"
+    echo -e "${GREEN}====================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+}
 
-            # 2. 识别架构并检索对应的下载 URL
-            local cpu_arch=$(uname -m)
-            local cf_url=""
-            
-            case "$cpu_arch" in
-                x86_64) 
-                    # 在最新的 Release 资源列表中搜索匹配含 'ubuntu' 且不含 'arm' 且不含 '.deb' 的裸文件下载链接
-                    cf_url=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("ubuntu") and (contains("arm") | not) and (contains(".deb") | not)) | .browser_download_url' | head -n 1)
-                    ;;
-                aarch64|arm64) 
-                    # 匹配含 'ubuntu' 且含 'arm' 且不含 '.deb' 的链接
-                    cf_url=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("ubuntu") and contains("arm") and (contains(".deb") | not)) | .browser_download_url' | head -n 1)
-                    ;;
-                *) 
-                    echo -e "${RED}❌ 错误: 不支持的系统架构 ${cpu_arch}${RESET}" >&2
-                    exit 1 
-                    ;;
-            esac
+# 1. 动态获取最新版并下载安装/更新
+download_and_install() {
+    echo -e "\n${YELLOW}[正在从 GitHub 检索 Riptide 最新发布版本...]${RESET}"
+    
+    # 自动请求 GitHub API 获取最新的 tag_name
+    LATEST_TAG=$(curl -s "$GITHUB_API" | grep -o '"tag_name": "[^"]*' | grep -o '[^"]*$')
+    
+    if [ -z "$LATEST_TAG" ]; then
+        # 兜底默认版本
+        LATEST_TAG="v1.4.0"
+    fi
+    echo -e "${GREEN}目标安装版本: ${LATEST_TAG}${RESET}"
 
-            # 3. 容错拦截：若未能提取到 URL，使用固定的稳妥降级方案
-            if [ -z "$cf_url" ] || [ "$cf_url" = "null" ]; then
-                echo -e "${YELLOW}⚠️ 提取最新下载链接失败，启用稳定版规则匹配下载...${RESET}"
-                if [ "$cpu_arch" = "x86_64" ]; then
-                    cf_url="https://github.com/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/download/v0.1.0/speed-cloudflare-cli-ubuntu-22.04"
-                else
-                    cf_url="https://github.com/Akaere-NetWorks/speed-cloudflare-cli-rs/releases/download/v0.1.0/speed-cloudflare-cli-ubuntu-22.04-arm"
-                fi
-            fi
-
-            # 4. 下载裸文件并赋权
-            echo -e "${YELLOW}📥 正在下载二进制资产...${RESET}"
-            wget -q "$cf_url" -O /usr/local/bin/speed-cloudflare-cli
-            if [ $? -eq 0 ]; then
-                chmod +x /usr/local/bin/speed-cloudflare-cli
-                echo -e "${GREEN}✅ speed-cloudflare-cli 部署成功！${RESET}"
-                sleep 1
-            else
-                echo -e "${RED}❌ 下载失败，请检查网络或 GitHub 连通性。${RESET}"
-                sleep 2
-            fi
+    # 识别系统架构
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)
+            FILENAME="riptide-linux-amd64.tar.gz"
+            ;;
+        aarch64|arm64)
+            FILENAME="riptide-linux-arm64.tar.gz"
+            ;;
+        *)
+            echo -e "${RED}❌ 抱歉，暂不支持当前系统架构: $ARCH${RESET}"
+            echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+            return 1
             ;;
     esac
-    hash -r 2>/dev/null
-}
 
-# ==========================================
-# 1) Speedtest 模块 (双保险免提示版)
-# ==========================================
-run_speedtest() {
-    clear
-    check_and_install speedtest
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   Speedtest 网速测试   ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}🚀 开始测速...${RESET}"
-    echo "-------------------------------------"
-    if speedtest --help 2>&1 | grep -q "accept-license"; then
-        echo "YES" | speedtest --accept-license --accept-gdpr --force || true
+    # 拼接官方 GitHub Release 下载链接
+    DOWNLOAD_URL="https://github.com/Foxemsx/riptide/releases/download/${LATEST_TAG}/${FILENAME}"
+    echo -e "${GREEN}准备下载: ${FILENAME}${RESET}"
+    
+    TMP_DIR=$(mktemp -d)
+    if curl -L "$DOWNLOAD_URL" -o "${TMP_DIR}/${FILENAME}"; then
+        echo -e "${YELLOW}下载成功，正在解压并配置路径...${RESET}"
+        
+        # 解压二进制文件
+        tar -xzf "${TMP_DIR}/${FILENAME}" -C "$TMP_DIR"
+        
+        if [ -f "${TMP_DIR}/riptide" ]; then
+            mkdir -p "$HOME/.local/bin"
+            mv "${TMP_DIR}/riptide" "$HOME/.local/bin/riptide"
+            chmod +x "$HOME/.local/bin/riptide"
+            
+            # 创建全局软链接
+            if [ -w "/usr/local/bin" ]; then
+                rm -f /usr/local/bin/riptide
+                ln -s "$HOME/.local/bin/riptide" /usr/local/bin/riptide
+            else
+                sudo rm -f /usr/local/bin/riptide
+                sudo ln -s "$HOME/.local/bin/riptide" /usr/local/bin/riptide
+            fi
+            echo -e "${GREEN}✔ Riptide (${LATEST_TAG}) 成功安装/更新！快捷指令: riptide${RESET}"
+        else
+            echo -e "${RED}❌ 解压文件中未找到可执行文件 riptide。${RESET}"
+        fi
     else
-        speedtest || speedtest-cli || true
+        echo -e "${RED}❌ 下载失败，请检查网络是否能正常访问 GitHub Release。${RESET}"
+        echo -e "${RED}失败链接: ${DOWNLOAD_URL}${RESET}"
     fi
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
+    rm -rf "$TMP_DIR"
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
 }
 
-# ==========================================
-# 2) NextTrace 模块
-# ==========================================
-run_nexttrace() {
-    clear
-    check_and_install nexttrace
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   NextTrace 路由追踪   ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p "请输入目标IP或域名: " target
-    if [ -z "$target" ]; then return; fi
-    echo -e "--------------------------------"
-    nexttrace "$target" || true
-    echo -e "${GREEN}================================${RESET}"
-    read -p "追踪完成，按回车返回面板..." dummy
-}
-
-# ==========================================
-# 3) iperf3 
-# ==========================================
-get_iperf_ip() {
-    read -p "请输入远端服务器 IP/域名: " SERVER_IP
-    if [ -z "$SERVER_IP" ]; then
-        echo -e "${RED}❌ 未输入有效 IP，操作取消。${RESET}"
-        sleep 1.5
-        return 1
+# 2 & 3. 启动 TUI 界面
+start_tui() {
+    get_paths
+    if [ -z "$REAL_EXEC_PATH" ]; then
+        echo -e "\n${RED}未检测到 riptide 命令，请先执行选项 1 进行安装！${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+        return
     fi
-    return 0
+    if [ "$1" == "compact" ]; then
+        "$REAL_EXEC_PATH" --compact
+    else
+        "$REAL_EXEC_PATH"
+    fi
 }
 
-run_iperf3() {
-    check_and_install iperf3
-    while true; do
-        clear
-        echo -e "${GREEN}===================================${RESET}"
-        echo -e "${GREEN}     ◈   iperf3 测速管理   ◈      ${RESET}"
-        echo -e "${GREEN}===================================${RESET}"
-        echo -e "${YELLOW}端口 = $IPERF_PORT  | 时长    = ${IPERF_TIME}s ${RESET}"
-        echo -e "${YELLOW}线程 = $IPERF_PARALLEL     | UDP带宽 = $IPERF_UDP_BW${RESET}"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}1) 启动 iperf3 本地服务端"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}2) 发起 TCP 下载 (↓) 测试${RESET}"
-        echo -e " ${GREEN}3) 发起 TCP 上传 (↑) 测试${RESET}"
-        echo -e " ${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}4) 发起 UDP 下载 (↓) 测试${RESET}"
-        echo -e " ${GREEN}5) 发起 UDP 上传 (↑) 测试${RESET}"
-        echo -e "${GREEN}-----------------------------------${RESET}"
-        echo -e " ${GREEN}6) 修改测试参数${RESET}"
-        echo -e " ${GREEN}0) 退出${RESET}"
-        echo -e "${GREEN}===================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
+# 4. 指定主题启动并保存偏好
+start_with_theme() {
+    get_paths
+    if [ -z "$REAL_EXEC_PATH" ]; then
+        echo -e "\n${RED}未检测到已安装的 Riptide。${RESET}"
+        echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+        return
+    fi
+    echo -e "\n${GREEN}[可用主题推荐]${RESET}: ocean, midnight, sunset, forest, dracula, cyber, nord, gruvbox, tokyo"
+    echo -ne "${YELLOW}请输入你想使用的主题名称 (直接回车默认 default): ${RESET}"
+    read -r target_theme
+    if [ -z "$target_theme" ]; then
+        target_theme="default"
+    fi
+    echo -e "${YELLOW}正在以 [${target_theme}] 主题启动 Riptide...${RESET}"
+    "$REAL_EXEC_PATH" --theme "$target_theme"
+}
+
+# 5. 查看配置与数据库实际路径
+show_config_details() {
+    echo -e "\n${YELLOW}------------------------------------------------${RESET}"
+    echo -e "${GREEN}【SQLite 数据库实际绝对路径】:${RESET}"
+    echo -e " $DB_PATH"
+    echo -e "${GREEN}【当前数据库状态】:${RESET}"
+    if [ -f "$DB_PATH" ]; then
+        ls -lh "$DB_PATH"
+    else
+        echo -e " 暂无本地数据库文件，运行一次网络测速后将自动创建。"
+    fi
+    echo -e "${YELLOW}------------------------------------------------${RESET}"
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+}
+
+# 6. 重置本地数据库
+reset_database() {
+    if [ -f "$DB_PATH" ]; then
+        echo -e "\n${RED}警告：准备重置本地 SQLite 数据库...${RESET}"
+        echo -ne "${RED}此操作将永久清空所有测速历史数据！确定要执行吗？(y/n): ${RESET}"
+        read -r ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+            rm -f "$DB_PATH"
+            echo -e "${GREEN}✔ 历史数据库已成功重置并清理。${RESET}"
+        else
+            echo -e "${GREEN}操作已取消。${RESET}"
+        fi
+    else
+        echo -e "\n${YELLOW}提示：本地尚无历史数据库文件，无需重置。${RESET}"
+    fi
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
+}
+
+# 7. 快捷键面板
+show_shortcuts() {
+    clear
+    echo -e "${YELLOW}==================================================================${RESET}"
+    echo -e "${YELLOW}                Riptide TUI 终端界面快捷操作指南                  ${RESET}"
+    echo -e "${YELLOW}==================================================================${RESET}"
+    echo -e "  ${GREEN}【常规导航】${RESET}"
+    echo -e "   ← → ↑ ↓ / h j k l  : 菜单选项移动"
+    echo -e "   Enter              : 确认选中当前项"
+    echo -e "   1, 2, 3, 4         : 快捷跳转 (1:测速 / 2:带宽 / 3:设置 / 4:退出)"
+    echo -e "   Esc / m            : 返回主菜单"
+    echo -e "   ?                  : 打开帮助遮罩层"
+    echo -e "   g                  : 在浏览器中打开官方 GitHub 项目"
+    echo -e "  ${GREEN}【测速/监控面板】${RESET}"
+    echo -e "   s                  : 测速面板 — 保存 / 重命名当前测速运行记录"
+    echo -e "   y                  : 测速面板 — 复制结果到剪贴板 (↓248 ↑19 12ms)"
+    echo -e "   c                  : 切换流量/速度显示单位"
+    echo -e "   r                  : 重新启动当前测试或网络监控"
+    echo -e "   p                  : 暂停 / 继续当前监控 (仅限带宽视图)"
+    echo -e "   a                  : 切换应用 (仅限带宽面板使用)"
+    echo -e "   t                  : 实时切换显示紧凑型/大 Logo 标志"
+    echo -e "  ${GREEN}【全局退出】${RESET}"
+    echo -e "   q / Ctrl+C         : 立即退出 Riptide 监控"
+    echo -e "${YELLOW}==================================================================${RESET}"
+    echo -ne "${GREEN}按回车键返回主菜单...${RESET}" && read -r
+}
+
+# 8. 卸载功能
+uninstall_riptide() {
+    get_paths
+    echo -e "\n${RED}警告：准备进入 Riptide 卸载流程...${RESET}"
+    echo -ne "${RED}确定要卸载二进制程序并清理全局快捷调用吗？(y/n): ${RESET}"
+    read -r ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        # 清除全局软链接
+        if [ -w "/usr/local/bin" ]; then rm -f /usr/local/bin/riptide; else sudo rm -f /usr/local/bin/riptide; fi
+        # 清除局部路径
+        [ -n "$REAL_EXEC_PATH" ] && [ "$REAL_EXEC_PATH" != "/usr/local/bin/riptide" ] && rm -f "$REAL_EXEC_PATH"
+        rm -f "$HOME/.local/bin/riptide"
         
-        case "$choice" in
-            1)
-                clear
-                echo -e "${ORANGE}===================================${RESET}"
-                echo -e "${GREEN}  iperf3 服务器已启动 (监听端口: $IPERF_PORT)${RESET}"
-                echo -e "${YELLOW}  👉 提示: 测速完毕后，按 Ctrl+C 可安全返回菜单${RESET}"
-                echo -e "${ORANGE}===================================${RESET}\n"
-                (trap 'echo -e "${YELLOW}服务端已安全关闭。${RESET}"; exit 0' INT; iperf3 -s -i 10 -p "$IPERF_PORT")
-                echo "-----------------------------------"
-                read -p "按回车继续..." dummy
-                ;;
-            2)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -R -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            3)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 TCP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -P "$IPERF_PARALLEL" -t "$IPERF_TIME" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            4)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 下载 (↓) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -R -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            5)
-                clear; get_iperf_ip || continue
-                echo -e "\n${GREEN}🚀 UDP 上传 (↑) 测试中...${RESET}"
-                iperf3 -c "$SERVER_IP" -u -b "$IPERF_UDP_BW" -t "$IPERF_TIME" -P "$IPERF_PARALLEL" -p "$IPERF_PORT" || true
-                read -p "测试完成，按回车继续..." dummy
-                ;;
-            6)
-                echo -e "${YELLOW}>>> 修改 iperf3 临时参数 <<<${RESET}"
-                read -p "修改端口 (当前 $IPERF_PORT): " in_p; IPERF_PORT=${in_p:-$IPERF_PORT}
-                read -p "修改时长 (当前 $IPERF_TIME): " in_t; IPERF_TIME=${in_t:-$IPERF_TIME}
-                read -p "修改线程 (当前 $IPERF_PARALLEL): " in_pa; IPERF_PARALLEL=${in_pa:-$IPERF_PARALLEL}
-                read -p "修改UDP带宽 (当前 $IPERF_UDP_BW): " in_b; IPERF_UDP_BW=${in_b:-$IPERF_UDP_BW}
-                ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
-        esac
-    done
+        echo -e "${GREEN}✔ 二进制程序清理完成。${RESET}"
+        echo -e "${YELLOW}💡 提示：本地测速历史仍保留在 $DB_PATH。如需彻底清除，请在菜单中选择选项 6。${RESET}"
+    else
+        echo -e "${GREEN}已取消卸载。${RESET}"
+    fi
+    echo -ne "\n${GREEN}按回车键返回主菜单...${RESET}" && read -r
 }
 
-# ==========================================
-# 4) MTR 面板模块
-# ==========================================
-run_mtr() {
-    check_and_install mtr
-    while true; do
-        clear
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}    ◈   MTR 链路诊断面板   ◈    ${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN}探测协议 :${RESET} ${YELLOW}$(echo "$MTR_PROTO" | tr 'a-z' 'A-Z')${RESET}"
-        echo -e "${GREEN}AS号展示 :${RESET} ${YELLOW}$([ "$MTR_SHOW_AS" = "true" ] && echo "开启" || echo "关闭")${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -e "${GREEN} 1) 实时动态检测${RESET}"
-        echo -e "${GREEN} 2) 静态报告模式${RESET}"
-        echo -e "${GREEN} 0) 退出${RESET}"
-        echo -e "${GREEN}================================${RESET}"
-        echo -ne "${GREEN} 请选择: ${RESET}"
-        read -r choice
-        
-        local args=""
-        [ "$MTR_SHOW_AS" = "true" ] && args="$args -z"
-
-        case "$choice" in
-            1)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                echo -e "--------------------------------"
-                mtr $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "检测结束，按回车返回..." dummy
-                ;;
-            2)
-                read -p "请输入目标IP/域名: " target
-                if [ -z "$target" ]; then continue; fi
-                clear
-                echo -e "${GREEN}报告生成中(发送100个包)...${RESET}\n"
-                mtr -r -c 100 $args "$target" || true
-                echo -e "--------------------------------"
-                read -p "分析结束，按回车返回..." dummy
-                ;;
-            0) exit 0 ;;
-        esac
-    done
-}
-
-
-# ==========================================
-# 5) Telegram-Speedtest
-# ==========================================
-run_Telegram() {
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈ Telegram-Speedtest ◈     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo "-------------------------------------"
-    bash <(curl -fsSL https://raw.githubusercontent.com/cazi-cc/Telegram-Speedtest/main/telegram-speedtest.sh)
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
-}
-
-
-# ==========================================
-# 6) iNetSpeed-CLI 模块 
-# ==========================================
-run_inetspeed() {
-    clear
-    check_and_install inetspeed
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  iNetSpeed Apple CDN测速  ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}🚀 开始连接 Apple CDN 节点进行测试...${RESET}"
-    echo "-------------------------------------"
-    inetspeed || true
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
-}
-
-# ==========================================
-# 7) Cloudflare Speedtest Rust 模块
-# ==========================================
-run_cloudflare_cli() {
-    clear
-    check_and_install speed-cloudflare-cli
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈ Cloudflare Speedtest (Rust) ◈ ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}🚀 开始连接 Cloudflare Anycast 边缘网络...${RESET}"
-    echo "-------------------------------------"
-    speed-cloudflare-cli || true
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
-}
-
-
-
-# ==========================================
-# 8) TCPBench 模块
-# ==========================================
-run_TCPBench() {
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈ 全球主流站点的 TCP 握手延迟 ◈${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo "-------------------------------------"
-    curl -sL https://tcpbench.com/run.sh | bash
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
-}
-
-
-# ==========================================
-# 9) nws.sh 模块
-# ==========================================
-run_nwssh() {
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      ◈   网络性能测试   ◈     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo "-------------------------------------"
-    wget -qO- nws.sh | bash
-    echo "-------------------------------------"
-    read -p "测试完成，按回车返回面板..." dummy
-}
-
-
-
-
-# ==========================================
-# 工具箱主面板循环
-# ==========================================
+# 主循环
 while true; do
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   网络管理 综合面板   ◈    ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}Speedtest :${RESET} $(get_status speedtest)"
-    echo -e "${GREEN}iNetSpeed :${RESET} $(get_status inetspeed)"
-    echo -e "${GREEN}Cloudflare:${RESET} $(get_status speed-cloudflare-cli)"
-    echo -e "${GREEN}NextTrace :${RESET} $(get_status nexttrace)"
-    echo -e "${GREEN}iperf3    :${RESET} $(get_status iperf3)"
-    echo -e "${GREEN}MTR       :${RESET} $(get_status mtr)"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e " ${GREEN}1) 运行 Speedtest  网速测试${RESET}"
-    echo -e " ${GREEN}2) 运行 NextTrace  路由追踪${RESET}"
-    echo -e " ${GREEN}3) 运行 iperf3     测速${RESET}"
-    echo -e " ${GREEN}4) 运行 MTR        链路诊断${RESET}"
-    echo -e " ${GREEN}5) 运行 Telegram   TG测速${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}6) 运行 iNetSpeed  测速 (AppleCDN)${RESET}"
-    echo -e " ${GREEN}7) 运行 Cloudflare 测速${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}8) 运行 TCPBench   全球主流站点TCP延迟${RESET}"
-    echo -e " ${GREEN}9) 运行 nws.sh     测速${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e " ${GREEN}0) 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    read -p $'\033[32m 请选择: \033[0m' choice
-
-    case "$choice" in
-        1) run_speedtest ;;
-        2) run_nexttrace ;;
-        3) run_iperf3 ;;
-        4) run_mtr ;;
-        5) run_Telegram ;;
-        6) run_inetspeed ;;
-        7) run_cloudflare_cli ;;
-        8) run_TCPBench ;;
-        9) run_nwssh ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入错误,重新输入${RESET}"; sleep 1 ;;
+    show_menu
+    read -r choice
+    case $choice in
+        1) download_and_install ;;
+        2) start_tui "standard" ;;
+        3) start_tui "compact" ;;
+        4) start_with_theme ;;
+        5) show_config_details ;;
+        6) reset_database ;;
+        7) show_shortcuts ;;
+        8) uninstall_riptide ;;
+        0) clear; exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新选择！${RESET}"; sleep 1 ;;
     esac
 done

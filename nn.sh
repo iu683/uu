@@ -1,505 +1,313 @@
 #!/bin/bash
-set -e
+# =================================================================
+# Pixhelf Gallery Docker Compose 管理面板 (支持自定义目录版)
+# =================================================================
 
-# ================== 颜色 ==================
-GREEN="\033[32m"
+# 颜色
 RED="\033[31m"
+GREEN="\033[32m"
 YELLOW="\033[33m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# ================== 变量 (已全部加上 v6 后缀独立化) ==================
-SNELL_DIR="/etc/snellv6"
-SNELL_CONFIG="$SNELL_DIR/snell-server-v6.conf"
-SNELL_SERVICE="/etc/systemd/system/snellv6.service"
-LOG_FILE="/var/log/snellv6_manager.log"
-SNELL_USER="snellv6"
+CONTAINER_NAME="gallery"
+BASE_DIR="/opt/gallery"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
-# ================== 工具函数 ==================
-create_user() {
-    # 建立独立的系统用户，避免权限交叉
-    id -u "$SNELL_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$SNELL_USER"
+# 加载保存的环境变量（如果存在）
+load_env() {
+    if [[ -f "$ENV_FILE" ]]; then
+        # 读取配置
+        PICTURES_DIR=$(grep -E '^PICTURES_DIR=' "$ENV_FILE" | cut -d'=' -f2-)
+        DATA_DIR=$(grep -E '^DATA_DIR=' "$ENV_FILE" | cut -d'=' -f2-)
+    fi
+    # 默认兜底路径
+    PICTURES_DIR="${PICTURES_DIR:-$BASE_DIR/pictures}"
+    DATA_DIR="${DATA_DIR:-$BASE_DIR/data}"
 }
 
+# 检测依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
+    fi
+}
+
+# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
+format_ip_for_url() {
+    local ip="$1"
+    if [[ "$ip" == *":"* ]]; then
+        echo "[$ip]"
+    else
+        echo "$ip"
+    fi
+}
+
+# 动态获取容器状态、映射端口
+get_status_info() {
+    load_env
+    if ! command -v docker &> /dev/null; then
+        status="${RED}未安装 Docker${RESET}"
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        return 0
+    fi
+    
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        local health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        if [[ "$health_status" == "healthy" ]]; then
+            status="${GREEN}运行中 (健康)${RESET}"
+        elif [[ "$health_status" == "unhealthy" ]]; then
+            status="${RED}运行中 (不健康)${RESET}"
+        elif [[ "$health_status" == "starting" ]]; then
+            status="${YELLOW}运行中 (启动中)${RESET}"
+        else
+            status="${GREEN}运行中${RESET}"
+        fi
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3002/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3002"
+    else
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+    fi
+}
+
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
-    local mode=${1:-"auto"} # auto: 自动, v4: 强制IPv4, v6: 强制IPv6
+    local mode=${1:-"auto"}
     local ip=""
     
     if [[ "$mode" == "v4" ]]; then
-        # 强制获取 IPv4
         for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
         done
     elif [[ "$mode" == "v6" ]]; then
-        # 强制获取 IPv6
         for url in "https://api64.ipify.org" "https://6.ip.sb"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
         done
     else
-        # auto 模式：双栈环境优先获取 IPv4 (更适合大众网络)，纯 v6 环境自动fallback到 v6
         for url in "https://api.ipify.org" "https://4.ip.sb"; do
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
-        # 如果获取 v4 失败，说明可能是纯 v6 机器，尝试获取 v6
         for url in "https://api64.ipify.org" "https://6.ip.sb"; do
             ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
     fi
-
-    # 兜底处理：所有接口都失败时，直接输出 127.0.0.1，不报错
     echo "127.0.0.1" && return 0
 }
 
-check_port() {
-    if ss -tlnp | grep -q ":$1 "; then
-        echo -e "${RED}端口 $1 已被占用，请更换端口！${RESET}"
-        return 1
-    fi
-}
-
-random_key() {
-    tr -dc A-Za-z0-9 </dev/urandom | head -c 16
-}
-
-random_port() {
-    shuf -i 2000-65000 -n 1
-}
-
-get_system_dns() {
-    grep -E "^nameserver" /etc/resolv.conf | awk '{print $2}' | paste -sd "," -
-}
-
-pause() {
-    read -n 1 -s -r -p "按任意键返回菜单..."
-}
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
-}
-
-# 动态获取官方最新 Snell v6 版本
-get_latest_snell_version() {
-    local latest_version
-    latest_version=$(curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-        "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" | \
-        grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 2>/dev/null || echo "")
-        
-    if [[ -z "$latest_version" ]]; then
-        latest_version="v6.0.0rc"
-    fi
-    echo "$latest_version"
-}
-
-# ================== 配置 Snell ==================
-configure_snell() {
-    echo -e "${GREEN}[信息] 开始配置 Snell v6 独立服务...${RESET}"
-
-    read -p "请输入端口 (默认: 随机生成): " input_port
-    port=${input_port:-$(random_port)}
-    check_port "$port" || return
-
-    read -p "请输入 Snell 密钥 (默认: 随机生成): " key
-    key=${key:-$(random_key)}
-
-    echo -e "${YELLOW}请选择 Snell 工作模式 (mode):${RESET}"
-    echo "1. default     (默认：流量混淆 + AES 加密)"
-    echo "2. unshaped    (禁用混淆，仅 AES 加密。吞吐量提升约 10%，等同于 v3 纯随机流量)"
-    echo "3. unsafe-raw  (明文模式：禁用加密和混淆，仅用于受信任内网/安全隧道)"
-    read -p "(默认: 1): " mode_choice
-    case $mode_choice in
-        2) snell_mode="unshaped" ;;
-        3) snell_mode="unsafe-raw" ;;
-        *) snell_mode="default" ;;
-    esac
-
-    echo -e "${YELLOW}请选择监听网络模式 (Listen Mode):${RESET}"
-    echo "1. 同时监听 IPv4 & IPv6 (双栈显式绑定，推荐)"
-    echo "2. 仅监听 IPv4 (0.0.0.0)"
-    echo "3. 仅监听 IPv6 ([::])"
-    read -p "(默认: 1): " listen_choice
-    listen_choice=${listen_choice:-1}
-    case $listen_choice in
-        2) LISTEN="0.0.0.0:$port" ;;
-        3) LISTEN="[::]:$port" ;;
-        *) LISTEN="0.0.0.0:$port,[::]:$port" ;;
-    esac
-
-    echo -e "${YELLOW}请选择 DNS 解析 IP 家族优先级 (dns-ip-preference):${RESET}"
-    echo "1. default      (系统默认)"
-    echo "2. prefer-ipv4  (IPv4 优先)"
-    echo "3. prefer-ipv6  (IPv6 优先)"
-    echo "4. ipv4-only    (仅使用 IPv4)"
-    echo "5. ipv6-only    (仅使用 IPv6)"
-    read -p "(默认: 1): " dns_pref_choice
-    case $dns_pref_choice in
-        2) dns_pref="prefer-ipv4" ;;
-        3) dns_pref="prefer-ipv6" ;;
-        4) dns_pref="ipv4-only" ;;
-        5) dns_pref="ipv6-only" ;;
-        *) dns_pref="default" ;;
-    esac
-
-    echo -e "${YELLOW}配置 OBFS：[注意] 无特殊作用不建议启用${RESET}"
-    echo "1. TLS   2. HTTP   3. 关闭"
-    read -p "(默认: 3): " obfs
-    case $obfs in
-        1) obfs="tls" ;;
-        2) obfs="http" ;;
-        *) obfs="off" ;;
-    esac
-
-    echo -e "${YELLOW}是否开启 TCP Fast Open？${RESET}"
-    echo "1. 开启   2. 关闭"
-    read -p "(默认: 1): " tfo
-    tfo=${tfo:-1}
-    tfo=$([ "$tfo" = "1" ] && echo true || echo false)
-
-    default_dns=$(get_system_dns)
-    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
-    read -p "请输入上游 DNS (默认: $default_dns): " dns
-    dns=${dns:-$default_dns}
-
-    cat > "$SNELL_CONFIG" <<EOF
-[snell-server]
-listen = $LISTEN
-psk = $key
-mode = $snell_mode
-obfs = $obfs
-tfo = $tfo
-dns = $dns
-dns-ip-preference = $dns_pref
-EOF
-
-    IP=$(get_public_ip)
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-
-    cat <<EOF > "$SNELL_DIR/config.txt"
-$HOSTNAME-SnellV6 = snell, $IP, $port, psk=$key, version=6, mode=$snell_mode, tfo=$tfo, reuse=true, ecn=true
-EOF
-
-    echo -e "${GREEN}[完成] 配置已写入 $SNELL_CONFIG${RESET}"
-    echo -e "${GREEN}====== Snell v6 Server 配置信息 ======${RESET}"
-    echo -e "${YELLOW} 绑定地址 (Listen) : $LISTEN${RESET}"
-    echo -e "${YELLOW} 密钥 (PSK)        : $key${RESET}"
-    echo -e "${YELLOW} 工作模式 (Mode)   : $snell_mode${RESET}"
-    echo -e "${YELLOW} OBFS 混淆         : $obfs${RESET}"
-    echo -e "${YELLOW} TFO 快速打开      : $tfo${RESET}"
-    echo -e "${YELLOW} DNS 上游          : $dns${RESET}"
-    echo -e "${YELLOW} DNS 家族优先级    : $dns_pref${RESET}"
-    echo -e "${YELLOW}---------------------------------${RESET}"
-    echo -e "${YELLOW}[信息] Surge 配置示例：${RESET}"
-    cat "$SNELL_DIR/config.txt"
-    echo -e "${YELLOW}---------------------------------\n${RESET}"
-}
-
-# ================== 修改配置 Snell ==================
-configures_snell() {
-    echo -e "${GREEN}[信息] 开始修改 Snell v6 配置...${RESET}"
-
-    if [[ -f "$SNELL_CONFIG" ]]; then
-        old_listen=$(grep '^listen' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-        old_port=$(echo "$old_listen" | awk -F: '{print $NF}')
-        old_key=$(grep '^psk' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-        old_mode=$(grep '^mode' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-        old_obfs=$(grep '^obfs' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-        old_tfo=$(grep '^tfo' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-        old_dns=$(grep '^dns' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-        old_dns_pref=$(grep '^dns-ip-preference' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-    fi
-
-    default_port=${old_port:-$(random_port)}
-    default_key=${old_key:-$(random_key)}
-    default_mode=${old_mode:-default}
-    default_obfs=${old_obfs:-off}
-    default_tfo=${old_tfo:-true}
-    default_dns_pref=${old_dns_pref:-default}
+# 部署 Gallery
+install_gallery() {
+    check_dependencies
     
-    default_dns=$(get_system_dns)
-    [[ -z "$default_dns" ]] && default_dns="1.1.1.1,8.8.8.8"
-    default_dns=${old_dns:-$default_dns}
+    mkdir -p "$BASE_DIR"
 
-    read -p "请输入端口 [当前: $default_port]: " input_port
-    port=${input_port:-$default_port}
-    if [[ "$port" != "$old_port" ]]; then
-        check_port "$port" || return
-    fi
-
-    read -p "请输入 Snell 密钥 [当前: $default_key]: " key
-    key=${key:-$default_key}
-
-    echo -e "${YELLOW}请选择 Snell 工作模式 [当前: $default_mode]:${RESET}"
-    echo "1. default    2. unshaped    3. unsafe-raw"
-    read -p "(直接回车保留当前): " mode_choice
-    case $mode_choice in
-        1) snell_mode="default" ;;
-        2) snell_mode="unshaped" ;;
-        3) snell_mode="unsafe-raw" ;;
-        *) snell_mode="$default_mode" ;;
-    esac
-
-    echo -e "${YELLOW}请选择监听网络模式 (当前: $old_listen):${RESET}"
-    echo "1. 同时监听 IPv4 & IPv6 (双栈绑定)"
-    echo "2. 仅监听 IPv4"
-    echo "3. 仅监听 IPv6"
-    read -p "(直接回车保留当前): " listen_choice
-    case $listen_choice in
-        1) LISTEN="0.0.0.0:$port,[::]:$port" ;;
-        2) LISTEN="0.0.0.0:$port" ;;
-        3) LISTEN="[::]:$port" ;;
-        *) LISTEN=${old_listen:-"0.0.0.0:$port,[::]:$port"} ;;
-    esac
-
-    echo -e "${YELLOW}请选择 DNS 解析 IP 家族优先级 (当前: $default_dns_pref):${RESET}"
-    echo "1. default    2. prefer-ipv4    3. prefer-ipv6    4. ipv4-only    5. ipv6-only"
-    read -p "(直接回车保留当前): " dns_pref_choice
-    case $dns_pref_choice in
-        1) dns_pref="default" ;;
-        2) dns_pref="prefer-ipv4" ;;
-        3) dns_pref="prefer-ipv6" ;;
-        4) dns_pref="ipv4-only" ;;
-        5) dns_pref="ipv6-only" ;;
-        *) dns_pref="$default_dns_pref" ;;
-    esac
-
-    echo -e "${YELLOW}配置 OBFS [当前: $default_obfs]:${RESET}"
-    echo "1. TLS   2. HTTP   3. 关闭"
-    read -p "(直接回车保留当前): " obfs_choice
-    case $obfs_choice in
-        1) obfs="tls" ;;
-        2) obfs="http" ;;
-        3) obfs="off" ;;
-        *) obfs="$default_obfs" ;;
-    esac
-
-    echo -e "${YELLOW}是否开启 TCP Fast Open？[当前: $default_tfo]${RESET}"
-    echo "1. 开启   2. 关闭"
-    read -p "(直接回车保留当前): " tfo_choice
-    case $tfo_choice in
-        1) tfo=true ;;
-        2) tfo=false ;;
-        *) tfo="$default_tfo" ;;
-    esac
-
-    read -p "请输入 DNS [当前: $default_dns]: " dns
-    dns=${dns:-$default_dns}
-
-    cat > "$SNELL_CONFIG" <<EOF
-[snell-server]
-listen = $LISTEN
-psk = $key
-mode = $snell_mode
-obfs = $obfs
-tfo = $tfo
-dns = $dns
-dns-ip-preference = $dns_pref
-EOF
-
-    IP=$(get_public_ip)
-    HOSTNAME=$(hostname -s | sed 's/ /_/g')
-    cat > "$SNELL_DIR/config.txt" <<EOF
-$HOSTNAME-SnellV6 = snell, $IP, $port, psk=$key, version=6, mode=$snell_mode, tfo=$tfo, reuse=true, ecn=true
-EOF
-
-    echo -e "${GREEN}[完成] 配置已保存${RESET}"
-}
-
-# ================== 下载与解压内核 ==================
-download_and_extract_snell() {
-    local RAW_VERSION=$1
-    local ARCH
-    ARCH=$(uname -m)
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    if ! command -v unzip &>/dev/null; then
-        echo -e "${YELLOW}[提示] 未检测到 unzip，正在安装...${RESET}"
-        if command -v apt &>/dev/null; then apt update && apt install -y unzip;
-        elif command -v yum &>/dev/null; then yum install -y unzip;
-        elif command -v apk &>/dev/null; then apk add unzip; fi
-    fi
-
-    local URL_ARCH
-    case "$ARCH" in
-        aarch64|arm64)              URL_ARCH="linux-aarch64" ;;
-        armv7l|armhf|armv8l)        URL_ARCH="linux-armv7l" ;;
-        x86_64|amd64)               URL_ARCH="linux-amd64" ;;
-        i386|i686|x86)              URL_ARCH="linux-i386" ;;
-        *) echo -e "${RED}[错误] 不支持的架构: ${ARCH}${RESET}"; return 1 ;;
-    esac
-
-    local VERSION_WITHOUT_V="${RAW_VERSION#v}"
-    local VERSION_WITH_V="v${VERSION_WITHOUT_V}"
-
-    local URLS=(
-        "https://dl.nssurge.com/snell/snell-server-${VERSION_WITH_V}-${URL_ARCH}.zip"
-        "https://dl.nssurge.com/snell/snell-server-${VERSION_WITHOUT_V}-${URL_ARCH}.zip"
-        "https://dl.nssurge.com/snell/snell-server-${VERSION_WITHOUT_V}rc-${URL_ARCH}.zip"
-        "https://dl.nssurge.com/snell/snell-server-v${VERSION_WITHOUT_V}rc-${URL_ARCH}.zip"
-    )
-
-    local success=false
-    for url in "${URLS[@]}"; do
-        echo -e "${GREEN}[信息] 尝试从路径下载: ${url}${RESET}"
-        if wget --spider -q -T 5 "$url"; then
-            if wget -O snell.zip "$url"; then
-                success=true
-                break
-            fi
-        fi
-    done
-
-    if [ "$success" = false ]; then
-        echo -e "${YELLOW}[提示] 动态版本下载失败，尝试使用已知稳定的 v6.0.0rc 保底下载...${RESET}"
-        local FALLBACK_URL="https://dl.nssurge.com/snell/snell-server-v6.0.0rc-${URL_ARCH}.zip"
-        if wget -O snell.zip "$FALLBACK_URL"; then
-            success=true
-        fi
-    fi
-
-    if [ "$success" = false ]; then
-        echo -e "${RED}[错误] 无法连接到官方下载服务器，请检查网络。${RESET}"
-        return 1
-    fi
-
-    unzip -o snell.zip -d "$SNELL_DIR"
-    rm -f snell.zip
-    chmod +x "$SNELL_DIR/snell-server"
-}
-
-# ================== 安装 Snell ==================
-install_snell() {
-    echo -e "${GREEN}[信息] 正在获取官方最新版本号...${RESET}"
-    local VERSION
-    VERSION=$(get_latest_snell_version)
-    echo -e "${GREEN}[信息] 检测到官方最新版本号为: ${VERSION}${RESET}"
-
-    create_user
-    mkdir -p "$SNELL_DIR"
-    cd "$SNELL_DIR"
-
-    download_and_extract_snell "$VERSION" || return
-    configure_snell
-
-    cat > "$SNELL_SERVICE" <<EOF
-[Unit]
-Description=Snell v6 Independent Server
-After=network.target
-
-[Service]
-ExecStart=$SNELL_DIR/snell-server -c $SNELL_CONFIG
-Restart=on-failure
-User=$SNELL_USER
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable snellv6
-    systemctl start snellv6
-    echo -e "${GREEN}[完成] Snell v6 独立服务已成功安装并启动！${RESET}"
-    log "Snell v6 已安装并启动 (${VERSION})"
-}
-
-# ================== 更新 Snell ==================
-update_snell() {
-    if [ ! -f "$SNELL_CONFIG" ]; then
-        echo -e "${RED}未找到配置文件，无法更新${RESET}"
+    # 1. 配置端口
+    echo -ne "${YELLOW}请输入服务访问端口 [默认: 3002]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3002"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -e "${GREEN}[信息] 正在获取官方最新版本号...${RESET}"
-    local VERSION
-    VERSION=$(get_latest_snell_version)
-    echo -e "${GREEN}[信息] 检测到官方最新版本为: ${VERSION}${RESET}"
-
-    systemctl stop snellv6 || true
-    cd "$SNELL_DIR"
-
-    download_and_extract_snell "$VERSION" || return
-    systemctl restart snellv6
-
-    echo -e "${GREEN}[完成] Snell v6 已更新至 ${VERSION}${RESET}"
-    log "Snell v6 已更新 (${VERSION})"
-}
-
-# ================== 卸载 Snell ==================
-uninstall_snell() {
-    echo -e "${RED}[警告] 正在彻底卸载 Snell v6 独立服务...${RESET}"
-    systemctl stop snellv6 || true
-    systemctl disable snellv6 || true
-    rm -f "$SNELL_SERVICE"
-    rm -rf "$SNELL_DIR"
-    systemctl daemon-reload
-    echo -e "${GREEN}[完成] Snell v6 已卸载${RESET}"
-    log "Snell v6 已卸载"
-}
-
-# ================== 菜单面版 ==================
-show_menu() {
-    clear
-    if systemctl is-active --quiet snellv6; then
-        STATUS="${GREEN}● 运行中${RESET}"
+    # 2. 配置图片挂载目录
+    echo -ne "${YELLOW}请输入图片存储目录 [默认: /opt/gallery/pictures]: ${RESET}"
+    read -r input_pictures_dir
+    if [[ -n "$input_pictures_dir" ]]; then
+        PICTURES_DIR="$input_pictures_dir"
     else
-        STATUS="${RED}● 未运行${RESET}"
+        PICTURES_DIR="/opt/gallery/pictures"
     fi
 
-    VERSION_SHOW="未安装"
-    if [ -x "$SNELL_DIR/snell-server" ]; then
-        VERSION_SHOW=$("$SNELL_DIR/snell-server" -v 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?')
-        [ -z "$VERSION_SHOW" ] && VERSION_SHOW=$("$SNELL_DIR/snell-server" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?')
-        [ -z "$VERSION_SHOW" ] && VERSION_SHOW="未知版本"
+    # 3. 配置应用数据存储目录
+    echo -ne "${YELLOW}请输入应用数据目录 [默认: /opt/gallery/data]: ${RESET}"
+    read -r input_data_dir
+    if [[ -n "$input_data_dir" ]]; then
+        DATA_DIR="$input_data_dir"
+    else
+        DATA_DIR="/opt/gallery/data"
     fi
 
-    LISTEN_SHOW="-"
-    if [ -f "$SNELL_CONFIG" ]; then
-        LISTEN_SHOW=$(grep '^listen' "$SNELL_CONFIG" | awk -F'= ' '{print $2}')
-    fi
+    # 自动创建目录并赋予权限
+    mkdir -p "$PICTURES_DIR" "$DATA_DIR"
+    chmod -R 777 "$PICTURES_DIR" "$DATA_DIR" "$BASE_DIR"
 
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈   Snell v6 管理面板   ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $STATUS"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}$VERSION_SHOW${RESET}"
-    echo -e "${GREEN}绑定   :${RESET} ${YELLOW}$LISTEN_SHOW${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Snell v6${RESET}"
-    echo -e "${GREEN}2. 更新 Snell v6${RESET}"
-    echo -e "${GREEN}3. 卸载 Snell v6${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Snell v6${RESET}"
-    echo -e "${GREEN}6. 停止 Snell v6${RESET}"
-    echo -e "${GREEN}7. 重启 Snell v6${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    # 保存配置到 .env 文件
+    cat <<EOF > "$ENV_FILE"
+PICTURES_DIR=${PICTURES_DIR}
+DATA_DIR=${DATA_DIR}
+EOF
+
+    # 生成 docker-compose.yml
+    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  gallery:
+    image: eureka6688/pixhelf:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:3002"
+    volumes:
+      - ${PICTURES_DIR}:/pictures:ro
+      - ${DATA_DIR}:/data
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Pixhelf Gallery 服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}          Pixhelf Gallery 部署及启动成功！          ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}图片存储目录 : $PICTURES_DIR (只读挂载)${RESET}"
+    echo -e "${YELLOW}应用数据目录 : $DATA_DIR${RESET}"
+    echo -e "${CYAN}提示: 请将你需要展示的图片放入上面列出的图片存储目录中。${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# ================== 主循环 ==================
-while true; do
-    show_menu
-    read -r -p $'\033[32m请输入选项: \033[0m' choice
-    case $choice in
-        1) install_snell; pause ;;
-        2) update_snell; pause ;;
-        3) uninstall_snell; pause ;;
-        4) configures_snell; systemctl restart snellv6; pause ;;
-        5) systemctl start snellv6; echo -e "${GREEN}[完成] 已启动${RESET}"; pause ;;
-        6) systemctl stop snellv6; echo -e "${GREEN}[完成] 已停止${RESET}"; pause ;;
-        7) systemctl restart snellv6; echo -e "${GREEN}[完成] 已重启${RESET}"; pause ;;
-        8) journalctl -u snellv6 -e --no-pager; pause ;;
-        9)
-            if [ -f "$SNELL_CONFIG" ]; then
-                echo -e "${GREEN}====== Snell v6 内部配置文件 ======${RESET}"
-                cat "$SNELL_CONFIG"
-                echo -e "${GREEN}====== Surge 节点配置单行 ======${RESET}"
-                cat "$SNELL_DIR/config.txt"
-            else
-                echo -e "${RED}配置文件不存在${RESET}"
+# 更新镜像
+update_gallery() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+}
+
+# 卸载服务
+uninstall_gallery() {
+    load_env
+    echo -ne "${YELLOW}确定要卸载并删除 Pixhelf Gallery 容器吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            
+            echo -e "${YELLOW}当前配置的目录信息：${RESET}"
+            echo -e "  - 基础配置路径: $BASE_DIR"
+            echo -e "  - 图片存储路径: $PICTURES_DIR"
+            echo -e "  - 应用数据路径: $DATA_DIR"
+            
+            echo -ne "${YELLOW}是否同时彻底删除上述所有图片及应用数据目录？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                rm -rf "$PICTURES_DIR"
+                rm -rf "$DATA_DIR"
+                echo -e "${GREEN}配置、图片及数据目录已彻底清理。${RESET}"
             fi
-            pause ;;
+        else
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
+}
+
+start_gallery() {
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"
+    else
+        echo -e "${RED}未找到配置文件，请先部署服务。${RESET}"
+    fi
+}
+
+stop_gallery() {
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"
+    else
+        echo -e "${RED}未找到配置文件，请先部署服务。${RESET}"
+    fi
+}
+
+restart_gallery() {
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"
+    else
+        echo -e "${RED}未找到配置文件，请先部署服务。${RESET}"
+    fi
+}
+
+logs_gallery() { 
+    echo -e "${CYAN}--- 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
+    docker logs -f "$CONTAINER_NAME"
+}
+
+show_info() {
+    get_status_info
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}图片存储目录 : ${PICTURES_DIR}${RESET}"
+    echo -e "${YELLOW}应用数据目录 : ${DATA_DIR}${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+}
+
+menu() {
+    clear
+    get_status_info
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}    ◈  Pixhelf Gallery  ◈    ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
+    case "$choice" in
+        1) install_gallery ;;
+        2) update_gallery ;;
+        3) uninstall_gallery ;;
+        4) start_gallery ;;
+        5) stop_gallery ;;
+        6) restart_gallery ;;
+        7) logs_gallery ;;
+        8) show_info ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效输入${RESET}"; pause ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
+}
+
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
 done

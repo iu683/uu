@@ -1,65 +1,102 @@
 #!/bin/bash
 # =================================================================
-# Aegis-Relay Emby 多服务器反向代理管理面板 自动化管理面板
+# MTProto (mtg) 代理 Docker Compose 多节点管理面板 (Surge 兼容版)
 # =================================================================
 
-# 颜色定义
+# 颜色
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="aegis-relay"
-BASE_DIR="/opt/aegis-relay"
-SRC_DIR="$BASE_DIR"
-REPO_URL="https://github.com/bear4f/aegis-relay.git"
+# 基础持久化路径
+GLOBAL_BASE="/opt/mtg-multinode"
+mkdir -p "$GLOBAL_BASE"
 
-# 检测基础依赖
+# 默认节点名
+INSTANCE_FILE="$GLOBAL_BASE/.current_instance"
+if [[ -f "$INSTANCE_FILE" ]]; then
+    CURRENT_INSTANCE=$(cat "$INSTANCE_FILE")
+else
+    CURRENT_INSTANCE="node-1"
+    echo "$CURRENT_INSTANCE" > "$INSTANCE_FILE"
+fi
+
+# 根据当前节点动态计算路径和容器名
+update_instance_env() {
+    CONTAINER_NAME="mtg-${CURRENT_INSTANCE}"
+    BASE_DIR="${GLOBAL_BASE}/${CURRENT_INSTANCE}"
+    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+    ENV_FILE="$BASE_DIR/.env"
+    CONFIG_FILE="$BASE_DIR/config.toml"
+}
+update_instance_env
+
+# 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
+    if ! docker compose version &> /dev/null && ! command -v docker-compose &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker Compose 插件！${RESET}"
         exit 1
     fi
-    if ! command -v openssl &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 OpenSSL，请先安装 OpenSSL！${RESET}"
+    if ! command -v wget &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 wget，请先安装 (如: apt install wget)${RESET}"
         exit 1
     fi
 }
 
-# 动态获取服务端口与运行状态
-get_status_info() {
-    if ! command -v docker &> /dev/null; then
-        status="${RED}未安装 Docker${RESET}"
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-        data_dir="N/A"
-        return 0
-    fi
-    local container_id=$(docker ps -q -f "name=aegis-relay" -f "status=running" 2>/dev/null)
-
-    if [[ -n "$container_id" ]]; then
-        status="${GREEN}运行中${RESET}"
-        admin_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9080/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
-        proxy_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
-        [[ -z "$admin_port" ]] && admin_port="9080"
-        [[ -z "$proxy_port" ]] && proxy_port="8080"
-    else
-        if [ -d "$SRC_DIR/.git" ]; then
-            status="${RED}已停止${RESET}"
-        else
-            status="${RED}未部署${RESET}"
+# 随机端口生成函数
+random_port() {
+    local port
+    while true; do
+        port=$((RANDOM % 16383 + 49152))
+        if ! ss -tuln | grep -q ":$port "; then
+            echo "$port"
+            return 0
         fi
-        admin_port="N/A"
-        proxy_port="N/A"
+    done
+}
+
+# 检查端口是否被占用
+check_port() {
+    local port=$1
+    if ss -tuln | grep -q ":$port "; then
+        echo -e "${RED}错误: 端口 $port 已被占用，请更换端口或选择随机端口！${RESET}"
+        return 1
+    fi
+    return 0
+}
+
+# 动态获取当前节点的状态及配置参数
+get_status_info() {
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${GREEN}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${YELLOW}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    if [[ -f "$ENV_FILE" ]]; then
+        source "$ENV_FILE"
+        mtg_port="${MTG_PORT:-N/A}"
+    else
+        mtg_port="N/A"
+    fi
+
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+    else
+        img_version="${RED}未安装${RESET}"
     fi
 }
 
-# 获取服务器公网 IP
+# 获取公网 IP
 get_public_ip() {
     local mode=${1:-"auto"}
     local ip=""
@@ -83,188 +120,244 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署核心逻辑
-install_translate() {
-    check_dependencies
-    mkdir -p "$BASE_DIR"
-
-    echo -e "${CYAN}====== 1. 端口与网络配置 ======${RESET}"
-
-    echo -ne "${YELLOW}管理后台绑定 IP (0.0.0.0 为全网开放，127.0.0.1 为本地独占) [默认: 0.0.0.0]: ${RESET}"
-    read -r admin_pub_ip
-    [[ -z "$admin_pub_ip" ]] && admin_pub_ip="0.0.0.0"
-
-    echo -ne "${YELLOW}代理服务绑定 IP (0.0.0.0 为全网开放，127.0.0.1 为本地独占) [默认: 0.0.0.0]: ${RESET}"
-    read -r proxy_pub_ip
-    [[ -z "$proxy_pub_ip" ]] && proxy_pub_ip="0.0.0.0"
-
-    # 克隆官方仓库到当前工作目录
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "\n${YELLOW}正在克隆 Aegis-Relay GitHub 仓库...${RESET}"
-        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
-        if [ $? -eq 0 ]; then
-            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
-            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
-            rm -rf "$SRC_DIR/tmp_repo"
-        else
-            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
-            exit 1
-        fi
-    else
-        echo -e "\n${GREEN}检测到本地已存在仓库，正在同步最新代码...${RESET}"
-        cd "$SRC_DIR" && git pull
+# 编号切换/新建节点
+switch_instance() {
+    clear
+    echo -e "${GREEN}====== 节点切换与添加 ======${RESET}"
+    echo -e "${YELLOW}当前已检测到以下节点：${RESET}"
+    
+    local idx=1
+    declare -A instance_map
+    
+    if [[ ! -d "$GLOBAL_BASE/node-1" ]]; then
+        mkdir -p "$GLOBAL_BASE/node-1"
     fi
 
-    cd "$SRC_DIR"
+    for dir in $(ls -1 "$GLOBAL_BASE" | grep -v '^\.'); do
+        if [[ "$dir" == "$CURRENT_INSTANCE" ]]; then
+            echo -e " ${GREEN}[${idx}] ${dir}${RESET} ${YELLOW}(当前选择)${RESET}"
+        else
+            echo -e " ${GREEN}[${idx}] ${dir}${RESET}"
+        fi
+        instance_map[$idx]="$dir"
+        ((idx++))
+    done
+    
+    echo -e " ${YELLOW}[n] 添加节点${RESET}"
+    echo -e " ${RED}[0] 返回主菜单${RESET}"
+    echo -e "${GREEN}---------------------------${RESET}"
+    echo -ne "${YELLOW}请输入对应编号: ${RESET}"
+    read -r inst_choice
 
-    # 预先创建本地映射目录并补全读写权限（对应容器 10001 用户）
-    echo -e "${YELLOW}正在创建并初始化本地数据存储目录 (${SRC_DIR}/data)...${RESET}"
-    mkdir -p "$SRC_DIR/data"
-    chmod -R 777 "$SRC_DIR/data"
-
-    # 生成安全随机 Token 与 Key
-    echo -e "${YELLOW}正在自动生成系统安全密钥与随机路径...${RESET}"
-    MASTER_KEY_VAL=$(openssl rand -hex 32)
-    SETUP_TOKEN_VAL=$(openssl rand -hex 16)
-    RANDOM_ADMIN_PATH="admin_$(openssl rand -hex 6)"
-
-    # 写入 .env 配置文件
-    echo -e "${YELLOW}正在配置 .env 环境变量...${RESET}"
-    cat <<EOF > .env
-APP_MASTER_KEY=${MASTER_KEY_VAL}
-SETUP_TOKEN=${SETUP_TOKEN_VAL}
-ADMIN_PATH=${RANDOM_ADMIN_PATH}
-ADMIN_HOST=0.0.0.0
-ADMIN_PORT=9080
-ADMIN_PUBLISH_IP=${admin_pub_ip}
-PROXY_HOST=0.0.0.0
-PROXY_PORT=8080
-PROXY_PUBLISH_IP=${proxy_pub_ip}
-SECURE_COOKIES=false
-PUBLIC_BASE_URL=
-LOCAL_PROXY_BASE_URL=
-CERTIFICATE_EMAIL=
-DATA_FILE=/app/data/aegis.enc.json
-EOF
-
-    # 编译并启动容器集群
-    echo -e "\n${YELLOW}正在执行 Docker 编译并启动服务...${RESET}"
-    docker compose up -d --build
-
-    echo -e "${YELLOW}正在等待容器编译并拉起服务 (约 5 秒)...${RESET}"
-    sleep 5
-
-    chmod -R 777 "$SRC_DIR/data" 2>/dev/null
-
-    get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}       Aegis-Relay 容器编译并启动成功！        ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}后台管理地址 : http://${DETECT_IP}:9080/${RANDOM_ADMIN_PATH}${RESET}"
-    echo -e "${YELLOW}初始化 Token : ${SETUP_TOKEN_VAL}${RESET}"
-    echo -e "${YELLOW}代理服务端口 : 8080${RESET}"
-    echo -e "${YELLOW}本地数据路径 : ${SRC_DIR}/data${RESET}"
-    echo -e "${YELLOW}项目所在路径 : ${SRC_DIR}${RESET}"
-    echo -e "${GREEN}----------------------------------------------------${RESET}"
-    echo -e "${CYAN}🔑 首次安装登录提示：${RESET}"
-    echo -e "${YELLOW}   - 访问后台需附带随机路径：/${RANDOM_ADMIN_PATH}${RESET}"
-    echo -e "${YELLOW}   - 使用设置 Token (${SETUP_TOKEN_VAL}) 完成初始化账号注册。${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-
-# 原生更新：拉取代码 + 重新 Build
-update_translate() {
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
+    if [[ "$inst_choice" == "0" ]]; then
+        return
+    elif [[ "$inst_choice" == "n" || "$inst_choice" == "N" ]]; then
+        echo -ne "${YELLOW}请输入新节点的名称 (建议字母加数字，如 node-2): ${RESET}"
+        read -r new_name
+        if [[ -z "$new_name" ]]; then
+            echo -e "${RED}错误：节点名不能为空！${RESET}"
+            sleep 2
+            return
+        fi
+        CURRENT_INSTANCE="$new_name"
+    elif [[ -n "${instance_map[$inst_choice]}" ]]; then
+        CURRENT_INSTANCE="${instance_map[$inst_choice]}"
+    else
+        echo -e "${RED}无效选择！${RESET}"
+        sleep 1
         return
     fi
 
-    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
-    cd "$SRC_DIR" && git pull
-    
-    echo -e "${YELLOW}正在使用 docker compose 重编镜像并热更新...${RESET}"
-    docker compose up -d --build --remove-orphans
-    
-    chmod -R 777 "$SRC_DIR/data" 2>/dev/null
-    echo -e "${GREEN}Aegis-Relay 镜像更新并重编完成！${RESET}"
+    # 保存并更新环境
+    echo "$CURRENT_INSTANCE" > "$INSTANCE_FILE"
+    update_instance_env
+    echo -e "${GREEN}成功切换至节点: ${CURRENT_INSTANCE}${RESET}"
+    sleep 1.5
 }
 
-# 彻底卸载
-uninstall_translate() {
-    echo -ne "${RED}确定要停止并卸载 Aegis-Relay 容器吗？(y/n): ${RESET}"
+# 部署当前节点
+install_utils() {
+    check_dependencies
+    
+    mkdir -p "$BASE_DIR"
+
+    echo -e "${CYAN}====== 部署 MTProto 节点: [ ${CURRENT_INSTANCE} ] ======${RESET}"
+    
+    # 1. 配置监听端口
+    echo -ne "${YELLOW}请输入监听端口 [默认随机]: ${RESET}"
+    read -r input_port
+    if [[ -z "$input_port" ]]; then
+        PORT=$(random_port)
+        echo -e "${GREEN}已自动生成随机端口: $PORT${RESET}"
+    else
+        PORT=$input_port
+        if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+            return
+        fi
+    fi
+
+    check_port "$PORT" || return
+
+    # 2. 生成兼容 Surge 的密钥 (优先生成 32位 Hex 密钥并带 dd 混淆前缀)
+    echo -e "${YELLOW}正在生成兼容 Surge 客户端的 Secret (dd+32位Hex)...${RESET}"
+    # 生成 16 字节 (32字符) 随机 hex
+    HEX_RAW=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | xxd -p)
+    SECRET="dd${HEX_RAW}"
+
+    # 3. 写入 .env 文件
+    cat <<EOF > "$ENV_FILE"
+MTG_PORT=${PORT}
+MTG_SECRET=${SECRET}
+EOF
+
+    # 4. 生成 config.toml
+    cat > "$CONFIG_FILE" <<EOF
+secret = "$SECRET"
+bind-to = "0.0.0.0:${PORT}"
+EOF
+
+    # 5. 生成 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  mtg:
+    image: nineseconds/mtg:master
+    container_name: ${CONTAINER_NAME}
+    network_mode: host
+    restart: always
+    command: run /config.toml
+    volumes:
+      - ./config.toml:/config.toml
+EOF
+
+    echo -e "${YELLOW}正在启动节点 [ ${CURRENT_INSTANCE} ] ...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
+
+    DETECT_IP=$(get_public_ip)
+
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${GREEN} 节点 [ ${CURRENT_INSTANCE} ] 部署成功！             ${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${YELLOW}绑定容器名     : ${CONTAINER_NAME}${RESET}"
+    echo -e "${YELLOW}服务器端口     : ${PORT}${RESET}"
+    echo -e "${YELLOW}混淆密钥 (Secret): ${SECRET}${RESET}"
+    echo -e "${CYAN}Telegram 点击直连内置链接:${RESET}"
+    echo -e "${GREEN}tg://proxy?server=${DETECT_IP}&port=${PORT}&secret=${SECRET}${RESET}"
+    echo -e "${GREEN}------------------------------------------------${RESET}"
+    echo -e "${CYAN}Surge 配置文件格式片段 (${YELLOW}导出时 Surge 会遮罩 Secret${CYAN}):${RESET}"
+    echo -e "${YELLOW}[MTProto]${RESET}"
+    echo -e "interface = 127.0.0.1"
+    echo -e "port = ${PORT}"
+    echo -e "secret = ${SECRET}"
+    echo -e "ipv6 = true"
+    echo -e "${GREEN}================================================${RESET}"
+}
+
+# 更新当前节点镜像
+update_utils() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 当前节点未部署配置文件！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}当前节点更新完成！${RESET}"
+}
+
+# 卸载当前节点
+uninstall_utils() {
+    echo -ne "${YELLOW}确定要卸载并删除节点 [ ${CURRENT_INSTANCE} ] 吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -d "$SRC_DIR/.git" ]; then
-            cd "$SRC_DIR" && docker compose down
-            echo -e "${GREEN}容器已被安全停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否彻底删除本地【源码、配置文件及 ./data 加密数据库】？(y/n): ${RESET}"
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除当前节点的本地配置文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有源码与持久化数据已被彻底清除！${RESET}"
+                echo -e "${GREEN}该节点文件夹已彻底清理。${RESET}"
+                echo "node-1" > "$INSTANCE_FILE"
+                update_instance_env
             fi
         else
-            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 基于 Compose 文件的生命周期联动
-start_translate() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}Aegis-Relay 服务已启动${RESET}"; }
-stop_translate() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}Aegis-Relay 服务已停止${RESET}"; }
-restart_translate() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}Aegis-Relay 服务已重启${RESET}"; }
-logs_translate() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
+start_utils() { cd "$BASE_DIR" 2>/dev/null && docker compose start && echo -e "${GREEN}节点容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" 2>/dev/null && docker compose stop && echo -e "${YELLOW}节点容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" 2>/dev/null && docker compose restart && echo -e "${GREEN}节点容器已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    local DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}集群运行状态     : $status"
-    echo -e "${YELLOW}代理监听端口     : ${proxy_port}"
-    if [ -f "$SRC_DIR/.env" ]; then
-        local admin_path_val=$(grep "^ADMIN_PATH=" "$SRC_DIR/.env" | cut -d '=' -f2-)
-        local setup_token_val=$(grep "^SETUP_TOKEN=" "$SRC_DIR/.env" | cut -d '=' -f2-)
-        echo -e "${YELLOW}后台管理地址     : http://${DETECT_IP}:${admin_port}/${admin_path_val}${RESET}"
-        echo -e "${YELLOW}初始化 Token     : ${setup_token_val}${RESET}"
+    if [ -f "$ENV_FILE" ]; then
+        source "$ENV_FILE"
+        DETECT_IP=$(get_public_ip)
+        echo -e "${GREEN}================================================${RESET}"
+        echo -e "${YELLOW}当前管理节点   : ${CYAN}${CURRENT_INSTANCE}${RESET}"
+        echo -e "${YELLOW}状态           : $status"
+        echo -e "${YELLOW}容器名称       : ${CONTAINER_NAME}${RESET}"
+        echo -e "${YELLOW}后端镜像       : ${img_version}${RESET}"
+        echo -e "${YELLOW}代理端口       : ${MTG_PORT}${RESET}"
+        echo -e "${YELLOW}混淆密钥       : ${MTG_SECRET}${RESET}"
+        echo -e "${GREEN}------------------------------------------------${RESET}"
+        echo -e "${CYAN}Telegram 快捷连接链接:${RESET}"
+        echo -e "${GREEN}tg://proxy?server=${DETECT_IP}&port=${MTG_PORT}&secret=${MTG_SECRET}${RESET}"
+        echo -e "${GREEN}------------------------------------------------${RESET}"
+        echo -e "${CYAN}Surge 配置文件格式片段:${RESET}"
+        echo -e "${YELLOW}[MTProto]${RESET}"
+        echo -e "interface = 127.0.0.1"
+        echo -e "port = ${MTG_PORT}"
+        echo -e "secret = ${MTG_SECRET}"
+        echo -e "ipv6 = true"
+        echo -e "${GREEN}================================================${RESET}"
     else
-        echo -e "${YELLOW}后台管理地址     : http://${DETECT_IP}:${admin_port}${RESET}"
+        echo -e "${RED}未检测到当前节点的部署环境文件。${RESET}"
     fi
-    echo -e "${YELLOW}本地数据存储     : ${SRC_DIR}/data${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN} ◈AegisRelay Emby反向代理管理面板◈ ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}服务状态 :${RESET} $status"
-    echo -e "${GREEN}管理端口 :${RESET} ${YELLOW}${admin_port}${RESET}"
-    echo -e "${GREEN}代理端口 :${RESET} ${YELLOW}${proxy_port}${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}  ◈ MTProto 多节点管理面板 ◈   ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}当前管理节点 :${RESET} ${CYAN}${CURRENT_INSTANCE}${RESET}"
+    echo -e "${GREEN}当前节点状态 :${RESET} $status"
+    echo -e "${GREEN}当前节点端口 :${RESET} ${YELLOW}[ ${mtg_port} ]${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 部署当前节点${RESET}"
+    echo -e "${GREEN}2. 更新当前节点${RESET}"
+    echo -e "${GREEN}3. 卸载当前节点${RESET}"
+    echo -e "${GREEN}4. 启动当前节点${RESET}"
+    echo -e "${GREEN}5. 停止当前节点${RESET}"
+    echo -e "${GREEN}6. 重启当前节点${RESET}"
+    echo -e "${GREEN}7. 查看当前节点日志${RESET}"
+    echo -e "${GREEN}8. 查看当前节点配置${RESET}"
+    echo -e "${GREEN}9. 管理节点${RESET}  ${YELLOW}← 添加 / 切换节点${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
         8) show_info ;;
+        9) switch_instance ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

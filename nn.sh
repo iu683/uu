@@ -1,37 +1,19 @@
 #!/bin/bash
 # =================================================================
-# MTProto (mtg) 代理 Docker Compose 多节点管理面板 (Surge 兼容版)
+# StorageUI Docker Compose 管理面板 
 # =================================================================
 
-# 颜色
+# 颜色定义
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-# 基础持久化路径
-GLOBAL_BASE="/opt/mtg-multinode"
-mkdir -p "$GLOBAL_BASE"
-
-# 默认节点名
-INSTANCE_FILE="$GLOBAL_BASE/.current_instance"
-if [[ -f "$INSTANCE_FILE" ]]; then
-    CURRENT_INSTANCE=$(cat "$INSTANCE_FILE")
-else
-    CURRENT_INSTANCE="node-1"
-    echo "$CURRENT_INSTANCE" > "$INSTANCE_FILE"
-fi
-
-# 根据当前节点动态计算路径和容器名
-update_instance_env() {
-    CONTAINER_NAME="mtg-${CURRENT_INSTANCE}"
-    BASE_DIR="${GLOBAL_BASE}/${CURRENT_INSTANCE}"
-    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-    ENV_FILE="$BASE_DIR/.env"
-    CONFIG_FILE="$BASE_DIR/config.toml"
-}
-update_instance_env
+CONTAINER_NAME="storage-ui"
+BASE_DIR="/opt/storageui"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -39,64 +21,60 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! docker compose version &> /dev/null && ! command -v docker-compose &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker Compose 插件！${RESET}"
-        exit 1
-    fi
-    if ! command -v wget &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 wget，请先安装 (如: apt install wget)${RESET}"
-        exit 1
+}
+
+# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
+format_ip_for_url() {
+    local ip="$1"
+    if [[ "$ip" == *":"* ]]; then
+        echo "[$ip]"
+    else
+        echo "$ip"
     fi
 }
 
-# 随机端口生成函数
-random_port() {
-    local port
-    while true; do
-        port=$((RANDOM % 16383 + 49152))
-        if ! ss -tuln | grep -q ":$port "; then
-            echo "$port"
-            return 0
-        fi
-    done
-}
-
-# 检查端口是否被占用
-check_port() {
-    local port=$1
-    if ss -tuln | grep -q ":$port "; then
-        echo -e "${RED}错误: 端口 $port 已被占用，请更换端口或选择随机端口！${RESET}"
-        return 1
-    fi
-    return 0
-}
-
-# 动态获取当前节点的状态及配置参数
+# 动态获取容器状态并联动健康检查
 get_status_info() {
+    if ! command -v docker &> /dev/null; then
+        status="${RED}未安装 Docker${RESET}"
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        return 0
+    fi
+    
+    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${GREEN}运行中${RESET}"
+        local health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        if [[ "$health_status" == "healthy" ]]; then
+            status="${GREEN}运行中 (健康)${RESET}"
+        elif [[ "$health_status" == "unhealthy" ]]; then
+            status="${RED}运行中 (不健康)${RESET}"
+        elif [[ "$health_status" == "starting" ]]; then
+            status="${YELLOW}运行中 (启动中)${RESET}"
+        else
+            status="${GREEN}运行中${RESET}"
+        fi
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}已停止${RESET}"
+        status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    if [[ -f "$ENV_FILE" ]]; then
-        source "$ENV_FILE"
-        mtg_port="${MTG_PORT:-N/A}"
-    else
-        mtg_port="N/A"
-    fi
-
+    # 2. 如果容器存在，提取镜像版本与主机端口
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
+
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
     else
         img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
     fi
 }
 
-# 获取公网 IP
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
     local mode=${1:-"auto"}
     local ip=""
@@ -120,170 +98,132 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 编号切换/新建节点
-switch_instance() {
-    clear
-    echo -e "${GREEN}====== 节点切换与添加 ======${RESET}"
-    echo -e "${YELLOW}当前已检测到以下节点：${RESET}"
-    
-    local idx=1
-    declare -A instance_map
-    
-    if [[ ! -d "$GLOBAL_BASE/node-1" ]]; then
-        mkdir -p "$GLOBAL_BASE/node-1"
-    fi
-
-    for dir in $(ls -1 "$GLOBAL_BASE" | grep -v '^\.'); do
-        if [[ "$dir" == "$CURRENT_INSTANCE" ]]; then
-            echo -e " ${GREEN}[${idx}] ${dir}${RESET} ${YELLOW}(当前选择)${RESET}"
-        else
-            echo -e " ${GREEN}[${idx}] ${dir}${RESET}"
-        fi
-        instance_map[$idx]="$dir"
-        ((idx++))
-    done
-    
-    echo -e " ${YELLOW}[n] 添加节点${RESET}"
-    echo -e " ${RED}[0] 返回主菜单${RESET}"
-    echo -e "${GREEN}---------------------------${RESET}"
-    echo -ne "${YELLOW}请输入对应编号: ${RESET}"
-    read -r inst_choice
-
-    if [[ "$inst_choice" == "0" ]]; then
-        return
-    elif [[ "$inst_choice" == "n" || "$inst_choice" == "N" ]]; then
-        echo -ne "${YELLOW}请输入新节点的名称 (建议字母加数字，如 node-2): ${RESET}"
-        read -r new_name
-        if [[ -z "$new_name" ]]; then
-            echo -e "${RED}错误：节点名不能为空！${RESET}"
-            sleep 2
-            return
-        fi
-        CURRENT_INSTANCE="$new_name"
-    elif [[ -n "${instance_map[$inst_choice]}" ]]; then
-        CURRENT_INSTANCE="${instance_map[$inst_choice]}"
-    else
-        echo -e "${RED}无效选择！${RESET}"
-        sleep 1
-        return
-    fi
-
-    # 保存并更新环境
-    echo "$CURRENT_INSTANCE" > "$INSTANCE_FILE"
-    update_instance_env
-    echo -e "${GREEN}成功切换至节点: ${CURRENT_INSTANCE}${RESET}"
-    sleep 1.5
-}
-
-# 部署当前节点
-install_utils() {
+# 部署 StorageUI 并初始化默认配置
+install_storageui() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 部署 MTProto 节点: [ ${CURRENT_INSTANCE} ] ======${RESET}"
-    
-    # 1. 配置监听端口
-    echo -ne "${YELLOW}请输入监听端口 [默认随机]: ${RESET}"
-    read -r input_port
-    if [[ -z "$input_port" ]]; then
-        PORT=$(random_port)
-        echo -e "${GREEN}已自动生成随机端口: $PORT${RESET}"
-    else
-        PORT=$input_port
-        if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-            return
-        fi
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 3000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3000"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
     fi
 
-    check_port "$PORT" || return
+    # 修改默认选项为 y
+    echo -ne "${YELLOW}是否设置登录账号密码？(y/n) [默认: y]: ${RESET}"
+    read -r set_auth
+    [[ -z "$set_auth" ]] && set_auth="y" # 如果直接回车，则默认为 y
 
-    # 2. 生成兼容 Surge 的密钥 (优先生成 32位 Hex 密钥并带 dd 混淆前缀)
-    echo -e "${YELLOW}正在生成兼容 Surge 客户端的 Secret (dd+32位Hex)...${RESET}"
-    # 生成 16 字节 (32字符) 随机 hex
-    HEX_RAW=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | xxd -p)
-    SECRET="dd${HEX_RAW}"
+    local auth_username=""
+    local auth_password=""
+    local auth_secret=""
 
-    # 3. 写入 .env 文件
-    cat <<EOF > "$ENV_FILE"
-MTG_PORT=${PORT}
-MTG_SECRET=${SECRET}
+    if [[ "$set_auth" == "y" || "$set_auth" == "Y" ]]; then
+        echo -ne "${YELLOW}请输入登录用户名 [默认: admin]: ${RESET}"
+        read -r auth_username
+        [[ -z "$auth_username" ]] && auth_username="admin" # 可选：顺便给用户名加个默认值
+
+        echo -ne "${YELLOW}请输入登录密码: ${RESET}"
+        read -r auth_password
+        
+        # 生成随机 SESSION 密钥
+        auth_secret=$(LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 32)
+    fi
+    
+
+    # 如果 .env 配置文件不存在，写入模板
+    if [[ ! -f "$ENV_FILE" ]]; then
+        echo -e "${YELLOW}正在初始化默认的 .env 配置文件...${RESET}"
+        cat <<EOF > "$ENV_FILE"
+NEXT_PUBLIC_APP_URL=http://localhost:${custom_port}
+
+# Serve under a sub-path, e.g. "/ui" (default: root).
+# NEXT_PUBLIC_BASE_PATH=
+# NEXT_PUBLIC_ASSET_PREFIX=
+
+# ─── Login (optional) ────────────────────────────────────────────────────────
+# Set both to require sign-in. AUTH_SECRET signs the session cookie (optional).
+AUTH_USERNAME=${auth_username}
+AUTH_PASSWORD=${auth_password}
+AUTH_SECRET=${auth_secret}
+
+# ─── Buckets (optional, server-only) ─────────────────────────────────────────
+# Number each bucket STORAGE_1_*, STORAGE_2_*, … Others can be added from the UI.
+
+# STORAGE_1_PROVIDER=s3         # s3 | r2 | alibaba | tencent | backblaze-b2 | minio | s3-compatible
+# STORAGE_1_BUCKET=my-bucket
+# STORAGE_1_REGION=us-east-1
+# STORAGE_1_ACCESS_KEY_ID=
+# STORAGE_1_SECRET_ACCESS_KEY=
 EOF
+    fi
 
-    # 4. 生成 config.toml
-    cat > "$CONFIG_FILE" <<EOF
-secret = "$SECRET"
-bind-to = "0.0.0.0:${PORT}"
-EOF
+    # 权限调整
+    chmod -R 777 "$BASE_DIR"
 
-    # 5. 生成 docker-compose.yml 配置文件
+    # 生成 docker-compose.yml
     echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  mtg:
-    image: nineseconds/mtg:master
+  storageui:
+    image: hahahumble/storageui:latest
     container_name: ${CONTAINER_NAME}
-    network_mode: host
-    restart: always
-    command: run /config.toml
-    volumes:
-      - ./config.toml:/config.toml
+    restart: unless-stopped
+    ports:
+      - "${custom_port}:3000"
+    env_file:
+      - .env
 EOF
 
-    echo -e "${YELLOW}正在启动节点 [ ${CURRENT_INSTANCE} ] ...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 StorageUI 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
-    sleep 3
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
 
-    DETECT_IP=$(get_public_ip)
-
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${GREEN} 节点 [ ${CURRENT_INSTANCE} ] 部署成功！             ${RESET}"
-    echo -e "${GREEN}================================================${RESET}"
-    echo -e "${YELLOW}绑定容器名     : ${CONTAINER_NAME}${RESET}"
-    echo -e "${YELLOW}服务器端口     : ${PORT}${RESET}"
-    echo -e "${YELLOW}混淆密钥 (Secret): ${SECRET}${RESET}"
-    echo -e "${CYAN}Telegram 点击直连内置链接:${RESET}"
-    echo -e "${GREEN}tg://proxy?server=${DETECT_IP}&port=${PORT}&secret=${SECRET}${RESET}"
-    echo -e "${GREEN}------------------------------------------------${RESET}"
-    echo -e "${CYAN}Surge 配置文件格式片段 (${YELLOW}导出时 Surge 会遮罩 Secret${CYAN}):${RESET}"
-    echo -e "${YELLOW}[MTProto]${RESET}"
-    echo -e "interface = 127.0.0.1"
-    echo -e "port = ${PORT}"
-    echo -e "secret = ${SECRET}"
-    echo -e "ipv6 = true"
-    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}          StorageUI 部署及启动成功！               ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}环境配置文件 : $ENV_FILE${RESET}"
+    if [[ -n "$auth_username" ]]; then
+        echo -e "${CYAN}登录凭据     : 用户名: ${auth_username} | 密码: ${auth_password}${RESET}"
+    else
+        echo -e "${CYAN}登录凭据     : 未设置登录认证（公开访问）${RESET}"
+    fi
+    echo -e "${CYAN}提示: 如需增加预设 S3 存储桶，可修改 .env 文件后重启容器。${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新当前节点镜像
-update_utils() {
+# 更新镜像
+update_storageui() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 当前节点未部署配置文件！${RESET}"
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
     echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}当前节点更新完成！${RESET}"
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载当前节点
-uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除节点 [ ${CURRENT_INSTANCE} ] 吗？(y/n): ${RESET}"
+# 卸载服务
+uninstall_storageui() {
+    echo -ne "${YELLOW}确定要卸载并删除 StorageUI 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除当前节点的本地配置文件？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有本地配置文件及数据目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}该节点文件夹已彻底清理。${RESET}"
-                echo "node-1" > "$INSTANCE_FILE"
-                update_instance_env
+                echo -e "${GREEN}配置及数据目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -292,72 +232,56 @@ uninstall_utils() {
     fi
 }
 
-start_utils() { cd "$BASE_DIR" 2>/dev/null && docker compose start && echo -e "${GREEN}节点容器已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" 2>/dev/null && docker compose stop && echo -e "${YELLOW}节点容器已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" 2>/dev/null && docker compose restart && echo -e "${GREEN}节点容器已重启${RESET}"; }
-logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+start_storageui() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_storageui() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_storageui() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_storageui() { 
+    echo -e "${CYAN}--- 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
+    docker logs -f "$CONTAINER_NAME"; 
+}
 
 show_info() {
     get_status_info
-    if [ -f "$ENV_FILE" ]; then
-        source "$ENV_FILE"
-        DETECT_IP=$(get_public_ip)
-        echo -e "${GREEN}================================================${RESET}"
-        echo -e "${YELLOW}当前管理节点   : ${CYAN}${CURRENT_INSTANCE}${RESET}"
-        echo -e "${YELLOW}状态           : $status"
-        echo -e "${YELLOW}容器名称       : ${CONTAINER_NAME}${RESET}"
-        echo -e "${YELLOW}后端镜像       : ${img_version}${RESET}"
-        echo -e "${YELLOW}代理端口       : ${MTG_PORT}${RESET}"
-        echo -e "${YELLOW}混淆密钥       : ${MTG_SECRET}${RESET}"
-        echo -e "${GREEN}------------------------------------------------${RESET}"
-        echo -e "${CYAN}Telegram 快捷连接链接:${RESET}"
-        echo -e "${GREEN}tg://proxy?server=${DETECT_IP}&port=${MTG_PORT}&secret=${MTG_SECRET}${RESET}"
-        echo -e "${GREEN}------------------------------------------------${RESET}"
-        echo -e "${CYAN}Surge 配置文件格式片段:${RESET}"
-        echo -e "${YELLOW}[MTProto]${RESET}"
-        echo -e "interface = 127.0.0.1"
-        echo -e "port = ${MTG_PORT}"
-        echo -e "secret = ${MTG_SECRET}"
-        echo -e "ipv6 = true"
-        echo -e "${GREEN}================================================${RESET}"
-    else
-        echo -e "${RED}未检测到当前节点的部署环境文件。${RESET}"
-    fi
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}环境配置文件 : ${ENV_FILE}${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈ MTProto 多节点管理面板 ◈   ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}当前管理节点 :${RESET} ${CYAN}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}当前节点状态 :${RESET} $status"
-    echo -e "${GREEN}当前节点端口 :${RESET} ${YELLOW}[ ${mtg_port} ]${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署当前节点${RESET}"
-    echo -e "${GREEN}2. 更新当前节点${RESET}"
-    echo -e "${GREEN}3. 卸载当前节点${RESET}"
-    echo -e "${GREEN}4. 启动当前节点${RESET}"
-    echo -e "${GREEN}5. 停止当前节点${RESET}"
-    echo -e "${GREEN}6. 重启当前节点${RESET}"
-    echo -e "${GREEN}7. 查看当前节点日志${RESET}"
-    echo -e "${GREEN}8. 查看当前节点配置${RESET}"
-    echo -e "${GREEN}9. 管理节点${RESET}  ${YELLOW}← 添加 / 切换节点${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}   ◈  StorageUI 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_utils ;;
-        2) update_utils ;;
-        3) uninstall_utils ;;
-        4) start_utils ;;
-        5) stop_utils ;;
-        6) restart_utils ;;
-        7) logs_utils ;;
+        1) install_storageui ;;
+        2) update_storageui ;;
+        3) uninstall_storageui ;;
+        4) start_storageui ;;
+        5) stop_storageui ;;
+        6) restart_storageui ;;
+        7) logs_storageui ;;
         8) show_info ;;
-        9) switch_instance ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

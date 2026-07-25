@@ -1,287 +1,417 @@
-#!/bin/bash
-# =================================================================
-# StorageUI Docker Compose 管理面板 
-# =================================================================
+#!/usr/bin/env bash
+#
+# vps_packet_test.sh
+# VPS 大小包优化 (小包优化/丢包大包) 通用测试脚本
+# 用法: 直接运行 ./vps_packet_test.sh，按提示交互输入
+#
+# 依赖: ping, mtr (或 mtr-tiny), iperf3 (可选，需要目标端配合起 iperf3 -s)
+#
 
-# 颜色定义
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\033[0m"
+set -o pipefail
 
-CONTAINER_NAME="storage-ui"
-BASE_DIR="/opt/storageui"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
+# ---------- 颜色 ----------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
 
-# 检测依赖
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
+line() { printf '%s\n' "------------------------------------------------------------"; }
+
+# ---------- 依赖检查 ----------
+check_deps() {
+    local missing=()
+    command -v ping >/dev/null 2>&1 || missing+=("ping")
+    command -v mtr  >/dev/null 2>&1 || missing+=("mtr")
+    command -v iperf3 >/dev/null 2>&1 || missing+=("iperf3(可选)")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${YELLOW}提示: 以下工具未检测到，相关测试项会自动跳过：${NC}"
+        printf '  - %s\n' "${missing[@]}"
+        echo -e "${YELLOW}macOS 可用: brew install mtr iperf3${NC}"
+        echo -e "${YELLOW}Debian/Ubuntu 可用: sudo apt install mtr-tiny iperf3${NC}"
+        echo
     fi
 }
 
-# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
-format_ip_for_url() {
-    local ip="$1"
-    if [[ "$ip" == *":"* ]]; then
-        echo "[$ip]"
-    else
-        echo "$ip"
+# ---------- 交互输入 ----------
+ask_inputs() {
+    echo -e "${BOLD}${CYAN}=== VPS 大小包优化测试脚本 ===${NC}"
+    line
+
+    read -rp "请输入目标 IP 或域名: " TARGET
+    while [ -z "$TARGET" ]; do
+        read -rp "目标不能为空，请重新输入: " TARGET
+    done
+
+    read -rp "Ping 测试次数 [默认 20]: " PING_COUNT
+    PING_COUNT=${PING_COUNT:-20}
+
+    read -rp "大包 ping 大小(字节) [默认 1400]: " BIG_SIZE
+    BIG_SIZE=${BIG_SIZE:-1400}
+
+    read -rp "小包 ping 大小(字节) [默认 56]: " SMALL_SIZE
+    SMALL_SIZE=${SMALL_SIZE:-56}
+
+    read -rp "是否运行 iperf3 吞吐测试? 需目标已开放 iperf3 -s (y/n) [默认 n]: " DO_IPERF
+    DO_IPERF=${DO_IPERF:-n}
+
+    if [[ "$DO_IPERF" =~ ^[Yy]$ ]]; then
+        read -rp "iperf3 端口 [默认 5201]: " IPERF_PORT
+        IPERF_PORT=${IPERF_PORT:-5201}
+        read -rp "iperf3 测试时长(秒) [默认 30]: " IPERF_TIME
+        IPERF_TIME=${IPERF_TIME:-30}
+        read -rp "iperf3 并发流数量 [默认 4]: " IPERF_STREAMS
+        IPERF_STREAMS=${IPERF_STREAMS:-4}
+        read -rp "是否同时测反向(-R, 服务器→本机) (y/n) [默认 y]: " IPERF_REVERSE
+        IPERF_REVERSE=${IPERF_REVERSE:-y}
     fi
+
+    read -rp "是否运行 mtr 路由对比(小包/大包)? (y/n) [默认 y]: " DO_MTR
+    DO_MTR=${DO_MTR:-y}
+    if [[ "$DO_MTR" =~ ^[Yy]$ ]]; then
+        read -rp "mtr 每种包大小发送次数 [默认 50]: " MTR_COUNT
+        MTR_COUNT=${MTR_COUNT:-50}
+    fi
+
+    OUTDIR="./vps_test_$(echo "$TARGET" | tr -c 'A-Za-z0-9._-' '_')_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$OUTDIR"
+
+    line
+    echo -e "${GREEN}配置确认:${NC}"
+    echo "  目标: $TARGET"
+    echo "  Ping次数: $PING_COUNT | 小包: ${SMALL_SIZE}B | 大包: ${BIG_SIZE}B"
+    [[ "$DO_IPERF" =~ ^[Yy]$ ]] && echo "  iperf3: 端口$IPERF_PORT, ${IPERF_TIME}s, ${IPERF_STREAMS}并发, 反向测试:${IPERF_REVERSE}"
+    [[ "$DO_MTR" =~ ^[Yy]$ ]] && echo "  mtr: 每种包${MTR_COUNT}次"
+    echo "  结果保存目录: $OUTDIR"
+    line
+    read -rp "按回车开始测试，或 Ctrl+C 取消..." _
 }
 
-# 动态获取容器状态并联动健康检查
-get_status_info() {
-    if ! command -v docker &> /dev/null; then
-        status="${RED}未安装 Docker${RESET}"
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-        return 0
-    fi
-    
-    # 1. 检查容器状态
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        local health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        if [[ "$health_status" == "healthy" ]]; then
-            status="${GREEN}运行中 (健康)${RESET}"
-        elif [[ "$health_status" == "unhealthy" ]]; then
-            status="${RED}运行中 (不健康)${RESET}"
-        elif [[ "$health_status" == "starting" ]]; then
-            status="${YELLOW}运行中 (启动中)${RESET}"
-        else
-            status="${GREEN}运行中${RESET}"
-        fi
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
+# ---------- Ping 测试 ----------
+run_ping() {
+    local size=$1
+    local label=$2
+    local outfile="$OUTDIR/ping_${label}.log"
+
+    echo -e "${CYAN}>>> 正在测试 ${label} (包大小 ${size} 字节, ${PING_COUNT} 次)...${NC}"
+
+    local uname_s
+    uname_s=$(uname -s)
+    local cmd
+    if [[ "$uname_s" == "Darwin" ]]; then
+        cmd="ping -s $size -c $PING_COUNT $TARGET"
     else
-        status="${RED}未部署${RESET}"
+        cmd="ping -s $size -c $PING_COUNT $TARGET"
     fi
 
-    # 2. 如果容器存在，提取镜像版本与主机端口
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3000"
-    else
-        img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
-    fi
+    eval "$cmd" | tee "$outfile"
+    echo
 }
 
-# 获取公网 IP (兼容双栈环境)
-get_public_ip() {
-    local mode=${1:-"auto"}
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
+parse_ping_stats() {
+    # 从 ping 输出中提取 avg延迟 与 丢包率，兼容 macOS(BSD) 和 Linux
+    local file=$1
+    local avg loss
+
+    # avg
+    avg=$(grep -Eo '[0-9.]+/[0-9.]+/[0-9.]+' "$file" | tail -1 | awk -F'/' '{print $2}')
+    # loss
+    loss=$(grep -Eo '[0-9.]+% packet loss' "$file" | head -1 | grep -Eo '^[0-9.]+')
+
+    echo "${avg:-N/A}|${loss:-N/A}"
 }
 
-# 部署 StorageUI 并初始化默认配置
-install_storageui() {
-    check_dependencies
-    
-    mkdir -p "$BASE_DIR"
+# ---------- mtr 测试 ----------
+run_mtr() {
+    local size=$1
+    local label=$2
+    local outfile="$OUTDIR/mtr_${label}.log"
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 3000]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+    echo -e "${CYAN}>>> 正在运行 mtr (${label}, 包大小 ${size} 字节, ${MTR_COUNT} 次)...${NC}"
+
+    if command -v mtr >/dev/null 2>&1; then
+        # -r 报告模式, -c 次数, -s 包大小, -n 不解析域名(可加速)
+        mtr -r -c "$MTR_COUNT" -s "$size" "$TARGET" | tee "$outfile"
+    else
+        echo -e "${YELLOW}未安装 mtr，跳过该项${NC}" | tee "$outfile"
+    fi
+    echo
+}
+
+# ---------- iperf3 测试 ----------
+run_iperf() {
+    local outfile="$OUTDIR/iperf3.log"
+    echo -e "${CYAN}>>> 正在运行 iperf3 吞吐测试 (${IPERF_TIME}s, ${IPERF_STREAMS}并发)...${NC}"
+    echo -e "${YELLOW}   注意: 目标机需已运行 iperf3 -s -p $IPERF_PORT${NC}"
+
+    if ! command -v iperf3 >/dev/null 2>&1; then
+        echo -e "${YELLOW}未安装 iperf3，跳过该项${NC}" | tee "$outfile"
         return
     fi
 
-    echo -ne "${YELLOW}是否设置登录账号密码？(y/n) [默认: n]: ${RESET}"
-    read -r set_auth
-    local auth_username=""
-    local auth_password=""
-    local auth_secret=""
+    {
+        echo "=== 正向测试 (本机 -> 目标) ==="
+        iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$IPERF_TIME" -P "$IPERF_STREAMS" -i 1
+    } | tee "$outfile"
 
-    if [[ "$set_auth" == "y" || "$set_auth" == "Y" ]]; then
-        echo -ne "${YELLOW}请输入登录用户名: ${RESET}"
-        read -r auth_username
-        echo -ne "${YELLOW}请输入登录密码: ${RESET}"
-        read -r auth_password
-        # 生成随机 SESSION 密钥
-        auth_secret=$(LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 32)
+    if [[ "$IPERF_REVERSE" =~ ^[Yy]$ ]]; then
+        {
+            echo
+            echo "=== 反向测试 (目标 -> 本机, -R) ==="
+            iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$IPERF_TIME" -P "$IPERF_STREAMS" -i 1 -R
+        } | tee -a "$outfile"
     fi
+    echo
+}
 
-    # 如果 .env 配置文件不存在，写入模板
-    if [[ ! -f "$ENV_FILE" ]]; then
-        echo -e "${YELLOW}正在初始化默认的 .env 配置文件...${RESET}"
-        cat <<EOF > "$ENV_FILE"
-NEXT_PUBLIC_APP_URL=http://localhost:${custom_port}
+parse_iperf_avg() {
+    # 提取 SUM sender 那一行的 Mbits/sec
+    local file=$1
+    grep -E '\[SUM\].*sender' "$file" | tail -1 | grep -Eo '[0-9.]+ [MGK]bits/sec' | head -1
+}
 
-# Serve under a sub-path, e.g. "/ui" (default: root).
-# NEXT_PUBLIC_BASE_PATH=
-# NEXT_PUBLIC_ASSET_PREFIX=
+# ---------- 打分辅助函数 ----------
+# 每一项打分函数输出: "分数|说明"
 
-# ─── Login (optional) ────────────────────────────────────────────────────────
-# Set both to require sign-in. AUTH_SECRET signs the session cookie (optional).
-AUTH_USERNAME=${auth_username}
-AUTH_PASSWORD=${auth_password}
-AUTH_SECRET=${auth_secret}
-
-# ─── Buckets (optional, server-only) ─────────────────────────────────────────
-# Number each bucket STORAGE_1_*, STORAGE_2_*, … Others can be added from the UI.
-
-# STORAGE_1_PROVIDER=s3         # s3 | r2 | alibaba | tencent | backblaze-b2 | minio | s3-compatible
-# STORAGE_1_BUCKET=my-bucket
-# STORAGE_1_REGION=us-east-1
-# STORAGE_1_ACCESS_KEY_ID=
-# STORAGE_1_SECRET_ACCESS_KEY=
-EOF
-    fi
-
-    # 权限调整
-    chmod -R 777 "$BASE_DIR"
-
-    # 生成 docker-compose.yml
-    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  storageui:
-    image: hahahumble/storageui:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:3000"
-    env_file:
-      - .env
-EOF
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 StorageUI 服务...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-    RAW_IP=$(get_public_ip)
-    DETECT_IP=$(format_ip_for_url "$RAW_IP")
-
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}          StorageUI 部署及启动成功！               ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}环境配置文件 : $ENV_FILE${RESET}"
-    if [[ -n "$auth_username" ]]; then
-        echo -e "${CYAN}登录凭据     : 用户名: ${auth_username} | 密码: ${auth_password}${RESET}"
+score_latency_diff() {
+    local diff=$1
+    local pts note
+    if awk -v d="$diff" 'BEGIN{exit !(d<10)}'; then
+        pts=0; note="大小包延迟差异 ${diff}ms，处于正常抖动范围"
+    elif awk -v d="$diff" 'BEGIN{exit !(d<25)}'; then
+        pts=1; note="大小包延迟差异 ${diff}ms，轻微差异"
+    elif awk -v d="$diff" 'BEGIN{exit !(d<60)}'; then
+        pts=2; note="大小包延迟差异 ${diff}ms，差异较明显"
     else
-        echo -e "${CYAN}登录凭据     : 未设置登录认证（公开访问）${RESET}"
+        pts=3; note="大小包延迟差异 ${diff}ms，差异非常明显"
     fi
-    echo -e "${CYAN}提示: 如需增加预设 S3 存储桶，可修改 .env 文件后重启容器。${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo "${pts}|${note}"
 }
 
-# 更新镜像
-update_storageui() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return
+score_big_loss() {
+    local loss=$1
+    local pts note
+    if awk -v l="$loss" 'BEGIN{exit !(l<=0.5)}'; then
+        pts=0; note="大包丢包率 ${loss}%，正常"
+    elif awk -v l="$loss" 'BEGIN{exit !(l<=3)}'; then
+        pts=1; note="大包丢包率 ${loss}%，轻微丢包"
+    elif awk -v l="$loss" 'BEGIN{exit !(l<=10)}'; then
+        pts=2; note="大包丢包率 ${loss}%，丢包较明显"
+    else
+        pts=3; note="大包丢包率 ${loss}%，丢包严重"
     fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+    echo "${pts}|${note}"
 }
 
-# 卸载服务
-uninstall_storageui() {
-    echo -ne "${YELLOW}确定要卸载并删除 StorageUI 容器吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有本地配置文件及数据目录？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}配置及数据目录已彻底清理。${RESET}"
+score_iperf_zero() {
+    local zero=$1
+    local total=$2
+    local pts note ratio
+    ratio=$(awk -v z="$zero" -v t="$total" 'BEGIN{ if(t==0){print 0} else {printf "%.0f", z/t*100} }')
+    if [ "$zero" -le 1 ]; then
+        pts=0; note="吞吐测试中断流采样点 ${zero} 个 (${ratio}%)，正常"
+    elif [ "$zero" -le 3 ]; then
+        pts=1; note="吞吐测试中断流采样点 ${zero} 个 (${ratio}%)，偶发断流"
+    elif [ "$zero" -le 8 ]; then
+        pts=2; note="吞吐测试中断流采样点 ${zero} 个 (${ratio}%)，频繁断流"
+    else
+        pts=3; note="吞吐测试中断流采样点 ${zero} 个 (${ratio}%)，持续大面积断流"
+    fi
+    echo "${pts}|${note}"
+}
+
+score_mtr_hop_diff() {
+    local small_file=$1
+    local big_file=$2
+    local pts=0 note="未检测到明显路由/节点异常差异"
+
+    if [ -f "$small_file" ] && [ -f "$big_file" ]; then
+        local missing_hops missing_hops_small
+        missing_hops=$(grep -c '???' "$big_file" 2>/dev/null)
+        missing_hops_small=$(grep -c '???' "$small_file" 2>/dev/null)
+        missing_hops=${missing_hops:-0}
+        missing_hops_small=${missing_hops_small:-0}
+
+        if [ "$missing_hops" -gt "$missing_hops_small" ]; then
+            local extra=$((missing_hops - missing_hops_small))
+            if [ "$extra" -ge 3 ]; then
+                pts=2; note="大包 mtr 中新增 ${extra} 个无响应跳点，疑似大包路径受限"
+            else
+                pts=1; note="大包 mtr 中新增 ${extra} 个无响应跳点"
             fi
-        else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
+    echo "${pts}|${note}"
+}
+
+# ---------- 等级映射 ----------
+grade_from_score() {
+    local score=$1
+    local max=$2
+    local pct
+    pct=$(awk -v s="$score" -v m="$max" 'BEGIN{ if(m==0){print 0} else {printf "%.0f", s/m*100} }')
+
+    if [ "$pct" -le 15 ]; then
+        echo "0|无明显优化|${GREEN}"
+    elif [ "$pct" -le 40 ]; then
+        echo "1|轻度嫌疑|${YELLOW}"
+    elif [ "$pct" -le 70 ]; then
+        echo "2|中度嫌疑|${YELLOW}"
+    else
+        echo "3|重度嫌疑|${RED}"
     fi
 }
 
-start_storageui() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_storageui() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_storageui() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_storageui() { 
-    echo -e "${CYAN}--- 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
-    docker logs -f "$CONTAINER_NAME"; 
+draw_bar() {
+    local score=$1
+    local max=$2
+    local filled=$((score * 10 / max))
+    local bar=""
+    local i
+    for ((i=0; i<10; i++)); do
+        if [ "$i" -lt "$filled" ]; then bar="${bar}█"; else bar="${bar}░"; fi
+    done
+    echo "$bar"
 }
 
-show_info() {
-    get_status_info
-    RAW_IP=$(get_public_ip)
-    DETECT_IP=$(format_ip_for_url "$RAW_IP")
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${YELLOW}当前状态     : $status"
-    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}环境配置文件 : ${ENV_FILE}${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+# ---------- 生成报告 ----------
+generate_report() {
+    local report="$OUTDIR/report.txt"
+    local total_score=0
+    local max_score=0
+
+    {
+        echo "================================================================"
+        echo " VPS 大小包优化测试报告"
+        echo " 目标: $TARGET"
+        echo " 时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "================================================================"
+        echo
+
+        echo "--- Ping 对比 ---"
+        avg_s="N/A"; loss_s="N/A"; avg_b="N/A"; loss_b="N/A"
+        if [ -f "$OUTDIR/ping_small.log" ]; then
+            IFS='|' read -r avg_s loss_s <<< "$(parse_ping_stats "$OUTDIR/ping_small.log")"
+            echo "小包(${SMALL_SIZE}B): 平均延迟 ${avg_s} ms | 丢包率 ${loss_s}%"
+        fi
+        if [ -f "$OUTDIR/ping_big.log" ]; then
+            IFS='|' read -r avg_b loss_b <<< "$(parse_ping_stats "$OUTDIR/ping_big.log")"
+            echo "大包(${BIG_SIZE}B): 平均延迟 ${avg_b} ms | 丢包率 ${loss_b}%"
+        fi
+        echo
+
+        zero_secs=0
+        total_secs=0
+        if [[ "$DO_IPERF" =~ ^[Yy]$ ]] && [ -f "$OUTDIR/iperf3.log" ]; then
+            echo "--- iperf3 吞吐 ---"
+            fwd=$(grep -E '\[SUM\].*sender' "$OUTDIR/iperf3.log" | head -1 | grep -Eo '[0-9.]+ [MGK]bits/sec' | head -1)
+            echo "正向(本机->目标) 平均: ${fwd:-N/A}"
+            if [[ "$IPERF_REVERSE" =~ ^[Yy]$ ]]; then
+                rev=$(grep -E '\[SUM\].*sender' "$OUTDIR/iperf3.log" | tail -1 | grep -Eo '[0-9.]+ [MGK]bits/sec' | head -1)
+                echo "反向(目标->本机) 平均: ${rev:-N/A}"
+            fi
+            zero_secs=$(grep -c '0.00 bits/sec' "$OUTDIR/iperf3.log")
+            total_secs=$(grep -cE '\[SUM\]' "$OUTDIR/iperf3.log")
+            echo "检测到 0 bits/sec 的采样点数量: $zero_secs / 约 $total_secs 个采样"
+            echo
+        fi
+
+        echo "================================================================"
+        echo " 大小包优化 - 评分明细"
+        echo "================================================================"
+
+        if [ "$avg_s" != "N/A" ] && [ "$avg_b" != "N/A" ]; then
+            diff=$(awk -v a="$avg_s" -v b="$avg_b" 'BEGIN{printf "%.1f", b-a}')
+            IFS='|' read -r pts note <<< "$(score_latency_diff "$diff")"
+            total_score=$((total_score + pts)); max_score=$((max_score + 3))
+            printf "[延迟差异]   %s/3  %s  %s\n" "$pts" "$(draw_bar "$pts" 3)" "$note"
+        fi
+
+        if [ "$loss_b" != "N/A" ]; then
+            IFS='|' read -r pts note <<< "$(score_big_loss "$loss_b")"
+            total_score=$((total_score + pts)); max_score=$((max_score + 3))
+            printf "[大包丢包]   %s/3  %s  %s\n" "$pts" "$(draw_bar "$pts" 3)" "$note"
+        fi
+
+        if [[ "$DO_IPERF" =~ ^[Yy]$ ]] && [ "$total_secs" -gt 0 ]; then
+            IFS='|' read -r pts note <<< "$(score_iperf_zero "$zero_secs" "$total_secs")"
+            total_score=$((total_score + pts)); max_score=$((max_score + 3))
+            printf "[持续吞吐]   %s/3  %s  %s\n" "$pts" "$(draw_bar "$pts" 3)" "$note"
+        fi
+
+        if [[ "$DO_MTR" =~ ^[Yy]$ ]]; then
+            IFS='|' read -r pts note <<< "$(score_mtr_hop_diff "$OUTDIR/mtr_small.log" "$OUTDIR/mtr_big.log")"
+            total_score=$((total_score + pts)); max_score=$((max_score + 2))
+            printf "[路由差异]   %s/2  %s  %s\n" "$pts" "$(draw_bar "$pts" 2)" "$note"
+        fi
+
+        echo
+        echo "================================================================"
+        echo " 综合判定"
+        echo "================================================================"
+
+        if [ "$max_score" -eq 0 ]; then
+            echo "有效测试项不足，无法给出评级，请至少完成 ping 测试。"
+        else
+            IFS='|' read -r glevel gname gcolor <<< "$(grade_from_score "$total_score" "$max_score")"
+            pct=$(awk -v s="$total_score" -v m="$max_score" 'BEGIN{printf "%.0f", s/m*100}')
+
+            echo -e "总分: ${total_score} / ${max_score}  (异常指数 ${pct}%)"
+            echo
+            case "$glevel" in
+                0) echo -e "${GREEN}${BOLD}★ 大小包优化等级：无明显优化 (Lv.0)${NC}" ;;
+                1) echo -e "${YELLOW}${BOLD}★ 大小包优化等级：轻度嫌疑 (Lv.1)${NC}" ;;
+                2) echo -e "${YELLOW}${BOLD}★ 大小包优化等级：中度嫌疑 (Lv.2)${NC}" ;;
+                3) echo -e "${RED}${BOLD}★ 大小包优化等级：重度嫌疑 (Lv.3)${NC}" ;;
+            esac
+            echo
+            case "$glevel" in
+                0) echo "小包/大包在延迟、丢包、吞吐表现上基本一致，未见明显的差异化处理。" ;;
+                1) echo "个别指标出现轻微异常，可能是网络正常抖动，也可能存在轻度优化，建议多测几次交叉验证。" ;;
+                2) echo "多项指标同时出现异常，大概率存在针对性的大小包优化或QoS限速，实际大流量体验会明显低于ping测速表现。" ;;
+                3) echo "延迟、丢包、吞吐、路由等多个维度同时严重异常，基本可以确认存在大小包优化，ping/跑分数据不能代表真实使用体验。" ;;
+            esac
+        fi
+
+        echo
+        echo "(评分仅基于本次测试的启发式规则，供参考，建议结合原始日志与多次测试人工复核)"
+        echo
+        echo "详细日志文件位于: $OUTDIR/"
+        echo "================================================================"
+    } | tee "$report"
 }
 
-menu() {
-    clear
-    get_status_info
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}   ◈  StorageUI 管理面板  ◈   ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_storageui ;;
-        2) update_storageui ;;
-        3) uninstall_storageui ;;
-        4) start_storageui ;;
-        5) stop_storageui ;;
-        6) restart_storageui ;;
-        7) logs_storageui ;;
-        8) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
+# ---------- 主流程 ----------
+main() {
+    check_deps
+    ask_inputs
+
+    echo
+    line
+    echo -e "${BOLD}开始测试...${NC}"
+    line
+
+    run_ping "$SMALL_SIZE" "small"
+    run_ping "$BIG_SIZE" "big"
+
+    if [[ "$DO_MTR" =~ ^[Yy]$ ]]; then
+        run_mtr "$SMALL_SIZE" "small"
+        run_mtr "$BIG_SIZE" "big"
+    fi
+
+    if [[ "$DO_IPERF" =~ ^[Yy]$ ]]; then
+        run_iperf
+    fi
+
+    line
+    echo -e "${BOLD}生成测试报告...${NC}"
+    line
+    generate_report
+
+    echo
+    echo -e "${GREEN}测试完成！所有结果已保存到目录: ${BOLD}$OUTDIR${NC}"
 }
 
-while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
-done
+main

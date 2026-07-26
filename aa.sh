@@ -422,7 +422,7 @@ print_node_summary() {
   echo -e "${GREEN}配置文件路径 :${RESET} $conf_file"
   echo -e "${GREEN}--------------------------------------------${RESET}"
   echo -e "${GREEN}👉 V2rayN 订阅链接:${RESET}"
-  echo -e "${YELLOW}any://$auth_pwd@$url_ip:$main_port?security=tls&sni=$sb_domain&insecure=${is_insecure}&allowInsecure=${is_insecure}&type=tcp#$hostname-anytls-${instance}${RESET}"
+  echo -e "${YELLOW}anytls://$auth_pwd@$url_ip:$main_port?security=tls&sni=$sb_domain&insecure=${is_insecure}&allowInsecure=${is_insecure}&type=tcp#$hostname-anytls-${instance}${RESET}"
   echo ""
   echo -e "${GREEN}👉 Surge 专属配置格式:${RESET}"
   echo -e "${YELLOW}$hostname-${instance}-AnyTLS = anytls, $url_ip, $main_port, password=$auth_pwd, sni=$sb_domain, tfo=true, skip-cert-verify=${skip_cert}, reuse=false${RESET}"
@@ -587,7 +587,7 @@ menu_switch_matrix() {
       local port_num=$(jq -r '.inbounds[0].listen_port' "$c_file" 2>/dev/null || echo "")
       local status_str="${RED}已停止${RESET}"
       if systemctl is-active --quiet "${TEMPLATE_NAME}@${name}"; then status_str="${GREEN}运行中${RESET}"; fi
-      echo -e " ${CYAN}[ ${count} ] ->${GREEN} 实例名: ${YELLOW}${name}${RESET} ${GREEN}[绑定端口: ${port_num} | 运行状态: ${status_str}]${RESET}"
+      echo -e " ${CYAN}[ ${count} ] ->${GREEN} 实例名: ${YELLOW}${name}${RESET} ${GREEN}[绑定端口: ${port_num} | 运行状态: ${status_str}${GREEN}]${RESET}"
     done < "$REGISTRY_FILE"
   fi
 
@@ -642,7 +642,7 @@ configure_custom_socks5_outbound() {
     fi
 
     local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].protocol // "freedom"' "$instance_config" 2>/dev/null || echo "freedom")
+    current_protocol=$(jq -r '.outbounds[0].type // "direct"' "$instance_config" 2>/dev/null || echo "direct")
 
     echo -e "${GREEN}-------------------------------------------${RESET}"
     echo -e "${YELLOW}请选择出口模式：${RESET}"
@@ -661,7 +661,7 @@ configure_custom_socks5_outbound() {
     case "$mode" in
         1)
             tmp_file=$(mktemp)
-            jq '.outbounds = [{"protocol":"freedom","tag":"direct"}]' "$instance_config" > "$tmp_file"
+            jq '.outbounds = [{"type":"direct","tag":"direct"}]' "$instance_config" > "$tmp_file"
             if ! jq empty "$tmp_file" >/dev/null 2>&1; then
                 rm -f "$tmp_file"
                 echo -e "${RED}[ERROR]生成的直连配置无效。${RESET}" >&2
@@ -729,7 +729,7 @@ configure_custom_socks5_outbound() {
             '
             .outbounds = [
               {
-                "protocol": "socks",
+                "type": "socks",
                 "tag": "custom-socks5-out",
                 "server": $host,
                 "server_port": $port,
@@ -745,7 +745,7 @@ configure_custom_socks5_outbound() {
             '
             .outbounds = [
               {
-                "protocol": "socks",
+                "type": "socks",
                 "tag": "custom-socks5-out",
                 "server": $host,
                 "server_port": $port
@@ -785,7 +785,7 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}     ◈  sing-box 多实例管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}    ◈  sing-box AnyTLS多实例管理面板  ◈     ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
     echo -e "${GREEN}目标实例端口 :${RESET} ${YELLOW}${port_show}${RESET}"
@@ -801,8 +801,8 @@ menu() {
     echo -e "${GREEN} 7. 重启当前实例${RESET}"
     echo -e "${GREEN} 8. 当前实例日志${RESET}"
     echo -e "${GREEN} 9. 当前实例配置${RESET}"
-    echo -e "${GREEN}10. 管理实例     ${YELLOW}← 添加/切换节点${RESET}"
-    echo -e "${GREEN}11. 配置出口代理 ${YELLOW}← 自适应/Socks5${RESET}"
+    echo -e "${GREEN}10. Socks5出口${RESET}     ${YELLOW}← 链式分流代理${RESET}"
+    echo -e "${GREEN}11. 管理实例${RESET}       ${YELLOW}← 添加/切换节点${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
 
@@ -823,8 +823,8 @@ menu() {
         journalctl -u "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" -n 50 -f || true
         ;;
       9) print_node_summary "$CURRENT_INSTANCE"; pause ;;
-      10) menu_switch_matrix ;;
-      11) configure_custom_socks5_outbound; pause ;;
+      10) configure_custom_socks5_outbound; pause ;;
+      11) menu_switch_matrix ;;
       0) clear; exit 0 ;;
       *) warn "输入未知操作序号！"; sleep 0.5 ;;
     esac

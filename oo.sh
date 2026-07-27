@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# sing-box (AnyTLS) 多实例核心控制面板 (Alpine OpenRC 适配版)
+# sing-box (AnyTLS) 多实例核心控制面板 (Alpine 专属版)
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -12,7 +12,7 @@ export LANG=en_US.UTF-8
 export TEMPLATE_NAME="mo-anytls-sb"
 export CONFIG_DIR="/etc/mo-anytls-sb"
 export BASE_DIR="/etc/mo-anytls-sb"
-export EXECUTABLE_INSTALL_PATH="/usr/local/bin/sing-box"
+export EXECUTABLE_INSTALL_PATH="/usr/bin/sing-box"
 export DATA_BASE_DIR="/var/lib/sing-box"
 export SB_DIR_BASE="/root/proxynode/Anytls"
 export REGISTRY_FILE="${BASE_DIR}/.instances.env"
@@ -23,10 +23,10 @@ REPO_URL="https://github.com/SagerNet/sing-box"
 API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
-PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
-OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+PACKAGE_MANAGEMENT_INSTALL="apk add --no-cache"
+OPERATING_SYSTEM="linux"
 ARCHITECTURE="${ARCHITECTURE:-}"
-SINGBOX_USER="${SINGBOX_USER:-sing-box}"
+SINGBOX_USER="sing-box"
 
 # 终端颜色代码
 GREEN="\033[32m"
@@ -58,124 +58,60 @@ error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
 pause() { echo; read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制面板...${RESET}")"; }
 
 generate_random_password() {
-  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
+  dd if=/dev/urandom bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
 }
 
-is_alpine() {
-  [[ -f /etc/alpine-release ]]
-}
-
-systemctl() {
-  if is_alpine; then
-    local action="$1"
-    local svc_name="$2"
-    local instance_name="${svc_name#*@}"
-    local rc_script="/etc/init.d/${TEMPLATE_NAME}-${instance_name}"
-    
-    case "$action" in
-      is-active)
-        if [[ -f "$rc_script" ]] && rc-service "${TEMPLATE_NAME}-${instance_name}" status 2>/dev/null | grep -q "started"; then
-          return 0
-        else
-          return 1
-        fi
-        ;;
-      start)
-        if [[ -f "$rc_script" ]]; then
-          rc-service "${TEMPLATE_NAME}-${instance_name}" start
-        fi
-        ;;
-      stop)
-        if [[ -f "$rc_script" ]]; then
-          rc-service "${TEMPLATE_NAME}-${instance_name}" stop
-        fi
-        ;;
-      restart)
-        if [[ -f "$rc_script" ]]; then
-          rc-service "${TEMPLATE_NAME}-${instance_name}" restart
-        fi
-        ;;
-      enable)
-        if [[ -f "$rc_script" ]]; then
-          rc-update add "${TEMPLATE_NAME}-${instance_name}" default >/dev/null 2>&1 || true
-        fi
-        ;;
-      disable)
-        if [[ -f "$rc_script" ]]; then
-          rc-update del "${TEMPLATE_NAME}-${instance_name}" default >/dev/null 2>&1 || true
-        fi
-        ;;
-      daemon-reload)
-        return 0
-        ;;
-      *)
-        return 0
-        ;;
-    es
-  else
-    if ! has_command systemctl; then
-      warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
-      return 0
-    fi
-    command systemctl "$@"
-  fi
-}
-
-journalctl() {
-  if is_alpine; then
-    local log_file="/var/log/${TEMPLATE_NAME}-${CURRENT_INSTANCE}.log"
-    if [[ -f "$log_file" ]]; then
-      tail -n "$@" "$log_file"
-    else
-      echo "暂无运行日志文件: $log_file"
-    fi
-  else
-    if has_command journalctl; then
-      command journalctl "$@"
-    else
-      echo "当前系统不支持 journalctl"
-    fi
-  fi
+# OpenRC 服务管理兼容层
+rc_service() {
+  local action=$1
+  local instance=$2
+  local service_name="${TEMPLATE_NAME}.${instance}"
+  
+  case "$action" in
+    is-active)
+      rc-service "$service_name" status --nocolor >/dev/null 2>&1
+      ;;
+    start)
+      rc-service "$service_name" start >/dev/null 2>&1
+      ;;
+    stop)
+      rc-service "$service_name" stop >/dev/null 2>&1
+      ;;
+    restart)
+      rc-service "$service_name" restart >/dev/null 2>&1
+      ;;
+    enable)
+      rc-update add "$service_name" default >/dev/null 2>&1
+      ;;
+    disable)
+      rc-update del "$service_name" default >/dev/null 2>&1
+      ;;
+  esac 2>/dev/null || true
 }
 
 is_user_exists() { id "$1" > /dev/null 2>&1; }
 
-detect_package_manager() {
-  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
-  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
-  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
-  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
-  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
-  return 1
-}
-
 install_software() {
   local _package_name="$1"
-  if ! detect_package_manager; then
-    error "未检测到支持的包管理器，请手动安装 $_package_name"
-    exit 65
-  fi
   echo "正在安装缺失的依赖 '$_package_name' ... "
   if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
     echo "依赖安装成功"
   else
-    error "无法通过包管理器安装 '$_package_name'，请手动安装。"
+    error "无法通过 apk 安装 '$_package_name'，请手动检查软件源。"
     exit 65
   fi
 }
 
 check_environment() {
-  if [[ "x$(uname)" == "xLinux" ]]; then
-    OPERATING_SYSTEM=linux
-  else
-    error "本脚本仅支持 Linux 系统。"
+  if [[ "x$(uname)" != "xLinux" ]]; then
+    error "本脚本仅支持 Linux (Alpine) 系统。"
     exit 95
   fi
 
   case "$(uname -m)" in
     'i386' | 'i686') ARCHITECTURE='386' ;;
     'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='armv7' ;;
+    'armv7' | 'armv7l') ARCHITECTURE='armv7' ;;
     'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
     's390x') ARCHITECTURE='s390x' ;;
     *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
@@ -188,10 +124,7 @@ check_environment() {
   has_command tar || install_software tar
   has_command socat || install_software socat
   has_command python3 || install_software python3
-  if is_alpine; then
-    has_command openrc || install_software openrc
-    has_command shadow || install_software shadow
-  fi
+  has_command shadow || install_software shadow
 }
 
 # =========================================================
@@ -203,18 +136,13 @@ fix_external_cert_permission() {
   
   if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
     error "致命拒绝: 检测到您的证书位于 /root/ 目录下！非 root 运行用户无权穿透读取。"
-    info "权威推荐: 请将证书导出到公共目录（如 /etc/ssl/ ）再试。"
+    info "权威推荐: 请将证书导出到公共目录再试。"
     return 1
-  fi
+  }
 
   local cert_dir=$(dirname "$cert")
   chmod +x "$cert_dir" 2>/dev/null || true
   chmod 644 "$cert" "$key" 2>/dev/null || true
-  
-  if command -v setfacl >/dev/null 2>&1; then
-    setfacl -m u:"$SINGBOX_USER":rx "$cert_dir" 2>/dev/null || true
-    setfacl -m u:"$SINGBOX_USER":r "$cert" "$key" 2>/dev/null || true
-  fi
   return 0
 }
 
@@ -246,20 +174,25 @@ sync_registry() {
   mv -f "$temp_reg" "$REGISTRY_FILE"
 }
 
-write_systemd_template() {
-  local instance="$1"
-  if is_alpine; then
-    local openrc_script="/etc/init.d/${TEMPLATE_NAME}-${instance}"
-    local log_file="/var/log/${TEMPLATE_NAME}-${instance}.log"
-    cat << EOF > "$openrc_script"
+write_openrc_init_script() {
+  local init_file="/etc/init.d/${TEMPLATE_NAME}"
+  cat << 'EOF' > "$init_file"
 #!/sbin/openrc-run
 
-name="${TEMPLATE_NAME}-${instance}"
-description="sing-box AnyTLS OpenRC Service for instance ${instance}"
-cfgfile="${BASE_DIR}/config_${instance}.json"
-logfile="${log_file}"
-command="$EXECUTABLE_INSTALL_PATH"
-command_args="run -c ${BASE_DIR}/config_${instance}.json"
+description="sing-box AnyTLS Service"
+instance="${RC_SVCNAME#*.}"
+if [ "$instance" = "$RC_SVCNAME" ]; then
+    instance=""
+fi
+
+config_file="/etc/mo-anytls-sb/config_${instance}.json"
+data_dir="/var/lib/sing-box/${instance}"
+command="/usr/bin/sing-box"
+command_args="run --config ${config_file}"
+pidfile="/run/sing-box_${instance}.pid"
+command_background="true"
+supervisor="supervise-daemon"
+rc_ulimit="nofile 65535 65535"
 
 depend() {
     need net
@@ -267,54 +200,23 @@ depend() {
 }
 
 start_pre() {
-    if [ ! -f "\$cfgfile" ]; then
-        eerror "Configuration file \$cfgfile missing!"
+    if [ -z "$instance" ]; then
+        eerror "请通过多实例符号链接调用服务"
         return 1
     fi
-    
-    touch "\$logfile"
-    chown $SINGBOX_USER:$SINGBOX_USER "\$logfile"
-    chmod 644 "\$logfile"
-    
-    command_background="yes"
-    pidfile="/run/\${RC_SVCNAME}.pid"
-    
-    output_log="\$logfile"
-    error_log="\$logfile"
-    
-    local port
-    port=\$(jq -r '.inbounds[0].listen_port // 0' "\$cfgfile" 2>/dev/null)
-    if [ "\$port" -lt 1024 ] && [ "\$port" -ne 0 ]; then
-        command_user="root:root"
-    else
-        command_user="$SINGBOX_USER:$SINGBOX_USER"
-    fi
+    [ -f "$config_file" ] || { eerror "配置文件不存在: $config_file"; return 1; }
+    mkdir -p "$data_dir"
+    chown -R sing-box:sing-box "$data_dir" 2>/dev/null || true
 }
 EOF
-    chmod +x "$openrc_script"
-  else
-    local template_file="/etc/systemd/system/${TEMPLATE_NAME}@.service"
-    cat << EOF > "$template_file"
-[Unit]
-Description=sing-box AnyTLS Service - Instance: %I
-After=network.target nss-lookup.target
+  chmod +x "$init_file"
+}
 
-[Service]
-Type=simple
-ExecStart=$EXECUTABLE_INSTALL_PATH run --config ${BASE_DIR}/config_%I.json
-WorkingDirectory=${DATA_BASE_DIR}/%I
-User=$SINGBOX_USER
-Group=$SINGBOX_USER
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=true
-Restart=on-failure
-RestartSec=10s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
+create_instance_symlink() {
+  local instance="$1"
+  local symlink_path="/etc/init.d/${TEMPLATE_NAME}.${instance}"
+  if [ ! -e "$symlink_path" ]; then
+    ln -s "${TEMPLATE_NAME}" "$symlink_path"
   fi
 }
 
@@ -360,11 +262,6 @@ get_public_ip() {
             ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
         done
     done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
     echo "127.0.0.1"
 }
 
@@ -381,13 +278,13 @@ is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 6553
 get_random_port() {
   local rand_port
   while true; do
-    rand_port=$(shuf -i 2000-65535 -n 1)
+    rand_port=$(( ( RANDOM % 63535 ) + 2000 ))
     check_port "$rand_port" && echo "$rand_port" && return 0
   done
 }
 
 get_sb_status() {
-  if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" 2>/dev/null; then
+  if rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" status --nocolor 2>/dev/null | grep -q "started"; then
     echo -e "${GREEN}● 运行中${RESET}"
   else
     echo -e "${RED}● 未运行${RESET}"
@@ -430,38 +327,13 @@ inst_cert() {
   echo "---------------------------------------------"
   echo -e "实例 [ ${instance} ] 证书配置选择："
   echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
-  echo -e " 2) Acme自动申请 (需放行 80 端口)"
-  echo -e " 3) 自定义证书路径"
+  echo -e " 2) 自定义证书路径"
   echo "---------------------------------------------"
   local certInput
-  read -rp "请输入选项 [1-3] (回车默认自签): " certInput
+  read -rp "请输入选项 [1-2] (回车默认自签): " certInput
   certInput=${certInput:-1}
 
   if [[ $certInput == 2 ]]; then
-    local vps_ip=$(get_public_ip)
-    read -rp "请输入需要申请证书的域名: " domain
-    [[ -z $domain ]] && error "未输入域名，操作取消！" && return 1
-    
-    local acme_cmd="/root/.acme.sh/acme.sh"
-    [[ ! -f "$acme_cmd" ]] && curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
-    
-    "$acme_cmd" --set-default-ca --server letsencrypt
-    local reload_cmd="systemctl restart ${TEMPLATE_NAME}@${instance}"
-    
-    if [[ "$vps_ip" =~ ":" ]]; then
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
-    else
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
-    fi
-    
-    if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "$reload_cmd"; then
-      sb_domain=$domain
-      info "Acme 独立实例证书部署成功！"
-    else
-      error "Acme 申请失败，降级回自签模式。"
-      certInput=1
-    fi
-  elif [[ $certInput == 3 ]]; then
     while true; do
       local user_cert user_key
       read -rp "请输入公钥文件绝对路径: " user_cert
@@ -517,7 +389,7 @@ inst_port() {
 print_node_summary() {
   local instance="$1"
   local conf_file="${BASE_DIR}/config_${instance}.json"
-  if [ ! -f "$conf_file" ]; then return; fi
+  [ ! -f "$conf_file" ] && return
 
   local hostname=$(hostname -s | sed 's/ /_/g')
   local vps_ip=$(get_public_ip)
@@ -544,18 +416,12 @@ print_node_summary() {
   echo -e "${GREEN}👉 V2rayN 订阅链接:${RESET}"
   echo -e "${YELLOW}anytls://$auth_pwd@$url_ip:$main_port?security=tls&sni=$sb_domain&insecure=${is_insecure}&allowInsecure=${is_insecure}&type=tcp#$hostname-anytls-${instance}${RESET}"
   echo ""
-  echo -e "${GREEN}👉 Surge 专属配置格式:${RESET}"
-  echo -e "${YELLOW}$hostname-${instance}-AnyTLS = anytls, $url_ip, $main_port, password=$auth_pwd, sni=$sb_domain, tfo=true, skip-cert-verify=${skip_cert}, reuse=false${RESET}"
-  echo ""
 }
 
 write_and_show_config() {
   local instance="$1"
   local conf_file="${BASE_DIR}/config_${instance}.json"
   local sb_dir="${SB_DIR_BASE}/${instance}"
-  local vps_ip=$(get_public_ip)
-  local url_ip="$vps_ip"
-  [[ "$vps_ip" =~ ":" ]] && url_ip="[$vps_ip]"
 
   cat << EOF > "$conf_file"
 {
@@ -598,14 +464,15 @@ EOF
   
   chown "$SINGBOX_USER":"$SINGBOX_USER" "$conf_file" 2>/dev/null || true
   chown -h "$SINGBOX_USER":"$SINGBOX_USER" "$EVAL_CERT_PATH" "$EVAL_KEY_PATH" 2>/dev/null || true
+  
   register_instance "$instance"
+  write_openrc_init_script
+  create_instance_symlink "$instance"
 
-  write_systemd_template "$instance"
-  systemctl daemon-reload
-  systemctl enable "${TEMPLATE_NAME}@${instance}" >/dev/null 2>&1 || true
-  systemctl restart "${TEMPLATE_NAME}@${instance}" >/dev/null 2>&1 || true
+  rc_service enable "$instance"
+  rc_service restart "$instance"
 
-  if systemctl is-active --quiet "${TEMPLATE_NAME}@${instance}" 2>/dev/null; then
+  if rc-service "${TEMPLATE_NAME}.${instance}" status --nocolor 2>/dev/null | grep -q "started"; then
     print_node_summary "$instance"
   else
     error "实例服务下发完成，但启动响应失败。请通过菜单 [8] 查看日志。"
@@ -630,14 +497,9 @@ instsingbox() {
   fi
 
   if ! is_user_exists "$SINGBOX_USER"; then
-    if is_alpine; then
-      addgroup -S "$SINGBOX_USER" 2>/dev/null || true
-      adduser -S -D -H -G "$SINGBOX_USER" -s /sbin/nologin "$SINGBOX_USER" 2>/dev/null || true
-    else
-      useradd -r -d "$DATA_BASE_DIR" -m "$SINGBOX_USER" >/dev/null 2>&1 || true
-    fi
+    adduser -S -D -H -h "$DATA_BASE_DIR" -s /sbin/nologin "$SINGBOX_USER" >/dev/null 2>&1 || true
   fi
-  write_systemd_template "$CURRENT_INSTANCE"
+  write_openrc_init_script
 
   local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
   if [[ "$mode" == "new" && -f "$conf_file" ]]; then
@@ -670,12 +532,10 @@ unstsingbox() {
   read -r -p "$(echo -e "${RED}确定完全卸载移除此实例？[y/N]: ${RESET}")" confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || return
 
-  systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-  systemctl disable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
-  if is_alpine; then
-    rm -f "/etc/init.d/${TEMPLATE_NAME}-${CURRENT_INSTANCE}"
-  fi
+  rc_service stop "$CURRENT_INSTANCE"
+  rc_service disable "$CURRENT_INSTANCE"
 
+  rm -f "/etc/init.d/${TEMPLATE_NAME}.${CURRENT_INSTANCE}"
   rm -f "${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
   rm -f "${BASE_DIR}/fullchain_${CURRENT_INSTANCE}.pem" "${BASE_DIR}/privkey_${CURRENT_INSTANCE}.pem"
   rm -rf "${DATA_BASE_DIR}/${CURRENT_INSTANCE}" "/root/proxynode/Anytls/${CURRENT_INSTANCE}"
@@ -686,15 +546,10 @@ unstsingbox() {
   sync_registry
   if [ ! -s "$REGISTRY_FILE" ]; then
     info "检测到矩阵内已无活跃节点，自动清理全局共享组件..."
-    if is_alpine; then
-      rm -f /etc/init.d/${TEMPLATE_NAME}-*
-    else
-      rm -f /etc/systemd/system/${TEMPLATE_NAME}@.service /etc/systemd/system/${TEMPLATE_NAME}.service
-    fi
+    rm -f /etc/init.d/${TEMPLATE_NAME}
     rm -f "$EXECUTABLE_INSTALL_PATH"
     rm -rf "$BASE_DIR" "$DATA_BASE_DIR"
-    userdel "$SINGBOX_USER" >/dev/null 2>&1 || true
-    systemctl daemon-reload
+    deluser "$SINGBOX_USER" >/dev/null 2>&1 || true
     CURRENT_INSTANCE="anytls"
   fi
 }
@@ -719,7 +574,7 @@ menu_switch_matrix() {
       
       local port_num=$(jq -r '.inbounds[0].listen_port' "$c_file" 2>/dev/null || echo "")
       local status_str="${RED}已停止${RESET}"
-      if systemctl is-active --quiet "${TEMPLATE_NAME}@${name}"; then status_str="${GREEN}运行中${RESET}"; fi
+      if rc-service "${TEMPLATE_NAME}.${name}" status --nocolor 2>/dev/null | grep -q "started"; then status_str="${GREEN}运行中${RESET}"; fi
       echo -e " ${CYAN}[ ${count} ] ->${GREEN} 实例名: ${YELLOW}${name}${RESET} ${GREEN}[绑定端口: ${port_num} | 运行状态: ${status_str}${GREEN}]${RESET}"
     done < "$REGISTRY_FILE"
   fi
@@ -764,9 +619,6 @@ update_singbox() {
   info "核心更新完毕！请视情况手动重启运行中的实例。"
 }
 
-# =========================================================
-# 5. 拓展组件：自适应配置当前实例的 Socks5 出口
-# =========================================================
 configure_custom_socks5_outbound() {
     local instance_config="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
     if [[ ! -f "$instance_config" ]]; then 
@@ -779,11 +631,6 @@ configure_custom_socks5_outbound() {
 
     echo -e "${GREEN}-------------------------------------------${RESET}"
     echo -e "${YELLOW}请选择出口模式：${RESET}"
-    if [[ "$current_protocol" == "socks" ]]; then
-        echo -e "${GREEN}当前模式:${RESET} ${YELLOW}Socks5${RESET}"
-    else
-        echo -e "${GREEN}当前模式:${RESET} ${YELLOW}直连${RESET}"
-    fi
     echo -e "${GREEN}1) 直连出口${RESET}"
     echo -e "${GREEN}2) Socks5出口${RESET}"
     echo -e "${GREEN}0) 取消${RESET}"
@@ -795,116 +642,41 @@ configure_custom_socks5_outbound() {
         1)
             tmp_file=$(mktemp)
             jq '.outbounds = [{"type":"direct","tag":"direct"}]' "$instance_config" > "$tmp_file"
-            if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-                rm -f "$tmp_file"
-                echo -e "${RED}[ERROR]生成的直连配置无效。${RESET}" >&2
-                return 1
-            fi
             cp "$instance_config" "${instance_config}.bak.$(date +%s)"
             mv "$tmp_file" "$instance_config"
-            chmod 644 "$instance_config" 2>/dev/null || true
-            
-            systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
-            sleep 0.5
-            if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
-                echo -e "${GREEN}[OK]已成功切换为直连出口！${RESET}"
-            else
-                echo -e "${RED}[ERROR]切换到直连失败。${RESET}" >&2
-                return 1
-            fi
+            rc_service restart "$CURRENT_INSTANCE"
+            echo -e "${GREEN}[OK]已切换为直连出口！${RESET}"
             return
             ;;
-        2)
-            ;;
-        0|"")
-            echo -e "${YELLOW}[INFO]已取消配置。${RESET}"
-            return
-            ;;
-        *)
-            echo -e "${RED}[ERROR]无效选项，请输入 0-2 之间的数字。${RESET}" >&2
-            return 1
-            ;;
-    es
-
-    echo -e "${YELLOW}[INFO]配置自定义 Socks5 出口代理...${RESET}"
+        2) ;;
+        *) return ;;
+    esac
 
     local socks_host socks_port socks_user socks_pass
-
     read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
-    [[ -z "$socks_host" ]] && echo -e "${YELLOW}[INFO]已取消配置。${RESET}" && return
-
-    while true; do
-        read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
-        [[ -z "$socks_port" ]] && socks_port=1080
-        if is_valid_port "$socks_port"; then
-            break
-        else
-            echo -e "${RED}[ERROR]端口无效，请输入一个1-65535之间的数字。${RESET}" >&2
-        fi
-    done
-
-    read -rp "请输入 Socks5 用户名 (若无密码认证请直接留空回车): " socks_user || true
+    read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
+    socks_port=${socks_port:-1080}
+    read -rp "请输入 Socks5 用户名 (无则直接回车): " socks_user || true
     if [[ -n "$socks_user" ]]; then
         read -rs -p "请输入 Socks5 密码: " socks_pass || true
         echo
-    else
-        socks_pass=""
     fi
 
     tmp_file=$(mktemp)
-
     if [[ -n "$socks_user" ]]; then
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            --arg user "$socks_user" \
-            --arg pass "$socks_pass" \
-            '
-            .outbounds = [
-              {
-                "type": "socks",
-                "tag": "custom-socks5-out",
-                "server": $host,
-                "server_port": $port,
-                "username": $user,
-                "password": $pass
-              }
-            ]
-            ' "$instance_config" > "$tmp_file"
+        jq --arg host "$socks_host" --argjson port "$socks_port" --arg user "$socks_user" --arg pass "$socks_pass" \
+        '.outbounds = [{"type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port, "username": $user, "password": $pass}]' \
+        "$instance_config" > "$tmp_file"
     else
-        jq \
-            --arg host "$socks_host" \
-            --argjson port "$socks_port" \
-            '
-            .outbounds = [
-              {
-                "type": "socks",
-                "tag": "custom-socks5-out",
-                "server": $host,
-                "server_port": $port
-              }
-            ]
-            ' "$instance_config" > "$tmp_file"
-    fi
-
-    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
-        rm -f "$tmp_file"
-        echo -e "${RED}[ERROR]生成的 Socks5 配置无效，请检查输入后重试。${RESET}" >&2
-        return 1
+        jq --arg host "$socks_host" --argjson port "$socks_port" \
+        '.outbounds = [{"type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port}]' \
+        "$instance_config" > "$tmp_file"
     fi
 
     cp "$instance_config" "${instance_config}.bak.$(date +%s)"
     mv "$tmp_file" "$instance_config"
-    chmod 644 "$instance_config" 2>/dev/null || true
-
-    systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"
-    sleep 0.5
-    if systemctl is-active --quiet "${TEMPLATE_NAME}@${CURRENT_INSTANCE}"; then
-        echo -e "${GREEN}[OK]已成功切换为 Socks5 出口！${RESET}"
-    else
-        echo -e "${RED}[ERROR]重启服务失败，当前配置可能与系统环境不兼容。${RESET}" >&2
-        return 1
-    fi
+    rc_service restart "$CURRENT_INSTANCE"
+    echo -e "${GREEN}[OK]已成功切换为 Socks5 出口！${RESET}"
 }
 
 menu() {
@@ -918,7 +690,7 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}   ◈   sing-box AnyTLS多实例管理面板   ◈    ${RESET}"
+    echo -e "${GREEN}     ◈  sing-box AnyTLS多实例管理面板 (Alpine) ◈     ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
     echo -e "${GREEN}目标实例端口 :${RESET} ${YELLOW}${port_show}${RESET}"
@@ -935,7 +707,7 @@ menu() {
     echo -e "${GREEN} 8. 当前实例日志${RESET}"
     echo -e "${GREEN} 9. 当前实例配置${RESET}"
     echo -e "${GREEN}10. Socks5出口${RESET}     ${YELLOW}← 链式分流代理${RESET}"
-    echo -e "${GREEN}11. 管理实例${RESET}      ${YELLOW}← 添加/切换节点${RESET}"
+    echo -e "${GREEN}11. 管理实例${RESET}       ${YELLOW}← 添加/切换节点${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
 
@@ -948,12 +720,13 @@ menu() {
       2) update_singbox; pause ;;
       3) unstsingbox; pause ;;
       4) instsingbox "edit"; pause ;;
-      5) systemctl start "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && info "启动成功" ; pause ;;
-      6) systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && info "停止成功" ; pause ;;
-      7) systemctl restart "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" && info "重启完毕" ; pause ;;
+      5) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" start && info "启动成功" ; pause ;;
+      6) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" stop && info "停止成功" ; pause ;;
+      7) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" restart && info "重启完毕" ; pause ;;
       8) 
         echo -e "${YELLOW}正在调取该实例实时日志 (按 Ctrl+C 退出):${RESET}\n"
-        journalctl -u "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" -n 50 -f || true
+        tail -n 50 -f /var/log/messages 2>/dev/null || cat /var/log/syslog 2>/dev/null || echo "请查看 OpenRC 日志系统输出"
+        sleep 2
         ;;
       9) print_node_summary "$CURRENT_INSTANCE"; pause ;;
       10) configure_custom_socks5_outbound; pause ;;

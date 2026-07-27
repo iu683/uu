@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# sing-box (AnyTLS) 多实例核心控制面板
+# sing-box (AnyTLS) 多实例核心控制面板 (Alpine OpenRC 适配版)
 # SPDX-License-Identifier: MIT
 #
 # =========================================================
@@ -61,12 +61,81 @@ generate_random_password() {
   dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
 }
 
+is_alpine() {
+  [[ -f /etc/alpine-release ]]
+}
+
 systemctl() {
-  if ! has_command systemctl; then
-    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
-    return 0
+  if is_alpine; then
+    local action="$1"
+    local svc_name="$2"
+    local instance_name="${svc_name#*@}"
+    local rc_script="/etc/init.d/${TEMPLATE_NAME}-${instance_name}"
+    
+    case "$action" in
+      is-active)
+        if [[ -f "$rc_script" ]] && rc-service "${TEMPLATE_NAME}-${instance_name}" status 2>/dev/null | grep -q "started"; then
+          return 0
+        else
+          return 1
+        fi
+        ;;
+      start)
+        if [[ -f "$rc_script" ]]; then
+          rc-service "${TEMPLATE_NAME}-${instance_name}" start
+        fi
+        ;;
+      stop)
+        if [[ -f "$rc_script" ]]; then
+          rc-service "${TEMPLATE_NAME}-${instance_name}" stop
+        fi
+        ;;
+      restart)
+        if [[ -f "$rc_script" ]]; then
+          rc-service "${TEMPLATE_NAME}-${instance_name}" restart
+        fi
+        ;;
+      enable)
+        if [[ -f "$rc_script" ]]; then
+          rc-update add "${TEMPLATE_NAME}-${instance_name}" default >/dev/null 2>&1 || true
+        fi
+        ;;
+      disable)
+        if [[ -f "$rc_script" ]]; then
+          rc-update del "${TEMPLATE_NAME}-${instance_name}" default >/dev/null 2>&1 || true
+        fi
+        ;;
+      daemon-reload)
+        return 0
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  else
+    if ! has_command systemctl; then
+      warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
+      return 0
+    fi
+    command systemctl "$@"
   fi
-  command systemctl "$@"
+}
+
+journalctl() {
+  if is_alpine; then
+    local log_file="/var/log/${TEMPLATE_NAME}-${CURRENT_INSTANCE}.log"
+    if [[ -f "$log_file" ]]; then
+      tail -n "$@" "$log_file"
+    else
+      echo "暂无运行日志文件: $log_file"
+    fi
+  else
+    if has_command journalctl; then
+      command journalctl "$@"
+    else
+      echo "当前系统不支持 journalctl"
+    fi
+  fi
 }
 
 is_user_exists() { id "$1" > /dev/null 2>&1; }
@@ -119,6 +188,10 @@ check_environment() {
   has_command tar || install_software tar
   has_command socat || install_software socat
   has_command python3 || install_software python3
+  if is_alpine; then
+    has_command openrc || install_software openrc
+    has_command shadow || install_software shadow
+  fi
 }
 
 # =========================================================
@@ -174,8 +247,54 @@ sync_registry() {
 }
 
 write_systemd_template() {
-  local template_file="/etc/systemd/system/${TEMPLATE_NAME}@.service"
-  cat << EOF > "$template_file"
+  local instance="$1"
+  if is_alpine; then
+    local openrc_script="/etc/init.d/${TEMPLATE_NAME}-${instance}"
+    local log_file="/var/log/${TEMPLATE_NAME}-${instance}.log"
+    cat << EOF > "$openrc_script"
+#!/sbin/openrc-run
+
+name="${TEMPLATE_NAME}-${instance}"
+description="sing-box AnyTLS OpenRC Service for instance ${instance}"
+cfgfile="${BASE_DIR}/config_${instance}.json"
+logfile="${log_file}"
+command="$EXECUTABLE_INSTALL_PATH"
+command_args="run -c ${BASE_DIR}/config_${instance}.json"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    if [ ! -f "\$cfgfile" ]; then
+        eerror "Configuration file \$cfgfile missing!"
+        return 1
+    fi
+    
+    touch "\$logfile"
+    chown $SINGBOX_USER:$SINGBOX_USER "\$logfile"
+    chmod 644 "\$logfile"
+    
+    command_background="yes"
+    pidfile="/run/\${RC_SVCNAME}.pid"
+    
+    output_log="\$logfile"
+    error_log="\$logfile"
+    
+    local port
+    port=\$(jq -r '.inbounds[0].listen_port // 0' "\$cfgfile" 2>/dev/null)
+    if [ "\$port" -lt 1024 ] && [ "\$port" -ne 0 ]; then
+        command_user="root:root"
+    else
+        command_user="$SINGBOX_USER:$SINGBOX_USER"
+    fi
+}
+EOF
+    chmod +x "$openrc_script"
+  else
+    local template_file="/etc/systemd/system/${TEMPLATE_NAME}@.service"
+    cat << EOF > "$template_file"
 [Unit]
 Description=sing-box AnyTLS Service - Instance: %I
 After=network.target nss-lookup.target
@@ -195,7 +314,8 @@ RestartSec=10s
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
+    systemctl daemon-reload
+  fi
 }
 
 get_installed_version() {
@@ -480,6 +600,7 @@ EOF
   chown -h "$SINGBOX_USER":"$SINGBOX_USER" "$EVAL_CERT_PATH" "$EVAL_KEY_PATH" 2>/dev/null || true
   register_instance "$instance"
 
+  write_systemd_template "$instance"
   systemctl daemon-reload
   systemctl enable "${TEMPLATE_NAME}@${instance}" >/dev/null 2>&1 || true
   systemctl restart "${TEMPLATE_NAME}@${instance}" >/dev/null 2>&1 || true
@@ -509,9 +630,14 @@ instsingbox() {
   fi
 
   if ! is_user_exists "$SINGBOX_USER"; then
-    useradd -r -d "$DATA_BASE_DIR" -m "$SINGBOX_USER" >/dev/null 2>&1 || true
+    if is_alpine; then
+      addgroup -S "$SINGBOX_USER" 2>/dev/null || true
+      adduser -S -D -H -G "$SINGBOX_USER" -s /sbin/nologin "$SINGBOX_USER" 2>/dev/null || true
+    else
+      useradd -r -d "$DATA_BASE_DIR" -m "$SINGBOX_USER" >/dev/null 2>&1 || true
+    fi
   fi
-  write_systemd_template
+  write_systemd_template "$CURRENT_INSTANCE"
 
   local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
   if [[ "$mode" == "new" && -f "$conf_file" ]]; then
@@ -546,6 +672,9 @@ unstsingbox() {
 
   systemctl stop "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
   systemctl disable "${TEMPLATE_NAME}@${CURRENT_INSTANCE}" >/dev/null 2>&1 || true
+  if is_alpine; then
+    rm -f "/etc/init.d/${TEMPLATE_NAME}-${CURRENT_INSTANCE}"
+  fi
 
   rm -f "${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
   rm -f "${BASE_DIR}/fullchain_${CURRENT_INSTANCE}.pem" "${BASE_DIR}/privkey_${CURRENT_INSTANCE}.pem"
@@ -557,7 +686,11 @@ unstsingbox() {
   sync_registry
   if [ ! -s "$REGISTRY_FILE" ]; then
     info "检测到矩阵内已无活跃节点，自动清理全局共享组件..."
-    rm -f /etc/systemd/system/${TEMPLATE_NAME}@.service /etc/systemd/system/${TEMPLATE_NAME}.service
+    if is_alpine; then
+      rm -f /etc/init.d/${TEMPLATE_NAME}-*
+    else
+      rm -f /etc/systemd/system/${TEMPLATE_NAME}@.service /etc/systemd/system/${TEMPLATE_NAME}.service
+    fi
     rm -f "$EXECUTABLE_INSTALL_PATH"
     rm -rf "$BASE_DIR" "$DATA_BASE_DIR"
     userdel "$SINGBOX_USER" >/dev/null 2>&1 || true
@@ -691,7 +824,7 @@ configure_custom_socks5_outbound() {
             echo -e "${RED}[ERROR]无效选项，请输入 0-2 之间的数字。${RESET}" >&2
             return 1
             ;;
-    esac
+    es
 
     echo -e "${YELLOW}[INFO]配置自定义 Socks5 出口代理...${RESET}"
 
@@ -785,7 +918,7 @@ menu() {
     local port_show=$(get_current_port_display)
 
     echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}    ◈  sing-box AnyTLS多实例管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}    ◈   sing-box AnyTLS多实例管理面板   ◈    ${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
     echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
     echo -e "${GREEN}目标实例端口 :${RESET} ${YELLOW}${port_show}${RESET}"
@@ -802,7 +935,7 @@ menu() {
     echo -e "${GREEN} 8. 当前实例日志${RESET}"
     echo -e "${GREEN} 9. 当前实例配置${RESET}"
     echo -e "${GREEN}10. Socks5出口${RESET}     ${YELLOW}← 链式分流代理${RESET}"
-    echo -e "${GREEN}11. 管理实例${RESET}       ${YELLOW}← 添加/切换节点${RESET}"
+    echo -e "${GREEN}11. 管理实例${RESET}      ${YELLOW}← 添加/切换节点${RESET}"
     echo -e "${GREEN} 0. 退出${RESET}"
     echo -e "${GREEN}===========================================${RESET}"
 

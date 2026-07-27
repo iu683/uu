@@ -1,740 +1,654 @@
-#!/usr/bin/env bash
-#
-# sing-box (AnyTLS) 多实例核心控制面板 (Alpine 专属版)
-# SPDX-License-Identifier: MIT
-#
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
-set -Eop pipefail
-export LANG=en_US.UTF-8
+#!/bin/bash
+# =================================================================
+# DuJiaoNext (独角数卡) Docker Compose 统一管理面板 (修复版)
+# =================================================================
 
-export TEMPLATE_NAME="mo-anytls-sb"
-export CONFIG_DIR="/etc/mo-anytls-sb"
-export BASE_DIR="/etc/mo-anytls-sb"
-export EXECUTABLE_INSTALL_PATH="/usr/bin/sing-box"
-export DATA_BASE_DIR="/var/lib/sing-box"
-export SB_DIR_BASE="/root/proxynode/Anytls"
-export REGISTRY_FILE="${BASE_DIR}/.instances.env"
-
-CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "anytls")"
-
-REPO_URL="https://github.com/SagerNet/sing-box"
-API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
-CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
-
-PACKAGE_MANAGEMENT_INSTALL="apk add --no-cache"
-OPERATING_SYSTEM="linux"
-ARCHITECTURE="${ARCHITECTURE:-}"
-SINGBOX_USER="sing-box"
-
-# 终端颜色代码
-GREEN="\033[32m"
+# 颜色定义
 RED="\033[31m"
+GREEN="\033[32m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-# =========================================================
-# 2. 底层工具函数
-# =========================================================
-has_command() {
-  local _command=$1
-  type -P "$_command" > /dev/null 2>&1
-}
+BASE_DIR="/opt/dujiao-next"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+CONFIG_FILE="$BASE_DIR/config/config.yml"
+ENV_FILE="$BASE_DIR/.env"
 
-curl() {
-  command curl "${CURL_FLAGS[@]}" "$@"
-}
-
-mktemp() {
-  command mktemp "$@" "sbservinst.XXXXXXXXXX"
-}
-
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { echo; read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制面板...${RESET}")"; }
-
-generate_random_password() {
-  dd if=/dev/urandom bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
-}
-
-# OpenRC 服务管理兼容层
-rc_service() {
-  local action=$1
-  local instance=$2
-  local service_name="${TEMPLATE_NAME}.${instance}"
-  
-  case "$action" in
-    is-active)
-      rc-service "$service_name" status --nocolor >/dev/null 2>&1
-      ;;
-    start)
-      rc-service "$service_name" start >/dev/null 2>&1
-      ;;
-    stop)
-      rc-service "$service_name" stop >/dev/null 2>&1
-      ;;
-    restart)
-      rc-service "$service_name" restart >/dev/null 2>&1
-      ;;
-    enable)
-      rc-update add "$service_name" default >/dev/null 2>&1
-      ;;
-    disable)
-      rc-update del "$service_name" default >/dev/null 2>&1
-      ;;
-  esac 2>/dev/null || true
-}
-
-is_user_exists() { id "$1" > /dev/null 2>&1; }
-
-install_software() {
-  local _package_name="$1"
-  echo "正在安装缺失的依赖 '$_package_name' ... "
-  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
-    echo "依赖安装成功"
-  else
-    error "无法通过 apk 安装 '$_package_name'，请手动检查软件源。"
-    exit 65
-  fi
-}
-
-check_environment() {
-  if [[ "x$(uname)" != "xLinux" ]]; then
-    error "本脚本仅支持 Linux (Alpine) 系统。"
-    exit 95
-  fi
-
-  case "$(uname -m)" in
-    'i386' | 'i686') ARCHITECTURE='386' ;;
-    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-    'armv7' | 'armv7l') ARCHITECTURE='armv7' ;;
-    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
-    's390x') ARCHITECTURE='s390x' ;;
-    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
-  esac
-
-  has_command curl || install_software curl
-  has_command grep || install_software grep
-  has_command jq || install_software jq
-  has_command openssl || install_software openssl
-  has_command tar || install_software tar
-  has_command socat || install_software socat
-  has_command python3 || install_software python3
-  has_command shadow || install_software shadow
-}
-
-# =========================================================
-# 2.5 权限修复与实例注册管理
-# =========================================================
-fix_external_cert_permission() {
-  local cert=$1
-  local key=$2
-  
-  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
-    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！非 root 运行用户无权穿透读取。"
-    info "权威推荐: 请将证书导出到公共目录再试。"
-    return 1
-  }
-
-  local cert_dir=$(dirname "$cert")
-  chmod +x "$cert_dir" 2>/dev/null || true
-  chmod 644 "$cert" "$key" 2>/dev/null || true
-  return 0
-}
-
-register_instance() {
-  local name="$1"
-  [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
-  touch "$REGISTRY_FILE"
-  if ! grep -q "^${name}$" "$REGISTRY_FILE" 2>/dev/null; then
-    echo "$name" >> "$REGISTRY_FILE"
-  fi
-}
-
-unregister_instance() {
-  local name="$1"
-  if [ -f "$REGISTRY_FILE" ]; then
-    sed -i "/^${name}$/d" "$REGISTRY_FILE"
-  fi
-}
-
-sync_registry() {
-  [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
-  touch "$REGISTRY_FILE"
-  local temp_reg=$(mktemp)
-  for f in "${BASE_DIR}"/config_*.json; do
-    [ -e "$f" ] || continue
-    local name=$(basename "$f" | sed 's/^config_//;s/\.json$//')
-    if [ -n "$name" ]; then echo "$name" >> "$temp_reg"; fi
-  done
-  mv -f "$temp_reg" "$REGISTRY_FILE"
-}
-
-write_openrc_init_script() {
-  local init_file="/etc/init.d/${TEMPLATE_NAME}"
-  cat << 'EOF' > "$init_file"
-#!/sbin/openrc-run
-
-description="sing-box AnyTLS Service"
-instance="${RC_SVCNAME#*.}"
-if [ "$instance" = "$RC_SVCNAME" ]; then
-    instance=""
-fi
-
-config_file="/etc/mo-anytls-sb/config_${instance}.json"
-data_dir="/var/lib/sing-box/${instance}"
-command="/usr/bin/sing-box"
-command_args="run --config ${config_file}"
-pidfile="/run/sing-box_${instance}.pid"
-command_background="true"
-supervisor="supervise-daemon"
-rc_ulimit="nofile 65535 65535"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    if [ -z "$instance" ]; then
-        eerror "请通过多实例符号链接调用服务"
-        return 1
+# 检测依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
     fi
-    [ -f "$config_file" ] || { eerror "配置文件不存在: $config_file"; return 1; }
-    mkdir -p "$data_dir"
-    chown -R sing-box:sing-box "$data_dir" 2>/dev/null || true
-}
-EOF
-  chmod +x "$init_file"
 }
 
-create_instance_symlink() {
-  local instance="$1"
-  local symlink_path="/etc/init.d/${TEMPLATE_NAME}.${instance}"
-  if [ ! -e "$symlink_path" ]; then
-    ln -s "${TEMPLATE_NAME}" "$symlink_path"
-  fi
-}
-
-get_installed_version() {
-  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    local version_out
-    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null | head -n 1 || echo "")
-    if [[ -n "$version_out" ]]; then
-      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
-    else echo "未知版本"; fi
-  else echo "未安装"; fi
-}
-
-get_latest_version() {
-  local _tmpfile=$(mktemp)
-  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases/latest" -o "$_tmpfile"; then
-    rm -f "$_tmpfile"
-    return
-  fi
-  local _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
-  rm -f "$_tmpfile"
-  if [[ -n "$_tag_name" ]]; then echo "${_tag_name##*v}"; else echo ""; fi
-}
-
-download_singbox() {
-  local _version="$1"
-  local _destination="$2"
-  local _download_url="$REPO_URL/releases/download/v${_version}/sing-box-${_version}-linux-${ARCHITECTURE}.tar.gz"
-  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "核心下载失败！请检查网络。"
-    return 11
-  fi
-  return 0
-}
-
-# =========================================================
-# 3. 网络与状态辅助函数
-# =========================================================
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    echo "127.0.0.1"
-}
-
-check_port() {
-  local port="$1"
-  if ss -tunlp 2>/dev/null | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
-    return 1
-  fi
-  return 0
-}
-
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-
-get_random_port() {
-  local rand_port
-  while true; do
-    rand_port=$(( ( RANDOM % 63535 ) + 2000 ))
-    check_port "$rand_port" && echo "$rand_port" && return 0
-  done
-}
-
-get_sb_status() {
-  if rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" status --nocolor 2>/dev/null | grep -q "started"; then
-    echo -e "${GREEN}● 运行中${RESET}"
-  else
-    echo -e "${RED}● 未运行${RESET}"
-  fi
-}
-
-get_current_port_display() {
-  local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
-  if [[ -f "$conf_file" ]]; then
-    local main_port=$(jq -r '.inbounds[0].listen_port' "$conf_file" 2>/dev/null || echo "")
-    echo "${main_port:- -}"
-  else echo "实例未初始化"; fi
-}
-
-# =========================================================
-# 4. 证书与端口配置交互
-# =========================================================
-inst_cert() {
-  local instance="$1"
-  local cert_path="${BASE_DIR}/fullchain_${instance}.pem"
-  local key_path="${BASE_DIR}/privkey_${instance}.pem"
-  local conf_file="${BASE_DIR}/config_${instance}.json"
-
-  if [[ -f "$cert_path" && -f "$key_path" ]]; then
-    echo "---------------------------------------------"
-    echo -e "${YELLOW}[提示] 检测到实例 [ ${instance} ] 已有历史证书文件。${RESET}"
-    read -rp "是否要重新配置证书？[y/N] (直接回车保持不变): " cert_change_choice
-    cert_change_choice=${cert_change_choice:-n}
-    if [[ ! "$cert_change_choice" =~ ^[Yy]$ ]]; then
-      info "保持原有证书配置不变。"
-      local old_sni="www.bing.com"
-      [[ -f "$conf_file" ]] && old_sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_file" 2>/dev/null || echo "www.bing.com")
-      export EVAL_CERT_PATH="$cert_path"
-      export EVAL_KEY_PATH="$key_path"
-      export EVAL_DOMAIN="${old_sni:-"www.bing.com"}"
-      return 0
+# 提取运行状态和端口
+get_status_info() {
+    if [ -f "$COMPOSE_FILE" ] && [ "$(cd "$BASE_DIR" 2>/dev/null && docker compose ps -q 2>/dev/null)" ]; then
+        status="${GREEN}运行中${RESET}"
+        app_p=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' dujiao-next 2>/dev/null)
+    else
+        if [ -f "$ENV_FILE" ]; then status="${RED}已停止${RESET}"; else status="${RED}未部署${RESET}" ; fi
     fi
-  fi
 
-  echo "---------------------------------------------"
-  echo -e "实例 [ ${instance} ] 证书配置选择："
-  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
-  echo -e " 2) 自定义证书路径"
-  echo "---------------------------------------------"
-  local certInput
-  read -rp "请输入选项 [1-2] (回车默认自签): " certInput
-  certInput=${certInput:-1}
-
-  if [[ $certInput == 2 ]]; then
-    while true; do
-      local user_cert user_key
-      read -rp "请输入公钥文件绝对路径: " user_cert
-      read -rp "请输入密钥文件绝对路径: " user_key
-      read -rp "请输入对应域名: " sb_domain
-      if [[ -f "$user_cert" && -f "$user_key" ]]; then
-        rm -f "$cert_path" "$key_path"
-        fix_external_cert_permission "$user_cert" "$user_key" || continue
-        ln -sf "$user_cert" "$cert_path"
-        ln -sf "$user_key" "$key_path"
-        break
-      else
-        error "路径未找到，请重新输入！"
-      fi
-    done
-  fi
-
-  if [[ $certInput == 1 ]]; then
-    rm -f "$cert_path" "$key_path"
-    openssl ecparam -genkey -name prime256v1 -out "$key_path"
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    sb_domain="www.bing.com"
-  fi
-
-  chown -h "$SINGBOX_USER":"$SINGBOX_USER" "$cert_path" "$key_path" 2>/dev/null || true
-  export EVAL_CERT_PATH="$cert_path"
-  export EVAL_KEY_PATH="$key_path"
-  export EVAL_DOMAIN="$sb_domain"
+    if [ -z "$app_p" ] || [ "$app_p" = "<no value>" ]; then
+        if [ -f "$ENV_FILE" ]; then
+            app_p=$(grep "APP_PORT=" "$ENV_FILE" | cut -d'=' -f2)
+        else
+            app_p="N/A"
+        fi
+    fi
 }
 
-inst_port() {
-  local instance="$1"
-  local conf_file="${BASE_DIR}/config_${instance}.json"
-  local default_port=""
-  [[ -f "$conf_file" ]] && default_port=$(jq -r '.inbounds[0].listen_port' "$conf_file" 2>/dev/null || echo "")
-
-  local prompt_msg="设置该实例监听端口 (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置该实例监听端口 [当前: ${default_port}, 回车不修改]: "
-
-  while true; do
-    read -rp "$prompt_msg" port
-    port=${port:-$default_port}
-    [[ -z "$port" ]] && port=$(get_random_port) && info "为您分发未占用端口: $port" && break
-    if is_valid_port "$port"; then
-      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
-        error "端口 ${port} 已被占用，请更换。" && continue
-      fi
-      break
-    else error "请输入合法端口数字！"; fi
-  done
+# 产生随机字符串
+generate_random_str() {
+    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w "${1:-32}" | head -n 1
 }
 
-print_node_summary() {
-  local instance="$1"
-  local conf_file="${BASE_DIR}/config_${instance}.json"
-  [ ! -f "$conf_file" ] && return
+# 部署 DuJiaoNext 核心逻辑
+install_dujiao() {
+    check_dependencies
+    clear
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    请选择 DuJiaoNext 数据库架构: ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${CYAN}1. 方案 A：SQLite + Redis (轻量本地化推荐)${RESET}"
+    echo -e "${CYAN}2. 方案 B：PostgreSQL + Redis (本地容器自建集群)${RESET}"
+    echo -e "${CYAN}3. 方案 C：连接远程/外部独立 PostgreSQL (本地带 Redis)${RESET}"
+    echo -e "${CYAN}4. 方案 D：远程 PostgreSQL + 远程 Redis (完全分离模式)${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${YELLOW}请输入编号 [1-4]: ${RESET}"
+    read -r db_choice
 
-  local hostname=$(hostname -s | sed 's/ /_/g')
-  local vps_ip=$(get_public_ip)
-  local main_port=$(jq -r '.inbounds[0].listen_port' "$conf_file" 2>/dev/null || echo "")
-  local auth_pwd=$(jq -r '.inbounds[0].users[0].password' "$conf_file" 2>/dev/null || echo "")
-  local sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$conf_file" 2>/dev/null || echo "www.bing.com")
-
-  local is_insecure="0" skip_cert="false"
-  if [[ "$sb_domain" == "www.bing.com" ]]; then
-    is_insecure="1"
-    skip_cert="true"
-  fi
-
-  local url_ip="$vps_ip"
-  [[ "$vps_ip" =~ ":" ]] && url_ip="[$vps_ip]"
-
-  echo -e "\n${GREEN}== sing-box (AnyTLS) 实例${RESET}${YELLOW} [ ${instance} ]${RESET} ${GREEN}配置详情 ==${RESET}"
-  echo -e "${GREEN}外网绑定 IP  :${RESET} $vps_ip"
-  echo -e "${GREEN}监听端口     :${RESET} $main_port"
-  echo -e "${GREEN}验证密码     :${RESET} $auth_pwd"
-  echo -e "${GREEN}伪装 SNI 域  :${RESET} $sb_domain"
-  echo -e "${GREEN}配置文件路径 :${RESET} $conf_file"
-  echo -e "${GREEN}--------------------------------------------${RESET}"
-  echo -e "${GREEN}👉 V2rayN 订阅链接:${RESET}"
-  echo -e "${YELLOW}anytls://$auth_pwd@$url_ip:$main_port?security=tls&sni=$sb_domain&insecure=${is_insecure}&allowInsecure=${is_insecure}&type=tcp#$hostname-anytls-${instance}${RESET}"
-  echo ""
-}
-
-write_and_show_config() {
-  local instance="$1"
-  local conf_file="${BASE_DIR}/config_${instance}.json"
-  local sb_dir="${SB_DIR_BASE}/${instance}"
-
-  cat << EOF > "$conf_file"
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "name": "user1",
-          "password": "$auth_pwd"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "$EVAL_DOMAIN",
-        "key_path": "$EVAL_KEY_PATH",
-        "certificate_path": "$EVAL_CERT_PATH"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
-
-  mkdir -p "$sb_dir"
-  local inst_data_dir="${DATA_BASE_DIR}/${instance}"
-  install -m 0750 -o "$SINGBOX_USER" -g "$SINGBOX_USER" -d "$inst_data_dir"
-  
-  chown "$SINGBOX_USER":"$SINGBOX_USER" "$conf_file" 2>/dev/null || true
-  chown -h "$SINGBOX_USER":"$SINGBOX_USER" "$EVAL_CERT_PATH" "$EVAL_KEY_PATH" 2>/dev/null || true
-  
-  register_instance "$instance"
-  write_openrc_init_script
-  create_instance_symlink "$instance"
-
-  rc_service enable "$instance"
-  rc_service restart "$instance"
-
-  if rc-service "${TEMPLATE_NAME}.${instance}" status --nocolor 2>/dev/null | grep -q "started"; then
-    print_node_summary "$instance"
-  else
-    error "实例服务下发完成，但启动响应失败。请通过菜单 [8] 查看日志。"
-  fi
-}
-
-instsingbox() {
-  local mode="${1:-new}"
-  check_environment
-  [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
-
-  if [[ ! -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    info "核心组件缺失，正在拉取最新 sing-box 引擎..."
-    local latest_version=$(get_latest_version)
-    [[ -z "$latest_version" ]] && error "无法获取云端版本号！" && return 1
-    local _tmparchive=$(mktemp)
-    download_singbox "$latest_version" "$_tmparchive" || return 1
-    local _tmpdir=$(mktemp -d)
-    tar -xzf "$_tmparchive" -C "$_tmpdir"
-    install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"
-    rm -rf "$_tmparchive" "$_tmpdir"
-  fi
-
-  if ! is_user_exists "$SINGBOX_USER"; then
-    adduser -S -D -H -h "$DATA_BASE_DIR" -s /sbin/nologin "$SINGBOX_USER" >/dev/null 2>&1 || true
-  fi
-  write_openrc_init_script
-
-  local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
-  if [[ "$mode" == "new" && -f "$conf_file" ]]; then
-    echo -e "${YELLOW}[WARN]检测到实例 [ ${CURRENT_INSTANCE} ] 已经存在配置。${RESET}"
-    read -r -p "$(echo -e "${GREEN}是否强行覆盖并重置该实例？[y/N]: ${RESET}")" confirm || true
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
-  fi
-
-  if [[ "$mode" == "edit" ]]; then
-    echo -e "\n${GREEN}==== [正在修改实例参数: ${CURRENT_INSTANCE}] ====${RESET}"
-    local old_pwd=$(jq -r '.inbounds[0].users[0].password' "$conf_file" 2>/dev/null || true)
-  fi
-
-  inst_cert "$CURRENT_INSTANCE" || return 1
-  inst_port "$CURRENT_INSTANCE"
-
-  if [[ "$mode" == "edit" ]]; then
-    read -rp "设置新认证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
-    auth_pwd=${auth_pwd:-$old_pwd}
-  else
-    read -rp "设置 AnyTLS 验证密码 (回车分配高强度随机密钥): " auth_pwd
-    auth_pwd=${auth_pwd:-$(generate_random_password)}
-  fi
-
-  write_and_show_config "$CURRENT_INSTANCE"
-}
-
-unstsingbox() {
-  echo -e "${YELLOW}[WARN]该操作将彻底销毁清理当前聚焦的 [ ${CURRENT_INSTANCE} ] 实例。${RESET}"
-  read -r -p "$(echo -e "${RED}确定完全卸载移除此实例？[y/N]: ${RESET}")" confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || return
-
-  rc_service stop "$CURRENT_INSTANCE"
-  rc_service disable "$CURRENT_INSTANCE"
-
-  rm -f "/etc/init.d/${TEMPLATE_NAME}.${CURRENT_INSTANCE}"
-  rm -f "${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
-  rm -f "${BASE_DIR}/fullchain_${CURRENT_INSTANCE}.pem" "${BASE_DIR}/privkey_${CURRENT_INSTANCE}.pem"
-  rm -rf "${DATA_BASE_DIR}/${CURRENT_INSTANCE}" "/root/proxynode/Anytls/${CURRENT_INSTANCE}"
-
-  unregister_instance "$CURRENT_INSTANCE"
-  info "实例 [ ${CURRENT_INSTANCE} ] 已彻底移除。"
-
-  sync_registry
-  if [ ! -s "$REGISTRY_FILE" ]; then
-    info "检测到矩阵内已无活跃节点，自动清理全局共享组件..."
-    rm -f /etc/init.d/${TEMPLATE_NAME}
-    rm -f "$EXECUTABLE_INSTALL_PATH"
-    rm -rf "$BASE_DIR" "$DATA_BASE_DIR"
-    deluser "$SINGBOX_USER" >/dev/null 2>&1 || true
-    CURRENT_INSTANCE="anytls"
-  fi
-}
-
-menu_switch_matrix() {
-  echo -e "\n${GREEN}==== [sing-box 多开实例中心] ====${RESET}"
-  echo -e "${GREEN}当前操作目标实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-  echo -e "${GREEN}当前独立实例列表:${RESET}"
-
-  sync_registry
-  local count=0
-  local -a instance_list=()
-
-  if [ -f "$REGISTRY_FILE" ]; then
-    while IFS= read -r name || [ -n "$name" ]; do
-      [ -z "$name" ] && continue
-      local c_file="${BASE_DIR}/config_${name}.json"
-      [ -f "$c_file" ] || continue
-
-      count=$((count + 1))
-      instance_list[$count]="$name"
-      
-      local port_num=$(jq -r '.inbounds[0].listen_port' "$c_file" 2>/dev/null || echo "")
-      local status_str="${RED}已停止${RESET}"
-      if rc-service "${TEMPLATE_NAME}.${name}" status --nocolor 2>/dev/null | grep -q "started"; then status_str="${GREEN}运行中${RESET}"; fi
-      echo -e " ${CYAN}[ ${count} ] ->${GREEN} 实例名: ${YELLOW}${name}${RESET} ${GREEN}[绑定端口: ${port_num} | 运行状态: ${status_str}${GREEN}]${RESET}"
-    done < "$REGISTRY_FILE"
-  fi
-
-  [ "$count" -eq 0 ] && echo -e " ${YELLOW}(当前矩阵内暂无实例，可在下方输入新名字直接创建)${RESET}"
-  
-  echo ""
-  echo -e "${GREEN}👉 输入已有实例前面的【数字编号】快速切换管理目标${RESET}"
-  echo -e "${GREEN}👉 或者直接输入一个【全新的英文别名】来新建独立多开实例${RESET}"
-  echo -ne "${YELLOW}请输入选择或名字: ${RESET}"
-  read -r input_val || true
-  [[ -z "$input_val" ]] && return
-
-  if [[ "$input_val" =~ ^[0-9]+$ ]]; then
-    if [ "$input_val" -gt 0 ] && [ "$input_val" -le "$count" ]; then
-      CURRENT_INSTANCE="${instance_list[$input_val]}"
-      echo -e "${GREEN}操作焦点成功切为已有实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    else error "编号超出可用范围！"; fi
-  else
-    if [[ "$input_val" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-      CURRENT_INSTANCE="$input_val"
-      echo -e "${GREEN}成功锁定并创建新焦点: ${YELLOW}${CURRENT_INSTANCE}${RESET}${GREEN} (请在主菜单选择 [1] 下发部署服务)${RESET}"
-    else error "命名不规范，仅限使用英文字母、数字、中划线和下划线！"; fi
-  fi
-}
-
-update_singbox() {
-  info "正在检查新版本..."
-  local current_version=$(get_installed_version)
-  local latest_version=$(get_latest_version)
-  [[ -z "$latest_version" ]] && error "无法获取云端版本号！" && return 1
-
-  info "当前版本: ${YELLOW}${current_version}${RESET} ${GREEN}| 最新版本:${RESET} ${YELLOW}${latest_version}${RESET}"
-  [[ "$current_version" == "$latest_version" ]] && info "已经是最新版本，无需更新。" && return 0
-
-  local _tmparchive=$(mktemp)
-  download_singbox "$latest_version" "$_tmparchive" || return 1
-  local _tmpdir=$(mktemp -d)
-  tar -xzf "$_tmparchive" -C "$_tmpdir"
-  install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"
-  rm -rf "$_tmparchive" "$_tmpdir"
-  info "核心更新完毕！请视情况手动重启运行中的实例。"
-}
-
-configure_custom_socks5_outbound() {
-    local instance_config="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
-    if [[ ! -f "$instance_config" ]]; then 
-        echo -e "${RED}[ERROR]未安装，无法配置出口模式。${RESET}" >&2
+    if [[ "$db_choice" != "1" && "$db_choice" != "2" && "$db_choice" != "3" && "$db_choice" != "4" ]]; then
+        echo -e "${RED}输入有误，取消部署。${RESET}"
         return
     fi
 
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].type // "direct"' "$instance_config" 2>/dev/null || echo "direct")
+    local remote_dsn=""
+    if [[ "$db_choice" == "3" || "$db_choice" == "4" ]]; then
+        echo -e "${CYAN}--- 远程 PostgreSQL 数据库连接配置 ---${RESET}"
+        echo -ne "${YELLOW}请输入远程数据库 主机IP/域名: ${RESET}"
+        read -r remote_host
+        echo -ne "${YELLOW}请输入远程数据库 端口 [默认: 5432]: ${RESET}"
+        read -r remote_port
+        [[ -z "$remote_port" ]] && remote_port="5432"
+        echo -ne "${YELLOW}请输入远程数据库 用户名: ${RESET}"
+        read -r remote_user
+        echo -ne "${YELLOW}请输入远程数据库 密码: ${RESET}"
+        read -r remote_pass
+        echo -ne "${YELLOW}请输入远程数据库 数据库名: ${RESET}"
+        read -r remote_dbname
 
-    echo -e "${GREEN}-------------------------------------------${RESET}"
-    echo -e "${YELLOW}请选择出口模式：${RESET}"
-    echo -e "${GREEN}1) 直连出口${RESET}"
-    echo -e "${GREEN}2) Socks5出口${RESET}"
-    echo -e "${GREEN}0) 取消${RESET}"
-    echo -e "${GREEN}-------------------------------------------${RESET}"
-
-    echo -ne "${YELLOW}请输入选项: ${RESET}"
-    read -r mode || true
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"type":"direct","tag":"direct"}]' "$instance_config" > "$tmp_file"
-            cp "$instance_config" "${instance_config}.bak.$(date +%s)"
-            mv "$tmp_file" "$instance_config"
-            rc_service restart "$CURRENT_INSTANCE"
-            echo -e "${GREEN}[OK]已切换为直连出口！${RESET}"
-            return
-            ;;
-        2) ;;
-        *) return ;;
-    esac
-
-    local socks_host socks_port socks_user socks_pass
-    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
-    read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
-    socks_port=${socks_port:-1080}
-    read -rp "请输入 Socks5 用户名 (无则直接回车): " socks_user || true
-    if [[ -n "$socks_user" ]]; then
-        read -rs -p "请输入 Socks5 密码: " socks_pass || true
-        echo
+        remote_dsn="host=${remote_host} user=${remote_user} password=${remote_pass} dbname=${remote_dbname} port=${remote_port} sslmode=disable TimeZone=Asia/Shanghai"
     fi
 
-    tmp_file=$(mktemp)
-    if [[ -n "$socks_user" ]]; then
-        jq --arg host "$socks_host" --argjson port "$socks_port" --arg user "$socks_user" --arg pass "$socks_pass" \
-        '.outbounds = [{"type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port, "username": $user, "password": $pass}]' \
-        "$instance_config" > "$tmp_file"
+    # 修复坑点 3：非完全分离模式下，Redis 必须使用 Docker 容器服务名 "redis" 供内部通信
+    local redis_host_cfg="redis"
+    local redis_port_cfg="6379"
+    local redis_pass_cfg=$(generate_random_str 16)
+    local redis_db_cfg="0"
+    local redis_queue_db_cfg="1"
+
+    if [[ "$db_choice" == "4" ]]; then
+        echo -e "${CYAN}--- 远程 Redis 缓存连接配置 ---${RESET}"
+        echo -ne "${YELLOW}请输入远程 Redis 主机IP/域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r redis_host_cfg
+        [[ -z "$redis_host_cfg" ]] && redis_host_cfg="127.0.0.1"
+
+        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
+        read -r redis_port_cfg
+        [[ -z "$redis_port_cfg" ]] && redis_port_cfg="6379"
+
+        echo -ne "${YELLOW}请输入远程 Redis 密码 (若无密码请直接回车): ${RESET}"
+        read -r redis_pass_cfg
+
+        echo -ne "${YELLOW}请输入远程 Redis 缓存型数据库号 (DB ID) [默认: 0]: ${RESET}"
+        read -r redis_db_cfg
+        [[ -z "$redis_db_cfg" ]] && redis_db_cfg="0"
+
+        echo -ne "${YELLOW}请输入远程 Redis 队列型数据库号 (DB ID) [默认: 1]: ${RESET}"
+        read -r redis_queue_db_cfg
+        [[ -z "$redis_queue_db_cfg" ]] && redis_queue_db_cfg="1"
+    fi
+
+    echo -e "${CYAN}====== 自定义基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入安装绝对路径 [默认: /opt/dujiao-next]: ${RESET}"
+    read -r custom_dir
+    [[ -z "$custom_dir" ]] && custom_dir="/opt/dujiao-next"
+    BASE_DIR="$custom_dir"
+    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+    CONFIG_FILE="$BASE_DIR/config/config.yml"
+    ENV_FILE="$BASE_DIR/.env"
+
+    echo -ne "${YELLOW}请输入服务映射端口 [默认: 8080]: ${RESET}"
+    read -r app_port
+    [[ -z "$app_port" ]] && app_port="8080"
+
+    echo -ne "${YELLOW}请输入自定义后台安全路径 [默认: /admin]: ${RESET}"
+    read -r admin_path
+    [[ -z "$admin_path" ]] && admin_path="/admin"
+
+    echo -ne "${YELLOW}设置首次初始化管理员密码 [默认: admin123]: ${RESET}"
+    read -r admin_pwd
+    [[ -z "$admin_pwd" ]] && admin_pwd="admin123"
+
+    # 1. 创建持久化目录并赋予权限
+    echo -e "${YELLOW}正在建立并授权本地持久化目录...${RESET}"
+    mkdir -p "$BASE_DIR/config" "$BASE_DIR/data/db" "$BASE_DIR/data/uploads" "$BASE_DIR/data/logs" "$BASE_DIR/data/redis" "$BASE_DIR/data/postgres"
+    chmod -R 0777 "$BASE_DIR/data"
+
+    # 修复坑点 2：生成三组互不相同的独立强随机密钥，绕过新版后端的安全强校验
+    echo -e "${YELLOW}正在生成强随机加密密钥...${RESET}"
+    local app_secret_key=$(generate_random_str 32)
+    local jwt_secret=$(generate_random_str 32)
+    local user_jwt_secret=$(generate_random_str 32)
+    local local_pg_pass=$(generate_random_str 16)
+
+    # 3. 写入标准的 config.yml（严格使用标准半角空格缩进，杜绝任何全角/不可见字符）
+    echo -e "${YELLOW}正在生成统一生产配置文件 (config.yml)...${RESET}"
+    cat <<EOF > "$CONFIG_FILE"
+app:
+  secret_key: "${app_secret_key}"
+  totp_issuer: "Dujiao-Next"
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  mode: "release"
+
+log:
+  dir: ""
+  filename: "app.log"
+  max_size_mb: 100
+  max_backups: 7
+  max_age_days: 30
+  compress: true
+
+bootstrap:
+  default_admin_username: "admin"
+  default_admin_password: "${admin_pwd}"
+
+jwt:
+  secret: "${jwt_secret}"
+  expire_hours: 24
+
+user_jwt:
+  secret: "${user_jwt_secret}"
+  expire_hours: 24
+  remember_me_expire_hours: 168
+
+redis:
+  enabled: true
+  host: "${redis_host_cfg}"
+  port: ${redis_port_cfg}
+  password: "${redis_pass_cfg}"
+  db: ${redis_db_cfg}
+  prefix: "dj"
+
+queue:
+  enabled: true
+  host: "${redis_host_cfg}"
+  port: ${redis_port_cfg}
+  password: "${redis_pass_cfg}"
+  db: ${redis_queue_db_cfg}
+  concurrency: 10
+  queues:
+    default: 10
+    critical: 5
+  upstream_sync_interval: "5m"
+
+upload:
+  max_size: 10485760
+  allowed_types:
+    - image/jpeg
+    - image/png
+    - image/gif
+    - image/webp
+    - image/svg+xml
+  allowed_extensions:
+    - .jpg
+    - .jpeg
+    - .png
+    - .gif
+    - .webp
+    - .svg
+  max_width: 4096
+  max_height: 4096
+
+cors:
+  allowed_origins:
+    - "*"
+  allowed_methods:
+    - GET
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    - OPTIONS
+  allowed_headers:
+    - Content-Type
+    - Content-Length
+    - Accept-Encoding
+    - Authorization
+    - Cache-Control
+    - X-Requested-With
+    - X-CSRF-Token
+  allow_credentials: true
+  max_age: 600
+
+security:
+  login_rate_limit:
+    window_seconds: 300
+    max_attempts: 5
+    block_seconds: 900
+  password_policy:
+    min_length: 8
+    require_upper: true
+    require_lower: true
+    require_number: true
+    require_special: false
+
+email:
+  enabled: false
+  host: ""
+  port: 465
+  username: ""
+  password: ""
+  from: ""
+  from_name: ""
+  use_tls: false
+  use_ssl: true
+  verify_code:
+    expire_minutes: 10
+    send_interval_seconds: 60
+    max_attempts: 5
+    length: 6
+
+order:
+  payment_expire_minutes: 15
+  max_refund_days: 30
+
+reseller:
+  enabled: false
+  main_hosts:
+    - localhost
+    - 127.0.0.1
+    - "::1"
+  trusted_forwarded_host: false
+  subdomain_base: ""
+  self_apply_enabled: true
+  settlement_confirm_days: 7
+
+web:
+  admin_path: "${admin_path}"
+EOF
+
+    # 按照规约拼接 database 节点
+    if [ "$db_choice" = "1" ]; then
+        cat <<EOF >> "$CONFIG_FILE"
+database:
+  driver: sqlite
+  dsn: ./db/dujiao.db
+  pool:
+    max_open_conns: 1
+    max_idle_conns: 1
+    conn_max_lifetime_seconds: 0
+    conn_max_idle_time_seconds: 0
+EOF
+    elif [ "$db_choice" = "2" ]; then
+        cat <<EOF >> "$CONFIG_FILE"
+database:
+  driver: postgres
+  dsn: host=postgres user=dujiao password=${local_pg_pass} dbname=dujiao_next port=5432 sslmode=disable TimeZone=Asia/Shanghai
+EOF
+    elif [[ "$db_choice" == "3" || "$db_choice" == "4" ]]; then
+        cat <<EOF >> "$CONFIG_FILE"
+database:
+  driver: postgres
+  dsn: "${remote_dsn}"
+EOF
+    fi
+
+    # 4. 生成 .env 文件
+    cat <<EOF > "$ENV_FILE"
+TAG=latest
+TZ=Asia/Shanghai
+APP_PORT=${app_port}
+DJ_DEFAULT_ADMIN_USERNAME=admin
+DJ_DEFAULT_ADMIN_PASSWORD=${admin_pwd}
+REDIS_PASSWORD=${redis_pass_cfg}
+POSTGRES_DB=dujiao_next
+POSTGRES_USER=dujiao
+POSTGRES_PASSWORD=${local_pg_pass}
+EOF
+
+    # 5. 生成标准化的 docker-compose.yml
+    local compose_content="services:"
+
+    if [ "$db_choice" != "4" ]; then
+        compose_content="${compose_content}
+  redis:
+    image: redis:7-alpine
+    container_name: dujiaonext-redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: \${REDIS_PASSWORD}
+    command: [\"redis-server\", \"--dir\", \"/data\", \"--appendonly\", \"yes\", \"--requirepass\", \"\${REDIS_PASSWORD}\"]
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: [\"CMD\", \"redis-cli\", \"-a\", \"\${REDIS_PASSWORD}\", \"ping\"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      - dujiao-net"
+    fi
+
+    if [ "$db_choice" = "2" ]; then
+        compose_content="${compose_content}
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: dujiaonext-postgres
+    restart: unless-stopped
+    environment:
+      TZ: \${TZ}
+      POSTGRES_DB: \${POSTGRES_DB}
+      POSTGRES_USER: \${POSTGRES_USER}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [\"CMD-SHELL\", \"pg_isready -U \${POSTGRES_USER} -d \${POSTGRES_DB}\"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - dujiao-net"
+    fi
+
+    # 主容器定义 (dujiao-next)
+    compose_content="${compose_content}
+
+  dujiao-next:
+    image: dujiaonext/dujiao-next:\${TAG}
+    container_name: dujiao-next
+    restart: unless-stopped
+    environment:
+      TZ: \${TZ}
+      DJ_DEFAULT_ADMIN_USERNAME: \${DJ_DEFAULT_ADMIN_USERNAME}
+      DJ_DEFAULT_ADMIN_PASSWORD: \${DJ_DEFAULT_ADMIN_PASSWORD}
+    ports:
+      - \"127.0.0.1:\${APP_PORT}:8080\"
+    volumes:
+      - ./config/config.yml:/app/config.yml:ro"
+
+    if [ "$db_choice" = "1" ]; then
+        compose_content="${compose_content}
+      - ./data/db:/app/db"
+    fi
+
+    compose_content="${compose_content}
+      - ./data/uploads:/app/uploads
+      - ./data/logs:/app/logs"
+
+    if [ "$db_choice" != "4" ]; then
+        compose_content="${compose_content}
+    depends_on:
+      redis:
+        condition: service_healthy"
+        if [ "$db_choice" = "2" ]; then
+            compose_content="${compose_content}
+      postgres:
+        condition: service_healthy"
+        fi
+    fi
+
+    compose_content="${compose_content}
+    healthcheck:
+      test: [\"CMD\", \"wget\", \"-qO-\", \"http://127.0.0.1:8080/health\"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      - dujiao-net
+
+networks:
+  dujiao-net:
+    driver: bridge"
+
+    echo "$compose_content" > "$COMPOSE_FILE"
+
+    # 6. 启动容器
+    echo -e "${YELLOW}正在拉取镜像并启动 DuJiaoNext 服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}等待服务自检 (8 秒)...${RESET}"
+    sleep 8
+
+    local current_admin_path=$(grep "admin_path:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}    DuJiaoNext 部署成功！      ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}前台访问 (本机) : http://127.0.0.1:${app_port}${RESET}"
+    echo -e "${YELLOW}后台访问 (本机) : http://127.0.0.1:${app_port}${current_admin_path}${RESET}"
+    echo -e "${RED}🔒 核心提示：服务默认仅绑定 127.0.0.1。${RESET}"
+    echo -e "${GREEN}--------------------------------${RESET}"
+    echo -e "${YELLOW}初始管理员账号 : admin${RESET}"
+    echo -e "${YELLOW}初始管理员密码 : ${admin_pwd}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+}
+
+# 更新服务
+update_dujiao() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！请清理浏览器缓存。${RESET}"
+}
+
+# 卸载服务
+uninstall_dujiao() {
+    echo -ne "${RED}警告：确认要彻底卸载独角数卡服务吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+        fi
+        docker rm -f dujiao-next dujiaonext-redis dujiaonext-postgres dujiaonext-server 2>/dev/null
+        echo -ne "${YELLOW}是否清空数据卷（数据库、上传文件和日志）？(y/n): ${RESET}"
+        read -r clean_data
+        if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+            rm -rf "$BASE_DIR"
+            echo -e "${GREEN}物理数据已彻底清除。${RESET}"
+        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
+    fi
+}
+
+start_dujiao() { cd "$BASE_DIR" 2>/dev/null && docker compose start && echo -e "${GREEN}服务已恢复启动${RESET}"; }
+stop_dujiao() { cd "$BASE_DIR" 2>/dev/null && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
+restart_dujiao() { cd "$BASE_DIR" 2>/dev/null && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
+
+# 查看日志
+logs_dujiao() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到部署集群，无法查看日志。${RESET}"
+        return
+    fi
+    cd "$BASE_DIR" && docker compose logs -f dujiao-next
+}
+
+# 清理 Nginx 旧配置
+safe_remove_old_conf() {
+    local domain=$1
+    local paths=("/etc/nginx/sites-enabled/$domain" "/etc/nginx/sites-available/$domain" "/etc/nginx/conf.d/$domain.conf")
+    sudo mkdir -p /tmp/nginx_bak/ 2>/dev/null
+
+    for path in "${paths[@]}"; do
+        if [ -f "$path" ] || [ -L "$path" ]; then
+            local filename=$(basename "$path")
+            local parent_dir=$(basename "$(dirname "$path")")
+            echo -e "${YELLOW}备份冲突的旧配置: $path 到 /tmp/nginx_bak/ ...${RESET}"
+            sudo mv "$path" "/tmp/nginx_bak/${parent_dir}_${filename}" 2>/dev/null
+        fi
+    done
+}
+
+# Nginx 反代逻辑
+configure_nginx() {
+    get_status_info
+    if [ "$app_p" = "N/A" ]; then
+        echo -e "${RED}错误: 未检测到应用实例，请先执行选项 1 部署。${RESET}"
+        return
+    fi
+
+    clear
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -e "${GREEN}        DuJiaoNext   Nginx 反代自动配置              ${RESET}"
+    echo -e "${GREEN}=====================================================${RESET}"
+    echo -ne "${CYAN}确认继续操作吗？(y/n): ${RESET}"
+    read -r cert_confirm
+    if [[ "$cert_confirm" != "y" && "$cert_confirm" != "Y" ]]; then
+        echo -e "${YELLOW}取消操作。${RESET}"
+        return
+    fi
+
+    echo ""
+    echo -ne "${YELLOW}请输入你的访问主域名 (例如: shop.example.com): ${RESET}"
+    read -r main_domain
+
+    if [ -z "$main_domain" ]; then
+        echo -e "${RED}域名不能为空！${RESET}"
+        return
+    fi
+
+    safe_remove_old_conf "$main_domain"
+
+    local AVAILABLE_DIR="/etc/nginx/sites-available"
+    local ENABLED_DIR="/etc/nginx/sites-enabled"
+    local CONF_D_DIR="/etc/nginx/conf.d"
+    local USE_SYMLINK=false
+
+    if [ -d "$AVAILABLE_DIR" ] && [ -d "$ENABLED_DIR" ]; then
+        MAIN_CONF="$AVAILABLE_DIR/$main_domain"
+        USE_SYMLINK=true
     else
-        jq --arg host "$socks_host" --argjson port "$socks_port" \
-        '.outbounds = [{"type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port}]' \
-        "$instance_config" > "$tmp_file"
+        sudo mkdir -p "$CONF_D_DIR"
+        MAIN_CONF="$CONF_D_DIR/${main_domain}.conf"
+        USE_SYMLINK=false
     fi
 
-    cp "$instance_config" "${instance_config}.bak.$(date +%s)"
-    mv "$tmp_file" "$instance_config"
-    rc_service restart "$CURRENT_INSTANCE"
-    echo -e "${GREEN}[OK]已成功切换为 Socks5 出口！${RESET}"
+    echo -e "${YELLOW}写入 Nginx 反代配置到 $MAIN_CONF ...${RESET}"
+    sudo tee "$MAIN_CONF" > /dev/null <<EOF
+server {
+    listen 80;
+    server_name $main_domain;
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name $main_domain;
+
+    ssl_certificate /etc/letsencrypt/live/$main_domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$main_domain/privkey.pem;
+
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:$app_p;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+    if [ "$USE_SYMLINK" = true ]; then
+        sudo ln -sf "$MAIN_CONF" "$ENABLED_DIR/$main_domain"
+    fi
+
+    if command -v nginx &> /dev/null; then
+        echo -e "${YELLOW}检查 Nginx 配置语法...${RESET}"
+        if sudo nginx -t; then
+            echo -e "${YELLOW}重载 Nginx 服务...${RESET}"
+            sudo nginx -s reload
+            echo -e "${GREEN}✔ Nginx 配置成功生效！${RESET}"
+        else
+            echo -e "${RED}❌ Nginx 语法检查未通过！请确保已经申请好了 LetsEncrypt SSL 证书。${RESET}"
+        fi
+    else
+        echo -e "${YELLOW}提示: 未检测到本地 Nginx 物理命令，配置文件已写好保存。${RESET}"
+    fi
+}
+
+show_info() {
+    get_status_info
+    
+    local current_admin_path="/admin"
+    if [ -f "$CONFIG_FILE" ]; then
+        local extracted_path=$(grep "admin_path:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
+        [ -n "$extracted_path" ] && current_admin_path="$extracted_path"
+    fi
+
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}集群运行状态 : $status"
+    echo -e "${YELLOW}应用服务端口 : 127.0.0.1:${app_p}"
+    echo -e "${YELLOW}后台安全路径 : ${current_admin_path}"
+    echo -e "${YELLOW}本地安装路径 : ${BASE_DIR}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
 menu() {
-  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
-  check_environment
-
-  while true; do
     clear
-    local status=$(get_sb_status)
-    local version=$(get_installed_version)
-    local port_show=$(get_current_port_display)
-
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}     ◈  sing-box AnyTLS多实例管理面板 (Alpine) ◈     ${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}目标实例端口 :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}服务活跃状态 :${RESET} $status"
-    echo -e "${GREEN}核心共享引擎 :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} 1. 安装当前实例${RESET}"
-    echo -e "${GREEN} 2. 更新内核程序${RESET}"
-    echo -e "${GREEN} 3. 卸载当前实例${RESET}"
-    echo -e "${GREEN} 4. 修改当前实例${RESET}"
-    echo -e "${GREEN} 5. 启动当前实例${RESET}"
-    echo -e "${GREEN} 6. 停止当前实例${RESET}"
-    echo -e "${GREEN} 7. 重启当前实例${RESET}"
-    echo -e "${GREEN} 8. 当前实例日志${RESET}"
-    echo -e "${GREEN} 9. 当前实例配置${RESET}"
-    echo -e "${GREEN}10. Socks5出口${RESET}     ${YELLOW}← 链式分流代理${RESET}"
-    echo -e "${GREEN}11. 管理实例${RESET}       ${YELLOW}← 添加/切换节点${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-
-    local choice=""
-    read -r -p $'\033[32m选择操作序号: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
-
+    get_status_info
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN} ◈ DuJiaoNext (独角数卡) 面板 ◈  ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}核心状态 :${RESET} $status"
+    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${app_p}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新服务${RESET}"
+    echo -e "${GREEN}3. 卸载服务${RESET}"
+    echo -e "${GREEN}4. 启动集群${RESET}"
+    echo -e "${GREEN}5. 停止集群${RESET}"
+    echo -e "${GREEN}6. 重启集群${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}9. 反向代理${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
     case "$choice" in
-      1) instsingbox "new"; pause ;;
-      2) update_singbox; pause ;;
-      3) unstsingbox; pause ;;
-      4) instsingbox "edit"; pause ;;
-      5) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" start && info "启动成功" ; pause ;;
-      6) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" stop && info "停止成功" ; pause ;;
-      7) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" restart && info "重启完毕" ; pause ;;
-      8) 
-        echo -e "${YELLOW}正在调取该实例实时日志 (按 Ctrl+C 退出):${RESET}\n"
-        tail -n 50 -f /var/log/messages 2>/dev/null || cat /var/log/syslog 2>/dev/null || echo "请查看 OpenRC 日志系统输出"
-        sleep 2
-        ;;
-      9) print_node_summary "$CURRENT_INSTANCE"; pause ;;
-      10) configure_custom_socks5_outbound; pause ;;
-      11) menu_switch_matrix ;;
-      0) clear; exit 0 ;;
-      *) warn "输入未知操作序号！"; sleep 0.5 ;;
+        1) install_dujiao ;;
+        2) update_dujiao ;;
+        3) uninstall_dujiao ;;
+        4) start_dujiao ;;
+        5) stop_dujiao ;;
+        6) restart_dujiao ;;
+        7) logs_dujiao ;;
+        8) show_info ;;
+        9) configure_nginx ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
-  done
 }
 
-menu "$@"
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

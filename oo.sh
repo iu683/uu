@@ -1,19 +1,19 @@
 #!/bin/bash
 # =================================================================
-# DuJiaoNext (独角数卡) Docker Compose 统一管理面板 (修复版)
+# Animaku 影视播放系统 (官方原生 Clone + 环境变量 Build) 自动化管理面板
 # =================================================================
 
-# 颜色定义
+# 颜色
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-BASE_DIR="/opt/dujiao-next"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-CONFIG_FILE="$BASE_DIR/config/config.yml"
-ENV_FILE="$BASE_DIR/.env"
+APP_NAME="animaku"
+BASE_DIR="/opt/animaku"
+SRC_DIR="$BASE_DIR" 
+REPO_URL="https://github.com/uerax/Animaku.git"
 
 # 检测依赖
 check_dependencies() {
@@ -21,627 +21,216 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
+    if ! command -v git &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
+        exit 1
+    fi
 }
 
-# 提取运行状态和端口
+# 动态获取服务端口与运行状态
 get_status_info() {
-    if [ -f "$COMPOSE_FILE" ] && [ "$(cd "$BASE_DIR" 2>/dev/null && docker compose ps -q 2>/dev/null)" ]; then
+    if ! command -v docker &> /dev/null; then
+        status="${RED}未安装 Docker${RESET}"
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        return 0
+    fi
+    local container_id=$(docker ps -q -f "ancestor=animaku:local" -f "status=running" 2>/dev/null)
+    [[ -z "$container_id" ]] && container_id=$(docker ps -q -f "name=animaku" -f "status=running" 2>/dev/null)
+
+    if [[ -n "$container_id" ]]; then
         status="${GREEN}运行中${RESET}"
-        app_p=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' dujiao-next 2>/dev/null)
+        # 优先从运行中的容器环境变量中提取 PORT
+        webui_port=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container_id" 2>/dev/null | grep "^PORT=" | cut -d'=' -f2)
+        # 如果环境变量没取到，则回退去解析宿主机端口映射
+        if [[ -z "$webui_port" ]]; then
+            webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8787/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
+        fi
+        [[ -z "$webui_port" ]] && webui_port="8787"
     else
-        if [ -f "$ENV_FILE" ]; then status="${RED}已停止${RESET}"; else status="${RED}未部署${RESET}" ; fi
-    fi
-
-    if [ -z "$app_p" ] || [ "$app_p" = "<no value>" ]; then
-        if [ -f "$ENV_FILE" ]; then
-            app_p=$(grep "APP_PORT=" "$ENV_FILE" | cut -d'=' -f2)
+        if [ -d "$SRC_DIR/.git" ]; then
+            status="${RED}已停止${RESET}"
         else
-            app_p="N/A"
+            status="${RED}未部署${RESET}"
         fi
+        webui_port="N/A"
     fi
 }
 
-# 产生随机字符串
-generate_random_str() {
-    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w "${1:-32}" | head -n 1
+get_public_ip() {
+    local mode=${1:-"auto"}
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+        done
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
+    else
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+    fi
+    echo "127.0.0.1" && return 0
 }
 
-# 部署 DuJiaoNext 核心逻辑
-install_dujiao() {
+# 部署核心逻辑
+install_translate() {
     check_dependencies
-    clear
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    请选择 DuJiaoNext 数据库架构: ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${CYAN}1. 方案 A：SQLite + Redis (轻量本地化推荐)${RESET}"
-    echo -e "${CYAN}2. 方案 B：PostgreSQL + Redis (本地容器自建集群)${RESET}"
-    echo -e "${CYAN}3. 方案 C：连接远程/外部独立 PostgreSQL (本地带 Redis)${RESET}"
-    echo -e "${CYAN}4. 方案 D：远程 PostgreSQL + 远程 Redis (完全分离模式)${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${YELLOW}请输入编号 [1-4]: ${RESET}"
-    read -r db_choice
 
-    if [[ "$db_choice" != "1" && "$db_choice" != "2" && "$db_choice" != "3" && "$db_choice" != "4" ]]; then
-        echo -e "${RED}输入有误，取消部署。${RESET}"
-        return
+    echo -e "${CYAN}====== 1. 端口与代理配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Animaku 映射端口 (对应 PORT) [默认: 8787]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8787"
+
+    echo -ne "${YELLOW}是否开启公开代理/插件API (PUBLIC_PROXY: 1=开启, 0=仅局域网) [默认: 1]: ${RESET}"
+    read -r custom_proxy
+    [[ -z "$custom_proxy" ]] && custom_proxy="1"
+
+    echo -ne "${YELLOW}是否开启 Anime1 完整媒体隧道 (MEDIA_FULL_PROXY: 1=开启, 0=仅m3u8) [默认: 0]: ${RESET}"
+    read -r custom_full_proxy
+    [[ -z "$custom_full_proxy" ]] && custom_full_proxy="0"
+
+    # 克隆官方仓库到当前工作目录
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "\n${YELLOW}正在克隆官方 GitHub 仓库...${RESET}"
+        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
+        if [ $? -eq 0 ]; then
+            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
+            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
+            rm -rf "$SRC_DIR/tmp_repo"
+        else
+            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
+            exit 1
+        fi
+    else
+        echo -e "\n${GREEN}检测到本地已存在官方仓库，正在同步最新代码...${RESET}"
+        cd "$SRC_DIR" && git pull
     fi
 
-    local remote_dsn=""
-    if [[ "$db_choice" == "3" || "$db_choice" == "4" ]]; then
-        echo -e "${CYAN}--- 远程 PostgreSQL 数据库连接配置 ---${RESET}"
-        echo -ne "${YELLOW}请输入远程数据库 主机IP/域名: ${RESET}"
-        read -r remote_host
-        echo -ne "${YELLOW}请输入远程数据库 端口 [默认: 5432]: ${RESET}"
-        read -r remote_port
-        [[ -z "$remote_port" ]] && remote_port="5432"
-        echo -ne "${YELLOW}请输入远程数据库 用户名: ${RESET}"
-        read -r remote_user
-        echo -ne "${YELLOW}请输入远程数据库 密码: ${RESET}"
-        read -r remote_pass
-        echo -ne "${YELLOW}请输入远程数据库 数据库名: ${RESET}"
-        read -r remote_dbname
+    # 回到仓库根目录
+    cd "$SRC_DIR"
 
-        remote_dsn="host=${remote_host} user=${remote_user} password=${remote_pass} dbname=${remote_dbname} port=${remote_port} sslmode=disable TimeZone=Asia/Shanghai"
-    fi
-
-    # 修复坑点 3：非完全分离模式下，Redis 必须使用 Docker 容器服务名 "redis" 供内部通信
-    local redis_host_cfg="redis"
-    local redis_port_cfg="6379"
-    local redis_pass_cfg=$(generate_random_str 16)
-    local redis_db_cfg="0"
-    local redis_queue_db_cfg="1"
-
-    if [[ "$db_choice" == "4" ]]; then
-        echo -e "${CYAN}--- 远程 Redis 缓存连接配置 ---${RESET}"
-        echo -ne "${YELLOW}请输入远程 Redis 主机IP/域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r redis_host_cfg
-        [[ -z "$redis_host_cfg" ]] && redis_host_cfg="127.0.0.1"
-
-        echo -ne "${YELLOW}请输入远程 Redis 端口 [默认: 6379]: ${RESET}"
-        read -r redis_port_cfg
-        [[ -z "$redis_port_cfg" ]] && redis_port_cfg="6379"
-
-        echo -ne "${YELLOW}请输入远程 Redis 密码 (若无密码请直接回车): ${RESET}"
-        read -r redis_pass_cfg
-
-        echo -ne "${YELLOW}请输入远程 Redis 缓存型数据库号 (DB ID) [默认: 0]: ${RESET}"
-        read -r redis_db_cfg
-        [[ -z "$redis_db_cfg" ]] && redis_db_cfg="0"
-
-        echo -ne "${YELLOW}请输入远程 Redis 队列型数据库号 (DB ID) [默认: 1]: ${RESET}"
-        read -r redis_queue_db_cfg
-        [[ -z "$redis_queue_db_cfg" ]] && redis_queue_db_cfg="1"
-    fi
-
-    echo -e "${CYAN}====== 自定义基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入安装绝对路径 [默认: /opt/dujiao-next]: ${RESET}"
-    read -r custom_dir
-    [[ -z "$custom_dir" ]] && custom_dir="/opt/dujiao-next"
-    BASE_DIR="$custom_dir"
-    COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-    CONFIG_FILE="$BASE_DIR/config/config.yml"
-    ENV_FILE="$BASE_DIR/.env"
-
-    echo -ne "${YELLOW}请输入服务映射端口 [默认: 8080]: ${RESET}"
-    read -r app_port
-    [[ -z "$app_port" ]] && app_port="8080"
-
-    echo -ne "${YELLOW}请输入自定义后台安全路径 [默认: /admin]: ${RESET}"
-    read -r admin_path
-    [[ -z "$admin_path" ]] && admin_path="/admin"
-
-    echo -ne "${YELLOW}设置首次初始化管理员密码 [默认: admin123]: ${RESET}"
-    read -r admin_pwd
-    [[ -z "$admin_pwd" ]] && admin_pwd="admin123"
-
-    # 1. 创建持久化目录并赋予权限
-    echo -e "${YELLOW}正在建立并授权本地持久化目录...${RESET}"
-    mkdir -p "$BASE_DIR/config" "$BASE_DIR/data/db" "$BASE_DIR/data/uploads" "$BASE_DIR/data/logs" "$BASE_DIR/data/redis" "$BASE_DIR/data/postgres"
-    chmod -R 0777 "$BASE_DIR/data"
-
-    # 修复坑点 2：生成三组互不相同的独立强随机密钥，绕过新版后端的安全强校验
-    echo -e "${YELLOW}正在生成强随机加密密钥...${RESET}"
-    local app_secret_key=$(generate_random_str 32)
-    local jwt_secret=$(generate_random_str 32)
-    local user_jwt_secret=$(generate_random_str 32)
-    local local_pg_pass=$(generate_random_str 16)
-
-    # 3. 写入标准的 config.yml（严格使用标准半角空格缩进，杜绝任何全角/不可见字符）
-    echo -e "${YELLOW}正在生成统一生产配置文件 (config.yml)...${RESET}"
-    cat <<EOF > "$CONFIG_FILE"
-app:
-  secret_key: "${app_secret_key}"
-  totp_issuer: "Dujiao-Next"
-
-server:
-  host: "0.0.0.0"
-  port: 8080
-  mode: "release"
-
-log:
-  dir: ""
-  filename: "app.log"
-  max_size_mb: 100
-  max_backups: 7
-  max_age_days: 30
-  compress: true
-
-bootstrap:
-  default_admin_username: "admin"
-  default_admin_password: "${admin_pwd}"
-
-jwt:
-  secret: "${jwt_secret}"
-  expire_hours: 24
-
-user_jwt:
-  secret: "${user_jwt_secret}"
-  expire_hours: 24
-  remember_me_expire_hours: 168
-
-redis:
-  enabled: true
-  host: "${redis_host_cfg}"
-  port: ${redis_port_cfg}
-  password: "${redis_pass_cfg}"
-  db: ${redis_db_cfg}
-  prefix: "dj"
-
-queue:
-  enabled: true
-  host: "${redis_host_cfg}"
-  port: ${redis_port_cfg}
-  password: "${redis_pass_cfg}"
-  db: ${redis_queue_db_cfg}
-  concurrency: 10
-  queues:
-    default: 10
-    critical: 5
-  upstream_sync_interval: "5m"
-
-upload:
-  max_size: 10485760
-  allowed_types:
-    - image/jpeg
-    - image/png
-    - image/gif
-    - image/webp
-    - image/svg+xml
-  allowed_extensions:
-    - .jpg
-    - .jpeg
-    - .png
-    - .gif
-    - .webp
-    - .svg
-  max_width: 4096
-  max_height: 4096
-
-cors:
-  allowed_origins:
-    - "*"
-  allowed_methods:
-    - GET
-    - POST
-    - PUT
-    - PATCH
-    - DELETE
-    - OPTIONS
-  allowed_headers:
-    - Content-Type
-    - Content-Length
-    - Accept-Encoding
-    - Authorization
-    - Cache-Control
-    - X-Requested-With
-    - X-CSRF-Token
-  allow_credentials: true
-  max_age: 600
-
-security:
-  login_rate_limit:
-    window_seconds: 300
-    max_attempts: 5
-    block_seconds: 900
-  password_policy:
-    min_length: 8
-    require_upper: true
-    require_lower: true
-    require_number: true
-    require_special: false
-
-email:
-  enabled: false
-  host: ""
-  port: 465
-  username: ""
-  password: ""
-  from: ""
-  from_name: ""
-  use_tls: false
-  use_ssl: true
-  verify_code:
-    expire_minutes: 10
-    send_interval_seconds: 60
-    max_attempts: 5
-    length: 6
-
-order:
-  payment_expire_minutes: 15
-  max_refund_days: 30
-
-reseller:
-  enabled: false
-  main_hosts:
-    - localhost
-    - 127.0.0.1
-    - "::1"
-  trusted_forwarded_host: false
-  subdomain_base: ""
-  self_apply_enabled: true
-  settlement_confirm_days: 7
-
-web:
-  admin_path: "${admin_path}"
-EOF
-
-    # 按照规约拼接 database 节点
-    if [ "$db_choice" = "1" ]; then
-        cat <<EOF >> "$CONFIG_FILE"
-database:
-  driver: sqlite
-  dsn: ./db/dujiao.db
-  pool:
-    max_open_conns: 1
-    max_idle_conns: 1
-    conn_max_lifetime_seconds: 0
-    conn_max_idle_time_seconds: 0
-EOF
-    elif [ "$db_choice" = "2" ]; then
-        cat <<EOF >> "$CONFIG_FILE"
-database:
-  driver: postgres
-  dsn: host=postgres user=dujiao password=${local_pg_pass} dbname=dujiao_next port=5432 sslmode=disable TimeZone=Asia/Shanghai
-EOF
-    elif [[ "$db_choice" == "3" || "$db_choice" == "4" ]]; then
-        cat <<EOF >> "$CONFIG_FILE"
-database:
-  driver: postgres
-  dsn: "${remote_dsn}"
-EOF
-    fi
-
-    # 4. 生成 .env 文件
-    cat <<EOF > "$ENV_FILE"
-TAG=latest
-TZ=Asia/Shanghai
-APP_PORT=${app_port}
-DJ_DEFAULT_ADMIN_USERNAME=admin
-DJ_DEFAULT_ADMIN_PASSWORD=${admin_pwd}
-REDIS_PASSWORD=${redis_pass_cfg}
-POSTGRES_DB=dujiao_next
-POSTGRES_USER=dujiao
-POSTGRES_PASSWORD=${local_pg_pass}
-EOF
-
-    # 5. 生成标准化的 docker-compose.yml
-    local compose_content="services:"
-
-    if [ "$db_choice" != "4" ]; then
-        compose_content="${compose_content}
-  redis:
-    image: redis:7-alpine
-    container_name: dujiaonext-redis
-    restart: unless-stopped
-    environment:
-      REDIS_PASSWORD: \${REDIS_PASSWORD}
-    command: [\"redis-server\", \"--dir\", \"/data\", \"--appendonly\", \"yes\", \"--requirepass\", \"\${REDIS_PASSWORD}\"]
-    volumes:
-      - ./data/redis:/data
-    healthcheck:
-      test: [\"CMD\", \"redis-cli\", \"-a\", \"\${REDIS_PASSWORD}\", \"ping\"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-    networks:
-      - dujiao-net"
-    fi
-
-    if [ "$db_choice" = "2" ]; then
-        compose_content="${compose_content}
-
-  postgres:
-    image: postgres:16-alpine
-    container_name: dujiaonext-postgres
-    restart: unless-stopped
-    environment:
-      TZ: \${TZ}
-      POSTGRES_DB: \${POSTGRES_DB}
-      POSTGRES_USER: \${POSTGRES_USER}
-      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: [\"CMD-SHELL\", \"pg_isready -U \${POSTGRES_USER} -d \${POSTGRES_DB}\"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    networks:
-      - dujiao-net"
-    fi
-
-    # 主容器定义 (dujiao-next)
-    compose_content="${compose_content}
-
-  dujiao-next:
-    image: dujiaonext/dujiao-next:\${TAG}
-    container_name: dujiao-next
-    restart: unless-stopped
-    environment:
-      TZ: \${TZ}
-      DJ_DEFAULT_ADMIN_USERNAME: \${DJ_DEFAULT_ADMIN_USERNAME}
-      DJ_DEFAULT_ADMIN_PASSWORD: \${DJ_DEFAULT_ADMIN_PASSWORD}
-    ports:
-      - \"127.0.0.1:\${APP_PORT}:8080\"
-    volumes:
-      - ./config/config.yml:/app/config.yml:ro"
-
-    if [ "$db_choice" = "1" ]; then
-        compose_content="${compose_content}
-      - ./data/db:/app/db"
-    fi
-
-    compose_content="${compose_content}
-      - ./data/uploads:/app/uploads
-      - ./data/logs:/app/logs"
-
-    if [ "$db_choice" != "4" ]; then
-        compose_content="${compose_content}
-    depends_on:
-      redis:
-        condition: service_healthy"
-        if [ "$db_choice" = "2" ]; then
-            compose_content="${compose_content}
-      postgres:
-        condition: service_healthy"
+    # 初始化 .env 配置文件
+    if [ ! -f ".env" ]; then
+        if [ -f ".env.example" ]; then
+            cp .env.example .env
+            echo -e "${GREEN}已基于 .env.example 自动创建 .env 配置文件${RESET}"
         fi
     fi
 
-    compose_content="${compose_content}
-    healthcheck:
-      test: [\"CMD\", \"wget\", \"-qO-\", \"http://127.0.0.1:8080/health\"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-    networks:
-      - dujiao-net
+    # 动态写入用户自定义的环境变量到 .env
+    sed -i "s/^PORT=.*/PORT=$custom_port/" .env 2>/dev/null || echo "PORT=$custom_port" >> .env
+    sed -i "s/^PUBLIC_PROXY=.*/PUBLIC_PROXY=$custom_proxy/" .env 2>/dev/null || echo "PUBLIC_PROXY=$custom_proxy" >> .env
+    sed -i "s/^MEDIA_FULL_PROXY=.*/MEDIA_FULL_PROXY=$custom_full_proxy/" .env 2>/dev/null || echo "MEDIA_FULL_PROXY=$custom_full_proxy" >> .env
 
-networks:
-  dujiao-net:
-    driver: bridge"
+    echo -e "\n${YELLOW}正在执行官方原生编译启动命令...${RESET}"
+    PORT=$custom_port PUBLIC_PROXY=$custom_proxy MEDIA_FULL_PROXY=$custom_full_proxy docker compose up -d --build
 
-    echo "$compose_content" > "$COMPOSE_FILE"
+    echo -e "${YELLOW}正在等待容器集群 Build 编译并拉起服务 (约 5 秒)...${RESET}"
+    sleep 5
 
-    # 6. 启动容器
-    echo -e "${YELLOW}正在拉取镜像并启动 DuJiaoNext 服务...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待服务自检 (8 秒)...${RESET}"
-    sleep 8
-
-    local current_admin_path=$(grep "admin_path:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    DuJiaoNext 部署成功！      ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}前台访问 (本机) : http://127.0.0.1:${app_port}${RESET}"
-    echo -e "${YELLOW}后台访问 (本机) : http://127.0.0.1:${app_port}${current_admin_path}${RESET}"
-    echo -e "${RED}🔒 核心提示：服务默认仅绑定 127.0.0.1。${RESET}"
-    echo -e "${GREEN}--------------------------------${RESET}"
-    echo -e "${YELLOW}初始管理员账号 : admin${RESET}"
-    echo -e "${YELLOW}初始管理员密码 : ${admin_pwd}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}        Animaku 官方原生集群编译并启动成功！         ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}默认访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}健康检查接口 : http://${DETECT_IP}:${custom_port}/api/health${RESET}"
+    echo -e "${YELLOW}仓库所在路径 : ${SRC_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 更新服务
-update_dujiao() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+# 原生更新：拉取代码 + 重新 Build
+update_translate() {
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！请清理浏览器缓存。${RESET}"
+    get_status_info
+    local current_port=$webui_port
+    [[ "$current_port" == "N/A" ]] && current_port="8787"
+
+    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
+    cd "$SRC_DIR" && git pull
+    
+    echo -e "${YELLOW}正在使用官方命令重编镜像并热更新...${RESET}"
+    PORT=$current_port docker compose up -d --build --remove-orphans
+    echo -e "${GREEN}官方集群更新并重编完成！${RESET}"
 }
 
-# 卸载服务
-uninstall_dujiao() {
-    echo -ne "${RED}警告：确认要彻底卸载独角数卡服务吗？(y/n): ${RESET}"
+# 彻底卸载
+uninstall_translate() {
+    echo -ne "${RED}确定要停止并卸载 Animaku 官方容器集群吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-        fi
-        docker rm -f dujiao-next dujiaonext-redis dujiaonext-postgres dujiaonext-server 2>/dev/null
-        echo -ne "${YELLOW}是否清空数据卷（数据库、上传文件和日志）？(y/n): ${RESET}"
-        read -r clean_data
-        if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-            rm -rf "$BASE_DIR"
-            echo -e "${GREEN}物理数据已彻底清除。${RESET}"
-        fi
-        echo -e "${GREEN}卸载完成！${RESET}"
-    fi
-}
-
-start_dujiao() { cd "$BASE_DIR" 2>/dev/null && docker compose start && echo -e "${GREEN}服务已恢复启动${RESET}"; }
-stop_dujiao() { cd "$BASE_DIR" 2>/dev/null && docker compose stop && echo -e "${YELLOW}服务已停止${RESET}"; }
-restart_dujiao() { cd "$BASE_DIR" 2>/dev/null && docker compose restart && echo -e "${GREEN}服务已重启${RESET}"; }
-
-# 查看日志
-logs_dujiao() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到部署集群，无法查看日志。${RESET}"
-        return
-    fi
-    cd "$BASE_DIR" && docker compose logs -f dujiao-next
-}
-
-# 清理 Nginx 旧配置
-safe_remove_old_conf() {
-    local domain=$1
-    local paths=("/etc/nginx/sites-enabled/$domain" "/etc/nginx/sites-available/$domain" "/etc/nginx/conf.d/$domain.conf")
-    sudo mkdir -p /tmp/nginx_bak/ 2>/dev/null
-
-    for path in "${paths[@]}"; do
-        if [ -f "$path" ] || [ -L "$path" ]; then
-            local filename=$(basename "$path")
-            local parent_dir=$(basename "$(dirname "$path")")
-            echo -e "${YELLOW}备份冲突的旧配置: $path 到 /tmp/nginx_bak/ ...${RESET}"
-            sudo mv "$path" "/tmp/nginx_bak/${parent_dir}_${filename}" 2>/dev/null
-        fi
-    done
-}
-
-# Nginx 反代逻辑
-configure_nginx() {
-    get_status_info
-    if [ "$app_p" = "N/A" ]; then
-        echo -e "${RED}错误: 未检测到应用实例，请先执行选项 1 部署。${RESET}"
-        return
-    fi
-
-    clear
-    echo -e "${GREEN}=====================================================${RESET}"
-    echo -e "${GREEN}        DuJiaoNext   Nginx 反代自动配置              ${RESET}"
-    echo -e "${GREEN}=====================================================${RESET}"
-    echo -ne "${CYAN}确认继续操作吗？(y/n): ${RESET}"
-    read -r cert_confirm
-    if [[ "$cert_confirm" != "y" && "$cert_confirm" != "Y" ]]; then
-        echo -e "${YELLOW}取消操作。${RESET}"
-        return
-    fi
-
-    echo ""
-    echo -ne "${YELLOW}请输入你的访问主域名 (例如: shop.example.com): ${RESET}"
-    read -r main_domain
-
-    if [ -z "$main_domain" ]; then
-        echo -e "${RED}域名不能为空！${RESET}"
-        return
-    fi
-
-    safe_remove_old_conf "$main_domain"
-
-    local AVAILABLE_DIR="/etc/nginx/sites-available"
-    local ENABLED_DIR="/etc/nginx/sites-enabled"
-    local CONF_D_DIR="/etc/nginx/conf.d"
-    local USE_SYMLINK=false
-
-    if [ -d "$AVAILABLE_DIR" ] && [ -d "$ENABLED_DIR" ]; then
-        MAIN_CONF="$AVAILABLE_DIR/$main_domain"
-        USE_SYMLINK=true
-    else
-        sudo mkdir -p "$CONF_D_DIR"
-        MAIN_CONF="$CONF_D_DIR/${main_domain}.conf"
-        USE_SYMLINK=false
-    fi
-
-    echo -e "${YELLOW}写入 Nginx 反代配置到 $MAIN_CONF ...${RESET}"
-    sudo tee "$MAIN_CONF" > /dev/null <<EOF
-server {
-    listen 80;
-    server_name $main_domain;
-    return 301 https://\$host\$request_uri;
-}
-
-server {
-    listen 443 ssl;
-    http2 on;
-    server_name $main_domain;
-
-    ssl_certificate /etc/letsencrypt/live/$main_domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$main_domain/privkey.pem;
-
-    client_max_body_size 50m;
-
-    location / {
-        proxy_pass http://127.0.0.1:$app_p;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-EOF
-
-    if [ "$USE_SYMLINK" = true ]; then
-        sudo ln -sf "$MAIN_CONF" "$ENABLED_DIR/$main_domain"
-    fi
-
-    if command -v nginx &> /dev/null; then
-        echo -e "${YELLOW}检查 Nginx 配置语法...${RESET}"
-        if sudo nginx -t; then
-            echo -e "${YELLOW}重载 Nginx 服务...${RESET}"
-            sudo nginx -s reload
-            echo -e "${GREEN}✔ Nginx 配置成功生效！${RESET}"
+        if [ -d "$SRC_DIR/.git" ]; then
+            cd "$SRC_DIR" && docker compose down
+            echo -e "${GREEN}官方容器与网络已被安全停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同步连根拔除本地克隆的【全部源码及配置文件】？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}本地所有源码与持久化数据已被彻底清除！${RESET}"
+            fi
         else
-            echo -e "${RED}❌ Nginx 语法检查未通过！请确保已经申请好了 LetsEncrypt SSL 证书。${RESET}"
+            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
         fi
-    else
-        echo -e "${YELLOW}提示: 未检测到本地 Nginx 物理命令，配置文件已写好保存。${RESET}"
     fi
 }
+
+# 基于官方 Compose 文件的生命周期联动
+start_translate() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}原生集群已全面启动${RESET}"; }
+stop_translate() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}原生集群已安全停止${RESET}"; }
+restart_translate() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}原生集群已平滑重启${RESET}"; }
+logs_translate() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
 
 show_info() {
     get_status_info
-    
-    local current_admin_path="/admin"
-    if [ -f "$CONFIG_FILE" ]; then
-        local extracted_path=$(grep "admin_path:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
-        [ -n "$extracted_path" ] && current_admin_path="$extracted_path"
-    fi
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}集群运行状态 : $status"
-    echo -e "${YELLOW}应用服务端口 : 127.0.0.1:${app_p}"
-    echo -e "${YELLOW}后台安全路径 : ${current_admin_path}"
-    echo -e "${YELLOW}本地安装路径 : ${BASE_DIR}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    local DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}集群运行状态     : $status"
+    echo -e "${YELLOW}前端访问地址     : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}健康检查接口     : http://${DETECT_IP}:${webui_port}/api/health${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN} ◈ DuJiaoNext (独角数卡) 面板 ◈  ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}核心状态 :${RESET} $status"
-    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${app_p}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}    ◈  Animaku 影视管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}集群状态 :${RESET} $status"
+    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新服务${RESET}"
-    echo -e "${GREEN}3. 卸载服务${RESET}"
-    echo -e "${GREEN}4. 启动集群${RESET}"
-    echo -e "${GREEN}5. 停止集群${RESET}"
-    echo -e "${GREEN}6. 重启集群${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}9. 反向代理${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_dujiao ;;
-        2) update_dujiao ;;
-        3) uninstall_dujiao ;;
-        4) start_dujiao ;;
-        5) stop_dujiao ;;
-        6) restart_dujiao ;;
-        7) logs_dujiao ;;
+        1) install_translate ;;
+        2) update_translate ;;
+        3) uninstall_translate ;;
+        4) start_translate ;;
+        5) stop_translate ;;
+        6) restart_translate ;;
+        7) logs_translate ;;
         8) show_info ;;
-        9) configure_nginx ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
     esac

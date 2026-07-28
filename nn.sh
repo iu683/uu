@@ -1,768 +1,238 @@
-#!/usr/bin/env bash
-#
-# sing-box (AnyTLS) 多实例核心控制面板 (Alpine 专属版)
-# SPDX-License-Identifier: MIT
-#
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
-set -Eop pipefail
-export LANG=en_US.UTF-8
+#!/bin/bash
+# =================================================================
+# Animaku 影视播放系统 (官方原生 Clone + 环境变量 Build) 自动化管理面板
+# =================================================================
 
-export TEMPLATE_NAME="mo-anytls-sb"
-export CONFIG_DIR="/etc/mo-anytls-sb"
-export BASE_DIR="/etc/mo-anytls-sb"
-export EXECUTABLE_INSTALL_PATH="/usr/bin/sing-box"
-export DATA_BASE_DIR="/var/lib/sing-box"
-export SB_DIR_BASE="/root/proxynode/Anytls"
-export REGISTRY_FILE="${BASE_DIR}/.instances.env"
-
-CURRENT_INSTANCE="$(hostname -s 2>/dev/null || echo "anytls")"
-
-REPO_URL="https://github.com/SagerNet/sing-box"
-API_BASE_URL="https://api.github.com/repos/SagerNet/sing-box"
-CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
-
-PACKAGE_MANAGEMENT_INSTALL="apk add --no-cache"
-OPERATING_SYSTEM="linux"
-ARCHITECTURE="${ARCHITECTURE:-}"
-SINGBOX_USER="sing-box"
-
-GREEN="\033[32m"
+# 颜色
 RED="\033[31m"
+GREEN="\033[32m"
 YELLOW="\033[33m"
-BLUE="\033[34m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-# =========================================================
-# 2. 底层工具函数
-# =========================================================
-has_command() {
-  local _command=$1
-  type -P "$_command" > /dev/null 2>&1
-}
+APP_NAME="animaku"
+BASE_DIR="/opt/animaku"
+SRC_DIR="$BASE_DIR" 
+REPO_URL="https://github.com/uerax/Animaku.git"
 
-curl() {
-  command curl "${CURL_FLAGS[@]}" "$@"
-}
-
-mktemp() {
-  command mktemp "$@" "sbservinst.XXXXXXXXXX"
-}
-
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { echo; read -n 1 -s -r -p "$(echo -e "${GREEN}按任意键重新返回控制面板...${RESET}")"; }
-
-generate_random_password() {
-  dd if=/dev/urandom bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
-}
-
-rc_service() {
-  local action=$1
-  local instance=$2
-  local service_name="${TEMPLATE_NAME}.${instance}"
-  
-  case "$action" in
-    is-active)
-      rc-service "$service_name" status --nocolor >/dev/null 2>&1
-      ;;
-    start)
-      rc-service "$service_name" start >/dev/null 2>&1
-      ;;
-    stop)
-      rc-service "$service_name" stop >/dev/null 2>&1
-      ;;
-    restart)
-      rc-service "$service_name" restart >/dev/null 2>&1
-      ;;
-    enable)
-      rc-update add "$service_name" default >/dev/null 2>&1
-      ;;
-    disable)
-      rc-update del "$service_name" default >/dev/null 2>&1
-      ;;
-  esac 2>/dev/null || true
-}
-
-is_user_exists() { id "$1" > /dev/null 2>&1; }
-
-install_software() {
-  local _package_name="$1"
-  echo "正在安装缺失的依赖 '$_package_name' ... "
-  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name" >/dev/null 2>&1; then
-    echo "依赖安装成功"
-  else
-    error "无法通过 apk 安装 '$_package_name'，请手动检查软件源。"
-    exit 65
-  fi
-}
-
-check_environment() {
-  if [[ "x$(uname)" != "xLinux" ]]; then
-    error "本脚本仅支持 Linux (Alpine) 系统。"
-    exit 95
-  fi
-
-  case "$(uname -m)" in
-    'i386' | 'i686') ARCHITECTURE='386' ;;
-    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-    'armv7' | 'armv7l') ARCHITECTURE='armv7' ;;
-    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
-    's390x') ARCHITECTURE='s390x' ;;
-    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
-  esac
-
-  has_command curl || install_software curl
-  has_command grep || install_software grep
-  has_command jq || install_software jq
-  has_command openssl || install_software openssl
-  has_command tar || install_software tar
-  has_command socat || install_software socat
-  has_command python3 || install_software python3
-  
-  # 优化：通过检查 useradd 命令是否存在来决定是否安装 shadow，避免重复安装
-  has_command useradd || install_software shadow
-}
-
-fix_external_cert_permission() {
-  local cert=$1
-  local key=$2
-  
-  if [[ "$cert" == /root/* ]] || [[ "$key" == /root/* ]]; then
-    error "致命拒绝: 检测到您的证书位于 /root/ 目录下！非 root 运行用户无权穿透读取。"
-    info "权威推荐: 请将证书导出到公共目录再试。"
-    return 1
-  fi
-
-  local cert_dir=$(dirname "$cert")
-  chmod +x "$cert_dir" 2>/dev/null || true
-  chmod 644 "$cert" "$key" 2>/dev/null || true
-  return 0
-}
-
-register_instance() {
-  local name="$1"
-  [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
-  touch "$REGISTRY_FILE"
-  if ! grep -q "^${name}$" "$REGISTRY_FILE" 2>/dev/null; then
-    echo "$name" >> "$REGISTRY_FILE"
-  fi
-}
-
-unregister_instance() {
-  local name="$1"
-  if [ -f "$REGISTRY_FILE" ]; then
-    sed -i "/^${name}$/d" "$REGISTRY_FILE"
-  fi
-}
-
-sync_registry() {
-  [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
-  touch "$REGISTRY_FILE"
-  local temp_reg=$(mktemp)
-  for f in "${BASE_DIR}"/config_*.json; do
-    [ -e "$f" ] || continue
-    local name=$(basename "$f" | sed 's/^config_//;s/\.json$//')
-    if [ -n "$name" ]; then echo "$name" >> "$temp_reg"; fi
-  done
-  mv -f "$temp_reg" "$REGISTRY_FILE"
-}
-
-write_openrc_init_script() {
-  local init_file="/etc/init.d/${TEMPLATE_NAME}"
-  cat << 'EOF' > "$init_file"
-#!/sbin/openrc-run
-
-description="sing-box AnyTLS Service"
-instance="${RC_SVCNAME#*.}"
-if [ "$instance" = "$RC_SVCNAME" ]; then
-    instance=""
-fi
-
-config_file="/etc/mo-anytls-sb/config_${instance}.json"
-data_dir="/var/lib/sing-box/${instance}"
-command="/usr/bin/sing-box"
-command_args="run --config ${config_file}"
-pidfile="/run/sing-box_${instance}.pid"
-command_background="true"
-supervisor="supervise-daemon"
-rc_ulimit="nofile 65535 65535"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    if [ -z "$instance" ]; then
-        eerror "请通过多实例符号链接调用服务"
-        return 1
+# 检测依赖
+check_dependencies() {
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
+        exit 1
     fi
-    if [ ! -f "$config_file" ]; then
-        eerror "配置文件不存在: $config_file"
-        return 1
+    if ! command -v git &> /dev/null; then
+        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
+        exit 1
     fi
-    mkdir -p "$data_dir"
-    chown -R sing-box:sing-box "$data_dir" 2>/dev/null || true
-}
-EOF
-  chmod +x "$init_file"
 }
 
-create_instance_symlink() {
-  local instance="$1"
-  local symlink_path="/etc/init.d/${TEMPLATE_NAME}.${instance}"
-  if [ ! -e "$symlink_path" ]; then
-    ln -s "${TEMPLATE_NAME}" "$symlink_path"
-  fi
+# 动态获取服务端口与运行状态
+get_status_info() {
+     if ! command -v docker &> /dev/null; then
+        status="${RED}未安装 Docker${RESET}"
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        return 0
+    fi
+    local container_id=$(docker ps -q -f "ancestor=animaku:local" -f "status=running" 2>/dev/null)
+    [[ -z "$container_id" ]] && container_id=$(docker ps -q -f "name=animaku" -f "status=running" 2>/dev/null)
+
+    if [[ -n "$container_id" ]]; then
+        status="${GREEN}运行中${RESET}"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8787/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8787"
+    else
+        if [ -d "$SRC_DIR/.git" ]; then
+            status="${RED}已停止${RESET}"
+        else
+            status="${RED}未部署${RESET}"
+        fi
+        webui_port="N/A"
+    fi
 }
 
-get_installed_version() {
-  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    local version_out
-    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null | head -n 1 || echo "")
-    if [[ -n "$version_out" ]]; then
-      echo "$version_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
-    else echo "未知版本"; fi
-  else echo "未安装"; fi
-}
-
-get_latest_version() {
-  local _tmpfile=$(mktemp)
-  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases/latest" -o "$_tmpfile"; then
-    rm -f "$_tmpfile"
-    return
-  fi
-  local _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
-  rm -f "$_tmpfile"
-  if [[ -n "$_tag_name" ]]; then echo "${_tag_name##*v}"; else echo ""; fi
-}
-
-download_singbox() {
-  local _version="$1"
-  local _destination="$2"
-  local _download_url="$REPO_URL/releases/download/v${_version}/sing-box-${_version}-linux-${ARCHITECTURE}.tar.gz"
-  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "核心下载失败！请检查网络。"
-    return 11
-  fi
-  return 0
-}
-
-# =========================================================
-# 3. 网络与状态辅助函数
-# =========================================================
 get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+    local mode=${1:-"auto"}
+    local ip=""
+    
+    if [[ "$mode" == "v4" ]]; then
+        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
         done
-    done
-    echo "127.0.0.1"
-}
-
-check_port() {
-  local port="$1"
-  if ss -tunlp 2>/dev/null | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
-    return 1
-  fi
-  return 0
-}
-
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-
-get_random_port() {
-  local rand_port
-  while true; do
-    rand_port=$(( ( RANDOM % 63535 ) + 2000 ))
-    check_port "$rand_port" && echo "$rand_port" && return 0
-  done
-}
-
-get_sb_status() {
-  if rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" status --nocolor 2>/dev/null | grep -q "started"; then
-    echo -e "${GREEN}● 运行中${RESET}"
-  else
-    echo -e "${RED}● 未运行${RESET}"
-  fi
-}
-
-get_current_port_display() {
-  local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
-  if [[ -f "$conf_file" ]]; then
-    local main_port=$(jq -r '.inbounds[0].listen_port' "$conf_file" 2>/dev/null || echo "")
-    echo "${main_port:- -}"
-  else echo "实例未初始化"; fi
-}
-
-# =========================================================
-# 4. 证书与端口配置交互
-# =========================================================
-inst_cert() {
-  local instance="$1"
-  local cert_path="${BASE_DIR}/fullchain_${instance}.pem"
-  local key_path="${BASE_DIR}/privkey_${instance}.pem"
-  local conf_file="${BASE_DIR}/config_${instance}.json"
-
-  if [[ -f "$cert_path" && -f "$key_path" ]]; then
-    echo "---------------------------------------------"
-    echo -e "${YELLOW}[提示] 检测到实例 [ ${instance} ] 已有历史证书文件。${RESET}"
-    read -rp "是否要重新配置证书？[y/N] (直接回车保持不变): " cert_change_choice
-    cert_change_choice=${cert_change_choice:-n}
-    if [[ ! "$cert_change_choice" =~ ^[Yy]$ ]]; then
-      info "保持原有证书配置不变。"
-      local old_sni="www.bing.com"
-      [[ -f "$conf_file" ]] && old_sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_file" 2>/dev/null || echo "www.bing.com")
-      export EVAL_CERT_PATH="$cert_path"
-      export EVAL_KEY_PATH="$key_path"
-      export EVAL_DOMAIN="${old_sni:-"www.bing.com"}"
-      return 0
-    fi
-  fi
-
-  echo "---------------------------------------------"
-  echo -e "实例 [ ${instance} ] 证书配置选择："
-  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
-  echo -e " 2) Acme自动申请 (需放行 80 端口)"
-  echo -e " 3) 自定义证书路径"
-  echo "---------------------------------------------"
-  local certInput
-  read -rp "请输入选项 [1-3] (回车默认自签): " certInput
-  certInput=${certInput:-1}
-
-  if [[ $certInput == 2 ]]; then
-    local vps_ip=$(get_public_ip)
-    read -rp "请输入需要申请证书的域名: " domain
-    [[ -z $domain ]] && error "未输入域名，操作取消！" && return 1
-    
-    local acme_cmd="/root/.acme.sh/acme.sh"
-    [[ ! -f "$acme_cmd" ]] && curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
-    
-    "$acme_cmd" --set-default-ca --server letsencrypt
-    local reload_cmd="rc-service ${TEMPLATE_NAME}.${instance} restart"
-    
-    if [[ "$vps_ip" =~ ":" ]]; then
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
+    elif [[ "$mode" == "v6" ]]; then
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+        done
     else
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
+        for url in "https://api.ipify.org" "https://4.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
+        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+        done
     fi
-    
-    if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc --reloadcmd "$reload_cmd"; then
-      sb_domain=$domain
-      info "Acme 独立实例证书部署成功！"
+    echo "127.0.0.1" && return 0
+}
+
+# 部署核心逻辑
+install_translate() {
+    check_dependencies
+
+    echo -e "${CYAN}====== 1. 端口与代理配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Animaku 映射端口 (对应 PORT) [默认: 8787]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="8787"
+
+    echo -ne "${YELLOW}是否开启公开代理/插件API (PUBLIC_PROXY: 1=开启, 0=仅局域网) [默认: 1]: ${RESET}"
+    read -r custom_proxy
+    [[ -z "$custom_proxy" ]] && custom_proxy="1"
+
+    echo -ne "${YELLOW}是否开启 Anime1 完整媒体隧道 (MEDIA_FULL_PROXY: 1=开启, 0=仅m3u8) [默认: 0]: ${RESET}"
+    read -r custom_full_proxy
+    [[ -z "$custom_full_proxy" ]] && custom_full_proxy="0"
+
+    # 克隆官方仓库到当前工作目录
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "\n${YELLOW}正在克隆官方 GitHub 仓库...${RESET}"
+        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
+        if [ $? -eq 0 ]; then
+            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
+            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
+            rm -rf "$SRC_DIR/tmp_repo"
+        else
+            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
+            exit 1
+        fi
     else
-      error "Acme 申请失败，降级回自签模式。"
-      certInput=1
+        echo -e "\n${GREEN}检测到本地已存在官方仓库，正在同步最新代码...${RESET}"
+        cd "$SRC_DIR" && git pull
     fi
-  elif [[ $certInput == 3 ]]; then
-    while true; do
-      local user_cert user_key
-      read -rp "请输入公钥文件绝对路径: " user_cert
-      read -rp "请输入密钥文件绝对路径: " user_key
-      read -rp "请输入对应域名: " sb_domain
-      if [[ -f "$user_cert" && -f "$user_key" ]]; then
-        rm -f "$cert_path" "$key_path"
-        fix_external_cert_permission "$user_cert" "$user_key" || continue
-        ln -sf "$user_cert" "$cert_path"
-        ln -sf "$user_key" "$key_path"
-        break
-      else
-        error "路径未找到，请重新输入！"
-      fi
-    done
-  fi
 
-  if [[ $certInput == 1 ]]; then
-    rm -f "$cert_path" "$key_path"
-    openssl ecparam -genkey -name prime256v1 -out "$key_path"
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    sb_domain="www.bing.com"
-  fi
+    # 回到仓库根目录
+    cd "$SRC_DIR"
 
-  chown -h "$SINGBOX_USER":"$SINGBOX_USER" "$cert_path" "$key_path" 2>/dev/null || true
-  export EVAL_CERT_PATH="$cert_path"
-  export EVAL_KEY_PATH="$key_path"
-  export EVAL_DOMAIN="$sb_domain"
+    # 初始化 .env 配置文件
+    if [ ! -f ".env" ]; then
+        if [ -f ".env.example" ]; then
+            cp .env.example .env
+            echo -e "${GREEN}已基于 .env.example 自动创建 .env 配置文件${RESET}"
+        fi
+    fi
+
+    # 动态写入用户自定义的环境变量到 .env
+    sed -i "s/^PORT=.*/PORT=$custom_port/" .env 2>/dev/null || echo "PORT=$custom_port" >> .env
+    sed -i "s/^PUBLIC_PROXY=.*/PUBLIC_PROXY=$custom_proxy/" .env 2>/dev/null || echo "PUBLIC_PROXY=$custom_proxy" >> .env
+    sed -i "s/^MEDIA_FULL_PROXY=.*/MEDIA_FULL_PROXY=$custom_full_proxy/" .env 2>/dev/null || echo "MEDIA_FULL_PROXY=$custom_full_proxy" >> .env
+
+    echo -e "\n${YELLOW}正在执行官方原生编译启动命令...${RESET}"
+    PORT=$custom_port PUBLIC_PROXY=$custom_proxy MEDIA_FULL_PROXY=$custom_full_proxy docker compose up -d --build
+
+    echo -e "${YELLOW}正在等待容器集群 Build 编译并拉起服务 (约 5 秒)...${RESET}"
+    sleep 5
+
+    get_status_info
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}        Animaku 官方原生集群编译并启动成功！         ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}默认访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}健康检查接口 : http://${DETECT_IP}:${custom_port}/api/health${RESET}"
+    echo -e "${YELLOW}仓库所在路径 : ${SRC_DIR}${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-inst_port() {
-  local instance="$1"
-  local conf_file="${BASE_DIR}/config_${instance}.json"
-  local default_port=""
-  [[ -f "$conf_file" ]] && default_port=$(jq -r '.inbounds[0].listen_port' "$conf_file" 2>/dev/null || echo "")
-
-  local prompt_msg="设置该实例监听端口 (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置该实例监听端口 [当前: ${default_port}, 回车不修改]: "
-
-  while true; do
-    read -rp "$prompt_msg" port
-    port=${port:-$default_port}
-    [[ -z "$port" ]] && port=$(get_random_port) && info "为您分发未占用端口: $port" && break
-    if is_valid_port "$port"; then
-      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
-        error "端口 ${port} 已被占用，请更换。" && continue
-      fi
-      break
-    else error "请输入合法端口数字！"; fi
-  done
-}
-
-print_node_summary() {
-  local instance="$1"
-  local conf_file="${BASE_DIR}/config_${instance}.json"
-  [ ! -f "$conf_file" ] && return
-
-  local hostname=$(hostname -s | sed 's/ /_/g')
-  local vps_ip=$(get_public_ip)
-  local main_port=$(jq -r '.inbounds[0].listen_port' "$conf_file" 2>/dev/null || echo "")
-  local auth_pwd=$(jq -r '.inbounds[0].users[0].password' "$conf_file" 2>/dev/null || echo "")
-  local sb_domain=$(jq -r '.inbounds[0].tls.server_name' "$conf_file" 2>/dev/null || echo "www.bing.com")
-
-  local is_insecure="0" skip_cert="false"
-  if [[ "$sb_domain" == "www.bing.com" ]]; then
-    is_insecure="1"
-    skip_cert="true"
-  fi
-
-  local url_ip="$vps_ip"
-  [[ "$vps_ip" =~ ":" ]] && url_ip="[$vps_ip]"
-
-  echo -e "\n${GREEN}== sing-box (AnyTLS) 实例${RESET}${YELLOW} [ ${instance} ]${RESET} ${GREEN}配置详情 ==${RESET}"
-  echo -e "${GREEN}外网绑定 IP  :${RESET} $vps_ip"
-  echo -e "${GREEN}监听端口     :${RESET} $main_port"
-  echo -e "${GREEN}验证密码     :${RESET} $auth_pwd"
-  echo -e "${GREEN}伪装 SNI 域  :${RESET} $sb_domain"
-  echo -e "${GREEN}配置文件路径 :${RESET} $conf_file"
-  echo -e "${GREEN}--------------------------------------------${RESET}"
-  echo -e "${GREEN}👉 V2rayN 订阅链接:${RESET}"
-  echo -e "${YELLOW}anytls://$auth_pwd@$url_ip:$main_port?security=tls&sni=$sb_domain&insecure=${is_insecure}&allowInsecure=${is_insecure}&type=tcp#$hostname-anytls-${instance}${RESET}"
-  echo ""
-  echo -e "${GREEN}👉 Surge 专属配置格式:${RESET}"
-  echo -e "${YELLOW}$hostname-${instance}-AnyTLS = anytls, $url_ip, $main_port, password=$auth_pwd, sni=$sb_domain, tfo=true, skip-cert-verify=${skip_cert}, reuse=false${RESET}"
-  echo ""
-}
-
-write_and_show_config() {
-  local instance="$1"
-  local conf_file="${BASE_DIR}/config_${instance}.json"
-  local sb_dir="${SB_DIR_BASE}/${instance}"
-
-  cat << EOF > "$conf_file"
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "name": "user1",
-          "password": "$auth_pwd"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "$EVAL_DOMAIN",
-        "key_path": "$EVAL_KEY_PATH",
-        "certificate_path": "$EVAL_CERT_PATH"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
-
-  mkdir -p "$sb_dir"
-  local inst_data_dir="${DATA_BASE_DIR}/${instance}"
-  install -m 0750 -o "$SINGBOX_USER" -g "$SINGBOX_USER" -d "$inst_data_dir"
-  
-  chown "$SINGBOX_USER":"$SINGBOX_USER" "$conf_file" 2>/dev/null || true
-  chown -h "$SINGBOX_USER":"$SINGBOX_USER" "$EVAL_CERT_PATH" "$EVAL_KEY_PATH" 2>/dev/null || true
-  
-  register_instance "$instance"
-  write_openrc_init_script
-  create_instance_symlink "$instance"
-
-  rc_service enable "$instance"
-  rc_service restart "$instance"
-
-  if rc-service "${TEMPLATE_NAME}.${instance}" status --nocolor 2>/dev/null | grep -q "started"; then
-    print_node_summary "$instance"
-  else
-    error "实例服务下发完成，但启动响应失败。请通过菜单 [8] 查看日志。"
-  fi
-}
-
-instsingbox() {
-  local mode="${1:-new}"
-  check_environment
-  [ -d "$BASE_DIR" ] || install -m 0755 -d "$BASE_DIR"
-
-  if [[ ! -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    info "核心组件缺失，正在拉取最新 sing-box 引擎..."
-    local latest_version=$(get_latest_version)
-    [[ -z "$latest_version" ]] && error "无法获取云端版本号！" && return 1
-    local _tmparchive=$(mktemp)
-    download_singbox "$latest_version" "$_tmparchive" || return 1
-    local _tmpdir=$(mktemp -d)
-    tar -xzf "$_tmparchive" -C "$_tmpdir"
-    install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"
-    rm -rf "$_tmparchive" "$_tmpdir"
-  fi
-
-  if ! is_user_exists "$SINGBOX_USER"; then
-    adduser -S -D -H -h "$DATA_BASE_DIR" -s /sbin/nologin "$SINGBOX_USER" >/dev/null 2>&1 || true
-  fi
-  write_openrc_init_script
-
-  local conf_file="${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
-  if [[ "$mode" == "new" && -f "$conf_file" ]]; then
-    echo -e "${YELLOW}[WARN]检测到实例 [ ${CURRENT_INSTANCE} ] 已经存在配置。${RESET}"
-    read -r -p "$(echo -e "${GREEN}是否强行覆盖并重置该实例？[y/N]: ${RESET}")" confirm || true
-    [[ "$confirm" =~ ^[Yy]$ ]] || return
-  fi
-
-  if [[ "$mode" == "edit" ]]; then
-    echo -e "\n${GREEN}==== [正在修改实例参数: ${CURRENT_INSTANCE}] ====${RESET}"
-    local old_pwd=$(jq -r '.inbounds[0].users[0].password' "$conf_file" 2>/dev/null || true)
-  fi
-
-  inst_cert "$CURRENT_INSTANCE" || return 1
-  inst_port "$CURRENT_INSTANCE"
-
-  if [[ "$mode" == "edit" ]]; then
-    read -rp "设置新认证密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
-    auth_pwd=${auth_pwd:-$old_pwd}
-  else
-    read -rp "设置 AnyTLS 验证密码 (回车分配高强度随机密钥): " auth_pwd
-    auth_pwd=${auth_pwd:-$(generate_random_password)}
-  fi
-
-  write_and_show_config "$CURRENT_INSTANCE"
-}
-
-unstsingbox() {
-  echo -e "${YELLOW}[WARN]该操作将彻底销毁清理当前聚焦的 [ ${CURRENT_INSTANCE} ] 实例。${RESET}"
-  read -r -p "$(echo -e "${RED}确定完全卸载移除此实例？[y/N]: ${RESET}")" confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || return
-
-  rc_service stop "$CURRENT_INSTANCE"
-  rc_service disable "$CURRENT_INSTANCE"
-
-  rm -f "/etc/init.d/${TEMPLATE_NAME}.${CURRENT_INSTANCE}"
-  rm -f "${BASE_DIR}/config_${CURRENT_INSTANCE}.json"
-  rm -f "${BASE_DIR}/fullchain_${CURRENT_INSTANCE}.pem" "${BASE_DIR}/privkey_${CURRENT_INSTANCE}.pem"
-  rm -rf "${DATA_BASE_DIR}/${CURRENT_INSTANCE}" "/root/proxynode/Anytls/${CURRENT_INSTANCE}"
-
-  unregister_instance "$CURRENT_INSTANCE"
-  info "实例 [ ${CURRENT_INSTANCE} ] 已彻底移除。"
-
-  sync_registry
-  if [ ! -s "$REGISTRY_FILE" ]; then
-    info "检测到矩阵内已无活跃节点，自动清理全局共享组件..."
-    rm -f /etc/init.d/${TEMPLATE_NAME}
-    rm -f "$EXECUTABLE_INSTALL_PATH"
-    rm -rf "$BASE_DIR" "$DATA_BASE_DIR"
-    deluser "$SINGBOX_USER" >/dev/null 2>&1 || true
-    CURRENT_INSTANCE="anytls"
-  fi
-}
-
-menu_switch_matrix() {
-  echo -e "\n${GREEN}==== [sing-box 多开实例中心] ====${RESET}"
-  echo -e "${GREEN}当前操作目标实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-  echo -e "${GREEN}当前独立实例列表:${RESET}"
-
-  sync_registry
-  local count=0
-  local -a instance_list=()
-
-  if [ -f "$REGISTRY_FILE" ]; then
-    while IFS= read -r name || [ -n "$name" ]; do
-      [ -z "$name" ] && continue
-      local c_file="${BASE_DIR}/config_${name}.json"
-      [ -f "$c_file" ] || continue
-
-      count=$((count + 1))
-      instance_list[$count]="$name"
-      
-      local port_num=$(jq -r '.inbounds[0].listen_port' "$c_file" 2>/dev/null || echo "")
-      local status_str="${RED}已停止${RESET}"
-      if rc-service "${TEMPLATE_NAME}.${name}" status --nocolor 2>/dev/null | grep -q "started"; then status_str="${GREEN}运行中${RESET}"; fi
-      echo -e " ${CYAN}[ ${count} ] ->${GREEN} 实例名: ${YELLOW}${name}${RESET} ${GREEN}[绑定端口: ${port_num} | 运行状态: ${status_str}${GREEN}]${RESET}"
-    done < "$REGISTRY_FILE"
-  fi
-
-  [ "$count" -eq 0 ] && echo -e " ${YELLOW}(当前矩阵内暂无实例，可在下方输入新名字直接创建)${RESET}"
-  
-  echo ""
-  echo -e "${GREEN}👉 输入已有实例前面的【数字编号】快速切换管理目标${RESET}"
-  echo -e "${GREEN}👉 或者直接输入一个【全新的英文别名】来新建独立多开实例${RESET}"
-  echo -ne "${YELLOW}请输入选择或名字: ${RESET}"
-  read -r input_val || true
-  [[ -z "$input_val" ]] && return
-
-  if [[ "$input_val" =~ ^[0-9]+$ ]]; then
-    if [ "$input_val" -gt 0 ] && [ "$input_val" -le "$count" ]; then
-      CURRENT_INSTANCE="${instance_list[$input_val]}"
-      echo -e "${GREEN}操作焦点成功切为已有实例: ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    else error "编号超出可用范围！"; fi
-  else
-    if [[ "$input_val" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-      CURRENT_INSTANCE="$input_val"
-      echo -e "${GREEN}成功锁定并创建新焦点: ${YELLOW}${CURRENT_INSTANCE}${RESET}${GREEN} (请在主菜单选择 [1] 下发部署服务)${RESET}"
-    else error "命名不规范，仅限使用英文字母, 数字, 中划线和下划线！"; fi
-  fi
-}
-
-update_singbox() {
-  info "正在检查新版本..."
-  local current_version=$(get_installed_version)
-  local latest_version=$(get_latest_version)
-  [[ -z "$latest_version" ]] && error "无法获取云端版本号！" && return 1
-
-  info "当前版本: ${YELLOW}${current_version}${RESET} ${GREEN}| 最新版本:${RESET} ${YELLOW}${latest_version}${RESET}"
-  [[ "$current_version" == "$latest_version" ]] && info "已经是最新版本，无需更新。" && return 0
-
-  local _tmparchive=$(mktemp)
-  download_singbox "$latest_version" "$_tmparchive" || return 1
-  local _tmpdir=$(mktemp -d)
-  tar -xzf "$_tmparchive" -C "$_tmpdir"
-  install -Dm755 "$_tmpdir"/sing-box-*/sing-box "$EXECUTABLE_INSTALL_PATH"
-  rm -rf "$_tmparchive" "$_tmpdir"
-  info "核心更新完毕！请视情况手动重启运行中的实例。"
-}
-
-configure_custom_socks5_outbound() {
-    local instance_config="${CONFIG_DIR}/config_${CURRENT_INSTANCE}.json"
-    if [[ ! -f "$instance_config" ]]; then 
-        echo -e "${RED}[ERROR]未安装，无法配置出口模式。${RESET}" >&2
+# 原生更新：拉取代码 + 重新 Build
+update_translate() {
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
         return
     fi
+    get_status_info
+    local current_port=$webui_port
+    [[ "$current_port" == "N/A" ]] && current_port="8787"
 
-    local mode current_protocol tmp_file
-    current_protocol=$(jq -r '.outbounds[0].type // "direct"' "$instance_config" 2>/dev/null || echo "direct")
+    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
+    cd "$SRC_DIR" && git pull
+    
+    echo -e "${YELLOW}正在使用官方命令重编镜像并热更新...${RESET}"
+    PORT=$current_port docker compose up -d --build --remove-orphans
+    echo -e "${GREEN}官方集群更新并重编完成！${RESET}"
+}
 
-    echo -e "${GREEN}-------------------------------------------${RESET}"
-    echo -e "${YELLOW}请选择出口模式：${RESET}"
-    echo -e "${GREEN}1) 直连出口${RESET}"
-    echo -e "${GREEN}2) Socks5出口${RESET}"
-    echo -e "${GREEN}0) 取消${RESET}"
-    echo -e "${GREEN}-------------------------------------------${RESET}"
-
-    echo -ne "${YELLOW}请输入选项: ${RESET}"
-    read -r mode || true
-    case "$mode" in
-        1)
-            tmp_file=$(mktemp)
-            jq '.outbounds = [{"type":"direct","tag":"direct"}]' "$instance_config" > "$tmp_file"
-            cp "$instance_config" "${instance_config}.bak.$(date +%s)"
-            mv "$tmp_file" "$instance_config"
-            rc_service restart "$CURRENT_INSTANCE"
-            echo -e "${GREEN}[OK]已成功切换为直连出口！${RESET}"
-            return
-            ;;
-        2) ;;
-        *) return ;;
-    esac
-
-    local socks_host socks_port socks_user socks_pass
-    read -rp "请输入 Socks5 服务器地址/IP: " socks_host || true
-    read -rp "请输入 Socks5 端口 (默认: 1080): " socks_port || true
-    socks_port=${socks_port:-1080}
-    read -rp "请输入 Socks5 用户名 (无则直接回车): " socks_user || true
-    if [[ -n "$socks_user" ]]; then
-        read -rs -p "请输入 Socks5 密码: " socks_pass || true
-        echo
+# 彻底卸载
+uninstall_translate() {
+    echo -ne "${RED}确定要停止并卸载 Animaku 官方容器集群吗？(y/n): ${RESET}"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -d "$SRC_DIR/.git" ]; then
+            cd "$SRC_DIR" && docker compose down
+            echo -e "${GREEN}官方容器与网络已被安全停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同步连根拔除本地克隆的【全部源码及配置文件】？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}本地所有源码与持久化数据已被彻底清除！${RESET}"
+            fi
+        else
+            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
+        fi
     fi
+}
 
-    tmp_file=$(mktemp)
-    if [[ -n "$socks_user" ]]; then
-        jq --arg host "$socks_host" --argjson port "$socks_port" --arg user "$socks_user" --arg pass "$socks_pass" \
-        '.outbounds = [{"type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port, "username": $user, "password": $pass}]' \
-        "$instance_config" > "$tmp_file"
-    else
-        jq --arg host "$socks_host" --argjson port "$socks_port" \
-        '.outbounds = [{"type": "socks", "tag": "custom-socks5-out", "server": $host, "server_port": $port}]' \
-        "$instance_config" > "$tmp_file"
-    fi
+# 基于官方 Compose 文件的生命周期联动
+start_translate() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}原生集群已全面启动${RESET}"; }
+stop_translate() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}原生集群已安全停止${RESET}"; }
+restart_translate() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}原生集群已平滑重启${RESET}"; }
+logs_translate() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
 
-    cp "$instance_config" "${instance_config}.bak.$(date +%s)"
-    mv "$tmp_file" "$instance_config"
-    rc_service restart "$CURRENT_INSTANCE"
-    echo -e "${GREEN}[OK]已成功切换为 Socks5 出口！${RESET}"
+show_info() {
+    get_status_info
+    local DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}集群运行状态     : $status"
+    echo -e "${YELLOW}前端访问地址     : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}健康检查接口     : http://${DETECT_IP}:${webui_port}/api/health${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
 menu() {
-  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
-  check_environment
-
-  while true; do
     clear
-    local status=$(get_sb_status)
-    local version=$(get_installed_version)
-    local port_show=$(get_current_port_display)
-
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}    ◈  sing-box AnyTLS多实例管理面板  ◈     ${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN}当前控制目标 :${RESET} ${YELLOW}${CURRENT_INSTANCE}${RESET}"
-    echo -e "${GREEN}目标实例端口 :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}服务活跃状态 :${RESET} $status"
-    echo -e "${GREEN}核心共享引擎 :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-    echo -e "${GREEN} 1. 安装当前实例${RESET}"
-    echo -e "${GREEN} 2. 更新内核程序${RESET}"
-    echo -e "${GREEN} 3. 卸载当前实例${RESET}"
-    echo -e "${GREEN} 4. 修改当前实例${RESET}"
-    echo -e "${GREEN} 5. 启动当前实例${RESET}"
-    echo -e "${GREEN} 6. 停止当前实例${RESET}"
-    echo -e "${GREEN} 7. 重启当前实例${RESET}"
-    echo -e "${GREEN} 8. 当前实例日志${RESET}"
-    echo -e "${GREEN} 9. 当前实例配置${RESET}"
-    echo -e "${GREEN}10. Socks5出口${RESET}     ${YELLOW}← 链式分流代理${RESET}"
-    echo -e "${GREEN}11. 管理实例${RESET}       ${YELLOW}← 添加/切换节点${RESET}"
-    echo -e "${GREEN} 0. 退出${RESET}"
-    echo -e "${GREEN}===========================================${RESET}"
-
-    local choice=""
-    read -r -p $'\033[32m选择操作序号: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
-
+    get_status_info
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}    ◈  Animaku 影视管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}集群状态 :${RESET} $status"
+    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}1. 部署启动${RESET}"
+    echo -e "${GREEN}2. 更新容器${RESET}"
+    echo -e "${GREEN}3. 卸载容器${RESET}"
+    echo -e "${GREEN}4. 启动容器${RESET}"
+    echo -e "${GREEN}5. 停止容器${RESET}"
+    echo -e "${GREEN}6. 重启容器${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
+    echo -e "${GREEN}0. 退出${RESET}"
+    echo -e "${GREEN}===================================${RESET}"
+    echo -ne "${GREEN}请输入选项: ${RESET}"
+    read -r choice
     case "$choice" in
-      1) instsingbox "new"; pause ;;
-      2) update_singbox; pause ;;
-      3) unstsingbox; pause ;;
-      4) instsingbox "edit"; pause ;;
-      5) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" start && info "启动成功" ; pause ;;
-      6) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" stop && info "停止成功" ; pause ;;
-      7) rc-service "${TEMPLATE_NAME}.${CURRENT_INSTANCE}" restart && info "重启完毕" ; pause ;;
-      8) 
-        echo -e "${YELLOW}正在调取该实例实时日志 (按 Ctrl+C 退出):${RESET}\n"
-        tail -n 50 -f /var/log/messages 2>/dev/null || cat /var/log/syslog 2>/dev/null || echo "请查看 OpenRC 日志系统输出"
-        sleep 2
-        ;;
-      9) print_node_summary "$CURRENT_INSTANCE"; pause ;;
-      10) configure_custom_socks5_outbound; pause ;;
-      11) menu_switch_matrix ;;
-      0) clear; exit 0 ;;
-      *) warn "输入未知操作序号！"; sleep 0.5 ;;
+        1) install_translate ;;
+        2) update_translate ;;
+        3) uninstall_translate ;;
+        4) start_translate ;;
+        5) stop_translate ;;
+        6) restart_translate ;;
+        7) logs_translate ;;
+        8) show_info ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项${RESET}" ;;
     esac
-  done
 }
 
-menu "$@"
+while true; do
+    menu
+    echo -ne "${YELLOW}按回车键继续...${RESET}"
+    read -r
+done

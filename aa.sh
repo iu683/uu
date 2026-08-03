@@ -101,9 +101,9 @@ install_translate() {
     read -r path_cache
     [[ -z "$path_cache" ]] && path_cache="$BASE_DIR/cache"
 
-    echo -ne "${YELLOW}3. 请输入【媒体库目录】挂载路径 [默认: /vol01/Media]: ${RESET}"
+    echo -ne "${YELLOW}3. 请输入【媒体库目录】挂载路径 [默认: /opt/Media]: ${RESET}"
     read -r path_media
-    [[ -z "$path_media" ]] && path_media="/vol01/Media"
+    [[ -z "$path_media" ]] && path_media="/opt/Media"
 
     # 初始化本地目录，赋予 777 最高权限，防止数据库写入和缓存失败
     echo -e "\n${YELLOW}正在对本地文件系统执行高兼容权限初始化...${RESET}"
@@ -113,7 +113,6 @@ install_translate() {
     # 生成规范化 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在构建符合 nowen-video 部署规范的 docker-compose.yml...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
-version: '3.8'
 
 services:
   nowen-video:

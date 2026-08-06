@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# PocketDrive Docker Compose 管理面板 
+# Pixtale Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,9 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="pocketdrive"
-ARIA2_CONTAINER_NAME="pocketdrive-aria2"
-BASE_DIR="/opt/pocketdrive"
+CONTAINER_NAME="pixtale"
+BASE_DIR="/opt/pixtale"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -66,9 +65,9 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "16688/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8082/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="16688"
+        [[ -z "$webui_port" ]] && webui_port="8082"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
@@ -99,109 +98,81 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 PocketDrive 并初始化默认配置
-install_pocketdrive() {
+# 部署 Pixtale 并初始化默认配置
+install_pixtale() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
     mkdir -p "$BASE_DIR/data"
-    mkdir -p "$BASE_DIR/config/aria2"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 PocketDrive 服务访问端口 (宿主机端口) [默认: 16688]: ${RESET}"
+    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 8082]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="16688"
+    [[ -z "$custom_port" ]] && custom_port="8082"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -ne "${YELLOW}请输入 Aria2 RPC 密钥 (留空则自动随机生成): ${RESET}"
-    read -r custom_aria2_secret
-    if [[ -z "$custom_aria2_secret" ]]; then
-        custom_aria2_secret=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 24)
-    fi
-
     echo -ne "${YELLOW}请输入管理员用户名 [默认: admin]: ${RESET}"
-    read -r custom_admin_user
-    [[ -z "$custom_admin_user" ]] && custom_admin_user="admin"
+    read -r custom_admin
+    [[ -z "$custom_admin" ]] && custom_admin="admin"
 
     echo -ne "${YELLOW}请输入管理员密码 (留空则自动随机生成): ${RESET}"
-    read -r custom_admin_password
-    if [[ -z "$custom_admin_password" ]]; then
-        custom_admin_password=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)
+    read -r custom_password
+    if [[ -z "$custom_password" ]]; then
+        custom_password=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)
     fi
+
+    # 生成随机的 JWT_SECRET
+    local jwt_secret=$(openssl rand -hex 32)
 
     # 生成 .env 配置文件
     echo -e "${YELLOW}正在生成 .env 配置文件...${RESET}"
     cat <<EOF > "$ENV_FILE"
-ARIA2_SECRET=$custom_aria2_secret
-POCKETDRIVE_ADMIN_USER=$custom_admin_user
-POCKETDRIVE_ADMIN_PASSWORD=$custom_admin_password
+PIX_PORT=$custom_port
+PIX_ADMIN=$custom_admin
+PIX_PASSWORD=$custom_password
+JWT_SECRET=$jwt_secret
 EOF
 
     # 生成 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-    pocketdrive:
-        image: ghcr.io/lqlcj/pocketdrive:latest
+    pixtale:
+        image: aslost/pixtale:latest
         container_name: ${CONTAINER_NAME}
         restart: unless-stopped
-        init: true
         ports:
-            - '${custom_port}:16688'
-        environment:
-            - POCKETDRIVE_DATA_DIR=/data
-            - POCKETDRIVE_DB=/config/pocketdrive.db
-            - POCKETDRIVE_ADMIN_USER=\${POCKETDRIVE_ADMIN_USER:-admin}
-            - POCKETDRIVE_ADMIN_PASSWORD=\${POCKETDRIVE_ADMIN_PASSWORD:-}
-            - POCKETDRIVE_ARIA2_RPC=http://aria2:6800/jsonrpc
-            - POCKETDRIVE_ARIA2_SECRET=\${ARIA2_SECRET:?请设置随机的 ARIA2_SECRET}
-            - POCKETDRIVE_ARIA2_DATA_DIR=/data
+            - "\${PIX_PORT:-8082}:8082"
         volumes:
-            - ./data:/data
-            - ./config:/config
-        depends_on:
-            - aria2
-    aria2:
-        image: p3terx/aria2-pro
-        container_name: ${ARIA2_CONTAINER_NAME}
-        restart: unless-stopped
+            - ./data:/app/data
         environment:
-            - RPC_SECRET=\${ARIA2_SECRET:?请设置随机的 ARIA2_SECRET}
-            - LISTEN_PORT=6888
-            - MAX_CONCURRENT_DOWNLOADS=3
-            - PUID=0
-            - PGID=0
-            - UMASK_SET=022
-        volumes:
-            - ./data:/data
-            - ./config/aria2:/config
-        ports:
-            - '6888:6888'
-            - '6888:6888/udp'
+            - ADMIN=\${PIX_ADMIN:-admin}
+            - PASSWORD=\${PIX_PASSWORD:-123456}
+            - JWT_SECRET=\${JWT_SECRET:-abc}
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 PocketDrive 及 Aria2 服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Pixtale 服务...${RESET}"
     cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" up -d --force-recreate
 
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
 
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}          PocketDrive 部署及启动成功！              ${RESET}"
+    echo -e "${GREEN}           Pixtale 部署及启动成功！                 ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}登录用户名   : ${custom_admin_user}${RESET}"
-    echo -e "${YELLOW}登录密码     : ${custom_admin_password}${RESET}"
-    echo -e "${YELLOW}Aria2 密钥   : ${custom_aria2_secret}${RESET}"
+    echo -e "${YELLOW}登录用户名   : ${custom_admin}${RESET}"
+    echo -e "${YELLOW}登录密码     : ${custom_password}${RESET}"
+    echo -e "${YELLOW}JWT 密钥     : ${jwt_secret}${RESET}"
     echo -e "${YELLOW}配置文件路径 : $ENV_FILE${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 # 更新镜像
-update_pocketdrive() {
+update_pixtale() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
@@ -213,31 +184,31 @@ update_pocketdrive() {
 }
 
 # 卸载服务
-uninstall_pocketdrive() {
-    echo -ne "${YELLOW}确定要卸载并删除 PocketDrive 及 Aria2 容器吗？(y/n): ${RESET}"
+uninstall_pixtale() {
+    echo -ne "${YELLOW}确定要卸载并删除 Pixtale 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有本地配置文件及下载挂载数据？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有本地配置文件及数据目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
                 echo -e "${GREEN}配置及本地数据目录已彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" "$ARIA2_CONTAINER_NAME" 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_pocketdrive() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_pocketdrive() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_pocketdrive() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_pocketdrive() { 
-    echo -e "${CYAN}--- PocketDrive 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
+start_pixtale() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_pixtale() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_pixtale() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_pixtale() { 
+    echo -e "${CYAN}--- Pixtale 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
     docker logs -f "$CONTAINER_NAME"; 
 }
 
@@ -246,23 +217,23 @@ show_info() {
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
     
-    # 尝试从 .env 中读取当前的用户名、密码和密钥展示
-    local env_user="N/A"
+    # 尝试从 .env 中读取当前的账号及密钥展示
+    local env_admin="N/A"
     local env_pass="N/A"
-    local env_secret="N/A"
+    local env_jwt="N/A"
     if [[ -f "$ENV_FILE" ]]; then
-        env_user=$(grep "^POCKETDRIVE_ADMIN_USER=" "$ENV_FILE" | cut -d'=' -f2-)
-        env_pass=$(grep "^POCKETDRIVE_ADMIN_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2-)
-        env_secret=$(grep "^ARIA2_SECRET=" "$ENV_FILE" | cut -d'=' -f2-)
+        env_admin=$(grep "^PIX_ADMIN=" "$ENV_FILE" | cut -d'=' -f2-)
+        env_pass=$(grep "^PIX_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2-)
+        env_jwt=$(grep "^JWT_SECRET=" "$ENV_FILE" | cut -d'=' -f2-)
     fi
 
     echo -e "${GREEN}========================================${RESET}"
     echo -e "${YELLOW}当前状态     : $status"
     echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
     echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}登录用户名   : ${env_user}${RESET}"
+    echo -e "${YELLOW}登录用户名   : ${env_admin}${RESET}"
     echo -e "${YELLOW}登录密码     : ${env_pass}${RESET}"
-    echo -e "${YELLOW}Aria2 密钥   : ${env_secret}${RESET}"
+    echo -e "${YELLOW}JWT 密钥     : ${env_jwt}${RESET}"
     echo -e "${YELLOW}配置文件路径 : ${ENV_FILE}${RESET}"
     echo -e "${GREEN}========================================${RESET}"
 }
@@ -271,7 +242,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}  ◈  PocketDrive 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}   ◈  Pixtale 管理面板   ◈   ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -289,13 +260,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_pocketdrive ;;
-        2) update_pocketdrive ;;
-        3) uninstall_pocketdrive ;;
-        4) start_pocketdrive ;;
-        5) stop_pocketdrive ;;
-        6) restart_pocketdrive ;;
-        7) logs_pocketdrive ;;
+        1) install_pixtale ;;
+        2) update_pixtale ;;
+        3) uninstall_pixtale ;;
+        4) start_pixtale ;;
+        5) stop_pixtale ;;
+        6) restart_pixtale ;;
+        7) logs_pixtale ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

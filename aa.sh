@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Onepick-Tools Docker Compose 管理面板 
+# Imgli Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="onepick-tools"
-BASE_DIR="/opt/onepick"
+CONTAINER_NAME="imgli"
+BASE_DIR="/opt/imgli"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -65,9 +65,9 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8686/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3877"
+        [[ -z "$webui_port" ]] && webui_port="8686"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
@@ -98,100 +98,73 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 onepick-tools 并初始化默认配置
-install_onepick() {
+# 部署 imgli 并初始化默认配置
+install_imgli() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
-    mkdir -p "$BASE_DIR/cookies"
     mkdir -p "$BASE_DIR/data"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 3877]: ${RESET}"
+    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 8686]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3877"
+    [[ -z "$custom_port" ]] && custom_port="8686"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -ne "${YELLOW}请输入管理员用户名 [默认: admin]: ${RESET}"
-    read -r custom_auth_user
-    [[ -z "$custom_auth_user" ]] && custom_auth_user="admin"
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+    default_base_url="http://${DETECT_IP}:${custom_port}"
 
-    echo -ne "${YELLOW}请输入管理员密码 (留空则自动随机生成): ${RESET}"
-    read -r custom_auth_password
-    if [[ -z "$custom_auth_password" ]]; then
-        custom_auth_password=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)
-    fi
+    echo -ne "${YELLOW}请输入 IMGLI_BASE_URL (浏览器实际访问地址) [默认: $default_base_url]: ${RESET}"
+    read -r custom_base_url
+    [[ -z "$custom_base_url" ]] && custom_base_url="$default_base_url"
 
-    # 生成随机密钥与 Token
-    local auth_secret=$(openssl rand -hex 32)
-    local api_token=$(openssl rand -hex 32)
+    echo -ne "${YELLOW}是否启用反代信任 IMGLI_TRUST_PROXY (true/false) [默认: true]: ${RESET}"
+    read -r custom_trust_proxy
+    [[ -z "$custom_trust_proxy" ]] && custom_trust_proxy="true"
 
     # 生成 .env 配置文件
     echo -e "${YELLOW}正在生成 .env 配置文件...${RESET}"
     cat <<EOF > "$ENV_FILE"
-ONEPICK_AUTH_USER=$custom_auth_user
-ONEPICK_AUTH_PASSWORD=$custom_auth_password
-ONEPICK_AUTH_SECRET=$auth_secret
-ONEPICK_API_TOKEN=$api_token
-ONEPICK_TOKEN_TTL_SECONDS=2592000
-
-NODE_USE_ENV_PROXY=0
-HTTP_PROXY=
-HTTPS_PROXY=
-NO_PROXY=localhost,127.0.0.1
-
-HOST_PORT=$custom_port
+IMGLI_PORT=$custom_port
+IMGLI_BASE_URL=$custom_base_url
+IMGLI_TRUST_PROXY=$custom_trust_proxy
 EOF
 
-    # 生成 docker-compose.yml 配置文件
+    # 生成 docker-compose.yml 配置文件（数据挂载到本地 ./data）
     echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  onepick-tools:
-    image: ghcr.io/hughryu/onepick:latest
+  imgli:
+    image: ghcr.io/yixian-huang/imgli:latest
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - COOKIE_DIR=/app/cookies
-      - DATA_DIR=/app/data
-      - HISTORY_MAX_LINES=500
-      - NODE_USE_ENV_PROXY=\${NODE_USE_ENV_PROXY:-0}
-      - HTTP_PROXY=\${HTTP_PROXY:-}
-      - HTTPS_PROXY=\${HTTPS_PROXY:-}
-      - NO_PROXY=\${NO_PROXY:-localhost,127.0.0.1}
-    volumes:
-      - ./cookies:/app/cookies
-      - ./data:/app/data
     ports:
-      - "\${HOST_PORT:-3877}:3000"
+      - "\${IMGLI_PORT:-8686}:8686"
+    environment:
+      IMGLI_BASE_URL: \${IMGLI_BASE_URL:-http://localhost:8686}
+      IMGLI_TRUST_PROXY: "\${IMGLI_TRUST_PROXY:-true}"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 onepick-tools 服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 imgli 服务...${RESET}"
     cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" up -d --force-recreate
 
-    RAW_IP=$(get_public_ip)
-    DETECT_IP=$(format_ip_for_url "$RAW_IP")
-
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}         Onepick-Tools 部署及启动成功！             ${RESET}"
+    echo -e "${GREEN}            Imgli 部署及启动成功！                  ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}登录用户名   : ${custom_auth_user}${RESET}"
-    echo -e "${YELLOW}登录密码     : ${custom_auth_password}${RESET}"
-    echo -e "${YELLOW}API Token    : ${api_token}${RESET}"
+    echo -e "${YELLOW}服务访问地址 : ${custom_base_url}${RESET}"
+    echo -e "${YELLOW}数据本地目录 : $BASE_DIR/data${RESET}"
     echo -e "${YELLOW}配置文件路径 : $ENV_FILE${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 # 更新镜像
-update_onepick() {
+update_imgli() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
@@ -203,14 +176,14 @@ update_onepick() {
 }
 
 # 卸载服务
-uninstall_onepick() {
-    echo -ne "${YELLOW}确定要卸载并删除 onepick-tools 容器吗？(y/n): ${RESET}"
+uninstall_imgli() {
+    echo -ne "${YELLOW}确定要卸载并删除 imgli 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有本地配置文件及数据/Cookie 目录？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有本地配置文件及数据目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
@@ -223,36 +196,28 @@ uninstall_onepick() {
     fi
 }
 
-start_onepick() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_onepick() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_onepick() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_onepick() { 
-    echo -e "${CYAN}--- onepick-tools 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
+start_imgli() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_imgli() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_imgli() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_imgli() { 
+    echo -e "${CYAN}--- imgli 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
     docker logs -f "$CONTAINER_NAME"; 
 }
 
 show_info() {
     get_status_info
-    RAW_IP=$(get_public_ip)
-    DETECT_IP=$(format_ip_for_url "$RAW_IP")
     
-    # 尝试从 .env 中读取当前的配置展示
-    local env_user="N/A"
-    local env_pass="N/A"
-    local env_token="N/A"
+    # 尝试从 .env 中读取配置展示
+    local env_base_url="N/A"
     if [[ -f "$ENV_FILE" ]]; then
-        env_user=$(grep "^ONEPICK_AUTH_USER=" "$ENV_FILE" | cut -d'=' -f2-)
-        env_pass=$(grep "^ONEPICK_AUTH_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2-)
-        env_token=$(grep "^ONEPICK_API_TOKEN=" "$ENV_FILE" | cut -d'=' -f2-)
+        env_base_url=$(grep "^IMGLI_BASE_URL=" "$ENV_FILE" | cut -d'=' -f2-)
     fi
 
     echo -e "${GREEN}========================================${RESET}"
     echo -e "${YELLOW}当前状态     : $status"
     echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}登录用户名   : ${env_user}${RESET}"
-    echo -e "${YELLOW}登录密码     : ${env_pass}${RESET}"
-    echo -e "${YELLOW}API Token    : ${env_token}${RESET}"
+    echo -e "${YELLOW}服务访问地址 : ${env_base_url}${RESET}"
+    echo -e "${YELLOW}本地数据路径 : ${BASE_DIR}/data${RESET}"
     echo -e "${YELLOW}配置文件路径 : ${ENV_FILE}${RESET}"
     echo -e "${GREEN}========================================${RESET}"
 }
@@ -261,7 +226,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}   ◈  Onepick  管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}   ◈    Imgli 管理面板    ◈   ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -279,13 +244,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_onepick ;;
-        2) update_onepick ;;
-        3) uninstall_onepick ;;
-        4) start_onepick ;;
-        5) stop_onepick ;;
-        6) restart_onepick ;;
-        7) logs_onepick ;;
+        1) install_imgli ;;
+        2) update_imgli ;;
+        3) uninstall_imgli ;;
+        4) start_imgli ;;
+        5) stop_imgli ;;
+        6) restart_imgli ;;
+        7) logs_imgli ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

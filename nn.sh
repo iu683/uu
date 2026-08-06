@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Animaku 影视播放系统 (官方原生 Clone + 环境变量 Build) 自动化管理面板
+# Aduaor-Wow Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,10 +10,11 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-APP_NAME="animaku"
-BASE_DIR="/opt/animaku"
-SRC_DIR="$BASE_DIR" 
-REPO_URL="https://github.com/uerax/Animaku.git"
+CONTAINER_NAME="aduoer-wow"
+BASE_DIR="/opt/aduoer-wow"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
+ACCOUNTS_FILE="$BASE_DIR/data/accounts.json"
 
 # 检测依赖
 check_dependencies() {
@@ -21,37 +22,60 @@ check_dependencies() {
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
+}
+
+# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
+format_ip_for_url() {
+    local ip="$1"
+    if [[ "$ip" == *":"* ]]; then
+        echo "[$ip]"
+    else
+        echo "$ip"
     fi
 }
 
-# 动态获取服务端口与运行状态
+# 动态获取容器状态并联动健康检查
 get_status_info() {
-     if ! command -v docker &> /dev/null; then
+    if ! command -v docker &> /dev/null; then
         status="${RED}未安装 Docker${RESET}"
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
         return 0
     fi
-    local container_id=$(docker ps -q -f "ancestor=animaku:local" -f "status=running" 2>/dev/null)
-    [[ -z "$container_id" ]] && container_id=$(docker ps -q -f "name=animaku" -f "status=running" 2>/dev/null)
-
-    if [[ -n "$container_id" ]]; then
-        status="${GREEN}运行中${RESET}"
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8787/tcp") 0).HostPort}}' "$container_id" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8787"
-    else
-        if [ -d "$SRC_DIR/.git" ]; then
-            status="${RED}已停止${RESET}"
+    
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        local health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        if [[ "$health_status" == "healthy" ]]; then
+            status="${GREEN}运行中 (健康)${RESET}"
+        elif [[ "$health_status" == "unhealthy" ]]; then
+            status="${RED}运行中 (不健康)${RESET}"
+        elif [[ "$health_status" == "starting" ]]; then
+            status="${YELLOW}运行中 (启动中)${RESET}"
         else
-            status="${RED}未部署${RESET}"
+            status="${GREEN}运行中${RESET}"
         fi
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
+    else
+        img_version="${RED}未安装${RESET}"
         webui_port="N/A"
     fi
 }
 
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
     local mode=${1:-"auto"}
     local ip=""
@@ -75,136 +99,162 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署核心逻辑
-install_translate() {
+# 部署 aduoer-wow 并初始化默认配置
+install_aduoer() {
     check_dependencies
+    
+    mkdir -p "$BASE_DIR"
+    mkdir -p "$BASE_DIR/data"
 
-    echo -e "${CYAN}====== 1. 端口与代理配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Animaku 映射端口 (对应 PORT) [默认: 8787]: ${RESET}"
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 3000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8787"
-
-    echo -ne "${YELLOW}是否开启公开代理/插件API (PUBLIC_PROXY: 1=开启, 0=仅局域网) [默认: 1]: ${RESET}"
-    read -r custom_proxy
-    [[ -z "$custom_proxy" ]] && custom_proxy="1"
-
-    echo -ne "${YELLOW}是否开启 Anime1 完整媒体隧道 (MEDIA_FULL_PROXY: 1=开启, 0=仅m3u8) [默认: 0]: ${RESET}"
-    read -r custom_full_proxy
-    [[ -z "$custom_full_proxy" ]] && custom_full_proxy="0"
-
-    # 克隆官方仓库到当前工作目录
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "\n${YELLOW}正在克隆官方 GitHub 仓库...${RESET}"
-        git clone "$REPO_URL" "$SRC_DIR/tmp_repo"
-        if [ $? -eq 0 ]; then
-            mv "$SRC_DIR/tmp_repo/"* "$SRC_DIR/" 2>/dev/null
-            mv "$SRC_DIR/tmp_repo/."* "$SRC_DIR/" 2>/dev/null
-            rm -rf "$SRC_DIR/tmp_repo"
-        else
-            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
-            exit 1
-        fi
-    else
-        echo -e "\n${GREEN}检测到本地已存在官方仓库，正在同步最新代码...${RESET}"
-        cd "$SRC_DIR" && git pull
-    fi
-
-    # 回到仓库根目录
-    cd "$SRC_DIR"
-
-    # 初始化 .env 配置文件
-    if [ ! -f ".env" ]; then
-        if [ -f ".env.example" ]; then
-            cp .env.example .env
-            echo -e "${GREEN}已基于 .env.example 自动创建 .env 配置文件${RESET}"
-        fi
-    fi
-
-    # 动态写入用户自定义的环境变量到 .env
-    sed -i "s/^PORT=.*/PORT=$custom_port/" .env 2>/dev/null || echo "PORT=$custom_port" >> .env
-    sed -i "s/^PUBLIC_PROXY=.*/PUBLIC_PROXY=$custom_proxy/" .env 2>/dev/null || echo "PUBLIC_PROXY=$custom_proxy" >> .env
-    sed -i "s/^MEDIA_FULL_PROXY=.*/MEDIA_FULL_PROXY=$custom_full_proxy/" .env 2>/dev/null || echo "MEDIA_FULL_PROXY=$custom_full_proxy" >> .env
-
-    echo -e "\n${YELLOW}正在执行官方原生编译启动命令...${RESET}"
-    PORT=$custom_port PUBLIC_PROXY=$custom_proxy MEDIA_FULL_PROXY=$custom_full_proxy docker compose up -d --build
-
-    echo -e "${YELLOW}正在等待容器集群 Build 编译并拉起服务 (约 5 秒)...${RESET}"
-    sleep 5
-
-    get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}        Animaku 官方原生集群编译并启动成功！         ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}默认访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}健康检查接口 : http://${DETECT_IP}:${custom_port}/api/health${RESET}"
-    echo -e "${YELLOW}仓库所在路径 : ${SRC_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-
-# 原生更新：拉取代码 + 重新 Build
-update_translate() {
-    if [ ! -d "$SRC_DIR/.git" ]; then
-        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
+    [[ -z "$custom_port" ]] && custom_port="3000"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
-    get_status_info
-    local current_port=$webui_port
-    [[ "$current_port" == "N/A" ]] && current_port="8787"
 
-    echo -e "${YELLOW}正在同步最新的远程官方代码...${RESET}"
-    cd "$SRC_DIR" && git pull
-    
-    echo -e "${YELLOW}正在使用官方命令重编镜像并热更新...${RESET}"
-    PORT=$current_port docker compose up -d --build --remove-orphans
-    echo -e "${GREEN}官方集群更新并重编完成！${RESET}"
+    # 生成随机的 api_access_key 用于初始化 accounts.json
+    local key_qq=$(openssl rand -hex 32)
+    local key_netease=$(openssl rand -hex 32)
+
+    # 生成 .env 配置文件
+    echo -e "${YELLOW}正在生成 .env 配置文件...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+PORT=3000
+HOST=0.0.0.0
+NODE_ENV=production
+LOG_LEVEL=info
+CORS_ALLOW_ORIGIN=*
+HOST_PORT=$custom_port
+EOF
+
+    # 生成 data/accounts.json 配置文件
+    echo -e "${YELLOW}正在生成 data/accounts.json 配置文件...${RESET}"
+    cat <<EOF > "$ACCOUNTS_FILE"
+[
+  {
+    "platform": "qq",
+    "name": "QQ 音乐",
+    "cookie": "",
+    "api_access_key": "$key_qq",
+    "stateless": false,
+    "needUnlock": true
+  },
+  {
+    "platform": "netease",
+    "name": "网易云音乐",
+    "cookie": "",
+    "api_access_key": "$key_netease",
+    "stateless": false,
+    "needUnlock": true
+  }
+]
+EOF
+
+    # 生成 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  aduoer-wow:
+    image: anomioo/wow-origin:latest
+    container_name: ${CONTAINER_NAME}
+    ports:
+      - "\${HOST_PORT:-3000}:\${PORT:-3000}"
+    env_file:
+      - .env
+    environment:
+      CORS_ALLOW_ORIGIN: "\${CORS_ALLOW_ORIGIN:-*}"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 aduoer-wow 服务...${RESET}"
+    cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" up -d --force-recreate
+
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}          aduoer-wow 部署及启动成功！               ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}QQ 音乐 Key  : ${key_qq}${RESET}"
+    echo -e "${YELLOW}网易云 Key   : ${key_netease}${RESET}"
+    echo -e "${YELLOW}配置文件路径 : $ENV_FILE 与 $ACCOUNTS_FILE${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-# 彻底卸载
-uninstall_translate() {
-    echo -ne "${RED}确定要停止并卸载 Animaku 官方容器集群吗？(y/n): ${RESET}"
+# 更新镜像
+update_aduoer() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" pull
+    docker compose --env-file "$ENV_FILE" up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+}
+
+# 卸载服务
+uninstall_aduoer() {
+    echo -ne "${YELLOW}确定要卸载并删除 aduoer-wow 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -d "$SRC_DIR/.git" ]; then
-            cd "$SRC_DIR" && docker compose down
-            echo -e "${GREEN}官方容器与网络已被安全停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同步连根拔除本地克隆的【全部源码及配置文件】？(y/n): ${RESET}"
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除所有本地配置文件及数据目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有源码与持久化数据已被彻底清除！${RESET}"
+                echo -e "${GREEN}配置及本地数据目录已彻底清理。${RESET}"
             fi
         else
-            echo -e "${YELLOW}未检测到运行中的 compose 环境，跳过物理删除。${RESET}"
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-# 基于官方 Compose 文件的生命周期联动
-start_translate() { cd "$SRC_DIR" && docker compose start && echo -e "${GREEN}原生集群已全面启动${RESET}"; }
-stop_translate() { cd "$SRC_DIR" && docker compose stop && echo -e "${YELLOW}原生集群已安全停止${RESET}"; }
-restart_translate() { cd "$SRC_DIR" && docker compose restart && echo -e "${GREEN}原生集群已平滑重启${RESET}"; }
-logs_translate() { cd "$SRC_DIR" && docker compose logs -f --tail=100; }
+start_aduoer() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_aduoer() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_aduoer() { cd "$BASE_DIR" && docker compose --env-file "$ENV_FILE" restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_aduoer() { 
+    echo -e "${CYAN}--- aduoer-wow 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
+    docker logs -f "$CONTAINER_NAME"; 
+}
 
 show_info() {
     get_status_info
-    local DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}集群运行状态     : $status"
-    echo -e "${YELLOW}前端访问地址     : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}健康检查接口     : http://${DETECT_IP}:${webui_port}/api/health${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}配置文件路径 : ${ENV_FILE}${RESET}"
+    echo -e "${YELLOW}账号配置路径 : ${ACCOUNTS_FILE}${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}    ◈  Animaku 影视管理面板  ◈     ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}集群状态 :${RESET} $status"
-    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}  ◈  Aduoer-Wow 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -214,17 +264,17 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
+        1) install_aduoer ;;
+        2) update_aduoer ;;
+        3) uninstall_aduoer ;;
+        4) start_aduoer ;;
+        5) stop_aduoer ;;
+        6) restart_aduoer ;;
+        7) logs_aduoer ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

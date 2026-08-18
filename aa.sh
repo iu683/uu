@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Download Manager Docker Compose 管理面板 
+# Voximailbox Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="download-manager"
-BASE_DIR="/opt/download-manager"
+CONTAINER_NAME="voximailbox"
+BASE_DIR="/opt/voximailbox"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -32,7 +32,7 @@ format_ip_for_url() {
     fi
 }
 
-# 动态获取容器状态并联动健康检查
+# 动态获取容器状态
 get_status_info() {
     if ! command -v docker &> /dev/null; then
         status="${RED}未安装 Docker${RESET}"
@@ -59,7 +59,7 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
+    # 2. 如果容器存在，提取镜像版本与主机端口
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
@@ -97,14 +97,14 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Download Manager 并初始化默认配置
-install_download_manager() {
+# 部署 Voximailbox 并初始化配置
+install_voximailbox() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
 
     echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 8000]: ${RESET}"
+    echo -ne "${YELLOW}请输入 WebUI 访问端口 (宿主机端口) [默认: 8000]: ${RESET}"
     read -r custom_port
     [[ -z "$custom_port" ]] && custom_port="8000"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
@@ -112,59 +112,40 @@ install_download_manager() {
         return
     fi
 
-    echo -ne "${YELLOW}请输入本地存储目录绝对路径 [默认: /opt/download-manager/data]: ${RESET}"
-    read -r custom_data_dir
-    [[ -z "$custom_data_dir" ]] && custom_data_dir="/opt/download-manager/data"
+    # 赋予权限
+    chmod -R 777 "$BASE_DIR"
 
-    echo -ne "${YELLOW}请输入下载链接缓存时间 (分钟) [默认: 60]: ${RESET}"
-    read -r ttl_minutes
-    [[ -z "$ttl_minutes" ]] && ttl_minutes="60"
-
-    echo -ne "${YELLOW}请输入最大并发下载数 [默认: 3]: ${RESET}"
-    read -r max_concurrent
-    [[ -z "$max_concurrent" ]] && max_concurrent="3"
-
-    # 创建并赋予自定义存储目录权限
-    mkdir -p "$custom_data_dir"
-    chmod -R 777 "$custom_data_dir"
-
-    # 生成符合要求的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    # 生成符合标准的 docker-compose.yml 配置文件 (修复了原 yaml 中 imge -> image 的拼写错误)
+    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  app:
-    image: ghcr.io/senhao-xu/download-manager:latest
+  voximailbox:
+    image: ghcr.io/qingqiu66/outlookmail-voxi:latest
     container_name: ${CONTAINER_NAME}
-    pull_policy: always
     ports:
       - "${custom_port}:8000"
-    environment:
-      - PORT=8000
-      - DATA_DIR=/data
-      - DOWNLOAD_DIR=/data/downloads
-      - TTL_MINUTES=${ttl_minutes}
-      - MAX_CONCURRENT=${max_concurrent}
-    volumes:
-      - ${custom_data_dir}:/data
     restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Download Manager 服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Voximailbox 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
 
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}        Download Manager 部署及启动成功！           ${RESET}"
+    echo -e "${GREEN}        Voximailbox 部署及启动成功！                ${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
     echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}本地存储目录 : $custom_data_dir${RESET}"
+    echo -e "${YELLOW}项目文件目录 : ${BASE_DIR}${RESET}"
+    echo -e "${YELLOW}配置文件路径 : ${COMPOSE_FILE}${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
 # 更新镜像
-update_download_manager() {
+update_voximailbox() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
@@ -176,30 +157,18 @@ update_download_manager() {
 }
 
 # 卸载服务
-uninstall_download_manager() {
-    echo -ne "${YELLOW}确定要卸载并删除 Download Manager 容器吗？(y/n): ${RESET}"
+uninstall_voximailbox() {
+    echo -ne "${YELLOW}确定要卸载并删除 Voximailbox 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            # 从 docker-compose.yml 中解析出当前挂载的宿主机数据目录路径
-            local mapped_dir=$(grep -A 5 "volumes:" "$COMPOSE_FILE" | tail -n 1 | awk -F':' '{print $1}' | tr -d '[:space:]-')
-            
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            
-            echo -ne "${YELLOW}是否同时删除管理面板目录 ($BASE_DIR)？(y/n): ${RESET}"
-            read -r clean_base
-            if [ "$clean_base" = "y" ] || [ "$clean_base" = "Y" ]; then
+            echo -ne "${YELLOW}是否同时删除本地项目目录？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-            fi
-
-            if [ -n "$mapped_dir" ] && [ -d "$mapped_dir" ]; then
-                echo -ne "${YELLOW}检测到自定义存储目录为 [$mapped_dir]，是否一并删除该目录及所有下载数据？(y/n): ${RESET}"
-                read -r clean_data
-                if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                    rm -rf "$mapped_dir"
-                    echo -e "${GREEN}自定义存储目录已彻底清理。${RESET}"
-                fi
+                echo -e "${GREEN}项目目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -208,10 +177,10 @@ uninstall_download_manager() {
     fi
 }
 
-start_download_manager() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_download_manager() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_download_manager() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_download_manager() { 
+start_voximailbox() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_voximailbox() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_voximailbox() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_voximailbox() { 
     echo -e "${CYAN}--- 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
     docker logs -f "$CONTAINER_NAME"; 
 }
@@ -220,17 +189,11 @@ show_info() {
     get_status_info
     RAW_IP=$(get_public_ip)
     DETECT_IP=$(format_ip_for_url "$RAW_IP")
-    
-    local current_data_dir="N/A"
-    if [ -f "$COMPOSE_FILE" ]; then
-        current_data_dir=$(grep -A 5 "volumes:" "$COMPOSE_FILE" | tail -n 1 | awk -F':' '{print $1}' | tr -d '[:space:]-')
-    fi
-
     echo -e "${GREEN}========================================${RESET}"
     echo -e "${YELLOW}当前状态     : $status"
     echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
     echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}存储目录路径 : ${current_data_dir}${RESET}"
+    echo -e "${YELLOW}项目目录路径 : ${BASE_DIR}${RESET}"
     echo -e "${GREEN}========================================${RESET}"
 }
 
@@ -238,7 +201,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}  ◈ Download Manager 面板 ◈    ${RESET}"
+    echo -e "${GREEN}   ◈ Voximailbox 管理面板 ◈   ${RESET}"
     echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
@@ -256,13 +219,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_download_manager ;;
-        2) update_download_manager ;;
-        3) uninstall_download_manager ;;
-        4) start_download_manager ;;
-        5) stop_download_manager ;;
-        6) restart_download_manager ;;
-        7) logs_download_manager ;;
+        1) install_voximailbox ;;
+        2) update_voximailbox ;;
+        3) uninstall_voximailbox ;;
+        4) start_voximailbox ;;
+        5) stop_voximailbox ;;
+        6) restart_voximailbox ;;
+        7) logs_voximailbox ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

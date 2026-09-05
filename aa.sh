@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# MoviePilot V3 Docker Compose 管理面板 
+# MeBox 媒体管理面板 Docker Compose 多模式管理脚本
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="moviepilot-v3"
-BASE_DIR="/opt/moviepilot-v3"
+CONTAINER_NAME="mebox"
+BASE_DIR="/opt/mebox"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -22,22 +22,9 @@ check_dependencies() {
     fi
 }
 
-# 生成随机密钥的辅助函数
-generate_random_password() {
-    if command -v openssl &> /dev/null; then
-        openssl_rand=$(openssl rand -hex 12 2>/dev/null)
-        if [[ -n "$openssl_rand" ]]; then
-            echo "$openssl_rand"
-            return 0
-        fi
-    fi
-    echo "pwd_$((RANDOM % 899999 + 100000))"
-}
-
-
-# 动态获取容器状态、映射端口（双端口）和数据目录
+# 动态获取容器状态、映射端口和数据目录
 get_status_info() {
-    # 1. 检查核心 Web 容器状态
+    # 1. 检查主容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${YELLOW}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
@@ -46,27 +33,19 @@ get_status_info() {
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取端口信息
+    # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 提取 WebUI 映射出来的宿主机端口 (内部默认 3000)
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3000"
-
-        # 【新增】提取 API 映射出来的宿主机端口 (内部默认 3001)
-        api_port_show=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3001/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$api_port_show" ]] && api_port_show="3001"
-
-        # 提取宿主机配置路径
-        data_dir=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$data_dir" ]] && data_dir="$BASE_DIR/config"
+        # 从容器状态提取 Web 端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="18080"
     else
         img_version="${RED}未安装${RESET}"
         webui_port="N/A"
-        api_port_show="N/A"
-        data_dir="N/A"
     fi
 }
 
@@ -94,281 +73,359 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署核心逻辑
-install_translate() {
+# 部署 MeBox
+install_utils() {
     check_dependencies
+    
     mkdir -p "$BASE_DIR"
 
-    echo -e "${CYAN}====== 请选择 MoviePilot V3 数据库部署模式 ======${RESET}"
-    echo -e "${GREEN}1. 本地轻量模式 (使用内置 SQLite 数据库，单容器运行) ${RESET}"
-    echo -e "${GREEN}2. 自带集成模式 (自动安装并关联 PostgreSQL + Redis 容器集群) ${RESET}"
-    echo -e "${GREEN}3. 远程/外部数据库模式 (关联您现有的独立 PostgreSQL 和 Redis 数据库) ${RESET}"
-    echo -ne "${YELLOW}请输入模式序号 [1-3, 默认 1]: ${RESET}"
-    read -r db_mode
-    [[ -z "$db_mode" ]] && db_mode="1"
+    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
+    echo -e "${YELLOW}提示: 如果路径不存在，将自动创建。可以直接回车使用默认值。${RESET}"
+    
+    # 路径 1: 运行数据
+    echo -ne "${YELLOW}请输入运行数据目录 [默认: ./data]: ${RESET}"
+    read -r path_data
+    [[ -z "$path_data" ]] && path_data="./data"
 
-    echo -e "\n${CYAN}====== 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入后台 WebUI 访问映射端口 (宿主机) [默认: 3000]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
+    # 路径 2: 缓存目录
+    echo -ne "${YELLOW}请输入缓存目录 [默认: ./cache]: ${RESET}"
+    read -r path_cache
+    [[ -z "$path_cache" ]] && path_cache="./cache"
 
-    echo -ne "${YELLOW}请输入 API 通讯映射端口 (宿主机) [默认: 3001]: ${RESET}"
-    read -r api_port
-    [[ -z "$api_port" ]] && api_port="3001"
-
-    # 【新增自定义】超级管理员用户名自定义
-    echo -ne "${YELLOW}请输入超级管理员用户名 (SUPERUSER) [默认: admin]: ${RESET}"
-    read -r mp_user
-    [[ -z "$mp_user" ]] && mp_user="admin"
-
-    echo -ne "${YELLOW}请输入初始登录超级密码 (SUPERUSER_PASSWORD) [默认: moviepilot123]: ${RESET}"
-    read -r mp_password
-    [[ -z "$mp_password" ]] && mp_password="moviepilot123"
-
-    echo -e "\n${CYAN}--- 目录挂载配置 (若不存在会自动创建) ---${RESET}"
-    echo -ne "${YELLOW}请输入持久化配置目录 [默认: $BASE_DIR/config]: ${RESET}"
-    read -r path_config
-    [[ -z "$path_config" ]] && path_config="$BASE_DIR/config"
-
-    echo -ne "${YELLOW}请输入媒体文件根目录 [默认: /media]: ${RESET}"
+    # 路径 3: 媒体库目录
+    echo -ne "${YELLOW}请输入媒体库真实路径 [默认: ./media]: ${RESET}"
     read -r path_media
-    [[ -z "$path_media" ]] && path_media="/media"
+    [[ -z "$path_media" ]] && path_media="./media"
 
-    # 初始化基础目录
-    mkdir -p "$path_config" "$path_media" "$BASE_DIR/core"
-    chmod -R 777 "$BASE_DIR" "$path_config" "$path_media"
+    # 路径 4: 下载目录
+    echo -ne "${YELLOW}请输入下载库真实路径 [默认: ./downloads]: ${RESET}"
+    read -r path_downloads
+    [[ -z "$path_downloads" ]] && path_downloads="./downloads"
 
-    echo -e "\n${YELLOW}正在生成规范化 docker-compose.yml 配置文件...${RESET}"
+    # 预创建目录
+    [[ "$path_data" == "./"* ]] && mkdir -p "$BASE_DIR/${path_data#./}" || mkdir -p "$path_data"
+    [[ "$path_cache" == "./"* ]] && mkdir -p "$BASE_DIR/${path_cache#./}" || mkdir -p "$path_cache"
+    [[ "$path_media" == "./"* ]] && mkdir -p "$BASE_DIR/${path_media#./}" || mkdir -p "$path_media"
+    [[ "$path_downloads" == "./"* ]] && mkdir -p "$BASE_DIR/${path_downloads#./}" || mkdir -p "$path_downloads"
 
-    if [[ "$db_mode" == "1" ]]; then
-        # ==================== 1. SQLite 本地轻量版 ====================
-        cat <<EOF > "$COMPOSE_FILE"
-services:
-  moviepilot:
-    stdin_open: true
-    tty: true
-    container_name: ${CONTAINER_NAME}
-    hostname: ${CONTAINER_NAME}
-    ports:
-      - '${custom_port}:3000'
-      - '${api_port}:3001'
-    volumes:
-      - '${path_media}:/media'
-      - '${path_config}:/config'
-      - '${BASE_DIR}/core:/moviepilot/.cloakbrowser'
-      - '/var/run/docker.sock:/var/run/docker.sock:ro'
+    echo -e "\n${CYAN}====== 2. 架构模式选择 ======${RESET}"
+    echo -e "${GREEN}1.${RESET} 本地 SQLite (极简单镜像模式)"
+    echo -e "${GREEN}2.${RESET} 本地 PostgreSQL (轻量推荐)"
+    echo -e "${GREEN}3.${RESET} 本地 PostgreSQL + 本地 Redis (多用户高并发推荐)"
+    echo -e "${GREEN}4.${RESET} 远程/外部 PostgreSQL (免建库模式)"
+    echo -e "${GREEN}5.${RESET} 远程 PostgreSQL + 远程 Redis (完全分离模式)"
+    echo -ne "${YELLOW}请选择模式编号 [默认: 3]: ${RESET}"
+    read -r mode_choice
+    [[ -z "$mode_choice" ]] && mode_choice="3"
+
+    echo -e "\n${CYAN}====== 3. 基础参数配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 18080]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="18080"
+
+    # 初始化变量
+    local depends_block=""
+    local redis_env=""
+    local db_type="postgres"
+    local db_dsn="postgres://mebox:mebox@postgres:5432/mebox?sslmode=disable"
+    local extra_services=""
+
+    # 模式判断与参数拼装
+    if [[ "$mode_choice" == "1" ]]; then
+        db_type="sqlite"
+        db_dsn=""
+    elif [[ "$mode_choice" == "2" ]]; then
+        mkdir -p "$BASE_DIR/postgres"
+        docker pull postgres:16-alpine
+        depends_block="depends_on:
+      postgres:
+        condition: service_healthy"
+        extra_services="  postgres:
+    image: postgres:16-alpine
+    pull_policy: missing
+    restart: unless-stopped
     environment:
-      - 'NGINX_PORT=3000'
-      - 'PORT=3001'
-      - 'PUID=0'
-      - 'PGID=0'
-      - 'UMASK=000'
-      - 'TZ=Asia/Shanghai'
-      - 'SUPERUSER=${mp_user}'
-      - 'SUPERUSER_PASSWORD=${mp_password}'
-    restart: always
-    image: jxxghp/moviepilot-v3:latest
-EOF
-
-    elif [[ "$db_mode" == "2" ]]; then
-        # ==================== 2. PostgreSQL + Redis 自带集成版 ====================
-        RAND_REDIS_PWD=$(generate_random_password)
-        RAND_PG_PWD=$(generate_random_password)
-        mkdir -p "$BASE_DIR/redis_data" "$BASE_DIR/pg_data"
-
-        cat <<EOF > "$COMPOSE_FILE"
-services:
-  moviepilot:
-    stdin_open: true
-    tty: true
-    container_name: ${CONTAINER_NAME}
-    hostname: ${CONTAINER_NAME}
-    ports:
-      - '${custom_port}:3000'
-      - '${api_port}:3001'
+      POSTGRES_DB: mebox
+      POSTGRES_USER: mebox
+      POSTGRES_PASSWORD: mebox
+      TZ: Asia/Shanghai
     volumes:
-      - '${path_media}:/media'
-      - '${path_config}:/config'
-      - '${BASE_DIR}/core:/moviepilot/.cloakbrowser'
-      - '/var/run/docker.sock:/var/run/docker.sock:ro'
-    environment:
-      - 'NGINX_PORT=3000'
-      - 'PORT=3001'
-      - 'PUID=0'
-      - 'PGID=0'
-      - 'UMASK=000'
-      - 'TZ=Asia/Shanghai'
-      - 'SUPERUSER=${mp_user}'
-      - 'SUPERUSER_PASSWORD=${mp_password}'
-      - 'DB_TYPE=postgresql'
-      - 'DB_POSTGRESQL_HOST=moviepilot-pg'
-      - 'DB_POSTGRESQL_PORT=5432'
-      - 'DB_POSTGRESQL_DATABASE=moviepilot'
-      - 'DB_POSTGRESQL_USERNAME=moviepilot'
-      - 'DB_POSTGRESQL_PASSWORD=${RAND_PG_PWD}'
-      - 'CACHE_BACKEND_TYPE=redis'
-      - 'CACHE_BACKEND_URL=redis://:${RAND_REDIS_PWD}@moviepilot-redis:6379'
-    restart: always
-    depends_on:
-      moviepilot-pg:
-        condition: service_healthy
-      moviepilot-redis:
-        condition: service_healthy
-    image: jxxghp/moviepilot-v3:latest
-
-  moviepilot-redis:
-    container_name: moviepilot-redis
-    image: redis:alpine
-    restart: always
-    volumes:
-      - ${BASE_DIR}/redis_data:/data
-    command: redis-server --save 600 1 --requirepass ${RAND_REDIS_PWD}
+      - ./postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${RAND_REDIS_PWD}", "--raw", "incr", "ping"]
+      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U mebox -d mebox\"]
       interval: 10s
       timeout: 5s
-      retries: 5
-
-  moviepilot-pg:
-    container_name: moviepilot-pg
-    image: postgres:17-alpine
-    restart: always
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: \"50m\"
+        max-file: \"10\""
+    elif [[ "$mode_choice" == "3" ]]; then
+        mkdir -p "$BASE_DIR/postgres" "$BASE_DIR/redis"
+        docker pull postgres:16-alpine
+        docker pull redis:7-alpine
+        depends_block="depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy"
+        redis_env="MEBOX_CACHE_REDIS_URL: redis://redis:6379/0"
+        extra_services="  postgres:
+    image: postgres:16-alpine
+    pull_policy: missing
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: moviepilot
-      POSTGRES_USER: moviepilot
-      POSTGRES_PASSWORD: ${RAND_PG_PWD}
+      POSTGRES_DB: mebox
+      POSTGRES_USER: mebox
+      POSTGRES_PASSWORD: mebox
+      TZ: Asia/Shanghai
     volumes:
-      - ${BASE_DIR}/pg_data:/var/lib/postgresql/data
+      - ./postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U moviepilot -d moviepilot"]
+      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U mebox -d mebox\"]
       interval: 10s
       timeout: 5s
-      retries: 5
-EOF
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: \"50m\"
+        max-file: \"10\"
 
-    elif [[ "$db_mode" == "3" ]]; then
-        # ==================== 3. 远程/外部数据库连接版 ====================
-        echo -e "\n${CYAN}--- 远程/外部 PostgreSQL 配置 ---${RESET}"
-        echo -ne "${YELLOW}请输入外部  PostgreSQL 数据库 IP/域名: ${RESET}"
-        read -r rem_pg_host
-        echo -ne "${YELLOW}请输入外部  PostgreSQL 数据库端口 [默认: 5432]: ${RESET}"
-        read -r rem_pg_port
-        [[ -z "$rem_pg_port" ]] && rem_pg_port="5432"
-        echo -ne "${YELLOW}请输入外部  PostgreSQL 数据库库名 [默认: moviepilot]: ${RESET}"
-        read -r rem_pg_db
-        [[ -z "$rem_pg_db" ]] && rem_pg_db="moviepilot"
-        echo -ne "${YELLOW}请输入外部  PostgreSQL 用户名 [默认: moviepilot]: ${RESET}"
-        read -r rem_pg_user
-        [[ -z "$rem_pg_user" ]] && rem_pg_user="moviepilot"
-        echo -ne "${YELLOW}请输入外部  PostgreSQL 密码 [必填]: ${RESET}"
-        read -r rem_pg_pwd
-
-        echo -e "\n${CYAN}--- 远程/外部 Redis 配置 ---${RESET}"
-        echo -ne "${YELLOW}请输入外部 Redis 连接 URL [格式示例: redis://:密码@IP:端口/0]: ${RESET}"
-        read -r rem_redis_url
-
-        cat <<EOF > "$COMPOSE_FILE"
-services:
-  moviepilot:
-    stdin_open: true
-    tty: true
-    container_name: ${CONTAINER_NAME}
-    hostname: ${CONTAINER_NAME}
-    ports:
-      - '${custom_port}:3000'
-      - '${api_port}:3001'
+  redis:
+    image: redis:7-alpine
+    pull_policy: missing
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - \"yes\"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
     volumes:
-      - '${path_media}:/media'
-      - '${path_config}:/config'
-      - '${BASE_DIR}/core:/moviepilot/.cloakbrowser'
-      - '/var/run/docker.sock:/var/run/docker.sock:ro'
-    environment:
-      - 'NGINX_PORT=3000'
-      - 'PORT=3001'
-      - 'PUID=0'
-      - 'PGID=0'
-      - 'UMASK=000'
-      - 'TZ=Asia/Shanghai'
-      - 'SUPERUSER=${mp_user}'
-      - 'SUPERUSER_PASSWORD=${mp_password}'
-      - 'DB_TYPE=postgresql'
-      - 'DB_POSTGRESQL_HOST=${rem_pg_host}'
-      - 'DB_POSTGRESQL_PORT=${rem_pg_port}'
-      - 'DB_POSTGRESQL_DATABASE=${rem_pg_db}'
-      - 'DB_POSTGRESQL_USERNAME=${rem_pg_user}'
-      - 'DB_POSTGRESQL_PASSWORD=${rem_pg_pwd}'
-      - 'CACHE_BACKEND_TYPE=redis'
-      - 'CACHE_BACKEND_URL=${rem_redis_url}'
-    restart: always
-    image: jxxghp/moviepilot-v3:latest
-EOF
+      - ./redis:/data
+    healthcheck:
+      test: [\"CMD\", \"redis-cli\", \"ping\"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: \"50m\"
+        max-file: \"10\""
+    elif [[ "$mode_choice" == "4" || "$mode_choice" == "5" ]]; then
+        echo -e "\n${CYAN}====== 远程/外部 PostgreSQL 信息输入 ======${RESET}"
+        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+        read -r ext_host
+        [[ -z "$ext_host" ]] && ext_host="127.0.0.1"
+        
+        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
+        read -r ext_port
+        [[ -z "$ext_port" ]] && ext_port="5432"
+        
+        echo -ne "${YELLOW}请输入数据库用户名 [默认: mebox]: ${RESET}"
+        read -r ext_user
+        [[ -z "$ext_user" ]] && ext_user="mebox"
+        
+        echo -ne "${YELLOW}请输入数据库密码 (必填): ${RESET}"
+        read -r ext_pass
+        if [[ -z "$ext_pass" ]]; then
+            echo -e "${RED}错误: 密码不能为空！${RESET}"
+            return
+        fi
+        
+        echo -ne "${YELLOW}请输入目标数据库名 [默认: mebox]: ${RESET}"
+        read -r ext_dbname
+        [[ -z "$ext_dbname" ]] && ext_dbname="mebox"
+
+        # 拼接成 DSN 字符串
+        db_dsn="postgres://${ext_user}:${ext_pass}@${ext_host}:${ext_port}/${ext_dbname}?sslmode=disable"
+
+        # 如果选了第 5 种模式，进一步索要远程 Redis 的配置信息
+        if [[ "$mode_choice" == "5" ]]; then
+            echo -e "\n${CYAN}====== 远程/外部 Redis 信息输入 ======${RESET}"
+            echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
+            read -r redis_host
+            [[ -z "$redis_host" ]] && redis_host="127.0.0.1"
+
+            echo -ne "${YELLOW}请输入 Redis 端口 [默认: 6379]: ${RESET}"
+            read -r redis_port
+            [[ -z "$redis_port" ]] && redis_port="6379"
+
+            echo -ne "${YELLOW}请输入 Redis 密码 (没有请直接回车): ${RESET}"
+            read -r redis_pass
+
+            echo -ne "${YELLOW}请输入 Redis 数据库号 (DB ID) [默认: 0]: ${RESET}"
+            read -r redis_db
+            [[ -z "$redis_db" ]] && redis_db="0"
+
+            # 组装 Redis 环境变量 URL
+            if [[ -n "$redis_pass" ]]; then
+                redis_env="MEBOX_CACHE_REDIS_URL: redis://:${redis_pass}@${redis_host}:${redis_port}/${redis_db}"
+            else
+                redis_env="MEBOX_CACHE_REDIS_URL: redis://${redis_host}:${redis_port}/${redis_db}"
+            fi
+        fi
+    else
+        echo -e "${RED}错误: 无效的选择！${RESET}"
+        return
     fi
 
-    echo -e "\n${YELLOW}正在通过 Docker Compose 启动部署集群...${RESET}"
+    # 动态生成符合要求的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  mebox:
+    image: ghcr.io/truewhile/mebox:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    init: true
+    ${depends_block}
+    ports:
+      - "${custom_port}:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - type: bind
+        source: ${path_data}
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${path_cache}
+        target: /cache
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${path_media}
+        target: /media
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${path_downloads}
+        target: /downloads
+        bind:
+          create_host_path: false
+      # 管理面板「系统更新」需要访问 Docker 引擎，需要时取消注释
+      # - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      TZ: Asia/Shanghai
+      PUID: "1000"
+      PGID: "1000"
+      MEBOX_APP_HOST: 0.0.0.0
+      MEBOX_APP_PORT: 8080
+      MEBOX_APP_WEB_DIR: /app/web/dist
+      MEBOX_APP_DATA_DIR: /data
+      MEBOX_LOGGING_LEVEL: info
+      MEBOX_LOGGING_FORMAT: console
+      MEBOX_LOGGING_OUTPUT_PATH: /data/logs
+      MEBOX_LOGGING_MAX_SIZE_MB: "50"
+      MEBOX_LOGGING_MAX_BACKUPS: "20"
+      MEBOX_LOGGING_MAX_AGE_DAYS: "30"
+      
+      MEBOX_DATABASE_TYPE: ${db_type}
+      MEBOX_DATABASE_DSN: "${db_dsn}"
+      MEBOX_DATABASE_DB_PATH: /data/mebox.db
+      ${redis_env}
+      MEBOX_CACHE_CACHE_DIR: /cache
+      
+      MEBOX_UPDATE_IMAGE: ghcr.io/truewhile/mebox:latest
+      MEBOX_MEDIA_DIR: /media
+      MEBOX_MEDIA_CONTAINER_DIR: /media
+      MEBOX_DOWNLOAD_DIR: /downloads
+      MEBOX_DOWNLOAD_CONTAINER_DIR: /downloads
+      
+      MEBOX_TRANSCODER_ENABLED: "true"
+      MEBOX_TRANSCODER_HARDWARE_ACCEL: "false"
+      MEBOX_TRANSCODER_REALTIME: "true"
+      MEBOX_TRANSCODER_THREADS: "2"
+      MEBOX_TRANSCODER_MAX_CONCURRENT: "1"
+      MEBOX_TRANSCODER_IDLE_TIMEOUT_SECONDS: "120"
+    healthcheck:
+      test: ["CMD-SHELL", "busybox wget -qO- http://127.0.0.1:8080/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+${extra_services}
+EOF
+
+    echo -e "${YELLOW}正在启动 Docker 容器集群...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务容器群启动初始化 (约5秒)...${RESET}"
+    echo -e "${YELLOW}等待服务初始化完成 (约5秒)...${RESET}"
     sleep 5
 
     DETECT_IP=$(get_public_ip)
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    MoviePilot V3 部署成功！    ${RESET}"
+    echo -e "${GREEN}     MeBox 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}部署模式       : 模式 ${db_mode}${RESET}"
-    echo -e "${YELLOW}WEB 访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}超级管理员账号 : ${mp_user}${RESET}"
-    echo -e "${YELLOW}超级管理员密码 : ${mp_password}${RESET}"
-    echo -e "${YELLOW}持久化配置路径 : ${path_config}${RESET}"
-    echo -e "${YELLOW}网络访问模式   : 端口映射模式 (宿主机 ${custom_port} -> 容器 3000)${RESET}"
+    echo -e "${YELLOW}当前模式       : 模式 ${mode_choice}${RESET}"
+    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}默认账号/密码  : admin / admin123${RESET}"
+    echo -e "${YELLOW}运行数据路径   : ${path_data}${RESET}"
+    echo -e "${YELLOW}影视媒体路径   : ${path_media}${RESET}"
+    echo -e "${YELLOW}配置文件存储   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新集群镜像
-update_translate() {
+# 更新
+update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在拉取最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
+    echo -e "${YELLOW}正在更新 MeBox 镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull mebox
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已安全重启并保持最新。${RESET}"
+    echo -e "${GREEN}更新完成！${RESET}"
 }
 
-# 卸载集群
-uninstall_translate() {
-    echo -ne "${YELLOW}确定要卸载并删除 MoviePilot V3 运行环境吗？(y/n): ${RESET}"
+# 卸载
+uninstall_utils() {
+    echo -ne "${YELLOW}确定要卸载并删除 MeBox 服务集群吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}所有关联容器已停止并安全移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地配置和数据库运行缓存？(绝不会删除您的电影媒体视频)(y/n): ${RESET}"
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时清理主配置目录 (不会主动删除独立媒体库)？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}主配置与数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}数据彻底清理。${RESET}"
             fi
         else
-            docker rm -f "$CONTAINER_NAME" moviepilot-redis moviepilot-pg 2>/dev/null
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
         echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务集群已启动${RESET}"; }
-stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务集群已停止${RESET}"; }
-restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务集群已重启${RESET}"; }
-logs_translate() { cd "$BASE_DIR" && docker compose logs -f --tail=100 moviepilot; }
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务集群已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务集群已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务集群已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    local DETECT_IP=$(get_public_ip)
+    DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}核心镜像       : ${img_version}${RESET}"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
     echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}宿主机配置路径 : ${data_dir}${RESET}"
+    echo -e "${YELLOW}默认管理账号   : admin / admin123${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -376,11 +433,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}  ◈  MoviePilot V3 管理面板  ◈ ${RESET}"
+    echo -e "${GREEN}    ◈  MeBox 媒体管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态    :${RESET} $status"
-    echo -e "${GREEN}Web端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}API端口 :${RESET} ${YELLOW}${api_port_show}${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -395,13 +451,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_translate ;;
-        2) update_translate ;;
-        3) uninstall_translate ;;
-        4) start_translate ;;
-        5) stop_translate ;;
-        6) restart_translate ;;
-        7) logs_translate ;;
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

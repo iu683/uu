@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# MeBox 媒体管理面板 Docker Compose 多模式管理脚本
+# ForwardXplus Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,9 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="mebox"
-BASE_DIR="/opt/mebox"
+CONTAINER_NAME="forwardxplus-panel"
+BASE_DIR="/opt/forwardxplus"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -22,30 +23,32 @@ check_dependencies() {
     fi
 }
 
-# 动态获取容器状态、映射端口和数据目录
+# 动态获取容器状态与映射端口
 get_status_info() {
-    # 1. 检查主容器状态
+    if ! command -v docker &> /dev/null; then
+        status="${RED}未安装 Docker${RESET}"
+        img_version="${RED}未安装${RESET}"
+        port_display="N/A"
+        return 0
+    fi
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${YELLOW}运行中${RESET}"
+        status="${GREEN}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        # 提取镜像名称/版本
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        # 从容器状态提取 Web 端口
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="18080"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="9810"
+        port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
+        port_display="N/A"
     fi
 }
 
@@ -73,338 +76,144 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 MeBox
+# 处理绝对路径与相对路径转换
+get_real_path() {
+    local input_path="$1"
+    local default_path="$2"
+    [[ -z "$input_path" ]] && input_path="$default_path"
+
+    if [[ "$input_path" == "./"* ]]; then
+        echo "$BASE_DIR/${input_path#./}"
+    else
+        echo "$input_path"
+    fi
+}
+
+# 部署 ForwardXplus
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
+    DETECT_IP=$(get_public_ip)
 
     echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 如果路径不存在，将自动创建。可以直接回车使用默认值。${RESET}"
-    
-    # 路径 1: 运行数据
-    echo -ne "${YELLOW}请输入运行数据目录 [默认: ./data]: ${RESET}"
-    read -r path_data
-    [[ -z "$path_data" ]] && path_data="./data"
+    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 文件夹。${RESET}"
+    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
+    read -r input_data
+    local path_data_raw="${input_data:-./data}"
+    local real_path_data=$(get_real_path "$path_data_raw" "./data")
 
-    # 路径 2: 缓存目录
-    echo -ne "${YELLOW}请输入缓存目录 [默认: ./cache]: ${RESET}"
-    read -r path_cache
-    [[ -z "$path_cache" ]] && path_cache="./cache"
+    mkdir -p "$real_path_data"
+    chmod -R 777 "$real_path_data"
 
-    # 路径 3: 媒体库目录
-    echo -ne "${YELLOW}请输入媒体库真实路径 [默认: ./media]: ${RESET}"
-    read -r path_media
-    [[ -z "$path_media" ]] && path_media="./media"
-
-    # 路径 4: 下载目录
-    echo -ne "${YELLOW}请输入下载库真实路径 [默认: ./downloads]: ${RESET}"
-    read -r path_downloads
-    [[ -z "$path_downloads" ]] && path_downloads="./downloads"
-
-    # 预创建目录
-    [[ "$path_data" == "./"* ]] && mkdir -p "$BASE_DIR/${path_data#./}" || mkdir -p "$path_data"
-    [[ "$path_cache" == "./"* ]] && mkdir -p "$BASE_DIR/${path_cache#./}" || mkdir -p "$path_cache"
-    [[ "$path_media" == "./"* ]] && mkdir -p "$BASE_DIR/${path_media#./}" || mkdir -p "$path_media"
-    [[ "$path_downloads" == "./"* ]] && mkdir -p "$BASE_DIR/${path_downloads#./}" || mkdir -p "$path_downloads"
-
-    echo -e "\n${CYAN}====== 2. 架构模式选择 ======${RESET}"
-    echo -e "${GREEN}1.${RESET} 本地 SQLite (极简单镜像模式)"
-    echo -e "${GREEN}2.${RESET} 本地 PostgreSQL (轻量推荐)"
-    echo -e "${GREEN}3.${RESET} 本地 PostgreSQL + 本地 Redis (多用户高并发推荐)"
-    echo -e "${GREEN}4.${RESET} 远程/外部 PostgreSQL (免建库模式)"
-    echo -e "${GREEN}5.${RESET} 远程 PostgreSQL + 远程 Redis (完全分离模式)"
-    echo -ne "${YELLOW}请选择模式编号 [默认: 3]: ${RESET}"
-    read -r mode_choice
-    [[ -z "$mode_choice" ]] && mode_choice="3"
-
-    echo -e "\n${CYAN}====== 3. 基础参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 18080]: ${RESET}"
+    echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 ForwardX 访问端口 [默认: 9810]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="18080"
-
-    # 初始化变量
-    local depends_block=""
-    local redis_env=""
-    local db_type="postgres"
-    local db_dsn="postgres://mebox:mebox@postgres:5432/mebox?sslmode=disable"
-    local extra_services=""
-
-    # 模式判断与参数拼装
-    if [[ "$mode_choice" == "1" ]]; then
-        db_type="sqlite"
-        db_dsn=""
-    elif [[ "$mode_choice" == "2" ]]; then
-        mkdir -p "$BASE_DIR/postgres"
-        docker pull postgres:16-alpine
-        depends_block="depends_on:
-      postgres:
-        condition: service_healthy"
-        extra_services="  postgres:
-    image: postgres:16-alpine
-    pull_policy: missing
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: mebox
-      POSTGRES_USER: mebox
-      POSTGRES_PASSWORD: mebox
-      TZ: Asia/Shanghai
-    volumes:
-      - ./postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U mebox -d mebox\"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    logging:
-      driver: json-file
-      options:
-        max-size: \"50m\"
-        max-file: \"10\""
-    elif [[ "$mode_choice" == "3" ]]; then
-        mkdir -p "$BASE_DIR/postgres" "$BASE_DIR/redis"
-        docker pull postgres:16-alpine
-        docker pull redis:7-alpine
-        depends_block="depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy"
-        redis_env="MEBOX_CACHE_REDIS_URL: redis://redis:6379/0"
-        extra_services="  postgres:
-    image: postgres:16-alpine
-    pull_policy: missing
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: mebox
-      POSTGRES_USER: mebox
-      POSTGRES_PASSWORD: mebox
-      TZ: Asia/Shanghai
-    volumes:
-      - ./postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U mebox -d mebox\"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    logging:
-      driver: json-file
-      options:
-        max-size: \"50m\"
-        max-file: \"10\"
-
-  redis:
-    image: redis:7-alpine
-    pull_policy: missing
-    restart: unless-stopped
-    command:
-      - redis-server
-      - --appendonly
-      - \"yes\"
-      - --maxmemory
-      - 256mb
-      - --maxmemory-policy
-      - allkeys-lru
-    volumes:
-      - ./redis:/data
-    healthcheck:
-      test: [\"CMD\", \"redis-cli\", \"ping\"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    logging:
-      driver: json-file
-      options:
-        max-size: \"50m\"
-        max-file: \"10\""
-    elif [[ "$mode_choice" == "4" || "$mode_choice" == "5" ]]; then
-        echo -e "\n${CYAN}====== 远程/外部 PostgreSQL 信息输入 ======${RESET}"
-        echo -ne "${YELLOW}请输入外部 PostgreSQL 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
-        read -r ext_host
-        [[ -z "$ext_host" ]] && ext_host="127.0.0.1"
-        
-        echo -ne "${YELLOW}请输入 PostgreSQL 端口 [默认: 5432]: ${RESET}"
-        read -r ext_port
-        [[ -z "$ext_port" ]] && ext_port="5432"
-        
-        echo -ne "${YELLOW}请输入数据库用户名 [默认: mebox]: ${RESET}"
-        read -r ext_user
-        [[ -z "$ext_user" ]] && ext_user="mebox"
-        
-        echo -ne "${YELLOW}请输入数据库密码 (必填): ${RESET}"
-        read -r ext_pass
-        if [[ -z "$ext_pass" ]]; then
-            echo -e "${RED}错误: 密码不能为空！${RESET}"
-            return
-        fi
-        
-        echo -ne "${YELLOW}请输入目标数据库名 [默认: mebox]: ${RESET}"
-        read -r ext_dbname
-        [[ -z "$ext_dbname" ]] && ext_dbname="mebox"
-
-        # 拼接成 DSN 字符串
-        db_dsn="postgres://${ext_user}:${ext_pass}@${ext_host}:${ext_port}/${ext_dbname}?sslmode=disable"
-
-        # 如果选了第 5 种模式，进一步索要远程 Redis 的配置信息
-        if [[ "$mode_choice" == "5" ]]; then
-            echo -e "\n${CYAN}====== 远程/外部 Redis 信息输入 ======${RESET}"
-            echo -ne "${YELLOW}请输入外部 Redis 的 IP 或域名 [默认: 127.0.0.1]: ${RESET}"
-            read -r redis_host
-            [[ -z "$redis_host" ]] && redis_host="127.0.0.1"
-
-            echo -ne "${YELLOW}请输入 Redis 端口 [默认: 6379]: ${RESET}"
-            read -r redis_port
-            [[ -z "$redis_port" ]] && redis_port="6379"
-
-            echo -ne "${YELLOW}请输入 Redis 密码 (没有请直接回车): ${RESET}"
-            read -r redis_pass
-
-            echo -ne "${YELLOW}请输入 Redis 数据库号 (DB ID) [默认: 0]: ${RESET}"
-            read -r redis_db
-            [[ -z "$redis_db" ]] && redis_db="0"
-
-            # 组装 Redis 环境变量 URL
-            if [[ -n "$redis_pass" ]]; then
-                redis_env="MEBOX_CACHE_REDIS_URL: redis://:${redis_pass}@${redis_host}:${redis_port}/${redis_db}"
-            else
-                redis_env="MEBOX_CACHE_REDIS_URL: redis://${redis_host}:${redis_port}/${redis_db}"
-            fi
-        fi
-    else
-        echo -e "${RED}错误: 无效的选择！${RESET}"
+    [[ -z "$custom_port" ]] && custom_port="9810"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成符合要求的 docker-compose.yml 配置文件
+    # 生成 .env 配置文件
+    echo -e "${YELLOW}正在生成 .env 配置文件...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+PORT=${custom_port}
+COMPOSE_PROJECT_NAME=forwardx
+FORWARDX_CONTAINER_NAME=${CONTAINER_NAME}
+FORWARDX_IMAGE=ghcr.io/wzwys9/forwardplus:latest
+EOF
+    echo "JWT_SECRET=$(openssl rand -hex 32)" >> "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+
+    # 生成 docker-compose.yml 配置文件 (使用本地目录挂载替代命名数据卷)
     echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
+name: \${COMPOSE_PROJECT_NAME:-forwardx}
+
 services:
-  mebox:
-    image: ghcr.io/truewhile/mebox:latest
-    container_name: ${CONTAINER_NAME}
+  forwardx:
+    image: \${FORWARDX_IMAGE:-ghcr.io/wzwys9/forwardplus:latest}
+    container_name: \${FORWARDX_CONTAINER_NAME:-forwardx-panel}
     restart: unless-stopped
-    init: true
-    ${depends_block}
-    ports:
-      - "${custom_port}:8080"
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - type: bind
-        source: ${path_data}
-        target: /data
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${path_cache}
-        target: /cache
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${path_media}
-        target: /media
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${path_downloads}
-        target: /downloads
-        bind:
-          create_host_path: false
-      # 管理面板「系统更新」需要访问 Docker 引擎，需要时取消注释
-      # - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "\${PORT:-9810}:3000"
     environment:
-      TZ: Asia/Shanghai
-      PUID: "1000"
-      PGID: "1000"
-      MEBOX_APP_HOST: 0.0.0.0
-      MEBOX_APP_PORT: 8080
-      MEBOX_APP_WEB_DIR: /app/web/dist
-      MEBOX_APP_DATA_DIR: /data
-      MEBOX_LOGGING_LEVEL: info
-      MEBOX_LOGGING_FORMAT: console
-      MEBOX_LOGGING_OUTPUT_PATH: /data/logs
-      MEBOX_LOGGING_MAX_SIZE_MB: "50"
-      MEBOX_LOGGING_MAX_BACKUPS: "20"
-      MEBOX_LOGGING_MAX_AGE_DAYS: "30"
-      
-      MEBOX_DATABASE_TYPE: ${db_type}
-      MEBOX_DATABASE_DSN: "${db_dsn}"
-      MEBOX_DATABASE_DB_PATH: /data/mebox.db
-      ${redis_env}
-      MEBOX_CACHE_CACHE_DIR: /cache
-      
-      MEBOX_UPDATE_IMAGE: ghcr.io/truewhile/mebox:latest
-      MEBOX_MEDIA_DIR: /media
-      MEBOX_MEDIA_CONTAINER_DIR: /media
-      MEBOX_DOWNLOAD_DIR: /downloads
-      MEBOX_DOWNLOAD_CONTAINER_DIR: /downloads
-      
-      MEBOX_TRANSCODER_ENABLED: "true"
-      MEBOX_TRANSCODER_HARDWARE_ACCEL: "false"
-      MEBOX_TRANSCODER_REALTIME: "true"
-      MEBOX_TRANSCODER_THREADS: "2"
-      MEBOX_TRANSCODER_MAX_CONCURRENT: "1"
-      MEBOX_TRANSCODER_IDLE_TIMEOUT_SECONDS: "120"
-    healthcheck:
-      test: ["CMD-SHELL", "busybox wget -qO- http://127.0.0.1:8080/api/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
+      NODE_ENV: production
+      PORT: 3000
+      JWT_SECRET: \${JWT_SECRET}
+      FORWARDPLUS_GITHUB_TOKEN: \${FORWARDPLUS_GITHUB_TOKEN:-}
+      DATABASE_CONFIG_PATH: /data/database.json
+      SQLITE_PATH: /data/forwardx.db
+      MYSQL_CONFIG_PATH: /data/mysql.json
+      DATABASE_TYPE: \${DATABASE_TYPE:-}
+      MYSQL_URL: \${MYSQL_URL:-}
+      MYSQL_HOST: \${MYSQL_HOST:-}
+      MYSQL_PORT: \${MYSQL_PORT:-3306}
+      MYSQL_USER: \${MYSQL_USER:-}
+      MYSQL_PASSWORD: \${MYSQL_PASSWORD:-}
+      MYSQL_DATABASE: \${MYSQL_DATABASE:-}
+      MYSQL_SSL: \${MYSQL_SSL:-false}
+      POSTGRES_URL: \${POSTGRES_URL:-}
+      POSTGRES_HOST: \${POSTGRES_HOST:-}
+      POSTGRES_PORT: \${POSTGRES_PORT:-5432}
+      POSTGRES_USER: \${POSTGRES_USER:-}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-}
+      POSTGRES_DATABASE: \${POSTGRES_DATABASE:-}
+      POSTGRES_SSL: \${POSTGRES_SSL:-false}
+      TELEGRAM_BOT_TOKEN: \${TELEGRAM_BOT_TOKEN:-}
+    volumes:
+      - ${path_data_raw}:/data
     logging:
-      driver: json-file
+      driver: local
       options:
-        max-size: "50m"
-        max-file: "10"
-
-${extra_services}
+        max-size: "\${FORWARDX_LOG_MAX_SIZE:-20m}"
+        max-file: "\${FORWARDX_LOG_MAX_FILES:-3}"
 EOF
 
-    echo -e "${YELLOW}正在启动 Docker 容器集群...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 ForwardX...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    echo -e "${YELLOW}等待服务初始化完成 (约5秒)...${RESET}"
-    sleep 5
-
-    DETECT_IP=$(get_public_ip)
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     MeBox 部署成功！       ${RESET}"
+    echo -e "${GREEN}    ForwardXplus 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前模式       : 模式 ${mode_choice}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}默认账号/密码  : admin / admin123${RESET}"
-    echo -e "${YELLOW}运行数据路径   : ${path_data}${RESET}"
-    echo -e "${YELLOW}影视媒体路径   : ${path_media}${RESET}"
-    echo -e "${YELLOW}配置文件存储   : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}访问地址       : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}数据直挂路径   : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新
+# 更新 ForwardXplus 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在更新 MeBox 镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull mebox
+    echo -e "${YELLOW}正在从远端拉取 ForwardXplus 最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！${RESET}"
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载
+# 卸载 ForwardXplus
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 MeBox 服务集群吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的转发及面板配置！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 ForwardXplus 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时清理主配置目录 (不会主动删除独立媒体库)？(y/n): ${RESET}"
+            echo -ne "${RED}是否同时彻底删除本地全量挂载的数据库？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}数据彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有配置及数据已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -413,9 +222,9 @@ uninstall_utils() {
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}服务集群已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}服务集群已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}服务集群已重启${RESET}"; }
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
 logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
@@ -424,8 +233,8 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址   : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}默认管理账号   : admin / admin123${RESET}"
+    echo -e "${YELLOW}访问地址       : http://${DETECT_IP}:${port_display}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -433,10 +242,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  MeBox 媒体管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}   ◈  ForwardXplus 管理面板  ◈  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"

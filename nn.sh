@@ -1,257 +1,148 @@
-#!/bin/bash
-# =================================================================
-# monitor 监控服务 Docker Compose 管理面板 
-# =================================================================
+#!/bin/sh
+# ==========================================
+# 哪吒监控 & Komari Agent & NodeGet & Monitor Agent 全自动卸载工具
+# 支持系统: Alpine (OpenRC), Debian/Ubuntu/CentOS (Systemd)
+# ==========================================
 
-# 颜色
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\033[0m"
+NZ_BASE_PATH="/opt/nezha"
+NZ_AGENT_PATH="${NZ_BASE_PATH}/agent"
+KOMARI_PATH="/opt/komari/agent"
+MONITOR_PATH="/opt/monitor"
 
-CONTAINER_NAME="monitor"
-BASE_DIR="/opt/monitor"
-COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+# 颜色定义
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+plain='\033[0m'
 
-# 检测依赖
-check_dependencies() {
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
-        exit 1
-    fi
-    if ! docker compose version &> /dev/null && ! command -v docker-compose &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker Compose，请先安装！${RESET}"
-        exit 1
-    fi
-}
+# 输出函数
+info() { printf "${yellow}[INFO] %s${plain}\n" "$*"; }
+err() { printf "${red}[ERROR] %s${plain}\n" "$*" >&2; }
+success() { printf "${green}[SUCCESS] %s${plain}\n" "$*"; }
 
-# 动态获取容器状态与映射端口
-get_status_info() {
-    if ! command -v docker &> /dev/null; then
-        status="${RED}未安装 Docker${RESET}"
-        img_version="${RED}未安装${RESET}"
-        port_display="N/A"
-        return 0
-    fi
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${GREEN}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
-
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        monitor_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "28080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$monitor_port" ]] && monitor_port="28080"
-        port_display="${monitor_port}"
-    else
-        img_version="${RED}未安装${RESET}"
-        port_display="N/A"
-    fi
-}
-
-# 获取公网 IP (兼容双栈环境)
-get_public_ip() {
-    local mode=${1:-"auto"}
-    local ip=""
-    
-    if [[ "$mode" == "v4" ]]; then
-        for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
-        done
-    elif [[ "$mode" == "v6" ]]; then
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
-        done
-    else
-        for url in "https://api.ipify.org" "https://4.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-        for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-        done
-    fi
-    echo "127.0.0.1" && return 0
-}
-
-# 处理绝对路径与相对路径转换
-get_real_path() {
-    local input_path="$1"
-    local default_path="$2"
-    [[ -z "$input_path" ]] && input_path="$default_path"
-
-    if [[ "$input_path" == "./"* ]]; then
-        echo "$BASE_DIR/${input_path#./}"
-    else
-        echo "$input_path"
-    fi
-}
-
-# 部署 monitor
-install_utils() {
-    check_dependencies
-    
-    mkdir -p "$BASE_DIR"
-    DETECT_IP=$(get_public_ip)
-
-    echo -e "${CYAN}====== 1. 目录挂载与配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 文件夹。${RESET}"
-    
-    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
-    read -r input_data
-    local path_data_raw="${input_data:-./data}"
-    local real_path_data=$(get_real_path "$path_data_raw" "./data")
-
-    mkdir -p "$real_path_data"
-
-    echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 monitor 访问端口 [默认: 28080]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="28080"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
-
-    # 动态生成纯净版 docker-compose.yml 配置文件 (本地目录挂载)
-    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  monitor:
-    image: stqfdyr/monitor
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${custom_port}:28080"
-    environment:
-      TZ: Asia/Shanghai
-    volumes:
-      - ${path_data_raw}:/data
-EOF
-
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 monitor...${RESET}"
-    cd "$BASE_DIR" && docker compose up -d --force-recreate
-
-    echo -e "${YELLOW}等待容器初始化并生成应急密码 (约 5 秒)...${RESET}"
-    sleep 5
-
-    # 自动尝试捕获日志中的应急密码
-    EMERGENCY_PASS=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -i "Emergency" | tail -n 1)
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}         monitor 部署成功！       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}本地访问地址   : http://127.0.0.1:${custom_port}${RESET}"
-    echo -e "${YELLOW}数据直挂路径   : ${real_path_data}${RESET}"
-    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
-    
-    if [ -n "$EMERGENCY_PASS" ]; then
-        echo -e "${CYAN}--------------------------------${RESET}"
-        echo -e "${RED} 首次应急密码 : ${GREEN}${EMERGENCY_PASS}${RESET}"
-        echo -e "${CYAN}--------------------------------${RESET}"
-    else
-        echo -e "${YELLOW}提示: 未在日志中直接匹配到 Emergency 关键字，可手动执行:${RESET}"
-        echo -e "${CYAN}docker logs monitor | grep -i Emergency${RESET}"
-    fi
-    echo -e "${GREEN}================================${RESET}"
-}
-
-# 更新 monitor 镜像
-update_utils() {
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
-        return
-    fi
-    echo -e "${YELLOW}正在从远端拉取 monitor 最新镜像...${RESET}"
-    cd "$BASE_DIR" && docker compose pull
-    docker compose up -d --remove-orphans
-    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
-}
-
-# 卸载 monitor
-uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的监控配置！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 monitor 容器吗？(y/n): ${RESET}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}是否同时彻底删除本地全量挂载的数据目录？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有监控配置及数据已被彻底销毁。${RESET}"
-            fi
+# 权限检查
+sudo_exec() {
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo > /dev/null 2>&1; then
+            sudo "$@"
         else
-            docker rm -f "$CONTAINER_NAME" 2>/dev/null
+            err "错误: 需要root权限且未找到sudo"
+            exit 1
         fi
-        echo -e "${GREEN}卸载完成！${RESET}"
+    else
+        "$@"
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+# --- 1. 卸载哪吒 Agent ---
+uninstall_nezha() {
+    if [ -d "$NZ_AGENT_PATH" ]; then
+        info "正在检测并停止 哪吒-agent 服务..."
+        config_files=$(find "$NZ_AGENT_PATH" -name "config*.yml" 2>/dev/null)
+        
+        if [ -n "$config_files" ]; then
+            for config in $config_files; do
+                sudo_exec "${NZ_AGENT_PATH}/nezha-agent" service -c "$config" uninstall >/dev/null 2>&1 || true
+            done
+        fi
 
-show_info() {
-    get_status_info
-    DETECT_IP=$(get_public_ip)
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}映射端口       : ${port_display}${RESET}"
-    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
-    if [ -f "$COMPOSE_FILE" ]; then
-        echo -e "${CYAN}--- docker-compose.yml 内容 ---${RESET}"
-        cat "$COMPOSE_FILE"
+        info "清理哪吒文件..."
+        sudo_exec rm -rf "$NZ_AGENT_PATH"
+        if [ -d "$NZ_BASE_PATH" ] && [ -z "$(ls -A "$NZ_BASE_PATH" 2>/dev/null)" ]; then
+            sudo_exec rm -rf "$NZ_BASE_PATH"
+        fi
+        success "哪吒-agent 卸载完成"
+    else
+        info "未发现哪吒安装目录，跳过"
     fi
-    echo -e "${GREEN}================================${RESET}"
 }
 
-menu() {
-    clear
-    get_status_info
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       ◈ monitor 管理面板 ◈     ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 部署启动${RESET}"
-    echo -e "${GREEN}2. 更新容器${RESET}"
-    echo -e "${GREEN}3. 卸载容器${RESET}"
-    echo -e "${GREEN}4. 启动容器${RESET}"
-    echo -e "${GREEN}5. 停止容器${RESET}"
-    echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志${RESET}"
-    echo -e "${GREEN}8. 查看配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -ne "${GREEN}请输入选项: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) install_utils ;;
-        2) update_utils ;;
-        3) uninstall_utils ;;
-        4) start_utils ;;
-        5) stop_utils ;;
-        6) restart_utils ;;
-        7) logs_utils ;;
-        8) show_info ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
+# --- 2. 卸载 Komari Agent ---
+uninstall_komari() {
+    info "开始检测并停止 Komari-agent..."
+
+    # Systemd
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files | grep -q "komari-agent"; then
+            sudo_exec systemctl stop komari-agent >/dev/null 2>&1 || true
+            sudo_exec systemctl disable komari-agent >/dev/null 2>&1 || true
+            sudo_exec rm -f /etc/systemd/system/komari-agent.service
+            sudo_exec systemctl daemon-reload
+            info "Systemd: Komari 服务已清理"
+        fi
+    fi
+
+    # OpenRC
+    if command -v rc-service >/dev/null 2>&1; then
+        if [ -f "/etc/init.d/komari-agent" ]; then
+            sudo_exec rc-service komari-agent stop >/dev/null 2>&1 || true
+            sudo_exec rc-update del komari-agent default >/dev/null 2>&1 || true
+            sudo_exec rm -f /etc/init.d/komari-agent
+            info "OpenRC: Komari 服务已清理"
+        fi
+    fi
+
+    info "清理 Komari 文件残留..."
+    sudo_exec rm -rf "$KOMARI_PATH"
+    
+    success "Komari-agent 卸载完成"
 }
 
-while true; do
-    menu
-    echo -ne "${YELLOW}按回车键继续...${RESET}"
-    read -r
-done
+# --- 3. 卸载 NodeGet Agent ---
+uninstall_nodeget() {
+    info "开始卸载 NodeGet Agent..."
+    bash <(curl -sL https://install.nodeget.com) uninstall-agent
+    success "NodeGet Agent 卸载完成"
+}
+
+# --- 4. 卸载 Monitor Agent ---
+uninstall_monitor() {
+    info "开始检测并停止 Monitor Agent..."
+
+    # Systemd
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files | grep -q "monitor-agent"; then
+            sudo_exec systemctl disable --now monitor-agent >/dev/null 2>&1 || true
+            sudo_exec rm -f /etc/systemd/system/monitor-agent.service
+            sudo_exec systemctl daemon-reload
+            info "Systemd: Monitor Agent 服务已清理"
+        fi
+    fi
+
+    # OpenRC
+    if command -v rc-service >/dev/null 2>&1; then
+        if [ -f "/etc/init.d/monitor-agent" ]; then
+            sudo_exec rc-update del monitor-agent default >/dev/null 2>&1 || true
+            sudo_exec rc-service monitor-agent stop >/dev/null 2>&1 || true
+            sudo_exec rm -f /etc/init.d/monitor-agent
+            info "OpenRC: Monitor Agent 服务已清理"
+        fi
+    fi
+
+    # 清理用户 (如果存在)
+    if id "monitor-agent" >/dev/null 2>&1; then
+        sudo_exec userdel monitor-agent >/dev/null 2>&1 || true
+        info "已删除 monitor-agent 用户"
+    fi
+
+    # 清理文件
+    info "清理 Monitor Agent 文件残留..."
+    sudo_exec rm -rf "/opt/monitor/monitor-agent"
+    sudo_exec rm -rf "/opt/monitor/agent.env"
+
+    success "Monitor Agent 卸载完成"
+}
+
+# --- 执行流程 ---
+echo -e "${green}===================================${plain}"
+echo -e "${yellow}    ◈  自动化清理程序启动  ◈        ${plain}"
+echo -e "${green}===================================${plain}"
+
+uninstall_nezha
+uninstall_komari
+uninstall_nodeget
+uninstall_monitor
+
+echo -e "${green}===================================${plain}"
+echo -e "${yellow}    🎉 ✔ 所有组件已检测清理完毕     ${plain}"
+echo -e "${green}===================================${plain}"

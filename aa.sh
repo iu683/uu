@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# ForumWatch Docker Compose 管理面板 
+# Sonar 监控服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="forumwatch"
-BASE_DIR="/opt/forumwatch"
+CONTAINER_NAME="Sonar"
+BASE_DIR="/opt/Sonar"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-DATA_DIR="$BASE_DIR/data"
 
 # 检测依赖
 check_dependencies() {
@@ -23,54 +22,32 @@ check_dependencies() {
     fi
 }
 
-# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
-format_ip_for_url() {
-    local ip="$1"
-    if [[ "$ip" == *":"* ]]; then
-        echo "[$ip]"
-    else
-        echo "$ip"
-    fi
-}
-
-# 动态获取容器状态并联动健康检查
+# 动态获取容器状态与映射端口
 get_status_info() {
     if ! command -v docker &> /dev/null; then
         status="${RED}未安装 Docker${RESET}"
         img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
+        port_display="N/A"
         return 0
     fi
-    
-    # 1. 检查容器状态
     if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        local health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        if [[ "$health_status" == "healthy" ]]; then
-            status="${GREEN}运行中 (健康)${RESET}"
-        elif [[ "$health_status" == "unhealthy" ]]; then
-            status="${RED}运行中 (不健康)${RESET}"
-        elif [[ "$health_status" == "starting" ]]; then
-            status="${YELLOW}运行中 (启动中)${RESET}"
-        else
-            status="${GREEN}运行中${RESET}"
-        fi
+        status="${GREEN}运行中${RESET}"
     elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         status="${RED}已停止${RESET}"
     else
         status="${RED}未部署${RESET}"
     fi
 
-    # 2. 如果容器存在，从容器状态中提取信息
     if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8787/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8787"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "25774/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="25774"
+        port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
-        webui_port="N/A"
+        port_display="N/A"
     fi
 }
 
@@ -98,91 +75,101 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 ForumWatch 并初始化
-install_forumwatch() {
+# 处理绝对路径与相对路径转换
+get_real_path() {
+    local input_path="$1"
+    local default_path="$2"
+    [[ -z "$input_path" ]] && input_path="$default_path"
+
+    if [[ "$input_path" == "./"* ]]; then
+        echo "$BASE_DIR/${input_path#./}"
+    else
+        echo "$input_path"
+    fi
+}
+
+# 部署 Sonar
+install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
-    mkdir -p "$DATA_DIR"
+    DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入服务访问端口 (宿主机端口) [默认: 8787]: ${RESET}"
+    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 文件夹。${RESET}"
+    
+    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
+    read -r input_data
+    local path_data_raw="${input_data:-./data}"
+    local real_path_data=$(get_real_path "$path_data_raw" "./data")
+
+    mkdir -p "$real_path_data"
+    chmod -R 777 "$real_path_data"
+
+    echo -e "\n${CYAN}====== 3. 网络端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Sonar 访问端口 [默认: 25774]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8787"
+    [[ -z "$custom_port" ]] && custom_port="25774"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 随机生成一个安全的访问令牌 (32位十六进制字符串)
-    local random_token
-    random_token=$(openssl rand -hex 16 2>/dev/null || cat /proc/sys/kernel/random/uuid | tr -d '-')
-
-    # 修改目录及文件权限，避免容器无权读写
-    chmod -R 777 "$BASE_DIR"
-
-    # 生成符合要求的 docker-compose.yml 配置文件（包含随机生成的 Token）
-    echo -e "${YELLOW}正在生成符合标准的 docker-compose.yml 配置文件...${RESET}"
+    # 动态生成纯净版 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  forumwatch:
-    image: cashewchickengazgazgood/forumwatch:latest
+  Sonar:
+    image: ghcr.io/komari-probe/komari-probe:v1.0.0-beta.1
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     ports:
-      - "${custom_port}:8787"
-    environment:
-      - TZ=Asia/Shanghai
-      - FW_WEB_TOKEN=${random_token}
+      - "${custom_port}:25774"
     volumes:
-      - ${DATA_DIR}:/data
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+      - ${path_data_raw}:/app/data
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 ForumWatch 服务...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Sonar...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
-    RAW_IP=$(get_public_ip)
-    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+    echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
+    sleep 3
 
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}          ForumWatch 部署及启动成功！              ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}网页访问令牌 : ${CYAN}${random_token}${RESET}"
-    echo -e "${YELLOW}本地数据目录 : $DATA_DIR${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}          Sonar 部署成功！       ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}访问地址       : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}数据直挂路径   : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新镜像
-update_forumwatch() {
+# 更新Sonar 镜像
+update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Sonar 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载服务
-uninstall_forumwatch() {
-    echo -ne "${YELLOW}确定要卸载并删除 ForumWatch 容器吗？(y/n): ${RESET}"
+# 卸载 Sonar
+uninstall_utils() {
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的监控项配置！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Sonar 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除所有本地数据目录 ($BASE_DIR)？(y/n): ${RESET}"
+            echo -ne "${RED}是否同时彻底删除本地全量挂载的监控数据库？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}配置及本地数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}本地所有监控配置及数据已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -191,44 +178,31 @@ uninstall_forumwatch() {
     fi
 }
 
-start_forumwatch() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_forumwatch() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_forumwatch() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_hubproxy() { 
-    echo -e "${CYAN}--- 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
-    docker logs -f "$CONTAINER_NAME"; 
-}
+start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    RAW_IP=$(get_public_ip)
-    DETECT_IP=$(format_ip_for_url "$RAW_IP")
-    
-    # 尝试从当前的 docker-compose.yml 中读取当前设置的 Token
-    local current_token="未检测到"
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        current_token=$(grep "FW_WEB_TOKEN=" "$COMPOSE_FILE" | cut -d'=' -f2)
-        [[ -z "$current_token" ]] && current_token="未设置"
-    fi
-
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${YELLOW}当前状态     : $status"
-    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
-    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}访问令牌(Token): ${CYAN}${current_token}${RESET}"
-    echo -e "${YELLOW}本地数据目录 : ${DATA_DIR}${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
+    DETECT_IP=$(get_public_ip)
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}访问地址       : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${GREEN}================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}==============================${RESET}"
-    echo -e "${GREEN}  ◈   ForumWatch 管理面板 ◈    ${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
+    echo -e "${GREEN}     ◈  Sonar 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -238,17 +212,17 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_forumwatch ;;
-        2) update_forumwatch ;;
-        3) uninstall_forumwatch ;;
-        4) start_forumwatch ;;
-        5) stop_forumwatch ;;
-        6) restart_forumwatch ;;
-        7) logs_forumwatch ;;
+        1) install_utils ;;
+        2) update_utils ;;
+        3) uninstall_utils ;;
+        4) start_utils ;;
+        5) stop_utils ;;
+        6) restart_utils ;;
+        7) logs_utils ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

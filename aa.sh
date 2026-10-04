@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Daily Check-in Panel Docker Compose 管理面板 
+# Foxel 网盘服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="daily-checkin-panel"
-BASE_DIR="/opt/daily-checkin-panel"
+CONTAINER_NAME="foxel"
+BASE_DIR="/opt/foxel"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -42,8 +42,8 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8787/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8787"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8088"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -58,11 +58,11 @@ get_public_ip() {
     
     if [[ "$mode" == "v4" ]]; then
         for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":" ]] && echo "$ip" && return 0
         done
     elif [[ "$mode" == "v6" ]]; then
         for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":" ]] && echo "$ip" && return 0
         done
     else
         for url in "https://api.ipify.org" "https://4.ip.sb"; do
@@ -88,14 +88,14 @@ get_real_path() {
     fi
 }
 
-# 部署 Daily Check-in Panel
+# 部署 Foxel
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 目录挂载与参数配置 ======${RESET}"
+    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
     echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 文件夹。${RESET}"
     
     echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
@@ -103,80 +103,95 @@ install_utils() {
     local path_data_raw="${input_data:-./data}"
     local real_path_data=$(get_real_path "$path_data_raw" "./data")
 
-    mkdir -p "$real_path_data"
+    mkdir -p "$real_path_data/db" "$real_path_data/mount"
     chmod -R 777 "$real_path_data"
 
-    echo -ne "${YELLOW}请输入账号凭据加密密钥 (ENCRYPT_KEY，留空则自动生成): ${RESET}"
-    read -r custom_encrypt_key
-
-    echo -e "\n${CYAN}====== 3. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入面板访问端口 [默认: 8787]: ${RESET}"
+    echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Foxel 访问端口 [默认: 8088]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8787"
+    [[ -z "$custom_port" ]] && custom_port="8088"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
+    fi
+
+    # 自动生成安全的随机密钥
+    echo -e "${YELLOW}正在生成安全的随机密钥 (SECRET_KEY)...${RESET}"
+    if command -v openssl &> /dev/null; then
+        generated_secret_key=$(openssl rand -base64 32)
+        generated_temp_secret_key=$(openssl rand -base64 32)
+    else
+        generated_secret_key=$(date +%s | sha256sum | base64 | head -c 32)
+        generated_temp_secret_key=$(date +%s | md5sum | base64 | head -c 32)
     fi
 
     # 动态生成纯净版 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  panel:
-    image: nameguoguo/daily-checkin-panel:latest
+  foxel:
+    image: ghcr.io/drizzletime/foxel:latest
     container_name: ${CONTAINER_NAME}
-    ports:
-      - "${custom_port}:8787"
-    environment:
-      ENCRYPT_KEY: "${custom_encrypt_key}"
-      PORT: "8787"
-      TZ: "Asia/Shanghai"
-    volumes:
-      - ${path_data_raw}:/data
     restart: unless-stopped
+    ports:
+      - "${custom_port}:80"
+    environment:
+      - TZ=Asia/Shanghai
+      - FOXEL_PORT=80
+      - SECRET_KEY=${generated_secret_key}
+      - TEMP_LINK_SECRET_KEY=${generated_temp_secret_key}
+    volumes:
+      - ${path_data_raw}:/app/data
+    pull_policy: always
+    networks:
+      - foxel-network
+
+networks:
+  foxel-network:
+    driver: bridge
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Daily Check-in Panel...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Foxel...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Daily Check-in 部署成功！   ${RESET}"
+    echo -e "${GREEN}          Foxel 部署成功！        ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}数据直挂路径  : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}数据挂载路径  : ${real_path_data}${RESET}"
     echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新镜像
+# 更新 Foxel 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Daily Check-in Panel 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Foxel 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载
+# 卸载 Foxel
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的签到配置与账号凭据！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 Daily Check-in 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的网盘文件及数据库配置！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Foxel 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}是否同时彻底删除本地全量挂载的数据库？(y/n): ${RESET}"
+            echo -ne "${RED}是否同时彻底删除本地全量挂载的数据目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有配置及数据已被彻底销毁。${RESET}"
+                echo -e "${GREEN}本地所有网盘配置及数据已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -193,16 +208,10 @@ logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 show_info() {
     get_status_info
     DETECT_IP=$(get_public_ip)
-    # 从 docker-compose 获取当前映射端口用于展示
-    local current_port="8787"
-    if [ -f "$COMPOSE_FILE" ]; then
-        current_port=$(grep -E '^\s*-\s*"[0-9]+:8787"' "$COMPOSE_FILE" | awk -F'"' '{print $2}' | cut -d':' -f1)
-        [[ -z "$current_port" ]] && current_port="8787"
-    fi
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态      : $status"
     echo -e "${YELLOW}镜像名称      : ${img_version}${RESET}"
-    echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${current_port}${RESET}"
+    echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${port_display}${RESET}"
     echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
@@ -211,7 +220,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈ Daily Check-in 面板 ◈    ${RESET}"
+    echo -e "${GREEN}     ◈   Foxel 管理面板   ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"

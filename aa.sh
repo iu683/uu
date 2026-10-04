@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Foxel 网盘服务 Docker Compose 管理面板 
+# Poznote 笔记服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,9 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="foxel"
-BASE_DIR="/opt/foxel"
+CONTAINER_NAME="poznote-webserver"
+BASE_DIR="/opt/poznote"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -43,7 +44,7 @@ get_status_info() {
         [[ -z "$img_version" ]] && img_version="已安装"
 
         webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8088"
+        [[ -z "$webui_port" ]] && webui_port="8040"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -88,7 +89,7 @@ get_real_path() {
     fi
 }
 
-# 部署 Foxel
+# 部署 Poznote
 install_utils() {
     check_dependencies
     
@@ -103,95 +104,120 @@ install_utils() {
     local path_data_raw="${input_data:-./data}"
     local real_path_data=$(get_real_path "$path_data_raw" "./data")
 
-    mkdir -p "$real_path_data/db" "$real_path_data/mount"
+    mkdir -p "$real_path_data"
     chmod -R 777 "$real_path_data"
 
     echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Foxel 访问端口 [默认: 8088]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Poznote Web 服务访问端口 [默认: 8040]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8088"
+    [[ -z "$custom_port" ]] && custom_port="8040"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 自动生成安全的随机密钥
-    echo -e "${YELLOW}正在生成安全的随机密钥 (SECRET_KEY)...${RESET}"
-    if command -v openssl &> /dev/null; then
-        generated_secret_key=$(openssl rand -base64 32)
-        generated_temp_secret_key=$(openssl rand -base64 32)
-    else
-        generated_secret_key=$(date +%s | sha256sum | base64 | head -c 32)
-        generated_temp_secret_key=$(date +%s | md5sum | base64 | head -c 32)
-    fi
+    # 生成配套的 .env 配置文件
+    echo -e "${YELLOW}正在生成配套的 .env 配置文件...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+# Poznote Configuration
+HTTP_WEB_PORT=${custom_port}
+POZNOTE_MCP_PORT=8045
+POZNOTE_MCP_AUTH_TOKEN=
+POZNOTE_DEBUG=false
+POZNOTE_PHP_FPM_MAX_CHILDREN=10
+POZNOTE_PHP_MEMORY_LIMIT=512
+
+# OIDC / SSO Configuration
+POZNOTE_OIDC_CLIENT_ID=your_client_id
+POZNOTE_OIDC_CLIENT_SECRET=your_client_secret
+POZNOTE_OIDC_DISABLE_NORMAL_LOGIN=false
+POZNOTE_SETTINGS_PASSWORD=
+EOF
 
     # 动态生成纯净版 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  foxel:
-    image: ghcr.io/drizzletime/foxel:latest
+  webserver:
+    image: ghcr.io/timothepoznanski/poznote:6
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:80"
+    restart: always
+    env_file: .env
     environment:
-      - TZ=Asia/Shanghai
-      - FOXEL_PORT=80
-      - SECRET_KEY=${generated_secret_key}
-      - TEMP_LINK_SECRET_KEY=${generated_temp_secret_key}
+      - SQLITE_DATABASE=/var/www/html/data/database/poznote.db
+      - POZNOTE_PHP_FPM_MAX_CHILDREN=\${POZNOTE_PHP_FPM_MAX_CHILDREN:-}
+      - POZNOTE_PHP_MEMORY_LIMIT=\${POZNOTE_PHP_MEMORY_LIMIT:-}
+      - POZNOTE_LISTEN_PORT=\${POZNOTE_LISTEN_PORT:-}
+    ports:
+      - "\${HTTP_WEB_PORT}:80"
     volumes:
-      - ${path_data_raw}:/app/data
-    pull_policy: always
-    networks:
-      - foxel-network
+      - ${path_data_raw}:/var/www/html/data
+    healthcheck:
+      test: ["CMD-SHELL", "port=\$\$(grep -o 'listen [0-9][0-9]*;' /etc/nginx/http.d/default.conf | head -n 1 | tr -dc 0-9); wget --quiet --tries=1 --timeout=5 -O /dev/null http://127.0.0.1:\$\${port:-80}/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
-networks:
-  foxel-network:
-    driver: bridge
+  mcp-server:
+    image: ghcr.io/timothepoznanski/poznote-mcp:6
+    container_name: poznote-mcp
+    restart: always
+    environment:
+      - POZNOTE_API_URL=http://webserver:80/api/v1
+      - POZNOTE_DEBUG=\${POZNOTE_DEBUG:-false}
+      - POZNOTE_USER_ID=\${POZNOTE_USER_ID:-1}
+      - POZNOTE_MCP_AUTH_TOKEN=\${POZNOTE_MCP_AUTH_TOKEN:-}
+    ports:
+      - "127.0.0.1:\${POZNOTE_MCP_PORT:-8045}:8045"
+    volumes:
+      - ${path_data_raw}:/var/www/html/data:ro
+    depends_on:
+      - webserver
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Foxel...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Poznote...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}          Foxel 部署成功！        ${RESET}"
+    echo -e "${GREEN}       Poznote 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${custom_port}${RESET}"
     echo -e "${YELLOW}数据挂载路径  : ${real_path_data}${RESET}"
     echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}.env 文件路径 : $ENV_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Foxel 镜像
+# 更新 Poznote 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Foxel 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Poznote 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Foxel
+# 卸载 Poznote
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的网盘文件及数据库配置！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 Foxel 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的所有笔记和数据库！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Poznote 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}是否同时彻底删除本地全量挂载的数据目录？(y/n): ${RESET}"
+            echo -ne "${RED}是否同时彻底删除本地全量挂载的笔记数据目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有网盘配置及数据已被彻底销毁。${RESET}"
+                echo -e "${GREEN}本地所有笔记数据及配置已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -213,6 +239,7 @@ show_info() {
     echo -e "${YELLOW}镜像名称      : ${img_version}${RESET}"
     echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${port_display}${RESET}"
     echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}.env 文件路径 : $ENV_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -220,7 +247,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈   Foxel 管理面板   ◈     ${RESET}"
+    echo -e "${GREEN}   ◈  Poznote 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"

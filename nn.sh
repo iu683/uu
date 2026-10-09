@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Lsky Pro 图床服务 Docker Compose 管理面板 
+# Kanban 任务板服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="lsky-pro"
-BASE_DIR="/opt/lsky-pro"
+CONTAINER_NAME="kanban"
+BASE_DIR="/opt/kanban"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -42,8 +42,8 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8089/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8089"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -88,7 +88,7 @@ get_real_path() {
     fi
 }
 
-# 部署 Lsky Pro
+# 部署 Kanban
 install_utils() {
     check_dependencies
     
@@ -107,38 +107,36 @@ install_utils() {
     chmod -R 777 "$real_path_data"
 
     echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Lsky Pro 访问端口 [默认: 8089]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Kanban Web 服务访问端口 [默认: 3000]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8089"
+    [[ -z "$custom_port" ]] && custom_port="3000"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成纯净版 docker-compose.yml 配置文件
+    # 动态生成纯净版 docker-compose.yml 配置文件 (直接嵌入端口和路径)
     echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  lsky-pro:
-    image: ghcr.io/mole404/lsky-pro-docker:latest
+  kanban:
+    image: ghcr.io/akvicor/kanban:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
-    ports:
-      - "${custom_port}:8089"
     volumes:
-      - ${path_data_raw}:/var/www/html
-    environment:
-      - WEB_PORT=8089
+      - ${path_data_raw}:/data
+    ports:
+      - "${custom_port}:3000"
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Lsky Pro...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Kanban...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Lsky Pro 部署成功！       ${RESET}"
+    echo -e "${GREEN}        Kanban 部署成功！        ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${custom_port}${RESET}"
     echo -e "${YELLOW}数据挂载路径  : ${real_path_data}${RESET}"
@@ -146,32 +144,32 @@ EOF
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Lsky Pro 镜像
+# 更新 Kanban 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Lsky Pro 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Kanban 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Lsky Pro
+# 卸载 Kanban
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的图床文件及数据库！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 Lsky Pro 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的所有看板和数据！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Kanban 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}是否同时彻底删除本地全量挂载的站点数据目录？(y/n): ${RESET}"
+            echo -ne "${RED}是否同时彻底删除本地全量挂载的看板数据目录？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有站点数据及配置已被彻底销毁。${RESET}"
+                echo -e "${GREEN}本地所有看板数据及配置已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -200,7 +198,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈  Lsky Pro 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  Kanban 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"

@@ -13,7 +13,6 @@ RESET="\033[0m"
 CONTAINER_NAME="kanban"
 BASE_DIR="/opt/kanban"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -116,7 +115,16 @@ install_utils() {
         return
     fi
 
-    # 动态生成规范版 docker-compose.yml 配置文件
+    echo -e "\n${CYAN}====== 3. 管理员账号密码配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入初始管理员用户名 [默认: admin]: ${RESET}"
+    read -r admin_user
+    [[ -z "$admin_user" ]] && admin_user="admin"
+
+    echo -ne "${YELLOW}请输入初始管理员密码 [默认: admin123456]: ${RESET}"
+    read -r admin_pass
+    [[ -z "$admin_pass" ]] && admin_pass="admin123456"
+
+    # 动态生成纯净版 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
@@ -124,10 +132,13 @@ services:
     image: ghcr.io/akvicor/kanban:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
+    environment:
+      - KANBAN_ADMIN_USERNAME=${admin_user}
+      - KANBAN_ADMIN_PASSWORD=${admin_pass}
     volumes:
       - ${path_data_raw}:/data
     ports:
-      - "\${KANBAN_PORT}:3000"
+      - "${custom_port}:3000"
 EOF
 
     echo -e "${YELLOW}正在通过 Docker Compose 启动 Kanban...${RESET}"
@@ -140,6 +151,8 @@ EOF
     echo -e "${GREEN}        Kanban 部署成功！        ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}管理员账号    : ${admin_user}${RESET}"
+    echo -e "${YELLOW}管理员密码    : ${admin_pass}${RESET}"
     echo -e "${YELLOW}数据挂载路径  : ${real_path_data}${RESET}"
     echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
@@ -199,7 +212,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  Kanban 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}    ◈  Kanban 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"

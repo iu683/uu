@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# MTProxy Docker Compose 管理面板 
+# WebProxy Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="mtproxy"
-BASE_DIR="/opt/mtproxy"
+CONTAINER_NAME="WebProxy"
+BASE_DIR="/opt/WebProxy"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -75,14 +75,14 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 MTProxy
+# 部署 WebProxy
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. MTProxy 密钥 (Secret) 配置 ======${RESET}"
+    echo -e "${CYAN}====== 1. WebProxy 密钥 (Secret) 配置 ======${RESET}"
     echo -e "${YELLOW}提示: 32位十六进制。留空则由容器自动生成，之后可从日志中查看。${RESET}"
     echo -ne "${YELLOW}请输入 Secret [默认: 留空自动生成]: ${RESET}"
     read -r custom_secret
@@ -107,7 +107,7 @@ install_utils() {
     fi
 
     echo -e "\n${CYAN}====== 3. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 MTProxy 访问端口 [默认: 18080]: ${RESET}"
+    echo -ne "${YELLOW}请输入 WebProxy 访问端口 [默认: 18080]: ${RESET}"
     read -r custom_port
     [[ -z "$custom_port" ]] && custom_port="18080"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
@@ -135,7 +135,7 @@ install_utils() {
 
     cat <<EOF > "$COMPOSE_FILE"
 services:
-    mtproxy:
+    WebProxy:
         container_name: ${CONTAINER_NAME}
         restart: always
 ${env_content}
@@ -144,36 +144,36 @@ ${env_content}
         image: ellermister/mtproxy:latest
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 MTProxy...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 WebProxy...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       MTProxy 部署成功！       ${RESET}"
+    echo -e "${GREEN}       WebProxy 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}访问/代理端口 : ${custom_port}${RESET}"
-    echo -e "${YELLOW}查看代理链接  : docker logs mtproxy${RESET}"
+    echo -e "${YELLOW}查看代理链接  : docker logs WebProxy${RESET}"
     echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 MTProxy 镜像
+# 更新 WebProxy 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 MTProxy 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 WebProxy 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 MTProxy
+# 卸载 WebProxy
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 MTProxy 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 WebProxy 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
@@ -208,7 +208,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     ◈  MTProxy 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}    ◈  WebProxy 管理面板  ◈     ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"

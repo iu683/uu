@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# WebProxy Docker Compose 管理面板 
+# Meridian 监控服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,9 +10,10 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="WebProxy"
-BASE_DIR="/opt/WebProxy"
+CONTAINER_NAME="meridian"
+BASE_DIR="/opt/meridian"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -42,8 +43,8 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "18080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="18080"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9090/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="9090"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -58,11 +59,11 @@ get_public_ip() {
     
     if [[ "$mode" == "v4" ]]; then
         for url in "https://api.ipify.org" "https://4.ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":"* ]] && echo "$ip" && return 0
+            ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" != *":" ]] && echo "$ip" && return 0
         done
     elif [[ "$mode" == "v6" ]]; then
         for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":"* ]] && echo "$ip" && return 0
+            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" && "$ip" == *":" ]] && echo "$ip" && return 0
         done
     else
         for url in "https://api.ipify.org" "https://4.ip.sb"; do
@@ -75,111 +76,138 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 WebProxy
+# 处理绝对路径与相对路径转换
+get_real_path() {
+    local input_path="$1"
+    local default_path="$2"
+    [[ -z "$input_path" ]] && input_path="$default_path"
+
+    if [[ "$input_path" == "./"* ]]; then
+        echo "$BASE_DIR/${input_path#./}"
+    else
+        echo "$input_path"
+    fi
+}
+
+# 部署 Meridian
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. WebProxy 密钥 (Secret) 配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 32位十六进制。留空则由容器自动生成，之后可从日志中查看。${RESET}"
-    echo -ne "${YELLOW}请输入 Secret [默认: 留空自动生成]: ${RESET}"
-    read -r custom_secret
+    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
+    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 文件夹。${RESET}"
+    
+    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
+    read -r input_data
+    local path_data_raw="${input_data:-./data}"
+    local real_path_data=$(get_real_path "$path_data_raw" "./data")
 
-    echo -e "\n${CYAN}====== 2. Web 伪装模式配置 (可选) ======${RESET}"
-    echo -ne "${YELLOW}是否启用 Web 伪装模式 (proxy_mode=web)？(y/n) [默认: y]: ${RESET}"
-    read -r enable_web
-    [[ -z "$enable_web" ]] && enable_web="y"
+    mkdir -p "$real_path_data"
+    chmod -R 777 "$real_path_data"
 
-    local env_web_block=""
-    if [[ "$enable_web" =~ ^[Yy]$ ]]; then
-        echo -ne "${YELLOW}请输入伪装域名 (web_hostname) [默认: your-domain-replace.it]: ${RESET}"
-        read -r web_host
-        [[ -z "$web_host" ]] && web_host="your-domain-replace.it"
-        
-        env_web_block="
-            - proxy_mode=web
-            - web_hostname=${web_host}
-            - web_fallback=public
-            - web_front=external
-            - web_listen=0.0.0.0:18080"
+    echo -e "\n${CYAN}====== 2. 安全密钥配置 ======${RESET}"
+    if [ ! -f "$ENV_FILE" ]; then
+        echo -e "${YELLOW}正在自动生成安全的随机环境变量密钥...${RESET}"
+        umask 077
+        for key in JWT_SECRET UPSTREAM_HEADER_KEY DYNAMIC_ROUTE_KEY MERIDIAN_SECRET_KEY SETUP_TOKEN; do
+            printf '%s=%s\n' "$key" "$(openssl rand -hex 32)"
+        done > "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+        echo -e "${GREEN}安全密钥已生成并写入到: $ENV_FILE${RESET}"
+    else
+        echo -e "${GREEN}检测到已存在 .env 密钥文件，将直接复用。${RESET}"
     fi
 
     echo -e "\n${CYAN}====== 3. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 WebProxy 访问端口 [默认: 18080]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Meridian 访问端口 [默认: 9090]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="18080"
+    [[ -z "$custom_port" ]] && custom_port="9090"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成规范的 docker-compose.yml 配置文件
+    # 动态生成规范、具备高安全硬化的 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
-    
-    # 组装 environment 部分
-    local env_content="        environment:"
-    if [[ -n "$custom_secret" ]]; then
-        env_content="${env_content}
-            - secret=${custom_secret}"
-    fi
-    if [[ -n "$env_web_block" ]]; then
-        env_content="${env_content}${env_web_block}"
-    fi
-    # 如果用户什么都没填，留空一项防止yaml语法错误
-    if [[ -z "$custom_secret" && -z "$env_web_block" ]]; then
-        env_content="${env_content}
-            - proxy_mode=classic"
-    fi
-
     cat <<EOF > "$COMPOSE_FILE"
 services:
-    WebProxy:
-        container_name: ${CONTAINER_NAME}
-        restart: always
-${env_content}
-        ports:
-            - "${custom_port}:18080"
-        image: ellermister/mtproxy:latest
+  meridian:
+    image: ghcr.io/snnabb/meridian:v1.13.2
+    container_name: ${CONTAINER_NAME}
+    user: "10001:10001"
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "${custom_port}:9090"
+    volumes:
+      - ${path_data_raw}:/app/data
+    env_file:
+      - .env
+    environment:
+      PANEL_BIND_ADDR: 0.0.0.0
+      ALLOW_INSECURE_HTTP: "true"
+
+volumes:
+  meridian-data:
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 WebProxy...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Meridian...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}       WebProxy 部署成功！       ${RESET}"
+    echo -e "${GREEN}        Meridian 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}访问/代理端口 : ${custom_port}${RESET}"
-    echo -e "${YELLOW}查看代理链接  : docker logs WebProxy${RESET}"
-    echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}访问地址     : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}数据直挂路径 : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}配置文件路径 : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}密钥文件路径 : $ENV_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 WebProxy 镜像
+# 更新 Meridian 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 WebProxy 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Meridian 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 WebProxy
+# 卸载 Meridian
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 WebProxy 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的面板配置！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Meridian 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
-            rm -rf "$BASE_DIR"
-            echo -e "${GREEN}容器已停止并清理相关配置目录。${RESET}"
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${RED}是否同时彻底删除本地全量挂载的数据及密钥目录 ($BASE_DIR)？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}本地所有配置、密钥及数据已被彻底销毁。${RESET}"
+            fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
@@ -195,12 +223,16 @@ logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 show_info() {
     get_status_info
     DETECT_IP=$(get_public_ip)
+    # 获取当前实际映射的端口显示
+    webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9090/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+    [[ -z "$webui_port" ]] && webui_port="9090"
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态      : $status"
+    echo -e "${YELLOW}当前状态      : $status${RESET}"
     echo -e "${YELLOW}镜像名称      : ${img_version}${RESET}"
-    echo -e "${YELLOW}映射端口      : ${port_display}${RESET}"
+    echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${webui_port}${RESET}"
     echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
-    echo -e "${GREEN}获取直连链接  : docker logs mtproxy${RESET}"
+    echo -e "${YELLOW}密钥文件路径  : $ENV_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -208,7 +240,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  WebProxy 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}    ◈  Meridian 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
@@ -219,8 +251,8 @@ menu() {
     echo -e "${GREEN}4. 启动容器${RESET}"
     echo -e "${GREEN}5. 停止容器${RESET}"
     echo -e "${GREEN}6. 重启容器${RESET}"
-    echo -e "${GREEN}7. 查看日志 (获取链接)${RESET}"
-    echo -e "${GREEN}8. 查看配置信息${RESET}"
+    echo -e "${GREEN}7. 查看日志${RESET}"
+    echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"

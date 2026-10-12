@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Meridian 监控服务 Docker Compose 管理面板 
+# Tg-SignPulse 监控服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="meridian"
-BASE_DIR="/opt/meridian"
+CONTAINER_NAME="tg-signpulse"
+BASE_DIR="/opt/tg-signpulse"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -43,8 +43,8 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9090/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="9090"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8080"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -89,7 +89,7 @@ get_real_path() {
     fi
 }
 
-# 部署 Meridian
+# 部署 Tg-SignPulse
 install_utils() {
     check_dependencies
     
@@ -107,106 +107,93 @@ install_utils() {
     mkdir -p "$real_path_data"
     chmod -R 777 "$real_path_data"
 
-    echo -e "\n${CYAN}====== 2. 安全密钥配置 ======${RESET}"
+    echo -e "\n${CYAN}====== 2. 安全凭证配置 ======${RESET}"
     if [ ! -f "$ENV_FILE" ]; then
-        echo -e "${YELLOW}正在自动生成安全的随机环境变量密钥...${RESET}"
+        echo -e "${YELLOW}正在自动生成应用密钥与管理员密码...${RESET}"
         umask 077
-        for key in JWT_SECRET UPSTREAM_HEADER_KEY DYNAMIC_ROUTE_KEY MERIDIAN_SECRET_KEY SETUP_TOKEN; do
-            printf '%s=%s\n' "$key" "$(openssl rand -hex 32)"
-        done > "$ENV_FILE"
+        {
+            echo "APP_SECRET_KEY=$(openssl rand -hex 32)"
+            echo "ADMIN_PASSWORD=$(openssl rand -hex 12)"
+        } > "$ENV_FILE"
         chmod 600 "$ENV_FILE"
-        echo -e "${GREEN}安全密钥已生成并写入到: $ENV_FILE${RESET}"
+        echo -e "${GREEN}安全凭证已生成并写入到: $ENV_FILE${RESET}"
     else
-        echo -e "${GREEN}检测到已存在 .env 密钥文件，将直接复用。${RESET}"
+        echo -e "${GREEN}检测到已存在 .env 配置文件，将直接复用。${RESET}"
     fi
 
     echo -e "\n${CYAN}====== 3. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Meridian 访问端口 [默认: 9090]: ${RESET}"
+    echo -ne "${YELLOW}请输入 Tg-SignPulse 访问端口 [默认: 8080]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="9090"
+    [[ -z "$custom_port" ]] && custom_port="8080"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成规范、具备高安全硬化的 docker-compose.yml 配置文件
+    # 动态生成规范的 docker-compose.yml 配置文件
     echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  meridian:
-    image: ghcr.io/snnabb/meridian:v1.13.2
+  app:
+    image: ghcr.io/silentely/tg-signpulse:latest
     container_name: ${CONTAINER_NAME}
-    user: "10001:10001"
     restart: unless-stopped
-    read_only: true
-    cap_drop:
-      - ALL
-    cap_add:
-      - NET_BIND_SERVICE
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=16m
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
     ports:
-      - "${custom_port}:9090"
+      - "${custom_port}:8080"
     volumes:
-      - ${path_data_raw}:/app/data
+      - ${path_data_raw}:/data
     env_file:
       - .env
     environment:
-      PANEL_BIND_ADDR: 0.0.0.0
-      ALLOW_INSECURE_HTTP: "true"
-
-volumes:
-  meridian-data:
+      - TZ=Asia/Shanghai
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Meridian...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Tg-SignPulse...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
+    # 读取生成的管理员密码用于提示展示
+    generated_pwd=$(grep "ADMIN_PASSWORD" "$ENV_FILE" | cut -d'=' -f2)
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Meridian 部署成功！       ${RESET}"
+    echo -e "${GREEN}     Tg-SignPulse 部署成功！    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}访问地址     : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}初始密码     : ${generated_pwd}${RESET}"
     echo -e "${YELLOW}数据直挂路径 : ${real_path_data}${RESET}"
     echo -e "${YELLOW}配置文件路径 : $COMPOSE_FILE${RESET}"
-    echo -e "${YELLOW}密钥文件路径 : $ENV_FILE${RESET}"
+    echo -e "${YELLOW}凭证文件路径 : $ENV_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Meridian 镜像
+# 更新 Tg-SignPulse 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Meridian 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Tg-SignPulse 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Meridian
+# 卸载 Tg-SignPulse
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的面板配置！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 Meridian 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的配置和数据库！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Tg-SignPulse 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}是否同时彻底删除本地全量挂载的数据及密钥目录 ($BASE_DIR)？(y/n): ${RESET}"
+            echo -ne "${RED}是否同时彻底删除本地全量挂载的数据及凭证目录 ($BASE_DIR)？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有配置、密钥及数据已被彻底销毁。${RESET}"
+                echo -e "${GREEN}本地所有配置、凭证及数据已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -223,16 +210,15 @@ logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 show_info() {
     get_status_info
     DETECT_IP=$(get_public_ip)
-    # 获取当前实际映射的端口显示
-    webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9090/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-    [[ -z "$webui_port" ]] && webui_port="9090"
+    webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+    [[ -z "$webui_port" ]] && webui_port="8080"
 
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态      : $status${RESET}"
     echo -e "${YELLOW}镜像名称      : ${img_version}${RESET}"
     echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${webui_port}${RESET}"
     echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
-    echo -e "${YELLOW}密钥文件路径  : $ENV_FILE${RESET}"
+    echo -e "${YELLOW}凭证文件路径  : $ENV_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -240,7 +226,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  Meridian 管理面板  ◈    ${RESET}"
+    echo -e "${GREEN}    ◈  Tg-SignPulse 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"

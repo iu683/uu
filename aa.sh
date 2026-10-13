@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Tg-SignPulse 监控服务 Docker Compose 管理面板 
+# EmbyRelay 中转服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="tg-signpulse"
-BASE_DIR="/opt/tg-signpulse"
+CONTAINER_NAME="embyrelay"
+BASE_DIR="/opt/embyrelay"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -43,8 +42,8 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8080"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "6689/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="6689"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -89,112 +88,94 @@ get_real_path() {
     fi
 }
 
-# 部署 Tg-SignPulse
+# 部署 EmbyRelay
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 文件夹。${RESET}"
-    
-    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
-    read -r input_data
-    local path_data_raw="${input_data:-./data}"
-    local real_path_data=$(get_real_path "$path_data_raw" "./data")
+    echo -e "${CYAN}====== 1. 账号密码安全配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入后台管理员用户名 [默认: admin]: ${RESET}"
+    read -r relay_user
+    [[ -z "$relay_user" ]] && relay_user="admin"
 
-    mkdir -p "$real_path_data"
-    chmod -R 777 "$real_path_data"
+    echo -ne "${YELLOW}请输入后台管理员密码 [默认: CHANGE-ME-before-first-start]: ${RESET}"
+    read -r relay_pass
+    [[ -z "$relay_pass" ]] && relay_pass="CHANGE-ME-before-first-start"
 
-    echo -e "\n${CYAN}====== 2. 安全凭证配置 ======${RESET}"
-    if [ ! -f "$ENV_FILE" ]; then
-        echo -e "${YELLOW}正在自动生成应用密钥与管理员密码...${RESET}"
-        umask 077
-        {
-            echo "APP_SECRET_KEY=$(openssl rand -hex 32)"
-            echo "ADMIN_PASSWORD=$(openssl rand -hex 12)"
-        } > "$ENV_FILE"
-        chmod 600 "$ENV_FILE"
-        echo -e "${GREEN}安全凭证已生成并写入到: $ENV_FILE${RESET}"
-    else
-        echo -e "${GREEN}检测到已存在 .env 配置文件，将直接复用。${RESET}"
-    fi
-
-    echo -e "\n${CYAN}====== 3. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Tg-SignPulse 访问端口 [默认: 8080]: ${RESET}"
+    echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 EmbyRelay 访问端口 [默认: 6689]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
+    [[ -z "$custom_port" ]] && custom_port="6689"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成规范的 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
+    # 动态生成纯净版 docker-compose.yml 配置文件 (继承你提供的安全加固配置)
+    echo -e "${YELLOW}正在生成符合安全规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  app:
-    image: ghcr.io/silentely/tg-signpulse:latest
+  embyrelay:
+    image: ecouus/embyrelay:latest
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "${custom_port}:8080"
-    volumes:
-      - ${path_data_raw}:/data
-    env_file:
-      - .env
     environment:
-      - TZ=Asia/Shanghai
+      RELAY_ADMIN_USER: "${relay_user}"
+      RELAY_ADMIN_PASSWORD: "${relay_pass}"
+      RELAY_ALLOW_INSECURE: "true"
+    volumes:
+      - relay_data:/data
+    ports:
+      - "${custom_port}:6689"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+volumes:
+  relay_data:
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Tg-SignPulse...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 EmbyRelay...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
-    # 读取生成的管理员密码用于提示展示
-    generated_pwd=$(grep "ADMIN_PASSWORD" "$ENV_FILE" | cut -d'=' -f2)
-
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     Tg-SignPulse 部署成功！    ${RESET}"
+    echo -e "${GREEN}        EmbyRelay 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}访问地址     : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}初始密码     : ${generated_pwd}${RESET}"
-    echo -e "${YELLOW}数据直挂路径 : ${real_path_data}${RESET}"
+    echo -e "${YELLOW}初始账号     : ${relay_user}${RESET}"
+    echo -e "${YELLOW}初始密码     : ${relay_pass}${RESET}"
     echo -e "${YELLOW}配置文件路径 : $COMPOSE_FILE${RESET}"
-    echo -e "${YELLOW}凭证文件路径 : $ENV_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Tg-SignPulse 镜像
+# 更新 EmbyRelay 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Tg-SignPulse 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 EmbyRelay 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Tg-SignPulse
+# 卸载 EmbyRelay
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的配置和数据库！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 Tg-SignPulse 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据卷，将永久丢失中转配置和数据库！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 EmbyRelay 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down
-            echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}是否同时彻底删除本地全量挂载的数据及凭证目录 ($BASE_DIR)？(y/n): ${RESET}"
-            read -r clean_data
-            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
-                rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有配置、凭证及数据已被彻底销毁。${RESET}"
-            fi
+            cd "$BASE_DIR" && docker compose down -v
+            echo -e "${GREEN}容器及数据卷已彻底清除。${RESET}"
+            rm -rf "$BASE_DIR"
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
@@ -210,15 +191,11 @@ logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 show_info() {
     get_status_info
     DETECT_IP=$(get_public_ip)
-    webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-    [[ -z "$webui_port" ]] && webui_port="8080"
-
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态      : $status${RESET}"
-    echo -e "${YELLOW}镜像名称      : ${img_version}${RESET}"
-    echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${webui_port}${RESET}"
-    echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
-    echo -e "${YELLOW}凭证文件路径  : $ENV_FILE${RESET}"
+    echo -e "${YELLOW}当前状态       : $status"
+    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
+    echo -e "${YELLOW}访问端口       : ${port_display}${RESET}"
+    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -226,7 +203,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  Tg-SignPulse 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}    ◈  EmbyRelay 管理面板  ◈   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"

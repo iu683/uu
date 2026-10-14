@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# EmbyRelay 中转服务 Docker Compose 管理面板 
+# Index Translate Docker 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="embyrelay"
-BASE_DIR="/opt/embyrelay"
+CONTAINER_NAME="index-translate-proxy"
+BASE_DIR="/opt/index-translate"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -42,8 +42,8 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "6689/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="6689"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8080"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -75,107 +75,77 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 处理绝对路径与相对路径转换
-get_real_path() {
-    local input_path="$1"
-    local default_path="$2"
-    [[ -z "$input_path" ]] && input_path="$default_path"
-
-    if [[ "$input_path" == "./"* ]]; then
-        echo "$BASE_DIR/${input_path#./}"
-    else
-        echo "$input_path"
-    fi
-}
-
-# 部署 EmbyRelay
+# 部署 Index Translate
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 账号密码安全配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入后台管理员用户名 [默认: admin]: ${RESET}"
-    read -r relay_user
-    [[ -z "$relay_user" ]] && relay_user="admin"
-
-    echo -ne "${YELLOW}请输入后台管理员密码 [默认: CHANGE-ME-before-first-start]: ${RESET}"
-    read -r relay_pass
-    [[ -z "$relay_pass" ]] && relay_pass="CHANGE-ME-before-first-start"
-
-    echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 EmbyRelay 访问端口 [默认: 6689]: ${RESET}"
+    echo -e "${CYAN}====== 网络端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入访问端口 [默认: 8080]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="6689"
+    [[ -z "$custom_port" ]] && custom_port="8080"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成纯净版 docker-compose.yml 配置文件 (继承你提供的安全加固配置)
-    echo -e "${YELLOW}正在生成符合安全规范的 docker-compose.yml 配置文件...${RESET}"
+    # 动态生成规范的 docker-compose.yml 配置文件
+    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  embyrelay:
-    image: ecouus/embyrelay:latest
+  index-translate-docker:
     container_name: ${CONTAINER_NAME}
-    environment:
-      RELAY_ADMIN_USER: "${relay_user}"
-      RELAY_ADMIN_PASSWORD: "${relay_pass}"
-      RELAY_ALLOW_INSECURE: "true"
-    volumes:
-      - relay_data:/data
     ports:
-      - "${custom_port}:6689"
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
+      - "${custom_port}:8080"
     restart: unless-stopped
-    stop_grace_period: 15s
-
-volumes:
-  relay_data:
+    image: ghcr.io/yeqingky/index-translate-docker:latest
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 EmbyRelay...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Index Translate...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        EmbyRelay 部署成功！       ${RESET}"
+    echo -e "${GREEN}   Index Translate 部署成功！   ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}访问地址     : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}初始账号     : ${relay_user}${RESET}"
-    echo -e "${YELLOW}初始密码     : ${relay_pass}${RESET}"
+    echo -e "${YELLOW}接口地址     : http://${DETECT_IP}:${custom_port}/v1${RESET}"
+    echo -e "${YELLOW}模型选择     : Index-Translate-35B-A3B${RESET}"
+    echo -e "${YELLOW}API Key     :随意填写 (如 index)${RESET}"
     echo -e "${YELLOW}配置文件路径 : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 EmbyRelay 镜像
+# 更新镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 EmbyRelay 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 EmbyRelay
+# 卸载服务 (应用你要求的样式)
 uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据卷，将永久丢失中转配置和数据库！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 EmbyRelay 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 index-translate-proxy 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
-            cd "$BASE_DIR" && docker compose down -v
-            echo -e "${GREEN}容器及数据卷已彻底清除。${RESET}"
-            rm -rf "$BASE_DIR"
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地数据目录及整个项目文件夹 (${BASE_DIR})？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                echo -e "${GREEN}项目及本地数据目录已彻底清理。${RESET}"
+            fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
@@ -194,7 +164,7 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}访问端口       : ${port_display}${RESET}"
+    echo -e "${YELLOW}访问地址       : http://${DETECT_IP}:${port_display}${RESET}"
     echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
@@ -203,7 +173,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  EmbyRelay 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}  ◈ Index Translate 管理面板 ◈  ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"

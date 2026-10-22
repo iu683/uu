@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# DailyCheckIn Plus Docker Compose 管理面板 
+# Calends 日历服务 Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="dailycheckin"
-BASE_DIR="/opt/dailycheckin"
+CONTAINER_NAME="calends"
+BASE_DIR="/opt/calends"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
 # 检测依赖
@@ -42,8 +42,8 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8080"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8787/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="8787"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -75,108 +75,86 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 处理绝对路径与相对路径转换
-get_real_path() {
-    local input_path="$1"
-    local default_path="$2"
-    [[ -z "$input_path" ]] && input_path="$default_path"
-
-    if [[ "$input_path" == "./"* ]]; then
-        echo "$BASE_DIR/${input_path#./}"
-    else
-        echo "$input_path"
-    fi
-}
-
-# 部署 DailyCheckIn
+# 部署 Calends
 install_utils() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 挂载目录自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用项目根目录下的子文件夹。${RESET}"
-
-    echo -ne "${YELLOW}请输入本地数据挂载根目录 [默认: $BASE_DIR]: ${RESET}"
-    read -r custom_base
-    [[ -z "$custom_base" ]] && custom_base="$BASE_DIR"
-
-    local path_config="${custom_base}/config"
-    local path_cron="${custom_base}/cron"
-    local path_logs="${custom_base}/logs"
-    local path_data="${custom_base}/data"
-
-    mkdir -p "$path_config" "$path_cron" "$path_logs" "$path_data"
-
-    echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 DailyCheckIn 访问端口 [默认: 8080]: ${RESET}"
+    echo -e "\n${CYAN}====== 网络端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Calends 访问端口 [默认: 8787]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="8080"
+    [[ -z "$custom_port" ]] && custom_port="8787"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    # 动态生成规范的 docker-compose.yml 配置文件
+    # 动态生成固定项目名与命名数据卷的 docker-compose.yml
     echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
+# 首次设置密码需要的初始化令牌：docker compose logs calends
+# 固定项目名，数据卷始终叫 calends_calends-data，不随所在目录名变化
+name: calends
 services:
-  dailycheckin:
-    image: ghcr.io/beacherz/dailycheckin-plus:latest
+  calends:
+    image: ghcr.io/imetn/calends:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     ports:
-      - "${custom_port}:8080"
+      - "${custom_port}:8787"
     volumes:
-      - "${path_config}:/dailycheckin/config"
-      - "${path_cron}:/dailycheckin/cron"
-      - "${path_logs}:/dailycheckin/logs"
-      - "${path_data}:/dailycheckin/data"
+      - calends-data:/data
     environment:
-      - TZ=Asia/Shanghai
+      TZ: UTC
+
+volumes:
+  calends-data:
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 DailyCheckIn...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Calends...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    DailyCheckIn 部署成功！     ${RESET}"
+    echo -e "${GREEN}       Calends 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}访问地址     : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}挂载根目录   : ${custom_base}${RESET}"
+    echo -e "${YELLOW}初始化命令   : docker compose logs calends (用于获取首次设置密码令牌)${RESET}"
     echo -e "${YELLOW}配置文件路径 : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新镜像
+# 更新 Calends 镜像
 update_utils() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 Calends 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载服务 (带分步清理确认)
+# 卸载 Calends
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 dailycheckin 容器吗？(y/n): ${RESET}"
+    echo -e "${RED}警告: 卸载如果清理数据卷，将永久丢失您的日历数据！${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 Calends 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地数据目录及整个项目文件夹 (${BASE_DIR})？(y/n): ${RESET}"
+            echo -ne "${RED}是否同时彻底删除 Docker 数据卷 (calends_calends-data) 及项目目录 ($BASE_DIR)？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                docker volume rm calends_calends-data 2>/dev/null
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}项目及本地数据目录已彻底清理。${RESET}"
+                echo -e "${GREEN}本地项目目录及命名数据卷已被彻底销毁。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -193,11 +171,15 @@ logs_utils() { docker logs -f "$CONTAINER_NAME"; }
 show_info() {
     get_status_info
     DETECT_IP=$(get_public_ip)
+    webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8787/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+    [[ -z "$webui_port" ]] && webui_port="8787"
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态       : $status"
-    echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}访问地址       : http://${DETECT_IP}:${port_display}${RESET}"
-    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}当前状态      : $status${RESET}"
+    echo -e "${YELLOW}镜像名称      : ${img_version}${RESET}"
+    echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${webui_port}${RESET}"
+    echo -e "${YELLOW}初始化查看命令: docker compose logs calends${RESET}"
+    echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -205,7 +187,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈ DailyCheckIn 管理面板 ◈   ${RESET}"
+    echo -e "${GREEN}    ◈  Calends 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"

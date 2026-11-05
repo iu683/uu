@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Silo Server Docker Compose 管理面板 
+# Transflux Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,8 +10,8 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="silo"
-BASE_DIR="/opt/silo"
+CONTAINER_NAME="transflux"
+BASE_DIR="/opt/transflux"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 ENV_FILE="$BASE_DIR/.env"
 
@@ -43,8 +43,8 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="8090"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="3000"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -76,109 +76,81 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Silo Server
+# 部署 Transflux
 install_utils() {
     check_dependencies
     
-    mkdir -p "$BASE_DIR/config" "$BASE_DIR/transcode" "$BASE_DIR/download-artifacts"
+    mkdir -p "$BASE_DIR/data"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 媒体库路径与权限配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入宿主机媒体库绝对路径 (MEDIA_ROOT) [例如: /srv/media]: ${RESET}"
-    read -r media_root
-    while [[ -z "$media_root" ]]; do
-        echo -e "${RED}错误: 媒体库路径不能为空！${RESET}"
-        echo -ne "${YELLOW}请输入宿主机媒体库绝对路径 (MEDIA_ROOT): ${RESET}"
-        read -r media_root
-    }
+    echo -e "${CYAN}====== 1. 安全与密钥配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入网关初始鉴权密钥 (AUTH_KEY) [默认: change-me-gateway-auth]: ${RESET}"
+    read -r auth_key
+    [[ -z "$auth_key" ]] && auth_key="change-me-gateway-auth"
 
-    echo -ne "${YELLOW}请输入 SECRET_KEY [回车自动生成随机密钥]: ${RESET}"
-    read -r secret_key
-    if [[ -z "$secret_key" ]]; then
+    echo -ne "${YELLOW}请输入加密主密钥 (MASTER_KEY) [回车自动生成 64 位随机 Hex 串]: ${RESET}"
+    read -r master_key
+    if [[ -z "$master_key" ]]; then
         if command -v openssl &> /dev/null; then
-            secret_key=$(openssl rand -base64 48)
+            master_key=$(openssl rand -hex 32)
         else
-            secret_key="silo_$(date +%s)_$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)"
+            master_key="tf_$(date +%s)_$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)"
         fi
-        echo -e "${GREEN}已自动生成安全密钥。${RESET}"
+        echo -e "${GREEN}已自动为您生成加密主密钥。${RESET}"
     fi
 
     echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Silo 主面板端口 [默认: 8090]: ${RESET}"
-    read -r port_main
-    [[ -z "$port_main" ]] && port_main="8090"
-
-    echo -ne "${YELLOW}请输入 Jellyfin 转发端口 [默认: 8096]: ${RESET}"
-    read -r port_jf
-    [[ -z "$port_jf" ]] && port_jf="8096"
-
-    echo -ne "${YELLOW}请输入 Audiobookshelf 转发端口 [默认: 13378]: ${RESET}"
-    read -r port_abs
-    [[ -z "$port_abs" ]] && port_abs="13378"
-
-    # 获取当前用户 PUID / PGID
-    local current_uid=$(id -u)
-    local current_gid=$(id -g)
+    echo -ne "${YELLOW}请输入 Transflux 访问端口 [默认: 3000]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="3000"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
+        return
+    fi
 
     # 生成 .env 文件
     echo -e "${YELLOW}正在生成 .env 配置文件...${RESET}"
     cat <<EOF > "$ENV_FILE"
-SECRET_KEY=${secret_key}
-MEDIA_ROOT=${media_root}
-SILO_DATA_ROOT=${BASE_DIR}
-PUID=${current_uid}
-PGID=${current_gid}
-TZ=Asia/Shanghai
-PORT=${port_main}
-JF_PORT=${port_jf}
-ABS_PORT=${port_abs}
-ENABLE_REDIS=true
+PORT=${custom_port}
+DB_PATH=./data/usage.sqlite
+CORS_ORIGINS=
+AUTH_KEY=${auth_key}
+MASTER_KEY=${master_key}
 EOF
 
     # 生成 docker-compose.yml 文件
     echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  silo:
-    image: \${SILO_OMNIBUS_IMAGE:-ghcr.io/silo-server/silo-server:latest}
+  gateway:
+    image: ghcr.io/no-token/transflux:latest
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
-    stop_grace_period: 2m
-    cap_add: [NET_ADMIN]
-    env_file: .env
-    environment:
-      PORT: "8080"
-      JF_PORT: "8096"
-      ABS_PORT: "13378"
-      ENABLE_REDIS: \${ENABLE_REDIS:-true}
     ports:
-      - "\${PORT:-8090}:8080"
-      - "\${JF_PORT:-8096}:8096"
-      - "\${ABS_PORT:-13378}:13378"
+      - "\${PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      PORT: 3000
+      DB_PATH: /app/data/usage.sqlite
     volumes:
-      - \${SILO_DATA_ROOT:-/opt/silo}/config:/config
-      - \${MEDIA_ROOT}:\${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
-      - \${SILO_DATA_ROOT:-/opt/silo}/transcode:/tmp/silo-transcode
-      - \${SILO_DATA_ROOT:-/opt/silo}/download-artifacts:/tmp/silo-download-artifacts
-    # Intel or AMD GPU: 取消下方两行的注释以启用硬件转码
-    # devices:
-    #   - /dev/dri:/dev/dri
+      - ./data:/app/data
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Silo Server...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Transflux...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}     Silo Server 部署成功！     ${RESET}"
+    echo -e "${GREEN}     Transflux 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}主面板访问地址 : http://${DETECT_IP}:${port_main}${RESET}"
-    echo -e "${YELLOW}Jellyfin 端口  : http://${DETECT_IP}:${port_jf}${RESET}"
-    echo -e "${YELLOW}ABS 端口       : http://${DETECT_IP}:${port_abs}${RESET}"
-    echo -e "${YELLOW}媒体库挂载目录 : ${media_root}${RESET}"
-    echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}访问地址     : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}后台账号密码 : admin / admin123${RESET}"
+    echo -e "${YELLOW}初始鉴权密钥 : ${auth_key}${RESET}"
+    echo -e "${YELLOW}数据持久化   : ${BASE_DIR}/data${RESET}"
+    echo -e "${YELLOW}配置文件路径 : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -196,13 +168,13 @@ update_utils() {
 
 # 卸载服务 (带分步清理确认)
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 silo 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 transflux 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地配置及整个项目文件夹 (${BASE_DIR})？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地数据目录及整个项目文件夹 (${BASE_DIR})？(y/n) [注意：包含 SQLite 数据库与加密密钥]: ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
@@ -226,7 +198,7 @@ show_info() {
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}当前状态       : $status"
     echo -e "${YELLOW}镜像名称       : ${img_version}${RESET}"
-    echo -e "${YELLOW}主面板访问     : http://${DETECT_IP}:${port_display}${RESET}"
+    echo -e "${YELLOW}访问地址       : http://${DETECT_IP}:${port_display}${RESET}"
     echo -e "${YELLOW}配置文件路径   : $COMPOSE_FILE${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
@@ -235,7 +207,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}   ◈ Silo Server 管理面板 ◈     ${RESET}"
+    echo -e "${GREEN}    ◈ Transflux 管理面板 ◈       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Kanban 任务板服务 Docker Compose 管理面板 
+# SaveAny-Bot 机器人服务 Docker Compose 管理面板 (支持自定义路径、密码与监听地址)
 # =================================================================
 
 # 颜色
@@ -10,45 +10,17 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="kanban"
-BASE_DIR="/opt/kanban"
+CONTAINER_NAME="saveany-bot"
+BASE_DIR="/opt/saveany"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+CONFIG_FILE="$BASE_DIR/config.toml"
+ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
-    fi
-}
-
-# 动态获取容器状态与映射端口
-get_status_info() {
-    if ! command -v docker &> /dev/null; then
-        status="${RED}未安装 Docker${RESET}"
-        img_version="${RED}未安装${RESET}"
-        port_display="N/A"
-        return 0
-    fi
-    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${GREEN}运行中${RESET}"
-    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        status="${RED}已停止${RESET}"
-    else
-        status="${RED}未部署${RESET}"
-    fi
-
-    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$img_version" ]] && img_version="已安装"
-
-        # 准确提取主机映射端口
-        webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if eq $p "3000/tcp"}}{{index $conf 0}.HostPort}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="3000"
-        port_display="${webui_port}"
-    else
-        img_version="${RED}未安装${RESET}"
-        port_display="N/A"
     fi
 }
 
@@ -76,115 +48,207 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 处理绝对路径与相对路径转换
-get_real_path() {
-    local input_path="$1"
-    local default_path="$2"
-    [[ -z "$input_path" ]] && input_path="$default_path"
+# 生成随机密钥的辅助函数
+generate_random_token() {
+    if command -v openssl &> /dev/null; then
+        openssl_rand=$(openssl rand -hex 16 2>/dev/null)
+        if [[ -n "$openssl_rand" ]]; then
+            echo "$openssl_rand"
+            return 0
+        fi
+    fi
+    echo "api_$(date +%s)_$((RANDOM % 10000))"
+}
 
-    if [[ "$input_path" == "./"* ]]; then
-        echo "$BASE_DIR/${input_path#./}"
+# 动态获取容器状态与配置信息
+get_status_info() {
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${GREEN}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
     else
-        echo "$input_path"
+        status="${RED}未部署${RESET}"
+    fi
+
+    # 2. 读取镜像版本
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+    else
+        img_version="${RED}未安装${RESET}"
+    fi
+
+    # 3. 从 .env 或默认路径安全读取下载目录与端口
+    if [ -f "$ENV_FILE" ]; then
+        source "$ENV_FILE"
+    fi
+    
+    data_dir="${CUSTOM_DOWNLOADS:-$BASE_DIR/downloads}"
+    
+    if [ -f "$CONFIG_FILE" ]; then
+        webui_port=$(grep -A 5 "\[api\]" "$CONFIG_FILE" | grep "port" | awk -F'=' '{print $2}' | tr -d ' "')
+        [[ -z "$webui_port" ]] && webui_port="28080"
+    else
+        webui_port="N/A"
     fi
 }
 
-# 部署 Kanban
-install_utils() {
+# 部署 SaveAny-Bot
+install_translate() {
     check_dependencies
     
     mkdir -p "$BASE_DIR"
-    DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 目录挂载自定义配置 ======${RESET}"
-    echo -e "${YELLOW}提示: 直接回车将默认采用同级路径下的 data 文件夹。${RESET}"
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
     
-    echo -ne "${YELLOW}请输入数据(data)本地挂载路径 [默认: ./data]: ${RESET}"
-    read -r input_data
-    local path_data_raw="${input_data:-./data}"
-    local real_path_data=$(get_real_path "$path_data_raw" "./data")
+    echo -ne "${YELLOW}请输入你的 Telegram Bot Token (必填): ${RESET}"
+    read -r tg_token
+    while [[ -z "$tg_token" ]]; do
+        echo -e "${RED}错误: Bot Token 不能为空！${RESET}"
+        echo -ne "${YELLOW}请重新输入 Telegram Bot Token: ${RESET}"
+        read -r tg_token
+    done
 
-    mkdir -p "$real_path_data"
-    chmod -R 777 "$real_path_data"
+    echo -ne "${YELLOW}请输入允许使用机器人的 Telegram 用户 ID: ${RESET}"
+    read -r tg_user_id
+    [[ -z "$tg_user_id" ]] && tg_user_id="114514"
 
-    echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Kanban Web 服务访问端口 [默认: 3000]: ${RESET}"
-    read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="3000"
-    if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
-        return
-    fi
+    echo -ne "${YELLOW}请输入自定义管理密码 (留空则由程序首启日志自动生成): ${RESET}"
+    read -r admin_password
+    [[ -z "$admin_password" ]] && admin_password="change-me"
 
-    echo -e "\n${CYAN}====== 3. 管理员账号密码配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入初始管理员用户名 [默认: admin]: ${RESET}"
-    read -r admin_user
-    [[ -z "$admin_user" ]] && admin_user="admin"
+    echo -ne "${YELLOW}请输入宿主机文件下载存储的绝对路径 [默认: $BASE_DIR/downloads]: ${RESET}"
+    read -r custom_downloads
+    [[ -z "$custom_downloads" ]] && custom_downloads="$BASE_DIR/downloads"
 
-    echo -ne "${YELLOW}请输入初始管理员密码 [默认: admin123456]: ${RESET}"
-    read -r admin_pass
-    [[ -z "$admin_pass" ]] && admin_pass="admin123456"
+    # 自动创建所需的所有挂载子目录
+    echo -e "${YELLOW}正在初始化宿主机目录...${RESET}"
+    mkdir -p "$BASE_DIR/data" "$BASE_DIR/cache" "$custom_downloads"
+    chmod -R 777 "$BASE_DIR" "$custom_downloads"
 
-    # 动态生成纯净版 docker-compose.yml 配置文件
-    echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
-    cat <<EOF > "$COMPOSE_FILE"
-services:
-  kanban:
-    image: ghcr.io/akvicor/kanban:latest
-    container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
-    environment:
-      - KANBAN_ADMIN_USERNAME=${admin_user}
-      - KANBAN_ADMIN_PASSWORD=${admin_pass}
-    volumes:
-      - ${path_data_raw}:/data
-    ports:
-      - "${custom_port}:3000"
+    # 生成一个随机的 API 认证 Token
+    RAND_API_TOKEN=$(generate_random_token)
+
+    # 1. 写入环境变量 .env 文件（用于面板精准记录用户配置）
+    echo -e "${YELLOW}正在生成 .env 配置文件...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+CUSTOM_DOWNLOADS=${custom_downloads}
+ADMIN_PASSWORD=${admin_password}
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Kanban...${RESET}"
+    # 2. 动态生成符合要求的 config.toml 配置文件
+    echo -e "${YELLOW}正在生成规范化的 config.toml 配置文件...${RESET}"
+    cat <<EOF > "$CONFIG_FILE"
+workers = 4    # 同时下载文件数
+retry = 3      # 下载失败重试次数
+threads = 4    # 单个任务下载使用的最大线程数
+stream = false # 使用流式传输模式
+
+[log]
+level = "info"
+
+[telegram]
+token = "${tg_token}"
+
+[telegram.proxy]
+enable = false
+url = "socks5://127.0.0.1:7890"
+
+[aria2]
+enable = false
+url = "http://localhost:6800/jsonrpc"
+secret = ""
+remove_after_transfer = true
+
+[api]
+enable = false
+host = "0.0.0.0"
+port = 28080
+token = "${RAND_API_TOKEN}"
+
+[[storages]]
+name = "本机1"
+type = "local"
+enable = true
+base_path = "./downloads"
+
+[[users]]
+id = ${tg_user_id}
+storages = []
+blacklist = true
+EOF
+
+    # 3. 动态生成符合要求的 docker-compose.yml 配置文件（已加入监听地址、密码环境变量及端口映射）
+    echo -e "${YELLOW}正在生成符合官方标准的 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  saveany-bot:
+    image: ghcr.io/krau/saveany-bot:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    ports:
+      - "28080:28080"
+    environment:
+      - SAVEANY_ADMIN_PASSWORD=${admin_password}
+      - SAVEANY_LISTEN=0.0.0.0:28080
+    volumes:
+      - ${BASE_DIR}/data:/app/data
+      - ${CONFIG_FILE}:/app/config.toml
+      - ${custom_downloads}:/app/downloads
+      - ${BASE_DIR}/cache:/app/cache
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 SaveAny-Bot 服务...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
+    DETECT_IP=$(get_public_ip)
+
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}        Kanban 部署成功！        ${RESET}"
+    echo -e "${GREEN}      SaveAny-Bot 部署成功！      ${RESET}"
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}管理员账号    : ${admin_user}${RESET}"
-    echo -e "${YELLOW}管理员密码    : ${admin_pass}${RESET}"
-    echo -e "${YELLOW}数据挂载路径  : ${real_path_data}${RESET}"
-    echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}访问地址       : http://${DETECT_IP}:28080${RESET}"
+    echo -e "${YELLOW}当前管理员 ID  : $tg_user_id${RESET}"
+    echo -e "${YELLOW}管理密码       : $admin_password${RESET}"
+    echo -e "${YELLOW}宿主机下载路径 : $custom_downloads${RESET}"
+    echo -e "${YELLOW}服务映射端口   : 28080 (监听地址: 0.0.0.0)${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
-# 更新 Kanban 镜像
-update_utils() {
+# 更新 SaveAny-Bot 镜像
+update_translate() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
         return
     fi
-    echo -e "${YELLOW}正在从远端拉取 Kanban 最新镜像...${RESET}"
+    echo -e "${YELLOW}正在从远端拉取 SaveAny-Bot 最新镜像...${RESET}"
     cd "$BASE_DIR" && docker compose pull
     docker compose up -d --remove-orphans
     echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
 }
 
-# 卸载 Kanban
-uninstall_utils() {
-    echo -e "${RED}警告: 卸载如果清理数据，将永久丢失您的所有看板和数据！${RESET}"
-    echo -ne "${YELLOW}确定要卸载并删除 Kanban 容器吗？(y/n): ${RESET}"
+# 卸载 SaveAny-Bot
+uninstall_translate() {
+    echo -ne "${YELLOW}确定要卸载并删除 SaveAny-Bot 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
+            get_status_info
+            local current_download_dir="$data_dir"
+
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${RED}是否同时彻底删除本地全量挂载的看板数据目录？(y/n): ${RESET}"
+            echo -ne "${YELLOW}是否同时删除配置文件、缓存以及已下载的文件？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
-                echo -e "${GREEN}本地所有看板数据及配置已被彻底销毁。${RESET}"
+                if [[ "$current_download_dir" != "$BASE_DIR"* && -d "$current_download_dir" ]]; then
+                    rm -rf "$current_download_dir"
+                fi
+                echo -e "${GREEN}所有数据和自定义下载目录已彻底清理。${RESET}"
             fi
         else
             docker rm -f "$CONTAINER_NAME" 2>/dev/null
@@ -193,19 +257,18 @@ uninstall_utils() {
     fi
 }
 
-start_utils() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
-stop_utils() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
-restart_utils() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
-logs_utils() { docker logs -f "$CONTAINER_NAME"; }
+start_translate() { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_translate() { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_translate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_translate() { docker logs -f "$CONTAINER_NAME"; }
 
 show_info() {
     get_status_info
-    DETECT_IP=$(get_public_ip)
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${YELLOW}当前状态      : $status"
-    echo -e "${YELLOW}镜像名称      : ${img_version}${RESET}"
-    echo -e "${YELLOW}访问地址      : http://${DETECT_IP}:${port_display}${RESET}"
-    echo -e "${YELLOW}配置文件路径  : $COMPOSE_FILE${RESET}"
+    echo -e "${YELLOW}当前状态        : $status"
+    echo -e "${YELLOW}镜像名称        : ${img_version}${RESET}"
+    echo -e "${YELLOW}监听与映射端口  : 0.0.0.0:28080${RESET}"
+    echo -e "${YELLOW}宿主机下载路径 : ${data_dir}${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -213,10 +276,10 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈  Kanban 管理面板  ◈     ${RESET}"
+    echo -e "${GREEN}   ◈  SaveAny-Bot 管理面板  ◈    ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
-    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"
+    echo -e "${GREEN}路径 :${RESET} ${YELLOW}${data_dir}${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
@@ -231,13 +294,13 @@ menu() {
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_utils ;;
-        2) update_utils ;;
-        3) uninstall_utils ;;
-        4) start_utils ;;
-        5) stop_utils ;;
-        6) restart_utils ;;
-        7) logs_utils ;;
+        1) install_translate ;;
+        2) update_translate ;;
+        3) uninstall_translate ;;
+        4) start_translate ;;
+        5) stop_translate ;;
+        6) restart_translate ;;
+        7) logs_translate ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;

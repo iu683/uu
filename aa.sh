@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Saveany-Bot Docker Compose 管理面板 
+# Gopeed Docker Compose 管理面板 
 # =================================================================
 
 # 颜色
@@ -10,10 +10,9 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-CONTAINER_NAME="saveany-bot"
-BASE_DIR="/opt/saveany-bot"
+CONTAINER_NAME="gopeed"
+BASE_DIR="/opt/gopeed"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
-ENV_FILE="$BASE_DIR/.env"
 
 # 检测依赖
 check_dependencies() {
@@ -43,8 +42,8 @@ get_status_info() {
         img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
         [[ -z "$img_version" ]] && img_version="已安装"
 
-        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "28080/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
-        [[ -z "$webui_port" ]] && webui_port="28080"
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "9999/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="9999"
         port_display="${webui_port}"
     else
         img_version="${RED}未安装${RESET}"
@@ -76,82 +75,59 @@ get_public_ip() {
     echo "127.0.0.1" && return 0
 }
 
-# 部署 Saveany-Bot
+# 部署 Gopeed
 install_utils() {
     check_dependencies
     
-    mkdir -p "$BASE_DIR/data" "$BASE_DIR/downloads" "$BASE_DIR/cache"
+    mkdir -p "$BASE_DIR/Downloads" "$BASE_DIR/storage"
     DETECT_IP=$(get_public_ip)
 
-    echo -e "${CYAN}====== 1. 管理员密码配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入 Web UI 管理员密码 (SAVEANY_ADMIN_PASSWORD) [直接回车跳过]: ${RESET}"
-    read -r admin_password
+    echo -e "${CYAN}====== 1. 目录挂载配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入下载目录绝对路径 [默认: ${BASE_DIR}/Downloads]: ${RESET}"
+    read -r download_path
+    [[ -z "$download_path" ]] && download_path="${BASE_DIR}/Downloads"
+    mkdir -p "$download_path"
 
-    echo -e "\n${CYAN}====== 2. 网络端口与绑定配置 ======${RESET}"
-    echo -ne "${YELLOW}请输入访问端口 [默认: 28080]: ${RESET}"
+    echo -e "\n${CYAN}====== 2. 网络端口配置 ======${RESET}"
+    echo -ne "${YELLOW}请输入 Gopeed 访问端口 [默认: 9999]: ${RESET}"
     read -r custom_port
-    [[ -z "$custom_port" ]] && custom_port="28080"
+    [[ -z "$custom_port" ]] && custom_port="9999"
     if ! [[ "$custom_port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须是纯数字！${RESET}"
         return
     fi
 
-    echo -e "${YELLOW}1) 仅本机访问 (127.0.0.1:28080 - 推荐，带 Token 地址打印在日志中)${RESET}"
-    echo -e "${YELLOW}2) 开放全部网卡 (0.0.0.0:28080 - 注意安全风险)${RESET}"
-    echo -ne "${YELLOW}请选择监听绑定模式 [默认: 1]: ${RESET}"
-    read -r bind_choice
-    local bind_ip="127.0.0.1"
-    [[ "$bind_choice" == "2" ]] && bind_ip="0.0.0.0"
-
-    # 生成 .env 文件
-    echo -e "${YELLOW}正在生成 .env 配置文件...${RESET}"
-    cat <<EOF > "$ENV_FILE"
-SAVEANY_ADMIN_PASSWORD=${admin_password}
-SAVEANY_LISTEN=${bind_ip}:${custom_port}
-HOST_PORT=${custom_port}
-BIND_ADDR=${bind_ip}
-EOF
-
     # 生成 docker-compose.yml 文件
     echo -e "${YELLOW}正在生成规范的 docker-compose.yml 配置文件...${RESET}"
     cat <<EOF > "$COMPOSE_FILE"
 services:
-  saveany-bot:
-    image: ghcr.io/krau/saveany-bot:latest
+  gopeed:
     container_name: ${CONTAINER_NAME}
-    restart: unless-stopped
     ports:
-      - "\${BIND_ADDR:-127.0.0.1}:\${HOST_PORT:-28080}:28080"
+      - "${custom_port}:9999"
     environment:
-      SAVEANY_ADMIN_PASSWORD: \${SAVEANY_ADMIN_PASSWORD}
-      SAVEANY_LISTEN: \${SAVEANY_LISTEN:-127.0.0.1:28080}
+      - PUID=0
+      - PGID=0
+      - UMASK=022
     volumes:
-      - ./data:/app/data
-      - ./downloads:/app/downloads
-      - ./cache:/app/cache
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - "${download_path}:/app/Downloads"
+      - "${BASE_DIR}/storage:/app/storage"
+    restart: unless-stopped
+    image: liwei2633/gopeed:latest
 EOF
 
-    echo -e "${YELLOW}正在通过 Docker Compose 启动 Saveany-Bot...${RESET}"
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 Gopeed...${RESET}"
     cd "$BASE_DIR" && docker compose up -d --force-recreate
 
     echo -e "${YELLOW}等待容器初始化 (约3秒)...${RESET}"
     sleep 3
 
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    Saveany-Bot 部署成功！      ${RESET}"
+    echo -e "${GREEN}      Gopeed 部署成功！       ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${YELLOW}访问地址     : http://${DETECT_IP}:${custom_port}${RESET}"
-    echo -e "${YELLOW}监听绑定     : ${bind_ip}:${custom_port}${RESET}"
-    echo -e "${YELLOW}数据挂载目录 : ${BASE_DIR}/data${RESET}"
-    echo -e "${YELLOW}下载挂载目录 : ${BASE_DIR}/downloads${RESET}"
-    echo -e "${YELLOW}缓存挂载目录 : ${BASE_DIR}/cache${RESET}"
+    echo -e "${YELLOW}下载目录     : ${download_path}${RESET}"
     echo -e "${YELLOW}配置文件路径 : $COMPOSE_FILE${RESET}"
-    echo -e "${GREEN}提示：如果未设置密码，带 Token 的访问地址会打印在容器日志中。${RESET}"
     echo -e "${GREEN}================================${RESET}"
 }
 
@@ -169,13 +145,13 @@ update_utils() {
 
 # 卸载服务 (带分步清理确认)
 uninstall_utils() {
-    echo -ne "${YELLOW}确定要卸载并删除 saveany-bot 容器吗？(y/n): ${RESET}"
+    echo -ne "${YELLOW}确定要卸载并删除 gopeed 容器吗？(y/n): ${RESET}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         if [ -f "$COMPOSE_FILE" ]; then
             cd "$BASE_DIR" && docker compose down
             echo -e "${GREEN}容器已停止并移除。${RESET}"
-            echo -ne "${YELLOW}是否同时删除本地数据目录及整个项目文件夹 (${BASE_DIR})？(y/n) [重要：包含下载及数据库]: ${RESET}"
+            echo -ne "${YELLOW}是否同时删除本地下载及整个项目文件夹 (${BASE_DIR})？(y/n): ${RESET}"
             read -r clean_data
             if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
                 rm -rf "$BASE_DIR"
@@ -208,7 +184,7 @@ menu() {
     clear
     get_status_info
     echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}    ◈ Saveany-Bot 管理面板 ◈    ${RESET}"
+    echo -e "${GREEN}     ◈ Gopeed 管理面板 ◈        ${RESET}"
     echo -e "${GREEN}================================${RESET}"
     echo -e "${GREEN}状态 :${RESET} $status"
     echo -e "${GREEN}端口 :${RESET} ${YELLOW}${port_display}${RESET}"

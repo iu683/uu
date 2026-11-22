@@ -1,70 +1,73 @@
 #!/bin/bash
 # =================================================================
-# simple-blog 后端 (官方原生 Clone + 环境变量 Build) 自动化管理面板
+# ClaudeGate Docker Compose 管理面板
 # =================================================================
 
+# 颜色
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-REPO_URL="https://github.com/usxs/simple-blog.git"
-BASE_DIR="/opt/simple-blog"
-BACKEND_DIR="$BASE_DIR/backend"
-RUN_UID_GID="1000:1000"
+CONTAINER_NAME="claudegate"
+BASE_DIR="/opt/claudegate"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+ENV_FILE="$BASE_DIR/.env"
+VOLUME_NAME="claudegate-data"
 
-PERSIST_DIRS="data article Musings img file"
-PERSIST_FILES="config.json"
-
+# 检测依赖
 check_dependencies() {
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}错误: 未检测到 Docker，请先安装 Docker！${RESET}"
         exit 1
     fi
-    if ! docker compose version &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Docker Compose (docker compose)，请先安装！${RESET}"
-        exit 1
-    fi
-    if ! command -v git &> /dev/null; then
-        echo -e "${RED}错误: 未检测到 Git，请先安装 Git！${RESET}"
-        exit 1
-    fi
 }
 
-get_env_port() {
-    local port=""
-    if [ -f "$BACKEND_DIR/.env" ]; then
-        port=$(grep -E '^HOST_PORT=' "$BACKEND_DIR/.env" | head -n1 | cut -d '=' -f2- | tr -d '"' | tr -d "'" | xargs)
-    fi
-    [[ -z "$port" ]] && port="33001"
-    echo "$port"
-}
-
-get_status_info() {
-    local container_id=""
-    if [ -d "$BACKEND_DIR" ] && [ -f "$BACKEND_DIR/docker-compose.yml" ]; then
-        container_id=$(cd "$BACKEND_DIR" && docker compose ps -q --status running 2>/dev/null | head -n1)
-    fi
-    if [[ -z "$container_id" ]]; then
-        container_id=$(docker ps -q -f "name=simple-blog-backend" -f "status=running" 2>/dev/null | head -n1)
-    fi
-
-    if [[ -n "$container_id" ]]; then
-        status="${GREEN}运行中${RESET}"
-        webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{end}}{{end}}' "$container_id" 2>/dev/null | head -n1)
-        [[ -z "$webui_port" ]] && webui_port=$(get_env_port)
+# 格式化 URL 中的 IP (如果是 IPv6 则加上方括号 [])
+format_ip_for_url() {
+    local ip="$1"
+    if [[ "$ip" == *":"* ]]; then
+        echo "[$ip]"
     else
-        if [ -d "$BASE_DIR/.git" ]; then
-            status="${RED}已停止${RESET}"
-        else
-            status="${RED}未部署${RESET}"
-        fi
-        webui_port=$(get_env_port)
-        [[ "$status" == "${RED}未部署${RESET}" ]] && webui_port="N/A"
+        echo "$ip"
     fi
 }
 
+# 动态获取容器状态、映射端口和镜像信息
+get_status_info() {
+    if ! command -v docker &> /dev/null; then
+        status="${RED}未安装 Docker${RESET}"
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+        return 0
+    fi
+
+    # 1. 检查容器状态
+    if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${GREEN}运行中${RESET}"
+    elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        status="${RED}已停止${RESET}"
+    else
+        status="${RED}未部署${RESET}"
+    fi
+
+    # 2. 如果容器存在，从容器状态中提取信息
+    if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+        img_version=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$img_version" ]] && img_version="已安装"
+
+        # 容器内部固定监听 8800 端口
+        webui_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8800/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port=$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{break}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+        [[ -z "$webui_port" ]] && webui_port="27666"
+    else
+        img_version="${RED}未安装${RESET}"
+        webui_port="N/A"
+    fi
+}
+
+# 获取公网 IP (兼容双栈环境)
 get_public_ip() {
     local mode=${1:-"auto"}
     local ip=""
@@ -82,220 +85,259 @@ get_public_ip() {
             ip=$(wget -qO- --timeout=3 --tries=1 -4 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
         for url in "https://api64.ipify.org" "https://6.ip.sb"; do
-            ip=$(wget -qO- --timeout=3 --tries=1 -6 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+            ip=$(wget -qO- --timeout=3 --tries=1 --no-check-certificate "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
         done
     fi
     echo "127.0.0.1" && return 0
 }
 
-set_env_kv() {
-    local key="$1"
-    local val="$2"
-    local file="$3"
-    if grep -qE "^${key}=" "$file"; then
-        sed -i "s|^${key}=.*|${key}=${val}|" "$file"
-    else
-        echo "${key}=${val}" >> "$file"
-    fi
-}
-
-prepare_dirs_and_perms() {
-    cd "$BACKEND_DIR" || return 1
-    echo -e "${YELLOW}正在创建持久化目录与文件 (config.json 必须为文件)...${RESET}"
-    mkdir -p $PERSIST_DIRS
-    for f in $PERSIST_FILES; do
-        # 若误建为目录则清理后重建为空文件
-        if [ -d "$f" ]; then
-            rm -rf "$f"
-        fi
-        [ ! -f "$f" ] && touch "$f"
-    done
-
-    echo -e "${YELLOW}正在修复目录与文件属主 (${RUN_UID_GID})...${RESET}"
-    if command -v sudo &> /dev/null && [ "$(id -u)" -ne 0 ]; then
-        sudo chown -R "$RUN_UID_GID" $PERSIST_DIRS $PERSIST_FILES
-    else
-        chown -R "$RUN_UID_GID" $PERSIST_DIRS $PERSIST_FILES 2>/dev/null || true
-    fi
-}
-
-configure_env() {
-    cd "$BACKEND_DIR" || return 1
-    if [ ! -f ".env" ]; then
-        if [ -f ".env.example" ]; then
-            cp .env.example .env
-        else
-            touch .env
-        fi
-    fi
-
-    local default_port
-    default_port=$(get_env_port)
-
-    echo -e "\n${CYAN}====== 1. 环境变量配置 (.env) ======${RESET}"
-    echo -ne "${YELLOW}宿主机监听端口 HOST_PORT [默认: ${default_port}]: ${RESET}"
-    read -r input_port
-    [[ -z "$input_port" ]] && input_port="$default_port"
-    set_env_kv "HOST_PORT" "$input_port" ".env"
-
-    echo -ne "${YELLOW}管理员账号 ADMIN_USERNAME [默认: admin，留空跳过修改]: ${RESET}"
-    read -r input_admin_user
-    if [[ -n "$input_admin_user" ]]; then
-        set_env_kv "ADMIN_USERNAME" "$input_admin_user" ".env"
-    elif ! grep -qE '^ADMIN_USERNAME=' ".env"; then
-        set_env_kv "ADMIN_USERNAME" "admin" ".env"
-    fi
-
-    echo -ne "${YELLOW}管理员密码 ADMIN_PASSWORD（仅首次初始化生效，留空则走向导/保持不变）: ${RESET}"
-    read -r input_admin_pass
-    if [[ -n "$input_admin_pass" ]]; then
-        set_env_kv "ADMIN_PASSWORD" "$input_admin_pass" ".env"
-    fi
-
-    echo -ne "${YELLOW}前端地址 SITE_PUBLIC_URL（如 https://www.example.com，留空跳过）: ${RESET}"
-    read -r input_site_url
-    [[ -n "$input_site_url" ]] && set_env_kv "SITE_PUBLIC_URL" "$input_site_url" ".env"
-
-    echo -ne "${YELLOW}后端地址 BACKEND_PUBLIC_URL（如 https://api.example.com，留空跳过）: ${RESET}"
-    read -r input_backend_url
-    [[ -n "$input_backend_url" ]] && set_env_kv "BACKEND_PUBLIC_URL" "$input_backend_url" ".env"
-
-    if ! grep -qE '^CAPTCHA_SECRET=.+' ".env" && command -v openssl &> /dev/null; then
-        local cap_secret
-        cap_secret=$(openssl rand -hex 32)
-        set_env_kv "CAPTCHA_SECRET" "$cap_secret" ".env"
-        echo -e "${GREEN}已自动生成 CAPTCHA_SECRET 并写入 .env${RESET}"
-    fi
-
-    echo -ne "${YELLOW}是否使用 vim 手动编辑 .env？(y/N): ${RESET}"
-    read -r edit_vim
-    if [[ "$edit_vim" == "y" || "$edit_vim" == "Y" ]]; then
-        vim .env
-    fi
-}
-
-install_blog() {
+# 部署 ClaudeGate
+install_claudegate() {
     check_dependencies
 
-    if [ ! -d "$BASE_DIR/.git" ]; then
-        echo -e "\n${YELLOW}正在克隆官方 GitHub 仓库...${RESET}"
-        mkdir -p "$BASE_DIR"
-        git clone "$REPO_URL" "$BASE_DIR/tmp_repo"
-        if [ $? -eq 0 ]; then
-            mv "$BASE_DIR/tmp_repo/"* "$BASE_DIR/" 2>/dev/null
-            mv "$BASE_DIR/tmp_repo/."* "$BASE_DIR/" 2>/dev/null
-            rm -rf "$BASE_DIR/tmp_repo"
-        else
-            echo -e "${RED}错误: 仓库克隆失败，请检查网络！${RESET}"
-            return 1
-        fi
-    else
-        echo -e "\n${GREEN}检测到本地已存在仓库，正在同步最新代码...${RESET}"
-        cd "$BASE_DIR" && git pull
-    fi
+    mkdir -p "$BASE_DIR"
 
-    if [ ! -d "$BACKEND_DIR" ]; then
-        echo -e "${RED}错误: 未找到 ${BACKEND_DIR} 目录！${RESET}"
-        return 1
-    fi
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
 
-    prepare_dirs_and_perms
-    configure_env
+    echo -e "${CYAN}====== 自定义参数配置 ======${RESET}"
 
-    echo -e "\n${YELLOW}正在执行 docker compose up -d --build...${RESET}"
-    cd "$BACKEND_DIR" && docker compose up -d --build
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}错误: 容器构建或启动失败，请检查日志！${RESET}"
-        return 1
-    fi
-
-    sleep 3
-    prepare_dirs_and_perms
-
-    get_status_info
-    local DETECT_IP
-    DETECT_IP=$(get_public_ip)
-    local PORT_NOW
-    PORT_NOW=$(get_env_port)
-
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}       simple-blog 后端编译并启动成功！             ${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}本地监听地址 : http://127.0.0.1:${PORT_NOW}${RESET}"
-    echo -e "${YELLOW}后台访问地址 : http://127.0.0.1:${PORT_NOW}/admin.html${RESET}"
-    echo -e "${YELLOW}账号         : ${ADMIN_USERNAME}${RESET}"
-    echo -e "${YELLOW}密码         : ${ADMIN_PASSWORD}${RESET}"
-    echo -e "${YELLOW}后端工作目录 : ${BACKEND_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
-}
-
-update_blog() {
-    if [ ! -d "$BASE_DIR/.git" ]; then
-        echo -e "${RED}错误: 未检测到克隆的仓库，请先执行选项 1！${RESET}"
+    echo -ne "${YELLOW}请输入宿主机映射端口 [默认: 27666，容器内固定 8800]: ${RESET}"
+    read -r custom_port
+    [[ -z "$custom_port" ]] && custom_port="27666"
+    if ! [[ "$custom_port" =~ ^[0-9]+$ ]] || [ "$custom_port" -lt 1 ] || [ "$custom_port" -gt 65535 ]; then
+        echo -e "${RED}错误: 端口必须是 1-65535 之间的数字！${RESET}"
         return
     fi
 
-    echo -e "${YELLOW}正在同步最新远程代码...${RESET}"
-    cd "$BASE_DIR" && git pull
+    echo -ne "${YELLOW}请输入 PUBLIC_URL (如 https://gw.example.com) [默认: http://${DETECT_IP}:${custom_port}]: ${RESET}"
+    read -r public_url
+    [[ -z "$public_url" ]] && public_url="http://${DETECT_IP}:${custom_port}"
 
-    prepare_dirs_and_perms
-    echo -e "${YELLOW}正在重新构建并启动容器...${RESET}"
-    cd "$BACKEND_DIR" && docker compose up -d --build --remove-orphans
-    echo -e "${GREEN}后端更新并重编完成！${RESET}"
+    echo -ne "${YELLOW}请输入出站代理 UPSTREAM_PROXY (如 socks5h://127.0.0.1:1080，留空直连): ${RESET}"
+    read -r upstream_proxy
+
+    echo -ne "${YELLOW}请输入默认模型 DEFAULT_MODEL [默认: claude-sonnet-4-5-20250929]: ${RESET}"
+    read -r default_model
+    [[ -z "$default_model" ]] && default_model="claude-sonnet-4-5-20250929"
+
+    echo -ne "${YELLOW}请输入网关令牌有效期 TOKEN_TTL_DAYS (天) [默认: 365]: ${RESET}"
+    read -r token_ttl
+    [[ -z "$token_ttl" ]] && token_ttl="365"
+
+    echo -e "${YELLOW}正在生成 .env 配置文件...${RESET}"
+    cat <<EOF > "$ENV_FILE"
+# ============ 监听 ============
+PORT=8800
+HOST=0.0.0.0
+PUBLIC_URL=${public_url}
+
+# ============ 安全 ============
+SECRET=
+ADMIN_TOKEN=
+ADMIN_SECRET=
+CG_ENV_FILE=
+TOKEN_TTL_DAYS=${token_ttl}
+TRUST_PROXY=true
+
+# ============ 上游 ============
+UPSTREAM_BASE=https://api.anthropic.com
+UPSTREAM_PROXY=${upstream_proxy}
+IP_CHECK=block
+IP_CHECK_URL=https://ipinfo.io/json
+TLS_MIN=TLSv1.2
+TLS_MAX=TLSv1.3
+UPSTREAM_ALPN=http/1.1
+UPSTREAM_TIMEOUT_MS=600000
+UPSTREAM_MAX_SOCKETS=64
+
+# ============ 占用与限流 ============
+MAX_BODY_BYTES=33554432
+SHUTDOWN_GRACE_MS=5000
+
+# ============ Claude Code 请求头守卫 ============
+GUARD_MODE=strict
+GUARD_REQUIRE=user-agent,x-app
+INJECT_MISSING=false
+
+# ============ 隐写拦截 ============
+STEGO_MODE=block
+
+# ============ 请求 ID ============
+REQ_ID_IN_RESPONSE=error
+
+# ============ OAuth ============
+OAUTH_MODE=claude_ai
+OAUTH_CLIENT_ID=
+OAUTH_SCOPES=
+OAUTH_AUTHORIZE_URL=
+OAUTH_TOKEN_URL=
+OAUTH_MANUAL_REDIRECT=https://platform.claude.com/oauth/code/callback
+TOKEN_AUTO_REFRESH=on
+TOKEN_REFRESH_INTERVAL_SEC=60
+TOKEN_REFRESH_LEAD_SEC=600
+OAUTH_PROFILE_URL=https://api.anthropic.com/api/oauth/profile
+
+# ============ 请求体身份校验 ============
+IDENTITY_MODE=block
+
+# ============ 模型上下文与输出 ============
+MODEL_LIMITS=
+CONTEXT_GUARD=block
+CONTEXT_HEADROOM=0.1
+IMAGE_MAX_TOKENS=1600
+
+# ============ 模型 ============
+DEFAULT_MODEL=${default_model}
+MAX_TOKENS_DEFAULT=8192
+
+# ============ 其他 ============
+DATA_DIR=/data
+LOG_LEVEL=info
+
+# ============ 模型目录 ============
+MODEL_CATALOG_URL=https://downloads.claude.ai/model-catalog/v1/catalog.json
+MODEL_CATALOG_TTL_MS=21600000
+MODEL_VALIDATION=strict
+MODEL_DISABLED=
+EOF
+    chmod 600 "$ENV_FILE"
+
+    echo -e "${YELLOW}正在生成 docker-compose.yml 配置文件...${RESET}"
+    cat <<EOF > "$COMPOSE_FILE"
+services:
+  claudegate:
+    image: ghcr.io/moteam-cn/claudegate:latest
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      PORT: "8800"
+      HOST: 0.0.0.0
+      NODE_OPTIONS: --disable-warning=ExperimentalWarning
+    ports:
+      - "${custom_port}:8800"
+    volumes:
+      - ${VOLUME_NAME}:/data
+    healthcheck:
+      test:
+        - CMD
+        - bun
+        - -e
+        - "fetch('http://127.0.0.1:8800/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  ${VOLUME_NAME}:
+EOF
+
+    echo -e "${YELLOW}正在通过 Docker Compose 启动 ClaudeGate 服务...${RESET}"
+    cd "$BASE_DIR" && docker compose up -d --force-recreate
+
+    echo -e "${YELLOW}正在等待容器初始化并提取面板登录密钥...${RESET}"
+    local count=0
+    local key_info=""
+    while [ $count -lt 15 ]; do
+        sleep 1
+        key_info=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -A 6 '面板登录密钥')
+        if [[ -n "$key_info" ]]; then
+            break
+        fi
+        ((count++))
+    done
+
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${GREEN}            ClaudeGate 部署及启动成功！             ${RESET}"
+    echo -e "${GREEN}====================================================${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${custom_port}${RESET}"
+    echo -e "${YELLOW}PUBLIC_URL   : ${public_url}${RESET}"
+    echo -e "${YELLOW}数据持久化卷 : ${VOLUME_NAME} -> /data${RESET}"
+    echo -e "${YELLOW}环境变量文件 : ${ENV_FILE}${RESET}"
+    echo -e "${GREEN}----------------------------------------------------${RESET}"
+    if [[ -n "$key_info" ]]; then
+        echo -e "${CYAN}🔑 面板登录密钥日志提取成功：${RESET}"
+        echo -e "${GREEN}${key_info}${RESET}"
+    else
+        echo -e "${RED}⚠️  提示: 暂未在启动日志中匹配到「面板登录密钥」（可能已非首次启动或已显式设置 ADMIN_TOKEN）。${RESET}"
+        echo -e "${YELLOW}      可选择选项 7 查看完整日志，或删除 data/admin.json 后重启重新派发。${RESET}"
+    fi
+    echo -e "${GREEN}====================================================${RESET}"
 }
 
-uninstall_blog() {
-    echo -ne "${RED}确定要停止并卸载 simple-blog 后端容器吗？(y/N): ${RESET}"
+# 更新镜像
+update_claudegate() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}错误: 未检测到配置文件，请先执行选项 1 进行部署！${RESET}"
+        return
+    fi
+    echo -e "${YELLOW}正在从远端拉取最新镜像...${RESET}"
+    cd "$BASE_DIR" && docker compose pull
+    docker compose up -d --remove-orphans
+    echo -e "${GREEN}更新完成！容器已处于最新状态。${RESET}"
+}
+
+# 卸载服务
+uninstall_claudegate() {
+    echo -ne "${YELLOW}确定要卸载并删除 ClaudeGate 容器吗？(y/n): ${RESET}"
     read -r confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        if [ -f "$BACKEND_DIR/docker-compose.yml" ]; then
-            cd "$BACKEND_DIR" && docker compose down
-            echo -e "${GREEN}容器与网络已被安全停止并移除。${RESET}"
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        if [ -f "$COMPOSE_FILE" ]; then
+            cd "$BASE_DIR" && docker compose down
+            echo -e "${GREEN}容器已停止并移除。${RESET}"
+            echo -ne "${YELLOW}是否同时删除配置目录 ($BASE_DIR) 及数据卷 ($VOLUME_NAME)？(y/n): ${RESET}"
+            read -r clean_data
+            if [ "$clean_data" = "y" ] || [ "$clean_data" = "Y" ]; then
+                rm -rf "$BASE_DIR"
+                docker volume rm "$VOLUME_NAME" 2>/dev/null
+                echo -e "${GREEN}配置目录及数据卷已彻底清理。${RESET}"
+            fi
+        else
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null
         fi
-        echo -ne "${YELLOW}是否同步删除本地整个目录 (${BASE_DIR}，含文章/随笔/图片/配置数据)？(y/N): ${RESET}"
-        read -r clean_data
-        if [[ "$clean_data" == "y" || "$clean_data" == "Y" ]]; then
-            rm -rf "$BASE_DIR"
-            echo -e "${GREEN}本地所有源码与持久化数据已被彻底清除！${RESET}"
-        fi
+        echo -e "${GREEN}卸载完成！${RESET}"
     fi
 }
 
-start_blog()   { [ -f "$BACKEND_DIR/docker-compose.yml" ] && (cd "$BACKEND_DIR" && docker compose start)   && echo -e "${GREEN}后端容器已启动${RESET}"   || echo -e "${RED}未找到 docker-compose.yml${RESET}"; }
-stop_blog()    { [ -f "$BACKEND_DIR/docker-compose.yml" ] && (cd "$BACKEND_DIR" && docker compose stop)    && echo -e "${YELLOW}后端容器已停止${RESET}"    || echo -e "${RED}未找到 docker-compose.yml${RESET}"; }
-restart_blog() { [ -f "$BACKEND_DIR/docker-compose.yml" ] && (cd "$BACKEND_DIR" && docker compose restart) && echo -e "${GREEN}后端容器已重启${RESET}"    || echo -e "${RED}未找到 docker-compose.yml${RESET}"; }
-logs_blog()    { [ -f "$BACKEND_DIR/docker-compose.yml" ] && (cd "$BACKEND_DIR" && docker compose logs -f --tail=100) || echo -e "${RED}未找到 docker-compose.yml${RESET}"; }
+start_claudegate()   { cd "$BASE_DIR" && docker compose start && echo -e "${GREEN}容器已启动${RESET}"; }
+stop_claudegate()    { cd "$BASE_DIR" && docker compose stop && echo -e "${YELLOW}容器已停止${RESET}"; }
+restart_claudegate() { cd "$BASE_DIR" && docker compose restart && echo -e "${GREEN}容器已重启${RESET}"; }
+logs_claudegate() {
+    echo -e "${CYAN}--- 容器当前运行日志 (按 Ctrl+C 退出查看) ---${RESET}"
+    docker logs -f "$CONTAINER_NAME"
+}
 
 show_info() {
     get_status_info
-    local DETECT_IP
-    DETECT_IP=$(get_public_ip)
-    local PORT_NOW
-    PORT_NOW=$(get_env_port)
-    local SITE_URL
-    SITE_URL=$(grep -E '^SITE_PUBLIC_URL=' "$BACKEND_DIR/.env" 2>/dev/null | cut -d '=' -f2-)
-    local BACKEND_URL
-    BACKEND_URL=$(grep -E '^BACKEND_PUBLIC_URL=' "$BACKEND_DIR/.env" 2>/dev/null | cut -d '=' -f2-)
-
-    echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${YELLOW}运行状态       : ${status}"
-    echo -e "${YELLOW}宿主机端口     : ${PORT_NOW} (127.0.0.1:${PORT_NOW})${RESET}"
-    echo -e "${YELLOW}参考访问地址   : http://${DETECT_IP}:${PORT_NOW}${RESET}"
-    echo -e "${YELLOW}SITE_PUBLIC_URL: ${SITE_URL:-未设置}${RESET}"
-    echo -e "${YELLOW}BACKEND_URL    : ${BACKEND_URL:-未设置}${RESET}"
-    echo -e "${YELLOW}后端目录       : ${BACKEND_DIR}${RESET}"
-    echo -e "${GREEN}====================================================${RESET}"
+    RAW_IP=$(get_public_ip)
+    DETECT_IP=$(format_ip_for_url "$RAW_IP")
+    local pub_url=""
+    if [[ -f "$ENV_FILE" ]]; then
+        pub_url=$(grep -E '^PUBLIC_URL=' "$ENV_FILE" | cut -d'=' -f2-)
+    fi
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${YELLOW}当前状态     : $status"
+    echo -e "${YELLOW}镜像名称     : ${img_version}${RESET}"
+    echo -e "${YELLOW}服务访问地址 : http://${DETECT_IP}:${webui_port}${RESET}"
+    [[ -n "$pub_url" ]] && echo -e "${YELLOW}PUBLIC_URL   : ${pub_url}${RESET}"
+    echo -e "${YELLOW}数据持久化卷 : ${VOLUME_NAME} -> /data${RESET}"
+    echo -e "${YELLOW}环境变量文件 : ${ENV_FILE}${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
 }
 
 menu() {
     clear
     get_status_info
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}    ◈  simple-blog 后端面板  ◈     ${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
-    echo -e "${GREEN}集群状态 :${RESET} $status"
-    echo -e "${GREEN}服务端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}  ◈  ClaudeGate 管理面板  ◈   ${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}状态 :${RESET} $status"
+    echo -e "${GREEN}端口 :${RESET} ${YELLOW}${webui_port}${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
     echo -e "${GREEN}1. 部署启动${RESET}"
     echo -e "${GREEN}2. 更新容器${RESET}"
     echo -e "${GREEN}3. 卸载容器${RESET}"
@@ -305,17 +347,17 @@ menu() {
     echo -e "${GREEN}7. 查看日志${RESET}"
     echo -e "${GREEN}8. 查看配置${RESET}"
     echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}===================================${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
     echo -ne "${GREEN}请输入选项: ${RESET}"
     read -r choice
     case "$choice" in
-        1) install_blog ;;
-        2) update_blog ;;
-        3) uninstall_blog ;;
-        4) start_blog ;;
-        5) stop_blog ;;
-        6) restart_blog ;;
-        7) logs_blog ;;
+        1) install_claudegate ;;
+        2) update_claudegate ;;
+        3) uninstall_claudegate ;;
+        4) start_claudegate ;;
+        5) stop_claudegate ;;
+        6) restart_claudegate ;;
+        7) logs_claudegate ;;
         8) show_info ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${RESET}" ;;
